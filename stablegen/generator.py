@@ -20,7 +20,16 @@ from PIL import Image, ImageEnhance
 
 from .util.helpers import prompt_text, prompt_text_img2img, prompt_text_qwen_image_edit # pylint: disable=relative-beyond-top-level
 from .render_tools import export_emit_image, export_visibility, export_canny, bake_texture, prepare_baking, unwrap # pylint: disable=relative-beyond-top-level
-from .utils import get_last_material_index, get_generation_dirs, get_file_path, get_dir_path, remove_empty_dirs # pylint: disable=relative-beyond-top-level
+from .utils import (
+    get_last_material_index,
+    get_generation_dirs,
+    get_file_path,
+    get_dir_path,
+    remove_empty_dirs,
+    get_compositor_node_tree,
+    configure_output_node_paths,
+    get_eevee_engine_id,
+) # pylint: disable=relative-beyond-top-level
 from .project import project_image, reinstate_compare_nodes # pylint: disable=relative-beyond-top-level
 from .workflows import WorkflowManager
 
@@ -449,7 +458,7 @@ class ComfyUIGenerate(bpy.types.Operator):
 
         print("Executing ComfyUI Generation")
 
-        if context.scene.model_architecture == 'qwen_image_edit':
+        if context.scene.model_architecture == 'qwen_image_edit' and not context.scene.generation_mode == 'project_only':
             context.scene.generation_method = 'sequential' # Force sequential for Qwen Image Edit
 
         render = bpy.context.scene.render
@@ -1224,6 +1233,12 @@ class ComfyUIGenerate(bpy.types.Operator):
         :return: None     
         """
         print("Exporting depth map")
+
+        # Check if blender version is > 5.0
+        legacy = True
+        if bpy.app.version >= (5, 0, 0):
+            legacy = False
+    
         # Save original settings to restore later.
         original_engine = bpy.context.scene.render.engine
         original_view_transform = bpy.context.scene.view_settings.view_transform
@@ -1255,8 +1270,12 @@ class ComfyUIGenerate(bpy.types.Operator):
 
         # Use the compositor to save the depth pass
         bpy.context.scene.use_nodes = True
-        nodes = bpy.context.scene.node_tree.nodes
-        links = bpy.context.scene.node_tree.links
+        node_tree = get_compositor_node_tree(context)
+        if node_tree is None:
+            print("Warning: Unable to access compositor node tree for depth export.")
+            return
+        nodes = node_tree.nodes
+        links = node_tree.links
         
         # Ensure animation format is not selected
         bpy.context.scene.render.image_settings.file_format = 'PNG'
@@ -1277,14 +1296,12 @@ class ComfyUIGenerate(bpy.types.Operator):
         # Add an invert node to flip the depth map values
         invert_node = nodes.new(type="CompositorNodeInvert")
         invert_node.location = (400, 0)
-        links.new(normalize_node.outputs[0], invert_node.inputs[1])
+        links.new(normalize_node.outputs[0], invert_node.inputs["Color"])
 
         # Add an output file node
         output_node = nodes.new(type="CompositorNodeOutputFile")
         output_node.location = (600, 0)
-        output_node.base_path = output_dir
-        output_node.file_slots[0].path = output_file
-        output_node.format.file_format = "PNG"  # Save as PNG
+        configure_output_node_paths(output_node, output_dir, output_file)
         links.new(invert_node.outputs[0], output_node.inputs[0])
 
         # Render the scene
@@ -1325,14 +1342,18 @@ class ComfyUIGenerate(bpy.types.Operator):
         original_view_transform = bpy.context.scene.view_settings.view_transform
         original_film_transparent = bpy.context.scene.render.film_transparent
 
-        bpy.context.scene.render.engine = 'BLENDER_EEVEE_NEXT'
+        bpy.context.scene.render.engine = get_eevee_engine_id()
         bpy.context.scene.view_settings.view_transform = 'Raw'
         bpy.context.scene.render.film_transparent = True
         bpy.context.scene.use_nodes = True
 
-        # Clear existing nodes.
-        nodes = bpy.context.scene.node_tree.nodes
-        links = bpy.context.scene.node_tree.links
+        # Clear existing nodes using Blender 4/5 compatible access.
+        node_tree = get_compositor_node_tree(context)
+        if node_tree is None:
+            print("Warning: Unable to access compositor node tree for normal export.")
+            return
+        nodes = node_tree.nodes
+        links = node_tree.links
         for node in nodes:
             nodes.remove(node)
 
@@ -1355,9 +1376,7 @@ class ComfyUIGenerate(bpy.types.Operator):
         # Create the Output File node.
         output_node = nodes.new(type="CompositorNodeOutputFile")
         output_node.location = (400, 0)
-        output_node.base_path = output_dir
-        output_node.file_slots[0].path = output_file
-        output_node.format.file_format = "PNG"
+        configure_output_node_paths(output_node, output_dir, output_file)
         links.new(alpha_over_node.outputs[0], output_node.inputs[0])
         links.new(render_layers_node.outputs["Alpha"], alpha_over_node.inputs[0])
 

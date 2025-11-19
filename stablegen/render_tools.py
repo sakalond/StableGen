@@ -1,14 +1,21 @@
 """ This file contains the operators and panels for the StableGen addon """
 # disable import-error because pylint doesn't recognize the blenders internal modules
 import os
-import bpy, bmesh  # pylint: disable=import-error
+import bpy, bmesh, bpy_extras  # pylint: disable=import-error
 import numpy as np
 import math
 import time
 import mathutils
 from mathutils import Matrix
 import blf
-from .utils import get_file_path, get_dir_path, remove_empty_dirs
+from .utils import (
+    get_file_path,
+    get_dir_path,
+    remove_empty_dirs,
+    get_compositor_node_tree,
+    configure_output_node_paths,
+    get_eevee_engine_id,
+)
 import tempfile
 import shutil
 from PIL import Image
@@ -17,6 +24,8 @@ from PIL import Image
 import cv2 
 import imageio
 import imageio_ffmpeg
+
+EEVEE_ENGINE_ID = get_eevee_engine_id()
 
 
 def apply_uv_inpaint_texture(context, obj, baked_image_path):
@@ -107,6 +116,9 @@ def export_emit_image(context, to_export, camera_id=None, bg_color=(0.5, 0.5, 0.
         original_materials = {}
         original_active_material = {}
         temporary_materials = {}
+
+        # Legacy mode for blender versions prior to 5.0
+        legacy = bpy.app.version < (5, 0, 0)
         
         # Check if there is BSDF applied
         
@@ -185,7 +197,10 @@ def export_emit_image(context, to_export, camera_id=None, bg_color=(0.5, 0.5, 0.
         # Switch to CYCLES render engine and configure settings
         context.scene.render.engine = 'CYCLES'
         # Enable OSL
-        context.scene.cycles.use_osl = True
+        if legacy:
+            context.scene.cycles.use_osl = True
+        else:
+            context.scene.cycles.shading_system = True
         context.scene.cycles.device = 'CPU'
         context.scene.render.film_transparent = False
         # Change color management to standard
@@ -207,24 +222,34 @@ def export_emit_image(context, to_export, camera_id=None, bg_color=(0.5, 0.5, 0.
 
         # Set up nodes for diffuse-only output
         context.scene.use_nodes = True
-        nodes = context.scene.node_tree.nodes
-        links = context.scene.node_tree.links
+        node_tree = get_compositor_node_tree(context)
+        if node_tree is None:
+            print("Warning: Unable to access compositor node tree for emit export.")
+            return
+        nodes = node_tree.nodes
+        links = node_tree.links
         
         # Clear existing nodes
         nodes.clear()
         
         # Create nodes
         render_layers = nodes.new('CompositorNodeRLayers')
-        mix_node = nodes.new('CompositorNodeMixRGB')
+        if legacy:
+            mix_node = nodes.new('CompositorNodeMixRGB')
+        else:
+            mix_node = nodes.new('ShaderNodeMixRGB')
         mix_node.blend_type = 'ADD'
         mix_node.inputs[0].default_value = 1
         output_node = nodes.new('CompositorNodeOutputFile')
-        output_node.base_path = output_dir
-        output_node.file_slots[0].path = output_file
+        configure_output_node_paths(output_node, output_dir, output_file)
     
         # Connect emission to output
-        links.new(render_layers.outputs['Emit'], mix_node.inputs[1])
-        links.new(render_layers.outputs['Env'], mix_node.inputs[2])
+        if legacy:
+            links.new(render_layers.outputs['Emit'], mix_node.inputs[1])
+            links.new(render_layers.outputs['Env'], mix_node.inputs[2])
+        else: # 5.0+
+            links.new(render_layers.outputs['Emission'], mix_node.inputs['Color1'])
+            links.new(render_layers.outputs['Environment'], mix_node.inputs['Color2'])
         links.new(mix_node.outputs[0], output_node.inputs[0])
             
         # Render
@@ -341,14 +366,17 @@ def export_render(context, camera_id=None):
 
     # Set up output nodes (Compositor setup remains the same)
     context.scene.use_nodes = True
-    nodes = context.scene.node_tree.nodes
-    links = context.scene.node_tree.links
+    node_tree = get_compositor_node_tree(context)
+    if node_tree is None:
+        print("Warning: Unable to access compositor node tree for Workbench render export.")
+        return
+    nodes = node_tree.nodes
+    links = node_tree.links
     nodes.clear()
 
     render_layers = nodes.new('CompositorNodeRLayers')
     output_node = nodes.new('CompositorNodeOutputFile')
-    output_node.base_path = output_dir
-    output_node.file_slots[0].path = output_file
+    configure_output_node_paths(output_node, output_dir, output_file)
     links.new(render_layers.outputs['Image'], output_node.inputs[0])
 
     # Render
@@ -1057,8 +1085,14 @@ class SwitchMaterial(bpy.types.Operator):
         return {'FINISHED'}
     
 def prepare_baking(context):
+    # Legacy mode for blender versions prior to 5.0
+    legacy = bpy.app.version < (5, 0, 0)
+
     bpy.context.scene.render.engine = 'CYCLES'
-    bpy.context.scene.cycles.use_osl = True
+    if legacy:
+        bpy.context.scene.cycles.use_osl = True
+    else:
+        bpy.context.scene.cycles.shading_system = True
     bpy.context.scene.cycles.device = 'CPU'
 
     # Set bake type to diffuse and contributions to color only
@@ -1118,9 +1152,14 @@ def unwrap(obj, method, overlap_only):
                 return
             
             # Check for ANY selected UV elements
+            def _loop_has_selection(loop):
+                if hasattr(loop, "uv_select_vert"):
+                    return loop.uv_select_vert
+                return loop[uv_layer].select
+
             has_overlap = any(
-                loop[uv_layer].select 
-                for face in bm.faces 
+                _loop_has_selection(loop)
+                for face in bm.faces
                 for loop in face.loops
             )
 
@@ -1537,7 +1576,7 @@ class ExportOrbitGIF(bpy.types.Operator):
         description="Render engine to use",
         items=[
             ('BLENDER_WORKBENCH', "Workbench", "Use Workbench render engine"),
-            ('BLENDER_EEVEE_NEXT', "Eevee", "Use Eevee render engine"),
+            (EEVEE_ENGINE_ID, "Eevee", "Use Eevee render engine"),
             ('CYCLES', "Cycles", "Use Cycles render engine")
         ],
         default='CYCLES'
@@ -1665,7 +1704,20 @@ class ExportOrbitGIF(bpy.types.Operator):
 
         # Set Interpolation to Linear for smooth rotation
         if self._temp_empty.animation_data and self._temp_empty.animation_data.action:
-            for fcurve in self._temp_empty.animation_data.action.fcurves:
+            action = self._temp_empty.animation_data.action
+            try:
+                fcurves = action.fcurves
+            except AttributeError:
+                fcurves = []
+                try:
+                    slot = action.slots[0]
+                    channelbag = bpy_extras.anim_utils.action_get_channelbag_for_slot(action, slot)
+                    if channelbag:
+                        fcurves = channelbag.fcurves
+                except (AttributeError, IndexError):
+                    fcurves = []
+
+            for fcurve in fcurves:
                 if fcurve.data_path == "rotation_euler" and fcurve.array_index == 2: # Z rotation
                     for kf_point in fcurve.keyframe_points:
                         kf_point.interpolation = 'LINEAR'

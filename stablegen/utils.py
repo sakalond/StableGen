@@ -293,6 +293,8 @@ def get_file_path(context, file_type, subtype=None, filename=None, camera_id=Non
 	:return: The full file path
 	"""
 	dirs = get_generation_dirs(context)
+	# set legacy mode for blender versions prior to 5.0
+	legacy = bpy.app.version < (5, 0, 0)
  
 	# Ensure the directories exist
 	ensure_dirs_exist(dirs)
@@ -300,12 +302,20 @@ def get_file_path(context, file_type, subtype=None, filename=None, camera_id=Non
 	if file_type == "controlnet" and subtype:
 		base_dir = dirs["controlnet"][subtype]
 		if not filename:
-			if subtype == "depth":
-				filename = f"depth_map{camera_id}0001" if camera_id is not None else "depth_map_grid"
-			elif subtype == "canny":  
-				filename = f"canny{camera_id}0001" if camera_id is not None else "canny_grid"
-			elif subtype == "normal":
-				filename = f"normal_map{camera_id}0001" if camera_id is not None else "normal_grid"
+			if legacy:
+				if subtype == "depth":
+					filename = f"depth_map{camera_id}0001" if camera_id is not None else "depth_map_grid"
+				elif subtype == "canny":  
+					filename = f"canny{camera_id}0001" if camera_id is not None else "canny_grid"
+				elif subtype == "normal":
+					filename = f"normal_map{camera_id}0001" if camera_id is not None else "normal_grid"
+			else:
+				if subtype == "depth":
+					filename = f"depth_map{camera_id}" if camera_id is not None else "depth_map_grid"
+				elif subtype == "canny":  
+					filename = f"canny{camera_id}0001" if camera_id is not None else "canny_grid"
+				elif subtype == "normal":
+					filename = f"normal_map{camera_id}" if camera_id is not None else "normal_grid"
 		return os.path.join(base_dir, f"{filename}.png")
 	
 	elif file_type == "generated":
@@ -387,3 +397,80 @@ def remove_empty_dirs(context, dirs_obj = None):
 			else:
 				if os.path.exists(value) and not os.listdir(value):
 					os.rmdir(value)
+
+def get_compositor_node_tree(context):
+	"""
+	Get the compositor node tree in a way compatible with both Blender 4.x and 5.0.
+	In Blender 5.0, scene.node_tree is removed and replaced by scene.compositing_node_group.
+	"""
+	scene = context.scene
+	
+	# Blender 5.0+ check
+	if hasattr(scene, "compositing_node_group"):
+		if scene.compositing_node_group is None:
+			# Create a new node tree if it doesn't exist
+			# We need to create a node group of type 'CompositorNodeTree'
+			# Note: In 5.0, we might need to ensure we are creating the right type of data block
+			# usually bpy.data.node_groups.new(name, type)
+			new_tree = bpy.data.node_groups.new(name="Compositing", type='CompositorNodeTree')
+			scene.compositing_node_group = new_tree
+		return scene.compositing_node_group
+	
+	# Blender 4.x fallback
+	if hasattr(scene, "node_tree"):
+		return scene.node_tree
+		
+	return None
+
+
+def configure_output_node_paths(node, directory, filename):
+	"""Configure output node paths using Blender 5.0 image-mode semantics."""
+
+	# 1. Force single-image mode so format enums unlock in Blender 5
+	if hasattr(node.format, "media_type"):
+		node.format.media_type = 'IMAGE'
+
+	# 2. Set PNG format
+	node.format.file_format = "PNG"
+
+
+	# 3. Configure directory/base path
+	if hasattr(node, "directory"):
+		node.directory = directory
+	else:
+		node.base_path = directory
+
+	# 4. Clear prefix
+	if hasattr(node, "file_name"):
+		node.file_name = ""
+
+	# 5. Update the visible slot label/path for both APIs
+	slot = None
+	if hasattr(node, "file_output_items"):
+		items = node.file_output_items
+		if items and len(items) > 0:
+			slot = items[0]
+			slot.name = filename
+			if hasattr(slot, "path"):
+				slot.path = filename
+		else:
+			slot = items.new(name=filename, socket_type='RGBA')
+			if hasattr(slot, "path"):
+				slot.path = filename
+	elif hasattr(node, "file_slots"):
+		slots = node.file_slots
+		if slots and len(slots) > 0:
+			slot = slots[0]
+			if hasattr(slot, "path"):
+				slot.path = filename
+		else:
+			slot = slots.new(filename)
+	else:
+		print("Warning: Output node API lacks slot accessors; output may fail.")
+
+	return slot
+
+
+def get_eevee_engine_id():
+	"""Return the correct Eevee engine identifier for the running Blender version."""
+	return 'BLENDER_EEVEE' if bpy.app.version >= (5, 0, 0) else 'BLENDER_EEVEE_NEXT'
