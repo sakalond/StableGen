@@ -972,6 +972,9 @@ class StableGenPanel(bpy.types.Panel):
             row = tools_box.row()
         row.operator("object.stablegen_reproject", text="Reproject Textures", icon="FILE_REFRESH")
 
+        row = layout.row()
+        row.operator("object.stablegen_mirror_reproject", text="Mirror Last Projection")
+
         layout.separator()
           
 

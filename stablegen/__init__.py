@@ -3,7 +3,7 @@ import bpy # pylint: disable=import-error
 from .stablegen import StableGenPanel, ApplyPreset, SavePreset, DeletePreset, get_preset_items, update_parameters, ResetQwenPrompt
 from .render_tools import BakeTextures, AddCameras, SwitchMaterial, ExportOrbitGIF, CollectCameraPrompts, CameraPromptItem 
 from .utils import AddHDRI, ApplyModifiers, CurvesToMesh
-from .generator import ComfyUIGenerate, Reproject, Regenerate
+from .generator import ComfyUIGenerate, Reproject, Regenerate, MirrorReproject
 import os
 import requests
 import json
@@ -35,7 +35,8 @@ classes = [
     CurvesToMesh,
     ComfyUIGenerate,
     Reproject,
-    Regenerate
+    Regenerate,
+    MirrorReproject,
 ]
 
 # Global caches for model lists fetched via API

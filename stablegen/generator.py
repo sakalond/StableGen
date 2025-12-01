@@ -17,6 +17,7 @@ from datetime import datetime
 import math
 import colorsys
 from PIL import Image, ImageEnhance
+import mathutils
 
 from .util.helpers import prompt_text, prompt_text_img2img, prompt_text_qwen_image_edit # pylint: disable=relative-beyond-top-level
 from .render_tools import export_emit_image, export_visibility, export_canny, bake_texture, prepare_baking, unwrap # pylint: disable=relative-beyond-top-level
@@ -321,6 +322,372 @@ def upload_image_to_comfyui(server_address, image_path, image_type="input"):
         traceback.print_exc() # Print full traceback for unexpected errors
 
     return None
+
+def mirror_camera_matrix_x(cam: bpy.types.Object) -> mathutils.Matrix:
+    """
+    Mirror a camera across the global X=0 plane, but rebuild the rotation
+    so we don't end up with negative scale / flipped handedness.
+    """
+    m = cam.matrix_world.copy()
+    loc = m.to_translation()
+    basis = m.to_3x3()
+
+    # Camera conventions: looks along local -Z, local +Y is "up"
+    forward = -(basis @ mathutils.Vector((0.0, 0.0, 1.0)))  # world-space view direction
+    up      =  (basis @ mathutils.Vector((0.0, 1.0, 0.0)))  # world-space up
+
+    # Mirror position & directions across X=0 (YZ plane)
+    loc_m = mathutils.Vector((-loc.x,  loc.y,  loc.z))
+    f_m   = mathutils.Vector((-forward.x, forward.y, forward.z))
+    u_m   = mathutils.Vector((-up.x,      up.y,      up.z))
+
+    f = f_m.normalized()
+    u0 = u_m.normalized()
+
+    # Build an orthonormal basis: right, up, -forward
+    r = f.cross(u0)
+    if r.length < 1e-6:
+        # Degenerate case: fall back to world Z as "up"
+        r = f.cross(mathutils.Vector((0.0, 0.0, 1.0)))
+    r.normalize()
+    u = r.cross(f).normalized()
+
+    # Columns: X = right, Y = up, Z = -forward (camera looks along -Z)
+    ori3 = mathutils.Matrix((r, u, -f)).transposed()
+    ori4 = ori3.to_4x4()
+    ori4.translation = loc_m
+    return ori4
+
+class MirrorReproject(bpy.types.Operator):
+    """Duplicate & mirror the last projection camera and image.
+
+    - In standard / non-refine workflows: mirrors the image and camera, then calls Reproject.
+    - In refine+preserve workflows: mirrors as a *new refine layer* using project_image directly.
+    """
+    bl_idname = "object.stablegen_mirror_reproject"
+    bl_label = "Mirror Last Projection"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    _original_method = None
+    _original_overwrite_material = None
+    _timer = None
+
+    @classmethod
+    def poll(cls, context):
+        # Same checks as Reproject
+        if context.scene.output_timestamp == "":
+            return False
+
+        operator = None
+        for window in context.window_manager.windows:
+            for op in window.modal_operators:
+                if (
+                    op.bl_idname == 'OBJECT_OT_add_cameras'
+                    or op.bl_idname == 'OBJECT_OT_bake_textures'
+                    or op.bl_idname == 'OBJECT_OT_collect_camera_prompts'
+                    or op.bl_idname == 'OBJECT_OT_test_stable'
+                    or op.bl_idname == 'OBJECT_OT_stablegen_reproject'
+                    or op.bl_idname == 'OBJECT_OT_stablegen_regenerate'
+                    or op.bl_idname == 'OBJECT_OT_stablegen_mirror_reproject'
+                    or context.scene.generation_status == 'waiting'
+                ):
+                    operator = op
+                    break
+            if operator:
+                break
+        if operator:
+            return False
+        return True
+
+    def _mirror_image_file(self, src_path: str, dst_path: str):
+        """Load an image from src_path, mirror it horizontally, save to dst_path."""
+        import bpy
+
+        os.makedirs(os.path.dirname(dst_path), exist_ok=True)
+
+        img = bpy.data.images.load(src_path)
+        try:
+            w, h = img.size
+            pixels = list(img.pixels[:])  # flat RGBA array
+
+            mirrored = [0.0] * len(pixels)
+            row_stride = w * 4  # RGBA per pixel
+
+            for y in range(h):
+                row_start = y * row_stride
+                for x in range(w):
+                    src_idx = row_start + x * 4
+                    mx = w - 1 - x
+                    dst_idx = row_start + mx * 4
+                    mirrored[dst_idx:dst_idx + 4] = pixels[src_idx:src_idx + 4]
+
+            img.pixels[:] = mirrored
+            img.filepath_raw = dst_path
+            img.file_format = 'PNG'
+            img.save()
+        finally:
+            bpy.data.images.remove(img)
+
+    def _mirror_camera_matrix_x(self, cam: bpy.types.Object) -> mathutils.Matrix:
+        """Mirror a camera across X=0 without negative scale / flipped handedness."""
+        m = cam.matrix_world.copy()
+        loc = m.to_translation()
+        basis = m.to_3x3()
+
+        # Camera convention: looks along local -Z, +Y is up
+        forward = -(basis @ mathutils.Vector((0.0, 0.0, 1.0)))
+        up      =  (basis @ mathutils.Vector((0.0, 1.0, 0.0)))
+
+        # Mirror across X=0 (YZ plane)
+        loc_m = mathutils.Vector((-loc.x,  loc.y,  loc.z))
+        f_m   = mathutils.Vector((-forward.x, forward.y, forward.z))
+        u_m   = mathutils.Vector((-up.x,      up.y,      up.z))
+
+        f = f_m.normalized()
+        u0 = u_m.normalized()
+
+        r = f.cross(u0)
+        if r.length < 1e-6:
+            r = f.cross(mathutils.Vector((0.0, 0.0, 1.0)))
+        r.normalize()
+        u = r.cross(f).normalized()
+
+        ori3 = mathutils.Matrix((r, u, -f)).transposed()
+        ori4 = ori3.to_4x4()
+        ori4.translation = loc_m
+        return ori4
+
+    def _get_to_texture(self, context):
+        if context.scene.texture_objects == 'all':
+            return [
+                obj for obj in bpy.context.view_layer.objects
+                if obj.type == 'MESH' and not obj.hide_get()
+            ]
+        else:
+            return [
+                obj for obj in bpy.context.selected_objects
+                if obj.type == 'MESH'
+            ]
+
+    def _get_sorted_cameras(self, context):
+        cams = [obj for obj in context.scene.objects if obj.type == 'CAMERA']
+        cams.sort(key=lambda c: c.name)
+        return cams
+
+    def _compute_latest_material_id(self, to_texture):
+        max_id = -1
+        for obj in to_texture:
+            mat_id = get_last_material_index(obj)
+            if mat_id > max_id:
+                max_id = mat_id
+        return max_id
+
+    def _do_refine_mirror(self, context, to_texture):
+        """
+        Special path for generation_method == 'refine' and refine_preserve == True.
+        We treat the mirror as a new refine layer: new material_id, and call project_image directly.
+        """
+        import shutil
+
+        scene = context.scene
+
+        # 1) Base material id (from existing stack)
+        base_id = self._compute_latest_material_id(to_texture)
+        if base_id < 0:
+            self.report({'ERROR'}, "No StableGen materials found to mirror.")
+            return {'CANCELLED'}
+
+        # Next refine layer id
+        new_material_id = base_id + 1
+
+        # 2) Cameras & active camera index
+        cameras = self._get_sorted_cameras(context)
+        if not cameras:
+            self.report({'ERROR'}, "No cameras found in the scene.")
+            return {'CANCELLED'}
+
+        orig_cam = scene.camera if scene.camera in cameras else cameras[0]
+        src_cam_idx = cameras.index(orig_cam)
+
+        # 3) Duplicate & mirror camera
+        mir_cam = orig_cam.copy()
+        mir_cam.data = orig_cam.data.copy()
+        scene.collection.objects.link(mir_cam)
+        mir_cam.matrix_world = self._mirror_camera_matrix_x(orig_cam)
+        mir_cam.name = orig_cam.name + "_MIRROR"
+
+        # Rebuild camera list so we can get the index of the mirrored camera
+        cameras = self._get_sorted_cameras(context)
+        dst_cam_idx = cameras.index(mir_cam)
+
+        # 4) Prepare images for ALL cameras in the new refine layer
+        #    For each camera:
+        #      - copy base_id image -> new_material_id image
+        #    Then we'll overwrite the mirrored camera's copy with a horizontally mirrored version.
+        for cam_idx, cam_obj in enumerate(cameras):
+            src_path = get_file_path(
+                context,
+                "generated",
+                camera_id=cam_idx,
+                material_id=base_id,
+            )
+            dst_path = get_file_path(
+                context,
+                "generated",
+                camera_id=cam_idx,
+                material_id=new_material_id,
+            )
+
+            if not os.path.exists(src_path):
+                # Nothing to copy for this camera; just skip it.
+                # project_image will either skip or log an error, but we won't
+                # clobber existing textures.
+                print(f"[MirrorReproject] No base image for cam {cam_idx} at {src_path}, skipping copy.")
+                continue
+
+            # For the mirrored camera index, we'll write a flipped image later,
+            # so don't bother copying the original now.
+            if cam_idx == dst_cam_idx:
+                continue
+
+            os.makedirs(os.path.dirname(dst_path), exist_ok=True)
+            shutil.copyfile(src_path, dst_path)
+            print(f"[MirrorReproject] Copied base image for cam {cam_idx}\n  {src_path}\n-> {dst_path}")
+
+        # 5) Now create the mirrored image just for the mirrored camera in the new layer
+        src_path = get_file_path(
+            context,
+            "generated",
+            camera_id=src_cam_idx,
+            material_id=base_id,
+        )
+        if not os.path.exists(src_path):
+            self.report(
+                {'ERROR'},
+                f"No generated image found for active camera index {src_cam_idx} at:\n{src_path}"
+            )
+            return {'CANCELLED'}
+
+        dst_path = get_file_path(
+            context,
+            "generated",
+            camera_id=dst_cam_idx,
+            material_id=new_material_id,
+        )
+
+        print(f"[MirrorReproject] Refine mirror image\n  {src_path}\n-> {dst_path}")
+        self._mirror_image_file(src_path, dst_path)
+
+        # 6) Call project_image directly as a new refine layer
+        project_image(context, to_texture, new_material_id)
+
+        # 7) Delete the temporary mirrored camera
+        try:
+            bpy.data.objects.remove(mir_cam, do_unlink=True)
+        except Exception:
+            pass
+
+        self.report(
+            {'INFO'},
+            f"Refine mirror applied as new layer (material id {new_material_id}). Temporary camera removed."
+        )
+        return {'FINISHED'}
+
+    def _do_standard_mirror(self, context, to_texture):
+        """
+        Original behavior: mirror within the current material id.
+        For standard / non-refine workflows, we mirror the image and camera,
+        then call project_image directly (no Reproject operator).
+        """
+        scene = context.scene
+
+        # 1) Find the latest StableGen material id
+        base_id = self._compute_latest_material_id(to_texture)
+        if base_id < 0:
+            self.report({'ERROR'}, "No StableGen materials found to mirror.")
+            return {'CANCELLED'}
+
+        # 2) Get cameras in the same order StableGen uses
+        cameras = self._get_sorted_cameras(context)
+        if not cameras:
+            self.report({'ERROR'}, "No cameras found in the scene.")
+            return {'CANCELLED'}
+
+        # Use active scene camera if possible, otherwise first camera
+        orig_cam = scene.camera if scene.camera in cameras else cameras[0]
+        src_cam_idx = cameras.index(orig_cam)
+
+        # 3) Duplicate & mirror camera
+        mir_cam = orig_cam.copy()
+        mir_cam.data = orig_cam.data.copy()
+        scene.collection.objects.link(mir_cam)
+        mir_cam.matrix_world = self._mirror_camera_matrix_x(orig_cam)
+        mir_cam.name = orig_cam.name + "_MIRROR"
+
+        # Rebuild sorted list so we know the mirrored camera's index
+        cameras = self._get_sorted_cameras(context)
+        dst_cam_idx = cameras.index(mir_cam)
+
+        # 4) Mirror the image on disk for this material id
+        src_path = get_file_path(
+            context,
+            "generated",
+            camera_id=src_cam_idx,
+            material_id=base_id,
+        )
+        if not os.path.exists(src_path):
+            self.report(
+                {'ERROR'},
+                f"No generated image found for active camera index {src_cam_idx} at:\n{src_path}"
+            )
+            # Clean up the temp camera if we bail early
+            try:
+                bpy.data.objects.remove(mir_cam, do_unlink=True)
+            except Exception:
+                pass
+            return {'CANCELLED'}
+
+        dst_path = get_file_path(
+            context,
+            "generated",
+            camera_id=dst_cam_idx,
+            material_id=base_id,
+        )
+        print(f"[MirrorReproject] Standard mirror image\n  {src_path}\n-> {dst_path}")
+        self._mirror_image_file(src_path, dst_path)
+
+        # 5) Project back onto the meshes directly for this material id
+        #    (this is the same core projection function used by the generate operator)
+        project_image(context, to_texture, base_id)
+
+        # 6) Delete the temporary mirrored camera now that projection is done
+        try:
+            bpy.data.objects.remove(mir_cam, do_unlink=True)
+        except Exception:
+            pass
+
+        self.report(
+            {'INFO'},
+            "Standard mirror applied and temporary camera removed."
+        )
+        return {'FINISHED'}
+
+
+    def execute(self, context):
+        scene = context.scene
+        to_texture = self._get_to_texture(context)
+
+        if not to_texture:
+            self.report({'ERROR'}, "No mesh objects found for texturing.")
+            return {'CANCELLED'}
+
+        # Branch: refine+preserve vs everything else
+        if scene.generation_method == 'refine' and getattr(scene, "refine_preserve", False):
+            return self._do_refine_mirror(context, to_texture)
+        else:
+            return self._do_standard_mirror(context, to_texture)
+
+
 
 class ComfyUIGenerate(bpy.types.Operator):
     """Generate textures using ComfyUI (to all mesh objects using all cameras in the scene)
