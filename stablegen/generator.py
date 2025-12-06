@@ -1,8 +1,10 @@
 import os
 import bpy  # pylint: disable=import-error
 import numpy as np
+from PIL import Image, ImageEnhance
 import cv2
 
+from .color_match import color_match_single
 import uuid
 import json
 import urllib.request
@@ -16,7 +18,7 @@ from datetime import datetime
 
 import math
 import colorsys
-from PIL import Image, ImageEnhance
+
 import mathutils
 
 from .util.helpers import prompt_text, prompt_text_img2img, prompt_text_qwen_image_edit # pylint: disable=relative-beyond-top-level
@@ -709,7 +711,84 @@ class MirrorReproject(bpy.types.Operator):
         else:
             return self._do_standard_mirror(context, to_texture)
 
+def _get_viewport_ref_np(obj):
+    """
+    Try to grab the current viewport/base color texture for this object as [H, W, 3] float32 [0,1].
+    Returns None if no suitable image is found.
+    """
+    mat = getattr(obj, "active_material", None)
+    if not mat or not mat.use_nodes:
+        return None
 
+    nt = mat.node_tree
+    if not nt:
+        return None
+
+    img = None
+    # Try the first image texture in the node tree that is plugged into Base Color
+    for node in nt.nodes:
+        if node.type == 'TEX_IMAGE' and node.image is not None:
+            img = node.image
+            break
+
+    if img is None:
+        return None
+
+    # Ensure the image has pixels loaded
+    if not img.has_data:
+        img.pixels[0]  # force load
+
+    w, h = img.size
+    # Blender stores pixels as flat RGBA floats in [0,1]
+    buf = np.array(img.pixels[:], dtype=np.float32).reshape(h, w, 4)
+    # Use RGB only
+    rgb = buf[..., :3]
+    return rgb
+
+def _apply_color_match_to_file(image_path, ref_rgb, scene):
+    """
+    Load image from disk, color-match to ref_rgb if enabled, and overwrite on disk.
+    """
+    if not scene.view_blend_use_color_match:
+        return image_path  # no-op
+
+    try:
+        with Image.open(image_path) as pil_img:
+            pil_img = pil_img.convert("RGBA")
+            w, h = pil_img.size
+            tgt_np = np.array(pil_img, dtype=np.float32) / 255.0  # [H, W, 4]
+
+        # Resize ref_rgb to match target resolution if needed
+        if ref_rgb.shape[:2] != (h, w):
+            ref_uint8 = np.clip(ref_rgb * 255.0, 0, 255).astype("uint8")
+            ref_img = Image.fromarray(ref_uint8, mode="RGB")
+            ref_img = ref_img.resize((w, h), Image.BILINEAR)
+            ref_resized = np.array(ref_img, dtype=np.float32) / 255.0
+        else:
+            ref_resized = ref_rgb
+
+        # Build a fake alpha channel of 1s so ref has 4 channels
+        ref_rgba = np.concatenate(
+            [ref_resized, np.ones((*ref_resized.shape[:2], 1), dtype=np.float32)],
+            axis=-1,
+        )
+
+        matched_np = color_match_single(
+            ref=ref_rgba,
+            target=tgt_np,
+            method=scene.view_blend_color_match_method,
+            strength=scene.view_blend_color_match_strength,
+        )
+
+        matched_np = np.clip(matched_np * 255.0, 0, 255).astype("uint8")
+        matched_img = Image.fromarray(matched_np, mode="RGBA")
+        matched_img.save(image_path)
+        print(f"[StableGen] Color matched: {image_path}")
+        return image_path
+
+    except Exception as e:
+        print(f"[StableGen] Color match failed for {image_path}: {e}")
+        return image_path
 
 class ComfyUIGenerate(bpy.types.Operator):
     """Generate textures using ComfyUI (to all mesh objects using all cameras in the scene)
@@ -1066,6 +1145,24 @@ class ComfyUIGenerate(bpy.types.Operator):
                     
                 # Export visibility masks for each object
                 export_visibility(context, None, obj)
+
+        if context.scene.view_blend_use_color_match and self._to_texture:
+            # Use the first target object as the reference for viewport color
+            ref_np = _get_viewport_ref_np(self._to_texture[0])
+            if ref_np is not None:
+                # Apply color match to ALL generated camera images for this material
+                for cam_idx, cam in enumerate(self._cameras):
+                    image_path = get_file_path(
+                        context,
+                        "generated",
+                        camera_id=cam_idx,
+                        material_id=self._material_id,
+                    )
+                    _apply_color_match_to_file(
+                        image_path=image_path,
+                        ref_rgb=ref_np,
+                        scene=context.scene,
+                    )
         
         self.prompt_text = context.scene.comfyui_prompt
 
@@ -1379,10 +1476,17 @@ class ComfyUIGenerate(bpy.types.Operator):
                     if context.scene.generation_method == 'sequential':
                         def image_project_callback():
                             redraw_ui(context)
-                            project_image(context, self._to_texture, self._material_id, stop_index=self._current_image)
-                            # Set the event to signal the end of the process
+                            project_image(
+                                context,
+                                self._to_texture,
+                                self._material_id,
+                                stop_index=self._current_image,
+                            )
                             self._wait_event.set()
                             return None
+                        bpy.app.timers.register(image_project_callback)
+                        self._wait_event.wait()
+                        self._wait_event.clear()
                         bpy.app.timers.register(image_project_callback)
                         # Wait for the event to be set
                         self._wait_event.wait()
@@ -1449,10 +1553,10 @@ class ComfyUIGenerate(bpy.types.Operator):
             if context.scene.bake_texture:
                 self._stage = "Baking Textures & Projecting"
             redraw_ui(context)
+
             if context.scene.generation_method != 'uv_inpaint':
                 project_image(context, self._to_texture, self._material_id)
             else:
-                # Apply the UV inpainted textures to each mesh
                 from .render_tools import apply_uv_inpaint_texture
                 for obj in self._to_texture:
                     texture_path = get_file_path(
@@ -1460,6 +1564,24 @@ class ComfyUIGenerate(bpy.types.Operator):
                     )
                     apply_uv_inpaint_texture(context, obj, texture_path)
             return None
+        
+        if context.scene.view_blend_use_color_match and self._to_texture:
+            # Use the first object in the target list as the color reference
+            ref_np = _get_viewport_ref_np(self._to_texture[0])
+            if ref_np is not None:
+                # Loop all cameras we generated for
+                for cam_idx, cam in enumerate(self._cameras):
+                    image_path = get_file_path(
+                        context,
+                        "generated",
+                        camera_id=cam_idx,
+                        material_id=self._material_id,
+                    )
+                    _apply_color_match_to_file(
+                        image_path=image_path,
+                        ref_rgb=ref_np,
+                        scene=context.scene,
+                    )
 
         bpy.app.timers.register(image_project_callback)
 

@@ -1457,6 +1457,7 @@ def register():
         max=180.0,
         update=update_parameters
     )
+
     bpy.types.Scene.discard_factor_generation_only = bpy.props.BoolProperty(
         name="Reset Discard Angle After Generation",
         description="If enabled, the 'Discard Factor' will be reset to a specified value after generation completes. Useful for sequential/Qwen modes where a low discard angle is needed during generation but not for final blending",
@@ -1470,6 +1471,34 @@ def register():
         min=0.0,
         max=180.0,
         update=update_parameters
+    )
+    bpy.types.Scene.view_blend_use_color_match = bpy.props.BoolProperty(
+        name="Match Colors to Viewport",
+        description="Match each generated view’s colors to the current viewport texture before blending",
+        default=False,
+        update=update_parameters,
+    )
+    bpy.types.Scene.view_blend_color_match_method = bpy.props.EnumProperty(
+        name="Color Match Method",
+        description="Algorithm used when matching view colors to the viewport texture",
+        items=[
+            ("mkl",        "MKL",           ""),
+            ("hm",         "Histogram",     ""),
+            ("reinhard",   "Reinhard",      ""),
+            ("mvgd",       "MVGD",          ""),
+            ("hm-mvgd-hm", "HM–MVGD–HM",    ""),
+            ("hm-mkl-hm",  "HM–MKL–HM",     ""),
+        ],
+        default="hm-mvgd-hm",
+        update=update_parameters,
+    )
+    bpy.types.Scene.view_blend_color_match_strength = bpy.props.FloatProperty(
+        name="Match Strength",
+        description="Blend between original and viewport-matched colors",
+        default=1.0,
+        min=0.0,
+        max=2.0,
+        update=update_parameters,
     )
     bpy.types.Scene.weight_exponent = bpy.props.FloatProperty(
         name="Weight Exponent",
