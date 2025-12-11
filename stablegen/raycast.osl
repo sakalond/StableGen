@@ -8,7 +8,9 @@ shader raycast(
     vector CameraDir = vector(0,0,-1), // Camera look direction in world space
     vector CameraUp = vector(0,1,0),   // Camera up vector in world space
     float AngleThreshold = 90.0,  // Maximum angle in degrees between ray and normal
-    float Power = 4.0, // Exponent for weight falloff (higher = sharper)
+    float Power = 4.0,            // Exponent for weight falloff (higher = sharper)
+    float EdgeFeather = 2.0,      // Fraction of radius used for feather (0 = off)
+    float EdgeGamma = 1.0,        // Softness of feather (<1 = softer, >1 = sharper)
     output float Result = 0
 )
 {
@@ -44,6 +46,21 @@ shader raycast(
         Result = 0;
         return;
     }
+
+    // Normalized distance to film edge: 0 at center, 1 at border.
+    float nx = abs(x_proj) / filmw;
+    float ny = abs(y_proj) / filmh;
+    float edge = max(nx, ny);
+
+    // Default: no feathering
+    float edge_factor = 1.0;
+    float feather = clamp(EdgeFeather, 0.0, 0.49);
+
+    if (feather > 0.0) {
+        // Soft feather near frustum border
+        edge_factor = 1.0 - smoothstep(1.0 - feather, 1.0, edge);
+        edge_factor = pow(edge_factor, max(0.01, EdgeGamma));
+    }
     
     // Continue with the raycast.
     float Distance = 99999999.99;
@@ -59,7 +76,9 @@ shader raycast(
             if (angle > AngleThreshold) {
                 Result = 0;
             } else {
-                Result = pow(orthogonality, Power);
+                // Original angle-based weight, modulated by edge feather.
+                float base_weight = pow(orthogonality, Power);
+                Result = base_weight * edge_factor;
             }
         }
     }

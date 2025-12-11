@@ -3,6 +3,69 @@
 from __future__ import annotations
 import numpy as np
 
+def _rgb_to_yuv(rgb: np.ndarray) -> np.ndarray:
+    """
+    Convert RGB [0,1] to YUV (BT.601-ish).
+    rgb: (..., 3)
+    """
+    r = rgb[..., 0]
+    g = rgb[..., 1]
+    b = rgb[..., 2]
+
+    y = 0.299 * r + 0.587 * g + 0.114 * b
+    u = -0.14713 * r - 0.28886 * g + 0.436 * b
+    v = 0.615 * r - 0.51499 * g - 0.10001 * b
+
+    return np.stack((y, u, v), axis=-1)
+
+
+def _yuv_to_rgb(yuv: np.ndarray) -> np.ndarray:
+    """
+    Convert YUV back to RGB [0,1] and clamp.
+    yuv: (..., 3)
+    """
+    y = yuv[..., 0]
+    u = yuv[..., 1]
+    v = yuv[..., 2]
+
+    r = y + 1.13983 * v
+    g = y - 0.39465 * u - 0.58060 * v
+    b = y + 2.03211 * u
+
+    rgb = np.stack((r, g, b), axis=-1)
+    return np.clip(rgb, 0.0, 1.0)
+
+def _boost_chroma_yuv(
+    tgt_rgb: np.ndarray,
+    matched_rgb: np.ndarray,
+    extra: float,
+) -> np.ndarray:
+    """
+    Exaggerate the chroma shift from tgt_rgb -> matched_rgb, while
+    preserving luminance from tgt_rgb.
+
+    extra: in [0, 1], where 0 = no extra, 1 = max extra.
+    """
+    extra = float(max(0.0, min(extra, 1.0)))
+
+    yuv_tgt = _rgb_to_yuv(tgt_rgb)      # Y from target
+    yuv_mat = _rgb_to_yuv(matched_rgb)  # UV from matched
+
+    y = yuv_tgt[..., 0]
+    uv_t = yuv_tgt[..., 1:]
+    uv_m = yuv_mat[..., 1:]
+
+    # Extrapolate UV away from target toward matched:
+    #   extra = 0 -> uv = uv_m   (no extra beyond matched)
+    #   extra = 1 -> uv = uv_t + 2 * (uv_m - uv_t)
+    scale = 1.0 + extra
+    uv = uv_t + scale * (uv_m - uv_t)
+
+    yuv = np.empty_like(yuv_tgt)
+    yuv[..., 0] = y
+    yuv[..., 1:] = uv
+
+    return _yuv_to_rgb(yuv)
 
 def _split_rgb_alpha(img: np.ndarray):
     """Return (rgb, alpha or None) from [H, W, 3/4] float32 [0, 1]."""
@@ -22,19 +85,36 @@ def _merge_rgb_alpha(rgb: np.ndarray, alpha: np.ndarray | None, like: np.ndarray
     return rgb
 
 
-def _reinhard(ref_rgb: np.ndarray, tgt_rgb: np.ndarray) -> np.ndarray:
-    """Per-channel mean/std transfer (Reinhard-style)."""
-    out = tgt_rgb.copy()
-    eps = 1e-8
-    for c in range(3):
-        ref_c = ref_rgb[..., c]
-        tgt_c = tgt_rgb[..., c]
+def _reinhard_preserve_luma(ref_rgb: np.ndarray, tgt_rgb: np.ndarray) -> np.ndarray:
+    """
+    Reinhard-style color transfer that matches only chroma (U/V),
+    while preserving the target luminance (Y).
 
-        m_ref, s_ref = ref_c.mean(), ref_c.std() + eps
-        m_tgt, s_tgt = tgt_c.mean(), tgt_c.std() + eps
+    This avoids the typical darkening/brightening side effects and
+    is better suited for 'make it bluer' style corrections.
+    """
+    ref_yuv = _rgb_to_yuv(ref_rgb)
+    tgt_yuv = _rgb_to_yuv(tgt_rgb)
 
-        out[..., c] = (tgt_c - m_tgt) * (s_ref / s_tgt) + m_ref
-    return np.clip(out, 0.0, 1.0)
+    # Flatten U/V for stats
+    ref_uv = ref_yuv[..., 1:].reshape(-1, 2)
+    tgt_uv = tgt_yuv[..., 1:].reshape(-1, 2)
+
+    ref_mu = ref_uv.mean(axis=0)
+    ref_sigma = ref_uv.std(axis=0) + 1e-6
+
+    tgt_mu = tgt_uv.mean(axis=0)
+    tgt_sigma = tgt_uv.std(axis=0) + 1e-6
+
+    out = np.copy(tgt_yuv)
+
+    uv = out[..., 1:]
+    uv = (uv - tgt_mu) / tgt_sigma
+    uv = uv * ref_sigma + ref_mu
+    out[..., 1:] = uv  # keep Y as-is, only adjust U/V
+
+    return _yuv_to_rgb(out)
+
 
 
 def _hist_match(ref_rgb: np.ndarray, tgt_rgb: np.ndarray) -> np.ndarray:
@@ -100,7 +180,7 @@ def _mvgd(ref_rgb: np.ndarray, tgt_rgb: np.ndarray) -> np.ndarray:
 def _apply_core(ref_rgb: np.ndarray, tgt_rgb: np.ndarray, method: str) -> np.ndarray:
     m = (method or "reinhard").lower()
     if m == "reinhard":
-        return _reinhard(ref_rgb, tgt_rgb)
+        return _reinhard_preserve_luma(ref_rgb, tgt_rgb)
     elif m == "hm":
         return _hist_match(ref_rgb, tgt_rgb)
     elif m in ("mvgd", "mkl"):  # treat MKL ~ MVGD
@@ -122,26 +202,41 @@ def _apply_core(ref_rgb: np.ndarray, tgt_rgb: np.ndarray, method: str) -> np.nda
 def color_match_single(
     ref: np.ndarray,
     target: np.ndarray,
-    method: str = "hm-mvgd-hm",
+    method: str = "reinhard",
     strength: float = 1.0,
 ) -> np.ndarray:
     """
     Color-match a single target to a reference.
     ref / target: [H, W, 3 or 4] in [0, 1].
+
+    UI strength is interpreted as:
+      0.0–1.0 : blend from original -> matched
+      1.0–2.0 : full match + extra chroma push (no big luminance change)
     """
     if ref.shape[:2] != target.shape[:2]:
         raise ValueError(
             f"Size mismatch: ref {ref.shape[:2]} vs target {target.shape[:2]}"
         )
 
+    # Split out RGB / A
     ref_rgb, _ = _split_rgb_alpha(ref)
     tgt_rgb, tgt_a = _split_rgb_alpha(target)
 
-    matched_rgb = _apply_core(ref_rgb, tgt_rgb, method)
+    # Full-strength match result (what "1.0" really means)
+    base_matched_rgb = _apply_core(ref_rgb, tgt_rgb, method)
 
-    s = float(max(0.0, min(strength, 10.0)))
-    if s != 1.0:
-        matched_rgb = tgt_rgb * (1.0 - s) + matched_rgb * s
+    # Clamp UI strength to [0, 2]
+    ui_s = float(max(0.0, min(strength, 2.0)))
+
+    if ui_s <= 1.0:
+        # 0–1: regular blend between target and matched
+        s = ui_s
+        matched_rgb = tgt_rgb * (1.0 - s) + base_matched_rgb * s
+    else:
+        # >1: start from fully matched, then push chroma harder
+        matched_rgb = base_matched_rgb
+        extra = ui_s - 1.0  # in (0, 1]
+        matched_rgb = _boost_chroma_yuv(tgt_rgb, matched_rgb, extra)
 
     matched_rgb = np.clip(matched_rgb, 0.0, 1.0)
     out = _merge_rgb_alpha(matched_rgb, tgt_a, like=target)

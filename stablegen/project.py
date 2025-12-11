@@ -407,8 +407,22 @@ def project_image(context, to_project, mat_id, stop_index=1000000):
             script.location = (-400, (-800) * i)
             script.mode = 'EXTERNAL'
             script.filepath = os.path.join(os.path.dirname(__file__), "raycast.osl")
+
+            # Angle / power from UI
             script.inputs["AngleThreshold"].default_value = context.scene.discard_factor
             script.inputs["Power"].default_value = context.scene.weight_exponent
+
+            # Frustum feather controls from UI
+            if context.scene.visibility_vignette:
+                # Use the same width as the visibility mask vignette
+                script.inputs["EdgeFeather"].default_value = context.scene.visibility_vignette_width
+                # New softness slider (gamma-like)
+                script.inputs["EdgeGamma"].default_value = context.scene.visibility_vignette_softness
+            else:
+                # Feathering off
+                script.inputs["EdgeFeather"].default_value = 0.0
+                script.inputs["EdgeGamma"].default_value = 1.0
+
             script.label = f"{i}-{mat_id}"
             script_nodes.append(script)
             if i > stop_index:

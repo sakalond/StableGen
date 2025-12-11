@@ -749,7 +749,7 @@ class StableGenPanel(bpy.types.Panel):
                                 row = content_box.row()
                                 
                             row.prop(scene, "blur_mask", text="Blur Mask", toggle=True, icon="SURFACE_NSPHERE")
-
+                            
                             if scene.blur_mask:
                                 row = content_box.row()
                                 row.prop(scene, "blur_mask_radius", text="Blur Radius")
@@ -764,195 +764,340 @@ class StableGenPanel(bpy.types.Panel):
                 # --- Generation Mode Specifics ---
                 mode_specific_outer_box = draw_collapsible_section(advanced_params_box, "show_mode_specific_settings", "Generation Mode Specifics", icon="OPTIONS")
                 if mode_specific_outer_box: # This is the box where all mode-specific UIs should go
-                    
-                    # Grid Mode Parameters
-                    if scene.generation_method == 'grid':
-                        # Draw Grid parameters directly into mode_specific_outer_box
-                        row = mode_specific_outer_box.row()
-                        row.alignment = 'CENTER'
-                        row.label(text="Grid Mode Parameters", icon="MESH_GRID")
                         
-                        row = mode_specific_outer_box.row()
-                        row.prop(scene, "refine_images", text="Refine Images", toggle=True, icon="SHADERFX")
-                        if scene.refine_images:
-                            split = mode_specific_outer_box.split(factor=0.5)
-                            split.label(text="Refine Sampler:")
-                            split.prop(scene, "refine_sampler", text="")
-                            
-                            split = mode_specific_outer_box.split(factor=0.5)
-                            split.label(text="Refine Scheduler:")
-                            split.prop(scene, "refine_scheduler", text="")
-                            
+                    # --- Generation Mode Specifics ---
+                    mode_specific_outer_box = draw_collapsible_section(
+                        advanced_params_box,
+                        "show_mode_specific_settings",
+                        "Generation Mode Specifics",
+                        icon="OPTIONS",
+                    )
+                    if mode_specific_outer_box:  # This is the box where all mode-specific UIs should go
+
+                        method = scene.generation_method
+
+                        # -------------------------
+                        # Grid Mode Parameters
+                        # -------------------------
+                        if method == 'grid':
+                            # Draw Grid parameters directly into mode_specific_outer_box
                             row = mode_specific_outer_box.row()
-                            row.prop(scene, "denoise", text="Denoise")
-                            if width_mode == 'narrow':
-                                row = mode_specific_outer_box.row()
-                            row.prop(scene, "refine_cfg", text="Refine CFG")
-                            if width_mode == 'narrow':
-                                row = mode_specific_outer_box.row()
-                            row.prop(scene, "refine_steps", text="Refine Steps")
+                            row.alignment = 'CENTER'
+                            row.label(text="Grid Mode Parameters", icon="MESH_GRID")
 
-                            row = mode_specific_outer_box.row() 
-                            split = mode_specific_outer_box.split(factor=0.25)
-                            split.label(text="Refine Prompt:")
-                            split.prop(scene, "refine_prompt", text="")
-                            
-                            split = mode_specific_outer_box.split(factor=0.5) 
-                            split.label(text="Refine Upscale:") 
-                            split.prop(scene, "refine_upscale_method", text="")
-
-                    # Separate Mode Parameters
-                    elif scene.generation_method == 'separate':
-                        row = mode_specific_outer_box.row()
-                        row.alignment = 'CENTER'
-                        row.label(text="Separate Mode Parameters", icon='FORCE_FORCE')
-                        
-                        row = mode_specific_outer_box.row() 
-                        row.prop(scene, "sequential_ipadapter", text="Use IPAdapter for Separate Mode", toggle=True, icon="MODIFIER")
-                        if scene.sequential_ipadapter: 
-                            sub_ip_box_separate = mode_specific_outer_box.box()
-                            
-                            split = sub_ip_box_separate.split(factor=0.5) 
-                            split.label(text="Mode:")
-                            split.prop(scene, "sequential_ipadapter_mode", text="") 
-
-                            if scene.sequential_ipadapter_mode == 'recent':
-                                sub_ip_box_separate.prop(scene, "sequential_desaturate_factor", text="Desaturate")
-                                sub_ip_box_separate.prop(scene, "sequential_contrast_factor", text="Reduce Contrast")
-
-                            if context.scene.model_architecture != 'qwen_image_edit':
-                                split = sub_ip_box_separate.split(factor=0.5) 
-                                if context.scene.model_architecture == 'sdxl':
-                                    split.label(text="Weight Type:")
-                                    split.prop(scene, "ipadapter_weight_type", text="")
-                            
-                            row = sub_ip_box_separate.row()
-                            row.prop(scene, "ipadapter_strength", text="Strength")
-                            if width_mode == 'narrow':
-                                row = sub_ip_box_separate.row()
-                            row.prop(scene, "ipadapter_start", text="Start")
-                            if width_mode == 'narrow':
-                                row = sub_ip_box_separate.row()
-                            row.prop(scene, "ipadapter_end", text="End")    
-                            
-                            if context.scene.sequential_ipadapter_mode == 'first':
-                                row = sub_ip_box_separate.row()
-                                row.prop(scene, "sequential_ipadapter_regenerate", text="Regenerate First Image", toggle=True, icon="FILE_REFRESH")
-                                if context.scene.sequential_ipadapter_regenerate:
-                                    row = sub_ip_box_separate.row()
-                                    row.prop(scene, "sequential_ipadapter_regenerate_wo_controlnet", text="Generate reference without ControlNet", toggle=True, icon="HIDE_OFF")
-
-                    # Refine Mode Parameters
-                    elif scene.generation_method == 'refine':
-                        row = mode_specific_outer_box.row()
-                        row.alignment = 'CENTER'
-                        row.label(text="Refine Mode Parameters", icon='SHADERFX')
-                        row = mode_specific_outer_box.row()
-                        row.prop(scene, "denoise", text="Denoise") 
-                        row = mode_specific_outer_box.row()
-                        row.prop(scene, "refine_preserve", text="Preserve Original Textures", toggle=True, icon="TEXTURE")
-                        row = mode_specific_outer_box.row() 
-                        row.prop(scene, "sequential_ipadapter", text="Use IPAdapter for Refine Mode", toggle=True, icon="MODIFIER")
-                        if scene.sequential_ipadapter: 
-                            sub_ip_box_separate = mode_specific_outer_box.box()
-                            
-                            split = sub_ip_box_separate.split(factor=0.5) 
-                            split.label(text="Mode:")
-                            split.prop(scene, "sequential_ipadapter_mode", text="") 
-
-                            split = sub_ip_box_separate.split(factor=0.5) 
-                            if context.scene.model_architecture == 'sdxl':
-                                split.label(text="Weight Type:")
-                                split.prop(scene, "ipadapter_weight_type", text="")
-                            
-                            row = sub_ip_box_separate.row()
-                            row.prop(scene, "ipadapter_strength", text="Strength")
-                            if width_mode == 'narrow':
-                                row = sub_ip_box_separate.row()
-                            row.prop(scene, "ipadapter_start", text="Start")
-                            if width_mode == 'narrow':
-                                row = sub_ip_box_separate.row()
-                            row.prop(scene, "ipadapter_end", text="End")    
-                            
-                            if context.scene.sequential_ipadapter_mode == 'first':
-                                row = sub_ip_box_separate.row()
-                                row.prop(scene, "sequential_ipadapter_regenerate", text="Regenerate First Image", toggle=True, icon="FILE_REFRESH")
-                                if context.scene.sequential_ipadapter_regenerate:
-                                    row = sub_ip_box_separate.row()
-                                    row.prop(scene, "sequential_ipadapter_regenerate_wo_controlnet", text="Generate reference without ControlNet", toggle=True, icon="HIDE_OFF")
-                    
-                    # UV Inpainting Parameters
-                    elif scene.generation_method == 'uv_inpaint':
-                        row = mode_specific_outer_box.row()
-                        row.alignment = 'CENTER'
-                        row.label(text="UV Inpainting Parameters", icon="IMAGE_PLANE")
-                        row = mode_specific_outer_box.row()
-                        row.prop(scene, "allow_modify_existing_textures", text="Allow Modifying Existing Textures", toggle=True, icon="TEXTURE")
-                        row = mode_specific_outer_box.row()
-                        row.prop(scene, "ask_object_prompts", text="Ask for Object Specific Prompts", toggle=True, icon="QUESTION")
-
-                    # Sequential Mode Parameters
-                    elif scene.generation_method == 'sequential':
-                        row = mode_specific_outer_box.row()
-                        row.alignment = 'CENTER'
-                        row.label(text="Sequential Mode Parameters", icon="SEQUENCE")
-                        
-                        split = mode_specific_outer_box.split(factor=0.5)
-                        split.label(text="Custom Camera Order:")
-                        split.prop(scene, "sequential_custom_camera_order", text="")
-                        
-                        if not (scene.differential_diffusion and not scene.differential_noise): 
                             row = mode_specific_outer_box.row()
-                            row.prop(scene, "sequential_smooth", text="Use Smooth Visibility Map", toggle=True, icon="MOD_SMOOTH")
-                            if width_mode == 'narrow':
+                            row.prop(scene, "refine_images",
+                                    text="Refine Images",
+                                    toggle=True, icon="SHADERFX")
+                            if scene.refine_images:
+                                split = mode_specific_outer_box.split(factor=0.5)
+                                split.label(text="Refine Sampler:")
+                                split.prop(scene, "refine_sampler", text="")
+
+                                split = mode_specific_outer_box.split(factor=0.5)
+                                split.label(text="Refine Scheduler:")
+                                split.prop(scene, "refine_scheduler", text="")
+
                                 row = mode_specific_outer_box.row()
-                            row.prop(scene, "weight_exponent_mask", text="Exponent for Visibility Map", toggle=True, icon="IPO_EXPO") 
-                            
-                            if not scene.sequential_smooth:
-                                row = mode_specific_outer_box.row()
-                                row.prop(scene, "sequential_factor", text="Visibility Threshold") 
-                            else:
-                                row = mode_specific_outer_box.row()
-                                row.prop(scene, "sequential_factor_smooth", text="Smooth Visibility Black Point")
+                                row.prop(scene, "denoise", text="Denoise")
                                 if width_mode == 'narrow':
                                     row = mode_specific_outer_box.row()
-                                row.prop(scene, "sequential_factor_smooth_2", text="Smooth Visibility White Point")
-                        
-                        row = mode_specific_outer_box.row()
-                        row.prop(scene, "sequential_ipadapter", text="Use IPAdapter for Sequential Mode", toggle=True, icon="MODIFIER")
-                        if scene.sequential_ipadapter:
-                            sub_ip_seq_box = mode_specific_outer_box.box()
-                            
-                            split = sub_ip_seq_box.split(factor=0.5)
-                            split.label(text="Mode:")
-                            split.prop(scene, "sequential_ipadapter_mode", text="")
+                                row.prop(scene, "refine_cfg", text="Refine CFG")
+                                if width_mode == 'narrow':
+                                    row = mode_specific_outer_box.row()
+                                row.prop(scene, "refine_steps", text="Refine Steps")
 
-                            if scene.sequential_ipadapter_mode == 'recent':
-                                sub_ip_seq_box.prop(scene, "sequential_desaturate_factor", text="Desaturate")
-                                sub_ip_seq_box.prop(scene, "sequential_contrast_factor", text="Reduce Contrast")
+                                row = mode_specific_outer_box.row()
+                                split = mode_specific_outer_box.split(factor=0.25)
+                                split.label(text="Refine Prompt:")
+                                split.prop(scene, "refine_prompt", text="")
 
-                            if context.scene.model_architecture != 'qwen_image_edit':
-                                split = sub_ip_seq_box.split(factor=0.5)
+                                split = mode_specific_outer_box.split(factor=0.5)
+                                split.label(text="Refine Upscale:")
+                                split.prop(scene, "refine_upscale_method", text="")
+
+                        # -------------------------
+                        # Separate Mode Parameters
+                        # -------------------------
+                        elif method == 'separate':
+                            row = mode_specific_outer_box.row()
+                            row.alignment = 'CENTER'
+                            row.label(text="Separate Mode Parameters", icon='FORCE_FORCE')
+
+                            row = mode_specific_outer_box.row()
+                            row.prop(scene, "sequential_ipadapter",
+                                    text="Use IPAdapter for Separate Mode",
+                                    toggle=True, icon="MODIFIER")
+                            if scene.sequential_ipadapter:
+                                sub_ip_box_separate = mode_specific_outer_box.box()
+
+                                split = sub_ip_box_separate.split(factor=0.5)
+                                split.label(text="Mode:")
+                                split.prop(scene, "sequential_ipadapter_mode", text="")
+
+                                if scene.sequential_ipadapter_mode == 'recent':
+                                    sub_ip_box_separate.prop(
+                                        scene, "sequential_desaturate_factor", text="Desaturate")
+                                    sub_ip_box_separate.prop(
+                                        scene, "sequential_contrast_factor", text="Reduce Contrast")
+
+                                if context.scene.model_architecture != 'qwen_image_edit':
+                                    split = sub_ip_box_separate.split(factor=0.5)
+                                    if context.scene.model_architecture == 'sdxl':
+                                        split.label(text="Weight Type:")
+                                        split.prop(scene, "ipadapter_weight_type", text="")
+
+                                row = sub_ip_box_separate.row()
+                                row.prop(scene, "ipadapter_strength", text="Strength")
+                                if width_mode == 'narrow':
+                                    row = sub_ip_box_separate.row()
+                                row.prop(scene, "ipadapter_start", text="Start")
+                                if width_mode == 'narrow':
+                                    row = sub_ip_box_separate.row()
+                                row.prop(scene, "ipadapter_end", text="End")
+
+                                if context.scene.sequential_ipadapter_mode == 'first':
+                                    row = sub_ip_box_separate.row()
+                                    row.prop(scene, "sequential_ipadapter_regenerate",
+                                            text="Regenerate First Image",
+                                            toggle=True, icon="FILE_REFRESH")
+                                    if context.scene.sequential_ipadapter_regenerate:
+                                        row = sub_ip_box_separate.row()
+                                        row.prop(
+                                            scene,
+                                            "sequential_ipadapter_regenerate_wo_controlnet",
+                                            text="Generate reference without ControlNet",
+                                            toggle=True, icon="HIDE_OFF",
+                                        )
+
+                        # -------------------------
+                        # Refine Mode Parameters
+                        # -------------------------
+                        elif method == 'refine':
+                            row = mode_specific_outer_box.row()
+                            row.alignment = 'CENTER'
+                            row.label(text="Refine Mode Parameters", icon='SHADERFX')
+
+                            row = mode_specific_outer_box.row()
+                            row.prop(scene, "denoise", text="Denoise")
+
+                            row = mode_specific_outer_box.row()
+                            row.prop(
+                                scene,
+                                "refine_preserve",
+                                text="Preserve Original Textures",
+                                toggle=True,
+                                icon="TEXTURE",
+                            )
+
+                            row = mode_specific_outer_box.row()
+                            row.prop(
+                                scene,
+                                "sequential_ipadapter",
+                                text="Use IPAdapter for Refine Mode",
+                                toggle=True,
+                                icon="MODIFIER",
+                            )
+
+                            if scene.sequential_ipadapter:
+                                sub_ip_box_separate = mode_specific_outer_box.box()
+
+                                split = sub_ip_box_separate.split(factor=0.5)
+                                split.label(text="Mode:")
+                                split.prop(scene, "sequential_ipadapter_mode", text="")
+
+                                split = sub_ip_box_separate.split(factor=0.5)
                                 if context.scene.model_architecture == 'sdxl':
                                     split.label(text="Weight Type:")
                                     split.prop(scene, "ipadapter_weight_type", text="")
-                            
-                            row = sub_ip_seq_box.row()
-                            row.prop(scene, "ipadapter_strength", text="Strength")
-                            if width_mode == 'narrow':
-                                row = sub_ip_seq_box.row()
-                            row.prop(scene, "ipadapter_start", text="Start")
-                            if width_mode == 'narrow':  
-                                row = sub_ip_seq_box.row()
-                            row.prop(scene, "ipadapter_end", text="End")     
-                            
-                            if context.scene.sequential_ipadapter_mode == 'first':
-                                row = sub_ip_seq_box.row()
-                                row.prop(scene, "sequential_ipadapter_regenerate", text="Regenerate First Image", toggle=True, icon="FILE_REFRESH")
-                                if context.scene.sequential_ipadapter_regenerate:
-                                    row = sub_ip_seq_box.row()
-                                    row.prop(scene, "sequential_ipadapter_regenerate_wo_controlnet", text="Generate reference without ControlNet", toggle=True, icon="HIDE_OFF")   
 
+                                row = sub_ip_box_separate.row()
+                                row.prop(scene, "ipadapter_strength", text="Strength")
+                                if width_mode == 'narrow':
+                                    row = sub_ip_box_separate.row()
+                                row.prop(scene, "ipadapter_start", text="Start")
+                                if width_mode == 'narrow':
+                                    row = sub_ip_box_separate.row()
+                                row.prop(scene, "ipadapter_end", text="End")
+
+                                if context.scene.sequential_ipadapter_mode == 'first':
+                                    row = sub_ip_box_separate.row()
+                                    row.prop(
+                                        scene,
+                                        "sequential_ipadapter_regenerate",
+                                        text="Regenerate First Image",
+                                        toggle=True,
+                                        icon="FILE_REFRESH",
+                                    )
+                                    if context.scene.sequential_ipadapter_regenerate:
+                                        row = sub_ip_box_separate.row()
+                                        row.prop(
+                                            scene,
+                                            "sequential_ipadapter_regenerate_wo_controlnet",
+                                            text="Generate reference without ControlNet",
+                                            toggle=True,
+                                            icon="HIDE_OFF",
+                                        )
+
+                        # -------------------------
+                        # UV Inpainting Parameters
+                        # -------------------------
+                        elif method == 'uv_inpaint':
+                            row = mode_specific_outer_box.row()
+                            row.alignment = 'CENTER'
+                            row.label(text="UV Inpainting Parameters", icon="IMAGE_PLANE")
+
+                            row = mode_specific_outer_box.row()
+                            row.prop(
+                                scene,
+                                "allow_modify_existing_textures",
+                                text="Allow Modifying Existing Textures",
+                                toggle=True,
+                                icon="TEXTURE",
+                            )
+
+                            row = mode_specific_outer_box.row()
+                            row.prop(
+                                scene,
+                                "ask_object_prompts",
+                                text="Ask for Object Specific Prompts",
+                                toggle=True,
+                                icon="QUESTION",
+                            )
+
+                        # -------------------------
+                        # Sequential Mode Parameters
+                        # -------------------------
+                        elif method == 'sequential':
+                            row = mode_specific_outer_box.row()
+                            row.alignment = 'CENTER'
+                            row.label(text="Sequential Mode Parameters", icon="SEQUENCE")
+
+                            split = mode_specific_outer_box.split(factor=0.5)
+                            split.label(text="Custom Camera Order:")
+                            split.prop(scene, "sequential_custom_camera_order", text="")
+
+                            if not (scene.differential_diffusion and not scene.differential_noise):
+                                row = mode_specific_outer_box.row()
+                                row.prop(
+                                    scene,
+                                    "sequential_smooth",
+                                    text="Use Smooth Visibility Map",
+                                    toggle=True,
+                                    icon="MOD_SMOOTH",
+                                )
+                                if width_mode == 'narrow':
+                                    row = mode_specific_outer_box.row()
+                                row.prop(
+                                    scene,
+                                    "weight_exponent_mask",
+                                    text="Exponent for Visibility Map",
+                                    toggle=True,
+                                    icon="IPO_EXPO",
+                                )
+
+                                if not scene.sequential_smooth:
+                                    row = mode_specific_outer_box.row()
+                                    row.prop(
+                                        scene,
+                                        "sequential_factor",
+                                        text="Visibility Threshold",
+                                    )
+                                else:
+                                    row = mode_specific_outer_box.row()
+                                    row.prop(
+                                        scene,
+                                        "sequential_factor_smooth",
+                                        text="Smooth Visibility Black Point",
+                                    )
+                                    if width_mode == 'narrow':
+                                        row = mode_specific_outer_box.row()
+                                    row.prop(
+                                        scene,
+                                        "sequential_factor_smooth_2",
+                                        text="Smooth Visibility White Point",
+                                    )
+
+                            row = mode_specific_outer_box.row()
+                            row.prop(
+                                scene,
+                                "sequential_ipadapter",
+                                text="Use IPAdapter for Sequential Mode",
+                                toggle=True,
+                                icon="MODIFIER",
+                            )
+                            if scene.sequential_ipadapter:
+                                sub_ip_seq_box = mode_specific_outer_box.box()
+
+                                split = sub_ip_seq_box.split(factor=0.5)
+                                split.label(text="Mode:")
+                                split.prop(scene, "sequential_ipadapter_mode", text="")
+
+                                if scene.sequential_ipadapter_mode == 'recent':
+                                    sub_ip_seq_box.prop(
+                                        scene, "sequential_desaturate_factor", text="Desaturate")
+                                    sub_ip_seq_box.prop(
+                                        scene, "sequential_contrast_factor", text="Reduce Contrast")
+
+                                if context.scene.model_architecture != 'qwen_image_edit':
+                                    split = sub_ip_seq_box.split(factor=0.5)
+                                    if context.scene.model_architecture == 'sdxl':
+                                        split.label(text="Weight Type:")
+                                        split.prop(scene, "ipadapter_weight_type", text="")
+
+                                row = sub_ip_seq_box.row()
+                                row.prop(scene, "ipadapter_strength", text="Strength")
+                                if width_mode == 'narrow':
+                                    row = sub_ip_seq_box.row()
+                                row.prop(scene, "ipadapter_start", text="Start")
+                                if width_mode == 'narrow':
+                                    row = sub_ip_seq_box.row()
+                                row.prop(scene, "ipadapter_end", text="End")
+
+                                if context.scene.sequential_ipadapter_mode == 'first':
+                                    row = sub_ip_seq_box.row()
+                                    row.prop(
+                                        scene,
+                                        "sequential_ipadapter_regenerate",
+                                        text="Regenerate First Image",
+                                        toggle=True,
+                                        icon="FILE_REFRESH",
+                                    )
+                                    if context.scene.sequential_ipadapter_regenerate:
+                                        row = sub_ip_seq_box.row()
+                                        row.prop(
+                                            scene,
+                                            "sequential_ipadapter_regenerate_wo_controlnet",
+                                            text="Generate reference without ControlNet",
+                                            toggle=True,
+                                            icon="HIDE_OFF",
+                                        )
+
+                        # -------------------------
+                        # Shared visibility controls
+                        # -------------------------
+                        if method in {'uv_inpaint', 'sequential', 'refine'}:
+                            row = mode_specific_outer_box.row()
+                            row.prop(
+                                scene,
+                                "visibility_vignette",
+                                text="Feather Visibility Edges",
+                                icon="MATERIAL",
+                            )
+                            if scene.visibility_vignette:
+                                row = mode_specific_outer_box.row()
+                                row.prop(
+                                    scene,
+                                    "visibility_vignette_width",
+                                    text="Feather Width",
+                                )
+                                row = mode_specific_outer_box.row()
+                                row.prop(
+                                    scene,
+                                    "visibility_vignette_softness",
+                                    text="Feather Softness",
+                                )
+    
         # --- Tools ---
         layout.separator()
         tools_box = layout.box()
@@ -986,6 +1131,12 @@ class StableGenPanel(bpy.types.Panel):
 
         row = layout.row()
         row.operator("object.stablegen_mirror_reproject", text="Mirror Last Projection")
+
+        row = layout.row(align=True)
+        row.label(text="Mirror Axes:")
+        row.prop(scene, "stablegen_mirror_axis_x", text="X", toggle=True)
+        row.prop(scene, "stablegen_mirror_axis_y", text="Y", toggle=True)
+        row.prop(scene, "stablegen_mirror_axis_z", text="Z", toggle=True)
 
         layout.separator()
           
