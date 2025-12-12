@@ -594,6 +594,32 @@ def get_or_load_image(filepath, force_reload=False):
     filename = os.path.basename(filepath)
     image = bpy.data.images.get(filename)
     
+    # Verify if the found image actually points to the requested file
+    if image:
+        # Normalize paths for comparison (handle // prefix and OS separators)
+        try:
+            # bpy.path.abspath resolves // relative paths to absolute paths
+            img_path = os.path.normpath(bpy.path.abspath(image.filepath))
+            req_path = os.path.normpath(bpy.path.abspath(filepath))
+            
+            if img_path != req_path:
+                # Name collision: found an image with the same name but different path.
+                # This is NOT the image we want.
+                image = None
+                
+                # Try to find if the correct image is already loaded under a different name
+                for img in bpy.data.images:
+                    if img.filepath:
+                        try:
+                            if os.path.normpath(bpy.path.abspath(img.filepath)) == req_path:
+                                image = img
+                                break
+                        except:
+                            continue
+        except Exception as e:
+            print(f"Warning: Error comparing image paths: {e}")
+            image = None
+
     if image and force_reload:
         # Image exists, but we are forced to reload (overwrite).
         try:
@@ -614,7 +640,10 @@ def get_or_load_image(filepath, force_reload=False):
         # Image does not exist in .data, or it failed to reload.
         try:
             image = bpy.data.images.load(filepath)
-            image.name = filename # Ensure name matches filename
+            # Only set the name if it's a new datablock to avoid renaming existing ones
+            # Blender will handle naming collisions (e.g. .001) automatically
+            if not bpy.data.images.get(filename):
+                image.name = filename 
         except RuntimeError as e:
             # Load can fail if the file isn't found.
             print(f"Warning: Could not load image file: {filepath}. Error: {e}")
