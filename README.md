@@ -133,7 +133,7 @@ StableGen acts as an intuitive interface within Blender that communicates with a
 
 ## 💻 System Requirements
 
-* **Blender:** Version 4.2 or newer.
+* **Blender:** Version 4.2 or newer. *Note: Blender 5.x is not supported yet (work in progress).*
 * **Operating System:** Windows 10/11 or Linux.
 * **GPU:** **NVIDIA GPU with CUDA is recommended** for ComfyUI. For further details, check ComfyUI's github page: [https://github.com/comfyanonymous/ComfyUI](https://github.com/comfyanonymous/ComfyUI).
     * At least 8 GB of VRAM is required to run SDXL at a usable speed; plan for 16 GB or more when running FLUX.1-dev or the Qwen-Image-Edit pipeline.
@@ -423,4 +423,4 @@ Ondřej Sakala
 * X/Twitter: `@sakalond`
 
 ---
-*Last Updated: November 3, 2025*
+*Last Updated: December 12, 2025*
