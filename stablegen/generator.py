@@ -10,10 +10,8 @@ import socket
 import threading
 import requests
 import traceback
-import json
 import io
 from datetime import datetime
-
 import math
 import colorsys
 from PIL import Image, ImageEnhance
@@ -23,6 +21,7 @@ from .render_tools import export_emit_image, export_visibility, export_canny, ba
 from .utils import get_last_material_index, get_generation_dirs, get_file_path, get_dir_path, remove_empty_dirs # pylint: disable=relative-beyond-top-level
 from .project import project_image, reinstate_compare_nodes # pylint: disable=relative-beyond-top-level
 from .workflows import WorkflowManager
+from .util.mirror_color import MirrorReproject, _get_viewport_ref_np, _apply_color_match_to_file
 
 # Import wheels
 import websocket
@@ -677,6 +676,24 @@ class ComfyUIGenerate(bpy.types.Operator):
                     
                 # Export visibility masks for each object
                 export_visibility(context, None, obj)
+
+        if context.scene.view_blend_use_color_match and self._to_texture:
+            # Use the first target object as the reference for viewport color
+            ref_np = _get_viewport_ref_np(self._to_texture[0])
+            if ref_np is not None:
+                # Apply color match to ALL generated camera images for this material
+                for cam_idx, cam in enumerate(self._cameras):
+                    image_path = get_file_path(
+                        context,
+                        "generated",
+                        camera_id=cam_idx,
+                        material_id=self._material_id,
+                    )
+                    _apply_color_match_to_file(
+                        image_path=image_path,
+                        ref_rgb=ref_np,
+                        scene=context.scene,
+                    )
         
         self.prompt_text = context.scene.comfyui_prompt
 
@@ -1071,6 +1088,24 @@ class ComfyUIGenerate(bpy.types.Operator):
                     )
                     apply_uv_inpaint_texture(context, obj, texture_path)
             return None
+        
+        if context.scene.view_blend_use_color_match and self._to_texture:
+            # Use the first object in the target list as the color reference
+            ref_np = _get_viewport_ref_np(self._to_texture[0])
+            if ref_np is not None:
+                # Loop all cameras we generated for
+                for cam_idx, cam in enumerate(self._cameras):
+                    image_path = get_file_path(
+                        context,
+                        "generated",
+                        camera_id=cam_idx,
+                        material_id=self._material_id,
+                    )
+                    _apply_color_match_to_file(
+                        image_path=image_path,
+                        ref_rgb=ref_np,
+                        scene=context.scene,
+                    )
 
         bpy.app.timers.register(image_project_callback)
 
@@ -1430,7 +1465,6 @@ class ComfyUIGenerate(bpy.types.Operator):
 
     def rescale_to_1mp(self, image):
         """Rescales the image to approximately 1MP."""
-        from PIL import Image
 
         width, height = image.size
         total_pixels = width * height
@@ -1453,7 +1487,6 @@ class ComfyUIGenerate(bpy.types.Operator):
         grid_image_path = get_file_path(context, "generated", camera_id=None, material_id=self._material_id)
 
         # Load the generated grid image
-        from PIL import Image
         grid_image = Image.open(grid_image_path)
 
         # Calculate grid dimensions to make it as square as possible

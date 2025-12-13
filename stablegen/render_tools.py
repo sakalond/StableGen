@@ -18,86 +18,351 @@ import cv2
 import imageio
 import imageio_ffmpeg
 
+def purge_orphans():
+    """
+    Purge unused datablocks (images, materials, node groups, etc).
+    Uses Blender's Outliner orphan purge.
+    """
+    try:
+        # Blender 3.x/4.x: call recursively a few times to fully purge
+        for _ in range(5):
+            result = bpy.ops.outliner.orphans_purge(do_recursive=True)
+            # If it reports "CANCELLED" or does nothing, we're done
+            if 'CANCELLED' in result:
+                break
+    except Exception as e:
+        print(f"[StableGen] Orphan purge failed: {e}")
+
+def apply_vignette_to_mask(mask_file_path, feather_width=0.15, gamma=1.0):
+    """
+    Soften hard edges in a grayscale visibility mask.
+
+    Instead of only darkening a thin border at the image edges, this applies
+    a Gaussian blur whose radius is proportional to the image size. That means
+    *any* 0→1 transition in the mask (occlusion edges, camera frustum edges,
+    etc.) becomes a smooth ramp, which the shader can use for a soft blend.
+
+    feather_width: fraction of min(image_w, image_h) used as blur radius.
+                   0.0 = no blur, 0.5 = very soft edges.
+    gamma: optional gamma applied to the blurred mask (1.0 = none).
+    """
+    log_prefix = "[StableGen] Vignette:"
+
+    # -------------------------------------------------------------------------
+    # Basic guards
+    # -------------------------------------------------------------------------
+    if feather_width <= 0.0:
+        return
+
+    if not isinstance(mask_file_path, str):
+        print(f"{log_prefix} mask_file_path must be a string, got {type(mask_file_path)}")
+        return
+
+    if not os.path.exists(mask_file_path):
+        print(f"{log_prefix} mask file not found: {mask_file_path}")
+        return
+
+    img = cv2.imread(mask_file_path, cv2.IMREAD_GRAYSCALE)
+    if img is None:
+        print(f"{log_prefix} failed to read mask: {mask_file_path}")
+        return
+
+    # -------------------------------------------------------------------------
+    # Blur-based feathering
+    # -------------------------------------------------------------------------
+    h, w = img.shape[:2]
+    base = img.astype(np.float32) / 255.0
+
+    # Radius as a fraction of the smallest dimension
+    min_dim = float(min(h, w))
+    radius = max(1.0, feather_width * min_dim)
+
+    # Kernel size must be odd and at least 3
+    ksize = int(max(3, int(radius) | 1))
+
+    blurred = cv2.GaussianBlur(base, (ksize, ksize), 0)
+
+    if gamma != 1.0:
+        blurred = np.power(blurred, gamma)
+
+    result = np.clip(blurred, 0.0, 1.0)
+    result_u8 = (result * 255.0).astype(np.uint8)
+    cv2.imwrite(mask_file_path, result_u8)
+
+    print(
+        f"{log_prefix} soft-edge blur applied to mask: {mask_file_path} "
+        f"(ksize={ksize}, fw={feather_width}, gamma={gamma})"
+    )
 
 def apply_uv_inpaint_texture(context, obj, baked_image_path):
     """
-    Applies the UV inpainted texture to the active material by replacing
-    the fallback color node in the node tree.
+    Apply a UV inpainted/baked texture to the active material.
+
+    Priority:
+      1) StableGen projection chain: replace LAST MixRGB with "Projection" in name (Color2).
+      2) Fallback: traverse from Material Output and find a suitable MIX_RGB (Color2 unlinked
+         or linked from TEX_IMAGE), then replace that (Color2).
+
+    In both cases:
+      - Insert TexImage + UVMap (first non-ProjectionUV layer) feeding Color2.
+      - Remove existing Color2 links.
+      - If replacing a projection input, also remove the old TexImage node and orphaned image.
     """
+
     mat = obj.active_material
-    if not mat or not mat.use_nodes:
+    if not mat or not mat.use_nodes or not mat.node_tree:
+        print("[StableGen] No active material or no node tree.")
         return
+
     nodes = mat.node_tree.nodes
     links = mat.node_tree.links
 
-    # Locate the Output Material node
-    output_node = None
-    for node in nodes:
-        if node.type == 'OUTPUT_MATERIAL':
-            output_node = node
-            break
-    if not output_node or not output_node.inputs["Surface"].links:
+    # -----------------------------
+    # Load baked image
+    # -----------------------------
+    try:
+        img = bpy.data.images.load(baked_image_path)
+    except Exception as e:
+        print("[StableGen] Failed to load baked image", baked_image_path, e)
         return
 
-    # Traverse from the output input to find a MIX_RGB node with unlinked Color2
-    mix_node = None
+    # -----------------------------
+    # Helpers
+    # -----------------------------
+    def pick_uv_name():
+        uv_layers = getattr(obj.data, "uv_layers", None)
+        if not uv_layers or len(uv_layers) == 0:
+            return None
+        for uv_layer in uv_layers:
+            if not uv_layer.name.startswith("ProjectionUV"):
+                return uv_layer.name
+        return uv_layers.active.name
+
+    def clear_color2_links(mix_node, cleanup_teximage=False):
+        """Remove links to Color2. Optionally remove upstream TexImage nodes & orphaned images."""
+        for link in list(mix_node.inputs["Color2"].links):
+            src = link.from_node
+            links.remove(link)
+
+            if cleanup_teximage and src and src.type == "TEX_IMAGE":
+                old_img = src.image
+                try:
+                    nodes.remove(src)
+                except Exception:
+                    pass
+                if old_img and old_img.users == 0:
+                    try:
+                        bpy.data.images.remove(old_img)
+                    except Exception:
+                        pass
+
+    def inject_tex_uv_into_color2(mix_node):
+        """Create TexImage+UVMap and connect into mix_node Color2."""
+        tex = nodes.new("ShaderNodeTexImage")
+        tex.image = img
+        tex.label = "BakedProjection"
+        tex.location = (mix_node.location[0] - 300, mix_node.location[1])
+
+        uv = nodes.new("ShaderNodeUVMap")
+        uv_name = pick_uv_name()
+        if uv_name:
+            uv.uv_map = uv_name
+        uv.location = (tex.location[0] - 300, tex.location[1] - 200)
+
+        links.new(uv.outputs["UV"], tex.inputs["Vector"])
+        links.new(tex.outputs["Color"], mix_node.inputs["Color2"])
+
+    # ============================================================
+    # 1) StableGen projection chain path
+    # ============================================================
+    proj_mix_nodes = [n for n in nodes if n.type == "MIX_RGB" and "Projection" in n.name]
+    if proj_mix_nodes:
+        mix_node = sorted(proj_mix_nodes, key=lambda n: n.name)[-1]
+
+        # Remove previous projection input, clean up old TexImage nodes
+        clear_color2_links(mix_node, cleanup_teximage=True)
+
+        # Inject baked texture
+        inject_tex_uv_into_color2(mix_node)
+
+        print(f"[StableGen] Injected baked projection into projection chain ({mix_node.name}) on {obj.name}")
+        return
+
+    # ============================================================
+    # 2) Fallback traversal path (your original logic)
+    # ============================================================
+    output_node = next((n for n in nodes if n.type == "OUTPUT_MATERIAL"), None)
+    if not output_node or not output_node.inputs["Surface"].links:
+        print("[StableGen] No Material Output surface link found for fallback.")
+        return
+
     before_output = output_node.inputs["Surface"].links[0].from_node
-    if before_output.type == 'BSDF_PRINCIPLED':
-        current_node = output_node.inputs[0].links[0].from_node.inputs[0].links[0].from_node
+
+    if before_output.type == "BSDF_PRINCIPLED":
+        # Follow: Output.Surface -> Principled -> Base Color -> upstream node
+        base_color = before_output.inputs.get("Base Color")
+        if base_color and base_color.links:
+            current_node = base_color.links[0].from_node
+        else:
+            current_node = None
     else:
-        # Already a color mix node
         current_node = before_output
-    while current_node:
-        # Base case: Found a MIX_RGB node with unlinked Color2 or linked to image texture
-        if (current_node.type == 'MIX_RGB' and 
-            (not current_node.inputs["Color2"].is_linked or current_node.inputs["Color2"].links[0].from_node.type == 'TEX_IMAGE')):
-            mix_node = current_node
-            break
-        # If possible, traverse one step back using the first input link
-        if current_node.inputs["Color2"].links:
-            current_node = current_node.inputs["Color2"].links[0].from_node
+
+    mix_node = None
+    visited = set()
+
+    while current_node and current_node.as_pointer() not in visited:
+        visited.add(current_node.as_pointer())
+
+        if current_node.type == "MIX_RGB":
+            c2 = current_node.inputs.get("Color2")
+            if c2:
+                if (not c2.is_linked) or (c2.is_linked and c2.links and c2.links[0].from_node.type == "TEX_IMAGE"):
+                    mix_node = current_node
+                    break
+
+        c2 = current_node.inputs.get("Color2")
+        if c2 and c2.links:
+            current_node = c2.links[0].from_node
         else:
             current_node = None
 
     if not mix_node:
+        print("[StableGen] No suitable fallback MixRGB node found.")
         return
 
-    # Insert the texture node feeding into the mix node
-    tex_node = nodes.new("ShaderNodeTexImage")
+    # Remove any existing links on Color2 (fallback does NOT aggressively delete nodes/images)
+    clear_color2_links(mix_node, cleanup_teximage=False)
+
+    # Insert baked texture + UVMap
+    inject_tex_uv_into_color2(mix_node)
+
+    print(f"[StableGen] Injected baked projection into fallback chain ({mix_node.name}) on {obj.name}")
+
+
+def flatten_projection_material_for_refine(context, obj, baked_image_path):
+    """
+    Replace the StableGen ProjectionMaterial on this object with a minimal
+    baked-base material that still matches the expectations of:
+      - export_emit_image / _setup_emit_material
+      - project_image refine_preserve logic
+
+    Final graph:
+        UV Map -> Baked Image -> MixRGB -> Principled BSDF -> Output
+    """
+    import os
     try:
         img = bpy.data.images.load(baked_image_path)
     except Exception as e:
-        print("Failed to load image", baked_image_path, e)
+        print(f"[StableGen] Failed to load baked image for {obj.name}: {baked_image_path} ({e})")
         return
+
+    # -------------------------------------------------------------------------
+    # 1) Find or create a suitable material
+    # -------------------------------------------------------------------------
+    target_mat = None
+    for slot in obj.material_slots:
+        mat = slot.material
+        if mat and mat.name.startswith("ProjectionMaterial"):
+            target_mat = mat
+            break
+
+    if target_mat is None:
+        target_mat = obj.active_material
+
+    if target_mat is None:
+        target_mat = bpy.data.materials.new(name="ProjectionMaterial")
+        obj.data.materials.append(target_mat)
+
+    obj.active_material = target_mat
+    if obj.active_material_index < 0:
+        if target_mat not in obj.data.materials:
+            obj.data.materials.append(target_mat)
+        obj.active_material_index = obj.material_slots.find(target_mat.name)
+
+    # -------------------------------------------------------------------------
+    # 2) Build: UV -> Tex -> MixRGB -> Principled -> Output
+    # -------------------------------------------------------------------------
+    target_mat.use_nodes = True
+    nodes = target_mat.node_tree.nodes
+    links = target_mat.node_tree.links
+
+    # Clear old nodes
+    for node in list(nodes):
+        nodes.remove(node)
+
+    # Output
+    output_node = nodes.new("ShaderNodeOutputMaterial")
+    output_node.location = (800, 0)
+
+    # Principled
+    principled_node = nodes.new("ShaderNodeBsdfPrincipled")
+    principled_node.location = (500, 0)
+    principled_node.inputs["Roughness"].default_value = 1.0
+
+    # MixRGB that _setup_emit_material expects to sit before the Principled
+    mix_node = nodes.new("ShaderNodeMixRGB")
+    mix_node.location = (200, 0)
+    mix_node.use_clamp = True
+    # Fac=0 -> output = Color1 (baked tex)
+    mix_node.inputs["Fac"].default_value = 0.0
+
+    # Baked texture
+    tex_node = nodes.new("ShaderNodeTexImage")
+    tex_node.location = (-100, 0)
     tex_node.image = img
-    tex_node.location = (mix_node.location[0] - 300, mix_node.location[1])
-    # Remove any existing links on Color2 and connect new texture output
-    for link in mix_node.inputs["Color2"].links:
-        links.remove(link)
-    links.new(tex_node.outputs["Color"], mix_node.inputs["Color2"])
-    # Add UV map node
-    uv_map_node = nodes.new("ShaderNodeUVMap")
-    # Find first UV map which doesn't start with "ProjectionUV"
-    uv_map_name = None
-    for uv_map in obj.data.uv_layers:
-        if uv_map.name.startswith("ProjectionUV"):
-            continue
-        uv_map_name = uv_map.name
-        break
-    if uv_map_name:
-        uv_map_node.uv_map = uv_map_name
-    else:
-        uv_map_node.uv_map = obj.data.uv_layers.active.name
-    uv_map_node.location = (tex_node.location[0] - 300, tex_node.location[1] - 200)
-    # Connect UV map node to texture node
-    links.new(uv_map_node.outputs["UV"], tex_node.inputs["Vector"])
+
+    # UV map
+    uv_node = nodes.new("ShaderNodeUVMap")
+    uv_node.location = (-400, -150)
+
+    # -------------------------------------------------------------------------
+    # 3) Choose a stable UV map (avoid ProjectionUV)
+    # -------------------------------------------------------------------------
+    uv_name = None
+    for uv in obj.data.uv_layers:
+        if not uv.name.startswith("ProjectionUV"):
+            uv_name = uv.name
+            break
+
+    if not uv_name:
+        uv_names = [uv.name for uv in obj.data.uv_layers]
+        if "BakeUV" in uv_names:
+            uv_name = "BakeUV"
+        else:
+            uv_layer = obj.data.uv_layers.new(name="BakeUV")
+            uv_name = uv_layer.name
+
+    uv_node.uv_map = uv_name
+
+    # -------------------------------------------------------------------------
+    # 4) Wire up the graph
+    # -------------------------------------------------------------------------
+    links.new(uv_node.outputs["UV"], tex_node.inputs["Vector"])
+    links.new(tex_node.outputs["Color"], mix_node.inputs["Color1"])
+
+    links.new(mix_node.outputs["Color"], principled_node.inputs["Base Color"])
+
+    # Drive emission too (Blender 4.x uses "Emission Color")
+    if "Emission Color" in principled_node.inputs:
+        links.new(mix_node.outputs["Color"], principled_node.inputs["Emission Color"])
+    elif "Emission" in principled_node.inputs:
+        links.new(mix_node.outputs["Color"], principled_node.inputs["Emission"])
+
+    if "Emission Strength" in principled_node.inputs:
+        principled_node.inputs["Emission Strength"].default_value = 1.0
+
+    links.new(principled_node.outputs["BSDF"], output_node.inputs["Surface"])
+
+
+    print(f"[StableGen] Flattened ProjectionMaterial for '{obj.name}' to baked texture '{os.path.basename(baked_image_path)}'")
 
 def export_emit_image(context, to_export, camera_id=None, bg_color=(0.5, 0.5, 0.5), view_transform='Standard', fallback_color=(0,0,0)):
-        """     
-        Exports a emit-only render of the scene from a camera's perspective.         
-        :param context: Blender context.         
-        :param camera_id: ID of the camera.         
-        :return: None     
+        """
+        Exports a emit-only render of the scene from a camera's perspective.
+        :param context: Blender context.
+        :param camera_id: ID of the camera.
+        :return: None
         """
         print("Exporting emit render")
         # Set animation frame to 1
@@ -107,16 +372,16 @@ def export_emit_image(context, to_export, camera_id=None, bg_color=(0.5, 0.5, 0.
         original_materials = {}
         original_active_material = {}
         temporary_materials = {}
-        
+
         # Check if there is BSDF applied
-        
+
         # We need to temporarily disconnect BDSF nodes and connect their inputs directly to the output
-       
+
         for obj in to_export:
             # Store original materials
             original_materials[obj] = list(obj.data.materials)
             original_active_material[obj] = obj.active_material
-        
+
             # Copy active material and switch to it
             mat = obj.active_material
             if not mat:
@@ -126,7 +391,7 @@ def export_emit_image(context, to_export, camera_id=None, bg_color=(0.5, 0.5, 0.
             # Clear materials and assign temp material
             obj.data.materials.clear()
             obj.data.materials.append(mat_copy)
-            
+
             # Store the temporary material for later deletion
             temporary_materials[obj] = mat_copy
 
@@ -141,7 +406,7 @@ def export_emit_image(context, to_export, camera_id=None, bg_color=(0.5, 0.5, 0.
                 if node.type == 'OUTPUT_MATERIAL':
                     output = node
                     break
-                
+
                 # Check the type of the node which connects to output
             before_output = output.inputs[0].links[0].from_node
             if before_output.type == 'BSDF_PRINCIPLED':
@@ -162,7 +427,7 @@ def export_emit_image(context, to_export, camera_id=None, bg_color=(0.5, 0.5, 0.
             color_mix = output.inputs[0].links[0].from_node.inputs[0].links[0].from_node
             # Connect the color mix node directly to the output
             links.new(color_mix.outputs[0], output.inputs[0])
-                
+
         output_dir = get_dir_path(context, "inpaint")["visibility"] if "visibility" in str(camera_id) else get_dir_path(context, "inpaint")["render"]
         output_file = f"render{camera_id}" if camera_id is not None else "render"
 
@@ -197,22 +462,22 @@ def export_emit_image(context, to_export, camera_id=None, bg_color=(0.5, 0.5, 0.
         view_layer.use_pass_diffuse_color = False
         view_layer.use_pass_diffuse_direct = False
         view_layer.use_pass_diffuse_indirect = False
-        
+
         # Disable all other passes
         view_layer.use_pass_ambient_occlusion = False
         view_layer.use_pass_shadow = False
         view_layer.use_pass_emit = True
         view_layer.use_pass_environment = True
- 
+
 
         # Set up nodes for diffuse-only output
         context.scene.use_nodes = True
         nodes = context.scene.node_tree.nodes
         links = context.scene.node_tree.links
-        
+
         # Clear existing nodes
         nodes.clear()
-        
+
         # Create nodes
         render_layers = nodes.new('CompositorNodeRLayers')
         mix_node = nodes.new('CompositorNodeMixRGB')
@@ -221,31 +486,37 @@ def export_emit_image(context, to_export, camera_id=None, bg_color=(0.5, 0.5, 0.
         output_node = nodes.new('CompositorNodeOutputFile')
         output_node.base_path = output_dir
         output_node.file_slots[0].path = output_file
-    
+
         # Connect emission to output
         links.new(render_layers.outputs['Emit'], mix_node.inputs[1])
         links.new(render_layers.outputs['Env'], mix_node.inputs[2])
         links.new(mix_node.outputs[0], output_node.inputs[0])
-            
+
         # Render
         bpy.ops.render.render(write_still=True)
-        
-        if context.scene.mask_blocky:
-            # If this is a visibility mask, expand it to blocks
-            if "visibility" in str(camera_id):
-                # Load the rendered image
-                image_path = os.path.join(output_dir, f"{output_file}.png")
-                image = cv2.imread(image_path, cv2.IMREAD_GRAYSCALE)
-                
-                image_path = image_path.replace(".png", "0001.png")
 
-                # Expand the mask to blocks
-                expanded_mask = expand_mask_to_blocks(image_path, block_size=8)
-                
-                # Scale float32 to uint8 [0, 255]
-                expanded_mask = (expanded_mask * 255).astype(np.uint8)
-                
-                cv2.imwrite(image_path, expanded_mask)
+        # Post-processing for visibility masks
+        if "visibility" in str(camera_id):
+            # Load the rendered image
+            image_path = os.path.join(output_dir, f"{output_file}.png")
+            # Blender output node might append frame number, e.g. render0001.png
+            # But here we assume standard naming or handle it if needed.
+            # The original code replaced .png with 0001.png, let's stick to that pattern if it matches
+            final_path = image_path.replace(".png", "0001.png")
+
+            if context.scene.visibility_vignette:
+                # Smooth edge feathering, no blocky mask
+                apply_vignette_to_mask(
+                    final_path,
+                    feather_width=context.scene.visibility_vignette_width,
+                    gamma=1.0,
+                )
+            elif context.scene.mask_blocky:
+                # Only do blocky mask if vignette is OFF
+                expanded_mask = expand_mask_to_blocks(final_path, block_size=8)
+                if expanded_mask is not None:
+                    expanded_mask_u8 = (expanded_mask * 255).astype(np.uint8)
+                    cv2.imwrite(final_path, expanded_mask_u8)
 
         # Restore original settings
         context.scene.render.engine = original_engine
@@ -265,13 +536,14 @@ def export_emit_image(context, to_export, camera_id=None, bg_color=(0.5, 0.5, 0.
             for mat in materials:
                 if mat != original_active_material[obj]:
                     obj.data.materials.append(mat)
-                    
+
         # Clean up temporary materials
         for _, temp_mat in temporary_materials.items():
             if temp_mat and temp_mat.name in bpy.data.materials:
                 bpy.data.materials.remove(temp_mat)
 
         print(f"Emmision render saved to: {os.path.join(output_dir, output_file)}.png")
+
 
 def export_render(context, camera_id=None):
     """
@@ -634,6 +906,13 @@ def export_visibility(context, to_export, obj=None, camera_visibility=None):
         image = cv2.normalize(image, None, 0, 255, cv2.NORM_MINMAX)
         # Save the image
         cv2.imwrite(image_path, image)
+
+        if context.scene.visibility_vignette:
+            apply_vignette_to_mask(
+                image_path,
+                feather_width=context.scene.visibility_vignette_width,
+                gamma=1.0,
+            )
     else:
         # Make sure the camera is active and set to render
         cameras = [obj for obj in context.scene.objects if obj.type == 'CAMERA']
@@ -1243,6 +1522,34 @@ def bake_texture(context, obj, texture_resolution, suffix = "", view_transform =
                 
         return True
 
+def _has_non_projection_uv(obj):
+    if not obj or obj.type != 'MESH':
+        return False
+    if not obj.data.uv_layers:
+        return False
+    for uv in obj.data.uv_layers:
+        if not uv.name.startswith("ProjectionUV"):
+            return True
+    return False
+
+def _uvs_likely_overlap(obj, uv_name=None):
+    me = obj.data
+    if not me.uv_layers:
+        return False
+    uv_layer = me.uv_layers.get(uv_name) if uv_name else me.uv_layers.active
+    if not uv_layer:
+        return False
+
+    seen = set()
+    for poly in me.polygons:
+        for li in poly.loop_indices:
+            uv = uv_layer.data[li].uv
+            key = (round(uv.x, 5), round(uv.y, 5))
+            if key in seen:
+                return True
+            seen.add(key)
+    return False
+
 class BakeTextures(bpy.types.Operator):
     """Bakes textures using the cycles render engine.
     
@@ -1278,6 +1585,12 @@ class BakeTextures(bpy.types.Operator):
         name="Add Material",
         description="Add the baked texture as a material to the objects",
         default=True
+    ) # type: ignore
+
+    flatten_for_refine: bpy.props.BoolProperty(
+        name="Bake & Continue Refining",
+        description="After baking, apply the baked texture to the StableGen projection material and clean up previous projection images",
+        default=False
     ) # type: ignore
 
     overlap_only: bpy.props.BoolProperty(
@@ -1329,6 +1642,14 @@ class BakeTextures(bpy.types.Operator):
         
         # Check if there are any textures to bake
         return True
+
+    def draw(self, context):
+        layout = self.layout
+        layout.prop(self, "texture_resolution")
+        layout.prop(self, "try_unwrap")
+        layout.prop(self, "overlap_only")
+        layout.prop(self, "add_material")
+        layout.prop(self, "flatten_for_refine")
 
     def invoke(self, context, event):
         """     
@@ -1391,7 +1712,17 @@ class BakeTextures(bpy.types.Operator):
                     self._stage = f"Unwrapping {obj.name}"
                     self._progress = 0
                     redraw()
-                    unwrap(obj, self.try_unwrap, self.overlap_only)
+
+                    if self.try_unwrap != 'none':
+                        if not _has_non_projection_uv(obj):
+                            unwrap(obj, self.try_unwrap, self.overlap_only)
+                        else:
+                            if self.overlap_only:
+                                if _uvs_likely_overlap(obj):
+                                    unwrap(obj, self.try_unwrap, self.overlap_only)
+                            else:
+                                pass
+
                     self._progress = 100
                 elif self._phase == 'bake':
                     self._stage = f"Baking {obj.name}"
@@ -1401,6 +1732,16 @@ class BakeTextures(bpy.types.Operator):
                         self.report({'ERROR'}, f"Failed to bake texture for {obj.name}. No materials found.")
                         context.window_manager.event_timer_remove(self._timer)
                         return {'CANCELLED'}
+
+                    # NEW: optionally flatten into the projection material so you can keep refining
+                    if self.flatten_for_refine:
+                        try:
+                            baked_path = get_file_path(context, "baked", object_name=obj.name)
+                            flatten_projection_material_for_refine(context, obj, baked_path)
+                            purge_orphans()
+                        except Exception as e:
+                            print(f"[StableGen] Failed to flatten projection material for {obj.name}: {e}")
+
                     self._progress = 100
                 elif self._phase == 'apply_material' and self.add_material:
                     self._stage = f"Applying Material to {obj.name}"
@@ -1491,7 +1832,7 @@ class BakeTextures(bpy.types.Operator):
             links.new(principled_node.outputs["BSDF"], output_node.inputs["Surface"])
         else:
             links.new(tex_image.outputs["Color"], output_node.inputs["Surface"])
-        
+            
     
 class ExportOrbitGIF(bpy.types.Operator):
     """Exports a GIF and MP4 animation orbiting the active object"""

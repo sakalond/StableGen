@@ -9,6 +9,10 @@ import urllib.request
 from .util.helpers import prompt_text_qwen_image_edit
 from .utils import get_generation_dirs
 
+from io import BytesIO
+import numpy as np
+from PIL import Image
+
 class WorkflowManager:
     def __init__(self, operator):
         """
@@ -18,6 +22,102 @@ class WorkflowManager:
             operator: The instance of the ComfyUIGenerate operator.
         """
         self.operator = operator
+
+    def _crop_and_vignette(
+        self,
+        img_bytes,
+        border_px: int = 8,
+        feather: float = 0.15,
+        gamma: float = 0.7,
+    ):
+        """
+        Crop a constant border from the image and apply an *alpha* vignette
+        that fades the image out toward the edges.
+
+        IMPORTANT:
+          - RGB is NOT darkened here, only alpha is shaped.
+          - This assumes the shader uses alpha to blend with the underlying
+            surface (e.g. Mix using alpha as Fac).
+
+        border_px : how many pixels to remove on each side.
+        feather   : fraction of min(width, height) that is used as the feather band.
+        gamma     : exponent applied to the feather mask (1.0 = linear).
+        """
+
+        if img_bytes is None:
+            return None
+
+        # --- Load image as RGBA without touching color ---
+        buf = BytesIO(img_bytes)
+        img = Image.open(buf).convert("RGBA")
+
+        w, h = img.size
+        if w <= 2 * border_px or h <= 2 * border_px:
+            # Too small to crop; just return as-is
+            out_buf = BytesIO()
+            img.save(out_buf, format="PNG")
+            return out_buf.getvalue()
+
+        # --- Crop hard Comfy border first ---
+        left   = border_px
+        top    = border_px
+        right  = w - border_px
+        bottom = h - border_px
+        img = img.crop((left, top, right, bottom))
+        w, h = img.size
+
+        # Convert to numpy for mask math
+        arr = np.asarray(img, dtype=np.float32) / 255.0  # [H, W, 4]
+        rgb = arr[..., :3]
+        alpha_orig = arr[..., 3]
+
+        # If there was no alpha, assume fully opaque as starting point
+        if np.all(alpha_orig == 0):
+            alpha_orig = np.ones_like(alpha_orig, dtype=np.float32)
+
+        # --- Build rectangular feather mask based on distance to nearest edge ---
+
+        # Normalized distance (in pixels) to each edge
+        yy, xx = np.mgrid[0:h, 0:w]
+        dist_to_left   = xx
+        dist_to_right  = (w - 1) - xx
+        dist_to_top    = yy
+        dist_to_bottom = (h - 1) - yy
+
+        dist_to_edge = np.minimum(
+            np.minimum(dist_to_left, dist_to_right),
+            np.minimum(dist_to_top, dist_to_bottom),
+        ).astype(np.float32)
+
+        # Feather band thickness in pixels
+        # (0.0–0.5 of the smaller dimension is reasonable)
+        min_dim = float(min(w, h))
+        feather_px = max(1.0, feather * 0.5 * min_dim)
+
+        # 0 at the border, 1 in the interior beyond the feather band
+        mask = dist_to_edge / feather_px
+        mask = np.clip(mask, 0.0, 1.0)
+
+        # Shape the transition with gamma (only on the mask, not on RGB!)
+        if gamma != 1.0:
+            # stronger bias toward 1.0 in mid-range
+            mask = np.clip(mask, 1e-6, 1.0)
+            mask = np.power(mask, gamma)
+
+        # Compose final alpha: original alpha * vignette mask
+        alpha_new = alpha_orig * mask
+
+        # Reassemble RGBA, leaving RGB completely unchanged
+        out = np.empty_like(arr)
+        out[..., :3] = rgb
+        out[..., 3] = alpha_new
+        out = np.clip(out * 255.0, 0, 255).astype(np.uint8)
+
+        img_out = Image.fromarray(out, mode="RGBA")
+
+        out_buf = BytesIO()
+        img_out.save(out_buf, format="PNG")
+        return out_buf.getvalue()
 
     def _get_qwen_default_prompts(self, context, is_initial_image):
         """Gets the default Qwen prompts based on the current context."""
@@ -793,10 +893,19 @@ class WorkflowManager:
         if images is None or isinstance(images, dict) and "error" in images:
             return {"error": "conn_failed"}
         
-        print(f"Image refined with prompt: {context.scene.refine_prompt if context.scene.refine_prompt else context.scene.comfyui_prompt}")
-        
-        # Return the refined image
-        return images[NODES['save_image']][0]
+        print(f"Image refined with prompt: ...")
+
+        img_bytes = images[NODES['save_image']][0]
+
+        # Remove Comfy’s hard border and add a soft alpha vignette
+        img_bytes = self._crop_and_vignette(
+            img_bytes,
+            border_px=8,   # tweak this if your Comfy border is wider/narrower
+            feather=0.08,  # thicker feather band
+            gamma=0.5,     # stronger fade near edge
+        )
+
+        return img_bytes
 
     def _create_img2img_base_prompt(self, context):
         """Creates and configures the base prompt for img2img refinement."""
