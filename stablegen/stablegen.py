@@ -1010,12 +1010,6 @@ class StableGenPanel(bpy.types.Panel):
         row = tools_box.row()
         row.operator("object.stablegen_mirror_reproject", text="Mirror Last Projection", icon="MOD_MIRROR")
 
-        row = tools_box.row(align=True)
-        row.label(text="Mirror Axes:")
-        row.prop(scene, "stablegen_mirror_axis_x", text="X", toggle=True)
-        row.prop(scene, "stablegen_mirror_axis_y", text="Y", toggle=True)
-        row.prop(scene, "stablegen_mirror_axis_z", text="Z", toggle=True)
-
         layout.separator()
           
 

@@ -1987,21 +1987,6 @@ def register():
         default=True,
         update=update_parameters
     )
-    bpy.types.Scene.stablegen_mirror_axis_x = bpy.props.BoolProperty(
-        name="X",
-        description="Mirror across X=0 (YZ plane)",
-        default=True,
-    )
-    bpy.types.Scene.stablegen_mirror_axis_y = bpy.props.BoolProperty(
-        name="Y",
-        description="Mirror across Y=0 (XZ plane)",
-        default=False,
-    )
-    bpy.types.Scene.stablegen_mirror_axis_z = bpy.props.BoolProperty(
-        name="Z",
-        description="Mirror across Z=0 (XY plane)",
-        default=False,
-    )
 
 
     # IPADAPTER parameters
@@ -2125,9 +2110,6 @@ def unregister():
     del bpy.types.Scene.qwen_context_cleanup_hue_tolerance
     del bpy.types.Scene.qwen_context_cleanup_value_adjust
     del bpy.types.Scene.qwen_context_fallback_dilation
-    del bpy.types.Scene.stablegen_mirror_axis_x
-    del bpy.types.Scene.stablegen_mirror_axis_y
-    del bpy.types.Scene.stablegen_mirror_axis_z
 
     for cls in reversed(classes):
         bpy.utils.unregister_class(cls)

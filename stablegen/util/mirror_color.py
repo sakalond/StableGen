@@ -74,6 +74,10 @@ class MirrorReproject(bpy.types.Operator):
     bl_label = "Mirror Last Projection"
     bl_options = {'REGISTER', 'UNDO'}
 
+    mirror_axis_x: bpy.props.BoolProperty(name="X", default=True)
+    mirror_axis_y: bpy.props.BoolProperty(name="Y", default=False)
+    mirror_axis_z: bpy.props.BoolProperty(name="Z", default=False)
+
     _original_method = None
     _original_overwrite_material = None
     _timer = None
@@ -105,6 +109,17 @@ class MirrorReproject(bpy.types.Operator):
                     return False
 
         return True
+
+    def invoke(self, context, event):
+        return context.window_manager.invoke_props_dialog(self)
+
+    def draw(self, context):
+        layout = self.layout
+        layout.label(text="Mirror Axes:")
+        row = layout.row()
+        row.prop(self, "mirror_axis_x")
+        row.prop(self, "mirror_axis_y")
+        row.prop(self, "mirror_axis_z")
 
     def _mirror_image_file(
         self,
@@ -217,23 +232,23 @@ class MirrorReproject(bpy.types.Operator):
         orig_cam = scene.camera if scene.camera in cameras_orig else cameras_orig[0]
         src_cam_idx = cameras_orig.index(orig_cam)
 
-        # --- Mirror axes from Scene (UI toggles), same pattern as standard mirror ---
+        # --- Mirror axes from Operator properties ---
         axis_configs = [
             (
                 "X",
-                getattr(scene, "stablegen_mirror_axis_x", True),
+                self.mirror_axis_x,
                 dict(mirror_x=True,  mirror_y=False, mirror_z=False),
                 (True, False),   # flip_x, flip_y
             ),
             (
                 "Y",
-                getattr(scene, "stablegen_mirror_axis_y", False),
+                self.mirror_axis_y,
                 dict(mirror_x=False, mirror_y=True,  mirror_z=False),
                 (False, True),
             ),
             (
                 "Z",
-                getattr(scene, "stablegen_mirror_axis_z", False),
+                self.mirror_axis_z,
                 dict(mirror_x=False, mirror_y=False, mirror_z=True),
                 (True, True),
             ),
@@ -393,23 +408,23 @@ class MirrorReproject(bpy.types.Operator):
         orig_cam = scene.camera if scene.camera in cameras else cameras[0]
         src_cam_idx = cameras.index(orig_cam)
 
-        # --- Mirror axes from Scene (UI toggles) ---
+        # --- Mirror axes from Operator properties ---
         axis_configs = [
             (
                 "X",
-                getattr(scene, "stablegen_mirror_axis_x", True),
+                self.mirror_axis_x,
                 dict(mirror_x=True,  mirror_y=False, mirror_z=False),
                 (True, False),   # flip_x, flip_y
             ),
             (
                 "Y",
-                getattr(scene, "stablegen_mirror_axis_y", False),
+                self.mirror_axis_y,
                 dict(mirror_x=False, mirror_y=True,  mirror_z=False),
                 (False, True),
             ),
             (
                 "Z",
-                getattr(scene, "stablegen_mirror_axis_z", False),
+                self.mirror_axis_z,
                 dict(mirror_x=False, mirror_y=False, mirror_z=True),
                 (True, True),
             ),
