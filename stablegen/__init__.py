@@ -3,7 +3,7 @@ import bpy # pylint: disable=import-error
 from .stablegen import StableGenPanel, ApplyPreset, SavePreset, DeletePreset, get_preset_items, update_parameters, ResetQwenPrompt
 from .render_tools import BakeTextures, AddCameras, SwitchMaterial, ExportOrbitGIF, CollectCameraPrompts, CameraPromptItem 
 from .utils import AddHDRI, ApplyModifiers, CurvesToMesh
-from .generator import ComfyUIGenerate, Reproject, Regenerate
+from .generator import ComfyUIGenerate, Reproject, Regenerate, MirrorReproject
 import os
 import requests
 import json
@@ -35,7 +35,8 @@ classes = [
     CurvesToMesh,
     ComfyUIGenerate,
     Reproject,
-    Regenerate
+    Regenerate,
+    MirrorReproject,
 ]
 
 # Global caches for model lists fetched via API
@@ -1456,6 +1457,7 @@ def register():
         max=180.0,
         update=update_parameters
     )
+
     bpy.types.Scene.discard_factor_generation_only = bpy.props.BoolProperty(
         name="Reset Discard Angle After Generation",
         description="If enabled, the 'Discard Factor' will be reset to a specified value after generation completes. Useful for sequential/Qwen modes where a low discard angle is needed during generation but not for final blending",
@@ -1469,6 +1471,34 @@ def register():
         min=0.0,
         max=180.0,
         update=update_parameters
+    )
+    bpy.types.Scene.view_blend_use_color_match = bpy.props.BoolProperty(
+        name="Match Colors to Viewport",
+        description="Match each generated view’s colors to the current viewport texture before blending",
+        default=False,
+        update=update_parameters,
+    )
+    bpy.types.Scene.view_blend_color_match_method = bpy.props.EnumProperty(
+        name="Color Match Method",
+        description="Algorithm used when matching view colors to the viewport texture",
+        items=[
+            ("mkl",        "MKL",           ""),
+            ("hm",         "Histogram",     ""),
+            ("reinhard",   "Reinhard",      ""),
+            ("mvgd",       "MVGD",          ""),
+            ("hm-mvgd-hm", "HM–MVGD–HM",    ""),
+            ("hm-mkl-hm",  "HM–MKL–HM",     ""),
+        ],
+        default="reinhard",
+        update=update_parameters,
+    )
+    bpy.types.Scene.view_blend_color_match_strength = bpy.props.FloatProperty(
+        name="Match Strength",
+        description="Blend between original and viewport-matched colors",
+        default=1.0,
+        min=0.0,
+        max=2.0,
+        update=update_parameters,
     )
     bpy.types.Scene.weight_exponent = bpy.props.FloatProperty(
         name="Weight Exponent",
@@ -1608,6 +1638,29 @@ def register():
         description="Uses a blocky visibility map. This will downscale the visibility map according to the 8x8 grid which Stable Diffusion uses in latent space. Highly experimental.",
         default=False,
         update=update_parameters
+    )
+    bpy.types.Scene.visibility_vignette = bpy.props.BoolProperty(
+        name="Feather Visibility Edges",
+        description="Multiply visibility masks by a soft vignette near the frame edges to reduce seams at camera borders",
+        default=True,
+        update=update_parameters,
+    )
+
+    bpy.types.Scene.visibility_vignette_width = bpy.props.FloatProperty(
+        name="Vignette Width",
+        description="Fraction of the image radius used as a feather band (0 = no feather, 0.5 = very soft edges)",
+        default=0.15,
+        min=0.0,
+        max=0.5,
+        update=update_parameters,
+    )
+    bpy.types.Scene.visibility_vignette_softness = bpy.props.FloatProperty(
+        name="Vignette Softness",
+        description="Exponent shaping feather falloff (<1 = softer, >1 = sharper)",
+        default=1.0,
+        min=0.1,
+        max=5.0,
+        update=update_parameters,
     )
     bpy.types.Scene.differential_diffusion = bpy.props.BoolProperty(
         name="Differential Diffusion",
@@ -1934,6 +1987,22 @@ def register():
         default=True,
         update=update_parameters
     )
+    bpy.types.Scene.stablegen_mirror_axis_x = bpy.props.BoolProperty(
+        name="X",
+        description="Mirror across X=0 (YZ plane)",
+        default=True,
+    )
+    bpy.types.Scene.stablegen_mirror_axis_y = bpy.props.BoolProperty(
+        name="Y",
+        description="Mirror across Y=0 (XZ plane)",
+        default=False,
+    )
+    bpy.types.Scene.stablegen_mirror_axis_z = bpy.props.BoolProperty(
+        name="Z",
+        description="Mirror across Z=0 (XY plane)",
+        default=False,
+    )
+
 
     # IPADAPTER parameters
 
@@ -2005,6 +2074,9 @@ def unregister():
     del bpy.types.Scene.sequential_factor
     del bpy.types.Scene.grow_mask_by
     del bpy.types.Scene.mask_blocky
+    del bpy.types.Scene.visibility_vignette
+    del bpy.types.Scene.visibility_vignette_width
+    del bpy.types.Scene.visibility_vignette_softness
     del bpy.types.Scene.differential_diffusion
     del bpy.types.Scene.differential_noise
     del bpy.types.Scene.blur_mask
@@ -2053,6 +2125,9 @@ def unregister():
     del bpy.types.Scene.qwen_context_cleanup_hue_tolerance
     del bpy.types.Scene.qwen_context_cleanup_value_adjust
     del bpy.types.Scene.qwen_context_fallback_dilation
+    del bpy.types.Scene.stablegen_mirror_axis_x
+    del bpy.types.Scene.stablegen_mirror_axis_y
+    del bpy.types.Scene.stablegen_mirror_axis_z
 
     for cls in reversed(classes):
         bpy.utils.unregister_class(cls)
