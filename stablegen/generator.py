@@ -931,7 +931,8 @@ class ComfyUIGenerate(bpy.types.Operator):
                                     export_emit_image(context, self._to_texture, camera_id=self._current_image, bg_color=background_color, fallback_color=fallback_color) # Export render for next view
                                     self._dilate_qwen_context_fallback(context, self._current_image, fallback_color)
                                 else:
-                                    export_emit_image(context, self._to_texture, camera_id=self._current_image, bg_color=context.scene.fallback_color, fallback_color=context.scene.fallback_color) # Export render for next view
+                                    # Use a gray (neutral) background and fallback for other architectures
+                                    export_emit_image(context, self._to_texture, camera_id=self._current_image, bg_color=(0.5, 0.5, 0.5), fallback_color=(0.5, 0.5, 0.5))
                                 self._wait_event.set()
                                 return None
                             bpy.app.timers.register(context_callback)

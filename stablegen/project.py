@@ -50,13 +50,62 @@ def project_image(context, to_project, mat_id, stop_index=1000000):
             # Create a compare node to drive the mix factor
             
             if context.scene.generation_method == 'refine' and context.scene.refine_preserve:
-                compare_node = nodes_collection.new("ShaderNodeValToRGB")
-                compare_node.location = (x_offset - 500, y_offset)
-                compare_node.color_ramp.elements[0].position = 0.0
-                compare_node.color_ramp.elements[0].color = (1, 1, 1, 1)
-                compare_node.color_ramp.elements[1].position = 0.6
-                compare_node.color_ramp.elements[1].color = (0, 0, 0, 1)
-                compare_node.color_ramp.interpolation = 'LINEAR'
+                w_node = weight_nodes[0]
+                if isinstance(w_node, tuple):
+                    angle_node, feather_node = w_node
+                    
+                    # Create Ramps (Output Visibility: 0=Invis, 1=Vis)
+                    # Angle Ramp
+                    cr_angle = nodes_collection.new("ShaderNodeValToRGB")
+                    cr_angle.location = (x_offset - 500, y_offset)
+                    cr_angle.color_ramp.elements[0].position = context.scene.refine_angle_ramp_pos_0 if context.scene.refine_angle_ramp_active else 0.0
+                    cr_angle.color_ramp.elements[0].color = (0, 0, 0, 1) # Black (Invis)
+                    cr_angle.color_ramp.elements[1].position = context.scene.refine_angle_ramp_pos_1 if context.scene.refine_angle_ramp_active else 0.0
+                    cr_angle.color_ramp.elements[1].color = (1, 1, 1, 1) # White (Vis)
+                    cr_angle.color_ramp.interpolation = 'LINEAR'
+                    links.new(angle_node.outputs[0], cr_angle.inputs[0])
+                    
+                    # Feather Ramp
+                    cr_feather = nodes_collection.new("ShaderNodeValToRGB")
+                    cr_feather.location = (x_offset - 500, y_offset - 200)
+                    cr_feather.color_ramp.elements[0].position = context.scene.refine_feather_ramp_pos_0 if context.scene.visibility_vignette else 0.0
+                    cr_feather.color_ramp.elements[0].color = (0, 0, 0, 1) # Black (Invis)
+                    cr_feather.color_ramp.elements[1].position = context.scene.refine_feather_ramp_pos_1 if context.scene.visibility_vignette else 0.0
+                    cr_feather.color_ramp.elements[1].color = (1, 1, 1, 1) # White (Vis)
+                    cr_feather.color_ramp.interpolation = 'LINEAR'
+                    links.new(feather_node.outputs[0], cr_feather.inputs[0])
+                    
+                    # Multiply (Intersection of Visibility)
+                    mult = nodes_collection.new("ShaderNodeMath")
+                    mult.operation = 'MULTIPLY'
+                    mult.location = (x_offset - 300, y_offset)
+                    links.new(cr_angle.outputs[0], mult.inputs[0])
+                    links.new(cr_feather.outputs[0], mult.inputs[1])
+                    
+                    # Invert (Convert Visibility to Mix Factor: 1=Vis->0=Proj, 0=Invis->1=Orig)
+                    invert = nodes_collection.new("ShaderNodeMath")
+                    invert.operation = 'SUBTRACT'
+                    invert.location = (x_offset - 150, y_offset)
+                    invert.inputs[0].default_value = 1.0
+                    links.new(mult.outputs[0], invert.inputs[1])
+
+                    compare_node = invert # For return
+                    links.new(invert.outputs[0], final_mix.inputs["Fac"])
+                else:
+                    # Fallback if not tuple (e.g. stop_index logic used LessThan node)
+                    # If it's a sum of processed weights (from multi-camera recursion), we need to invert it
+                    # to get the Mix Factor (1 - TotalVis)
+                    if context.scene.generation_method == 'refine' and context.scene.refine_preserve:
+                        invert = nodes_collection.new("ShaderNodeMath")
+                        invert.operation = 'SUBTRACT'
+                        invert.location = (x_offset - 150, y_offset)
+                        invert.inputs[0].default_value = 1.0
+                        links.new(w_node.outputs[0], invert.inputs[1])
+                        links.new(invert.outputs[0], final_mix.inputs["Fac"])
+                        compare_node = invert
+                    else:
+                        links.new(w_node.outputs[0], final_mix.inputs["Fac"])
+                        compare_node = w_node
             else:
                 compare_node = nodes_collection.new("ShaderNodeMath")
                 compare_node.operation = 'COMPARE'
@@ -65,9 +114,9 @@ def project_image(context, to_project, mat_id, stop_index=1000000):
                 # Epsilon for comparison
                 compare_node.inputs[2].default_value = 0.0
                 compare_node.location = (x_offset - 500, y_offset)
-            # Connect final add node to compare node
-            links.new(weight_nodes[0].outputs[0], compare_node.inputs[0])
-            links.new(compare_node.outputs[0], final_mix.inputs["Fac"])
+                # Connect final add node to compare node
+                links.new(weight_nodes[0].outputs[0], compare_node.inputs[0])
+                links.new(compare_node.outputs[0], final_mix.inputs["Fac"])
             
             if not context.scene.apply_bsdf:
                 return final_mix, compare_node
@@ -98,14 +147,54 @@ def project_image(context, to_project, mat_id, stop_index=1000000):
                 sum_node = nodes_collection.new("ShaderNodeMath")
                 sum_node.operation = 'ADD'
                 sum_node.location = (x_offset - 800, y_offset + vert_offset) if context.scene.early_priority else (x_offset - 600, y_offset + vert_offset)
-                links.new(weight_nodes[i].outputs[0], sum_node.inputs[0])
-                links.new(weight_nodes[i+1].outputs[0], sum_node.inputs[1])
+                
+                def get_weight_output(w_item):
+                    if isinstance(w_item, tuple):
+                        angle_node, feather_node = w_item
+                        
+                        # Create Ramps (Output Visibility: 0=Invis, 1=Vis)
+                        # Angle Ramp
+                        cr_angle = nodes_collection.new("ShaderNodeValToRGB")
+                        cr_angle.location = (x_offset - 1100, y_offset + vert_offset)
+                        cr_angle.color_ramp.elements[0].position = context.scene.refine_angle_ramp_pos_0 if context.scene.refine_angle_ramp_active else 0.0
+                        cr_angle.color_ramp.elements[0].color = (0, 0, 0, 1) # Black (Invis)
+                        cr_angle.color_ramp.elements[1].position = context.scene.refine_angle_ramp_pos_1 if context.scene.refine_angle_ramp_active else 0.0
+                        cr_angle.color_ramp.elements[1].color = (1, 1, 1, 1) # White (Vis)
+                        cr_angle.color_ramp.interpolation = 'LINEAR'
+                        links.new(angle_node.outputs[0], cr_angle.inputs[0])
+                        
+                        # Feather Ramp
+                        cr_feather = nodes_collection.new("ShaderNodeValToRGB")
+                        cr_feather.location = (x_offset - 1100, y_offset + vert_offset - 200)
+                        cr_feather.color_ramp.elements[0].position = context.scene.refine_feather_ramp_pos_0 if context.scene.visibility_vignette else 0.0
+                        cr_feather.color_ramp.elements[0].color = (0, 0, 0, 1) # Black (Invis)
+                        cr_feather.color_ramp.elements[1].position = context.scene.refine_feather_ramp_pos_1 if context.scene.visibility_vignette else 0.0
+                        cr_feather.color_ramp.elements[1].color = (1, 1, 1, 1) # White (Vis)
+                        cr_feather.color_ramp.interpolation = 'LINEAR'
+                        links.new(feather_node.outputs[0], cr_feather.inputs[0])
+                        
+                        # Multiply (Intersection of Visibility)
+                        m = nodes_collection.new("ShaderNodeMath")
+                        m.operation = 'MULTIPLY'
+                        m.location = (x_offset - 900, y_offset + vert_offset)
+                        links.new(cr_angle.outputs[0], m.inputs[0])
+                        links.new(cr_feather.outputs[0], m.inputs[1])
+                        return m.outputs[0]
+                    else:
+                        return w_item.outputs[0]
+
+                # Cache outputs to avoid creating duplicate nodes
+                w_out_1 = get_weight_output(weight_nodes[i])
+                w_out_2 = get_weight_output(weight_nodes[i+1])
+
+                links.new(w_out_1, sum_node.inputs[0])
+                links.new(w_out_2, sum_node.inputs[1])
 
                 # Compute mix factor: weight_A / (weight_A+weight_B)
                 div_node = nodes_collection.new("ShaderNodeMath")
                 div_node.operation = 'DIVIDE'
                 div_node.location = (x_offset - 600, y_offset + vert_offset) if context.scene.early_priority else (x_offset - 400, y_offset + vert_offset)
-                links.new(weight_nodes[i+1].outputs[0], div_node.inputs[0])
+                links.new(w_out_2, div_node.inputs[0])
                 links.new(sum_node.outputs[0], div_node.inputs[1])
 
                 if context.scene.early_priority:
@@ -232,6 +321,8 @@ def project_image(context, to_project, mat_id, stop_index=1000000):
     context.scene.cycles.device = 'CPU'
     context.scene.cycles.shading_system = True
 
+    processed_materials = set()
+
     for obj in to_project:
 
         # Deselect all objects
@@ -282,9 +373,9 @@ def project_image(context, to_project, mat_id, stop_index=1000000):
         if (context.scene.generation_method == 'sequential' and stop_index > 0) or context.scene.generation_mode == 'regenerate_selected':
             # We just need to remove the compare nodes which are connected to script node at stop_index
             script_node = None
-            # First find all script nodes with label {stop_index}-{mat_id}
+            # First find all script nodes with label Angle-{stop_index}-{mat_id} or {stop_index}-{mat_id} (legacy)
             for node in nodes:
-                if node.type == 'SCRIPT' and node.label == f"{stop_index}-{mat_id}":
+                if node.type == 'SCRIPT' and (node.label == f"Angle-{stop_index}-{mat_id}" or node.label == f"{stop_index}-{mat_id}"):
                     script_node = node
                     break
             compare_output_sockets = set()
@@ -298,8 +389,9 @@ def project_image(context, to_project, mat_id, stop_index=1000000):
                         # Remove the compare node
                         nodes.remove(link.to_node)
             # Connect the script node to all outputs
-            for output in compare_output_sockets:
-                links.new(script_node.outputs[0], output)
+            if script_node:
+                for output in compare_output_sockets:
+                    links.new(script_node.outputs[0], output)
             # We also need to set the generated image to the texture node with label {stop_index}-{mat_id}
             for node in nodes:
                 if node.type == 'TEX_IMAGE' and node.label == f"{stop_index}-{mat_id}":
@@ -401,39 +493,57 @@ def project_image(context, to_project, mat_id, stop_index=1000000):
             normalize.location = (-400, -500 + (-800) * (i))
             normalize_nodes.append(normalize)
 
-            # Add a script node
-            script = nodes.new("ShaderNodeScript")
-            script.location = (-400, (-800) * i)
-            script.mode = 'EXTERNAL'
-            script.filepath = os.path.join(os.path.dirname(__file__), "raycast.osl")
+            # Add script nodes (Angle)
+            script_angle = nodes.new("ShaderNodeScript")
+            script_angle.location = (-400, (-800) * i)
+            script_angle.mode = 'EXTERNAL'
+            script_angle.filepath = os.path.join(os.path.dirname(__file__), "raycast.osl")
+            script_angle.inputs["AngleThreshold"].default_value = context.scene.discard_factor
+            script_angle.inputs["Power"].default_value = context.scene.weight_exponent
+            script_angle.label = f"Angle-{i}-{mat_id}"
 
-            # Angle / power from UI
-            script.inputs["AngleThreshold"].default_value = context.scene.discard_factor
-            script.inputs["Power"].default_value = context.scene.weight_exponent
+            scripts_to_connect = [script_angle]
+            final_weight_node = None
 
-            # Frustum feather controls from UI
-            if context.scene.visibility_vignette:
-                # Use the same width as the visibility mask vignette
-                script.inputs["EdgeFeather"].default_value = context.scene.visibility_vignette_width
-                # New softness slider (gamma-like)
-                script.inputs["EdgeGamma"].default_value = context.scene.visibility_vignette_softness
+            if context.scene.generation_method == 'refine' and context.scene.refine_preserve:
+                # Add Feather script
+                script_feather = nodes.new("ShaderNodeScript")
+                script_feather.location = (-400, (-800) * i - 200) # Offset slightly
+                script_feather.mode = 'EXTERNAL'
+                script_feather.filepath = os.path.join(os.path.dirname(__file__), "feather.osl")
+                
+                if context.scene.visibility_vignette: # Only set if feathering is active
+                    script_feather.inputs["EdgeFeather"].default_value = context.scene.visibility_vignette_width
+                    script_feather.inputs["EdgeGamma"].default_value = context.scene.visibility_vignette_softness
+                else:
+                    script_feather.inputs["EdgeFeather"].default_value = 0.0
+                    script_feather.inputs["EdgeGamma"].default_value = 1.0
+                script_feather.label = f"Feather-{i}-{mat_id}"
+                scripts_to_connect.append(script_feather)
+
+                # Pass tuple of (Angle, Feather) to build_mix_tree
+                final_weight_node = (script_angle, script_feather)
             else:
-                # Feathering off
-                script.inputs["EdgeFeather"].default_value = 0.0
-                script.inputs["EdgeGamma"].default_value = 1.0
+                # Just use Angle script output directly
+                final_weight_node = script_angle
 
-            script.label = f"{i}-{mat_id}"
-            script_nodes.append(script)
+            script_nodes.append(scripts_to_connect)
+
             if i > stop_index:
                 # Connect a temporary less than node to the script node
                 less_than = nodes.new("ShaderNodeMath")
                 less_than.operation = 'LESS_THAN'
                 less_than.location = (-200, (-800) * i)
                 less_than.inputs[1].default_value = -1
-                links.new(script.outputs[0], less_than.inputs[0])
+                
+                # For stop_index check, we use the Angle script output
+                # (or the first element if it's a tuple)
+                source_node = final_weight_node[0] if isinstance(final_weight_node, tuple) else final_weight_node
+                links.new(source_node.outputs[0], less_than.inputs[0])
+                
                 script_nodes_outputs.append(less_than)
             else:
-                script_nodes_outputs.append(script)
+                script_nodes_outputs.append(final_weight_node)
 
             # Add additional add node, which will contain camera's FOV in first default value, and camera's aspect ratio in second default value
             camera_fov = nodes.new("ShaderNodeValue")
@@ -481,8 +591,16 @@ def project_image(context, to_project, mat_id, stop_index=1000000):
             length_nodes.append(length)
 
         # Build mix shader tree
-        mix_node, _ = build_mix_tree(tex_image_nodes, script_nodes_outputs, nodes, links, previous_node, stop_index=stop_index)
-        links.new(mix_node.outputs[0], output.inputs["Surface"])
+        if not context.scene.bake_texture and mat.name in processed_materials and context.scene.generation_method == 'refine' and context.scene.refine_preserve:
+            # If we already processed this material, we don't need to rebuild the mix tree
+            # But we still need to connect the nodes for the current object (done in the loop below)
+            # We need to find the existing mix node to position the output node
+            # The mix node is connected to the output node
+            mix_node = output.inputs["Surface"].links[0].from_node
+        else:
+            mix_node, _ = build_mix_tree(tex_image_nodes, script_nodes_outputs, nodes, links, previous_node, stop_index=stop_index)
+            links.new(mix_node.outputs[0], output.inputs["Surface"])
+            processed_materials.add(mat.name)
 
         # Move output node right to the mix_node
         output.location = (mix_node.location[0] + 400, mix_node.location[1])
@@ -492,7 +610,7 @@ def project_image(context, to_project, mat_id, stop_index=1000000):
             uv_map_node = uv_map_nodes[i]
             subtract = subtract_nodes[i] 
             normalize = normalize_nodes[i] 
-            script = script_nodes[i]
+            scripts = script_nodes[i]
             add_camera_loc = add_camera_loc_nodes[i] 
             length = length_nodes[i] 
             camera_fov = camera_fov_nodes[i]
@@ -504,14 +622,23 @@ def project_image(context, to_project, mat_id, stop_index=1000000):
             links.new(uv_map_node.outputs["UV"], tex_image.inputs["Vector"])
             links.new(geometry.outputs["Position"], subtract.inputs[0])
             links.new(subtract.outputs["Vector"], normalize.inputs[0])
-            links.new(normalize.outputs["Vector"], script.inputs["Direction"])
-            links.new(add_camera_loc.outputs["Vector"], script.inputs["Origin"])
-            links.new(length.outputs["Value"], script.inputs["threshold"])
-            links.new(geometry.outputs["Normal"], script.inputs["SurfaceNormal"])
-            links.new(camera_fov.outputs[0], script.inputs["CameraFOV"])
-            links.new(camera_aspect_ratio.outputs[0], script.inputs["CameraAspect"])
-            links.new(camera_direction.outputs[0], script.inputs["CameraDir"])
-            links.new(camera_up.outputs[0], script.inputs["CameraUp"])
+            
+            for script in scripts:
+                links.new(normalize.outputs["Vector"], script.inputs["Direction"])
+                
+                if "Origin" in script.inputs:
+                    links.new(add_camera_loc.outputs["Vector"], script.inputs["Origin"])
+                
+                if "threshold" in script.inputs:
+                    links.new(length.outputs["Value"], script.inputs["threshold"])
+                    
+                if "SurfaceNormal" in script.inputs:
+                    links.new(geometry.outputs["Normal"], script.inputs["SurfaceNormal"])
+                links.new(camera_fov.outputs[0], script.inputs["CameraFOV"])
+                links.new(camera_aspect_ratio.outputs[0], script.inputs["CameraAspect"])
+                links.new(camera_direction.outputs[0], script.inputs["CameraDir"])
+                links.new(camera_up.outputs[0], script.inputs["CameraUp"])
+            
             links.new(subtract.outputs["Vector"], length.inputs[0])
 
         # Add material index node (subtract node)

@@ -1,0 +1,62 @@
+shader raycast_feather(
+    vector Direction = N,    // Ray direction in world space
+    float CameraAspect = 1.77778, // width/height ratio (e.g., 16:9)
+    float CameraFOV = 1.0,        // horizontal FOV in radians
+    vector CameraDir = vector(0,0,-1), // Camera look direction in world space
+    vector CameraUp = vector(0,1,0),   // Camera up vector in world space
+    float EdgeFeather = 0.0,      // Fraction of radius used for feather (0 = off)
+    float EdgeGamma = 1.0,        // Softness of feather (<1 = softer, >1 = sharper)
+    output float Result = 0
+)
+{
+    // Normalize the world-space ray direction.
+    vector d = normalize(Direction);
+    
+    // Build camera basis.
+    vector forward = normalize(CameraDir);
+    vector r = normalize(cross(forward, CameraUp));
+    vector upVector = normalize(cross(r, forward));
+    
+    // Transform the ray direction into the camera's coordinate system.
+    float cam_x = dot(d, r);
+    float cam_y = dot(d, upVector);
+    float cam_z = dot(d, -forward); // should be negative for rays in front of the camera
+    
+    // Only process rays that are in front of the camera.
+    if (cam_z >= 0) {
+        Result = 0;
+        return;
+    }
+    
+    // Compute film extents at a virtual film plane at z = -1.
+    float filmw = tan(CameraFOV * 0.5);
+    float filmh = filmw / CameraAspect;
+    
+    // Project the ray direction onto the film plane.
+    float x_proj = cam_x / -cam_z;
+    float y_proj = cam_y / -cam_z;
+    
+    // If the projected point falls outside the film bounds, exit.
+    if (abs(x_proj) > filmw || abs(y_proj) > filmh) {
+        Result = 0;
+        return;
+    }
+
+    // Normalized distance to film edge: 0 at center, 1 at border.
+    float nx = abs(x_proj) / filmw;
+    float ny = abs(y_proj) / filmh;
+    float edge = max(nx, ny);
+
+    // Default: no feathering
+    float edge_factor = 1.0;
+    float feather = clamp(EdgeFeather, 0.0, 0.49);
+
+    if (feather > 0.0) {
+        // Soft feather near frustum border
+        edge_factor = 1.0 - smoothstep(1.0 - feather, 1.0, edge);
+        edge_factor = pow(edge_factor, max(0.01, EdgeGamma));
+    }
+    
+    // No raycast needed here (handled by angle shader).
+    Result = edge_factor;
+}

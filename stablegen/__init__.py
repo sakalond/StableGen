@@ -1641,7 +1641,7 @@ def register():
     )
     bpy.types.Scene.visibility_vignette = bpy.props.BoolProperty(
         name="Feather Visibility Edges",
-        description="Multiply visibility masks by a soft vignette near the frame edges to reduce seams at camera borders",
+        description="Blend refinement edges using a vignette mask to reduce seams",
         default=True,
         update=update_parameters,
     )
@@ -1662,6 +1662,53 @@ def register():
         max=5.0,
         update=update_parameters,
     )
+    bpy.types.Scene.visibility_vignette_blur = bpy.props.BoolProperty(
+        name="Blur Vignette Mask",
+        description="Apply a Gaussian blur to the vignette mask to soften edges",
+        default=False,
+        update=update_parameters,
+    )
+
+    # Refine Mode Ramp Controls
+    bpy.types.Scene.refine_angle_ramp_active = bpy.props.BoolProperty(
+        name="Use Angle Ramp",
+        description="Blend refinement based on surface angle",
+        default=False,
+        update=update_parameters
+    )
+    bpy.types.Scene.refine_angle_ramp_pos_0 = bpy.props.FloatProperty(
+        name="Angle Ramp Black Point",
+        description="Position of the black point (Invisible) for the angle ramp",
+        default=0.0,
+        min=0.0,
+        max=1.0,
+        update=update_parameters
+    )
+    bpy.types.Scene.refine_angle_ramp_pos_1 = bpy.props.FloatProperty(
+        name="Angle Ramp White Point",
+        description="Position of the white point (Visible) for the angle ramp",
+        default=0.6,
+        min=0.0,
+        max=1.0,
+        update=update_parameters
+    )
+    bpy.types.Scene.refine_feather_ramp_pos_0 = bpy.props.FloatProperty(
+        name="Feather Ramp Black Point",
+        description="Position of the black point (Invisible) for the feather ramp",
+        default=0.0,
+        min=0.0,
+        max=1.0,
+        update=update_parameters
+    )
+    bpy.types.Scene.refine_feather_ramp_pos_1 = bpy.props.FloatProperty(
+        name="Feather Ramp White Point",
+        description="Position of the white point (Visible) for the feather ramp",
+        default=0.6,
+        min=0.0,
+        max=1.0,
+        update=update_parameters
+    )
+
     bpy.types.Scene.differential_diffusion = bpy.props.BoolProperty(
         name="Differential Diffusion",
         description="Replace standard inpainting with a differential diffusion based workflow\n\n - Generally works better and reduces artifacts.\n - Using a Smooth Visibilty Map is recommended for Sequential Mode.",

@@ -33,7 +33,7 @@ def purge_orphans():
     except Exception as e:
         print(f"[StableGen] Orphan purge failed: {e}")
 
-def apply_vignette_to_mask(mask_file_path, feather_width=0.15, gamma=1.0):
+def apply_vignette_to_mask(mask_file_path, feather_width=0.15, gamma=1.0, blur=True):
     """
     Soften hard edges in a grayscale visibility mask.
 
@@ -45,6 +45,7 @@ def apply_vignette_to_mask(mask_file_path, feather_width=0.15, gamma=1.0):
     feather_width: fraction of min(image_w, image_h) used as blur radius.
                    0.0 = no blur, 0.5 = very soft edges.
     gamma: optional gamma applied to the blurred mask (1.0 = none).
+    blur: whether to apply Gaussian blur.
     """
     log_prefix = "[StableGen] Vignette:"
 
@@ -80,7 +81,10 @@ def apply_vignette_to_mask(mask_file_path, feather_width=0.15, gamma=1.0):
     # Kernel size must be odd and at least 3
     ksize = int(max(3, int(radius) | 1))
 
-    blurred = cv2.GaussianBlur(base, (ksize, ksize), 0)
+    if blur:
+        blurred = cv2.GaussianBlur(base, (ksize, ksize), 0)
+    else:
+        blurred = base
 
     if gamma != 1.0:
         blurred = np.power(blurred, gamma)
@@ -91,7 +95,7 @@ def apply_vignette_to_mask(mask_file_path, feather_width=0.15, gamma=1.0):
 
     print(
         f"{log_prefix} soft-edge blur applied to mask: {mask_file_path} "
-        f"(ksize={ksize}, fw={feather_width}, gamma={gamma})"
+        f"(ksize={ksize}, fw={feather_width}, gamma={gamma}, blur={blur})"
     )
 
 def apply_uv_inpaint_texture(context, obj, baked_image_path):
@@ -504,12 +508,13 @@ def export_emit_image(context, to_export, camera_id=None, bg_color=(0.5, 0.5, 0.
             # The original code replaced .png with 0001.png, let's stick to that pattern if it matches
             final_path = image_path.replace(".png", "0001.png")
 
-            if context.scene.visibility_vignette:
+            if context.scene.visibility_vignette and context.scene.generation_method == 'refine' and context.scene.refine_preserve:
                 # Smooth edge feathering, no blocky mask
                 apply_vignette_to_mask(
                     final_path,
                     feather_width=context.scene.visibility_vignette_width,
                     gamma=1.0,
+                    blur=context.scene.visibility_vignette_blur
                 )
             elif context.scene.mask_blocky:
                 # Only do blocky mask if vignette is OFF
@@ -907,11 +912,12 @@ def export_visibility(context, to_export, obj=None, camera_visibility=None):
         # Save the image
         cv2.imwrite(image_path, image)
 
-        if context.scene.visibility_vignette:
+        if context.scene.visibility_vignette and context.scene.generation_method == 'refine' and context.scene.refine_preserve:
             apply_vignette_to_mask(
                 image_path,
                 feather_width=context.scene.visibility_vignette_width,
                 gamma=1.0,
+                blur=context.scene.visibility_vignette_blur
             )
     else:
         # Make sure the camera is active and set to render

@@ -851,6 +851,33 @@ class StableGenPanel(bpy.types.Panel):
                         row.prop(scene, "denoise", text="Denoise") 
                         row = mode_specific_outer_box.row()
                         row.prop(scene, "refine_preserve", text="Preserve Original Textures", toggle=True, icon="TEXTURE")
+                        
+                        if scene.refine_preserve:
+                            row = mode_specific_outer_box.row()
+                            # Angle Ramp Controls
+                            box = mode_specific_outer_box.box()
+                            row = box.row()
+                            row.prop(scene, "refine_angle_ramp_active", text="Use Angle-Based Blending", icon="DRIVER")
+                            if scene.refine_angle_ramp_active:
+                                row = box.row()
+                                row.prop(scene, "refine_angle_ramp_pos_0", text="Black Point")
+                                row.prop(scene, "refine_angle_ramp_pos_1", text="White Point")
+                            
+                            # Feather Ramp Controls
+                            box = mode_specific_outer_box.box()
+                            row = box.row()
+                            row.prop(scene, "visibility_vignette", text="Use Vignette Blending", icon="DRIVER")
+                            if scene.visibility_vignette:
+                                row = box.row()
+                                row.prop(scene, "refine_feather_ramp_pos_0", text="Black Point")
+                                row.prop(scene, "refine_feather_ramp_pos_1", text="White Point")
+                                row = box.row()
+                                row.prop(scene, "visibility_vignette_width", text="Feather Width")
+                                if width_mode == 'narrow':
+                                    row = box.row()
+                                row.prop(scene, "visibility_vignette_softness", text="Feather Softness")
+                                row = box.row()
+                                row.prop(scene, "visibility_vignette_blur", text="Blur Mask", icon="SURFACE_NSPHERE")
                         row = mode_specific_outer_box.row() 
                         row.prop(scene, "sequential_ipadapter", text="Use IPAdapter for Refine Mode", toggle=True, icon="MODIFIER")
                         if scene.sequential_ipadapter: 
@@ -952,29 +979,6 @@ class StableGenPanel(bpy.types.Panel):
                                 if context.scene.sequential_ipadapter_regenerate:
                                     row = sub_ip_seq_box.row()
                                     row.prop(scene, "sequential_ipadapter_regenerate_wo_controlnet", text="Generate reference without ControlNet", toggle=True, icon="HIDE_OFF")   
-
-                    # Shared visibility controls
-                    if scene.generation_method in {'uv_inpaint', 'sequential', 'refine'}:
-                        row = mode_specific_outer_box.row()
-                        row.prop(
-                            scene,
-                            "visibility_vignette",
-                            text="Feather Visibility Edges",
-                            icon="MATERIAL",
-                        )
-                        if scene.visibility_vignette:
-                            row = mode_specific_outer_box.row()
-                            row.prop(
-                                scene,
-                                "visibility_vignette_width",
-                                text="Feather Width",
-                            )
-                            row = mode_specific_outer_box.row()
-                            row.prop(
-                                scene,
-                                "visibility_vignette_softness",
-                                text="Feather Softness",
-                            )
 
         # --- Tools ---
         layout.separator()
