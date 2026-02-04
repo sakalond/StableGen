@@ -328,6 +328,7 @@ class WorkflowManager:
                     "inputs": {
                         "upscale_method": "lanczos",
                         "megapixels": 1,
+                        "resolution_steps": 1,
                         "image": [NODES['style_map_loader'], 0]
                     },
                     "class_type": "ImageScaleToTotalPixels",

@@ -1408,6 +1408,7 @@ prompt_text_qwen_image_edit = """
     "inputs": {
       "upscale_method": "lanczos",
       "megapixels": 1,
+      "resolution_steps": 1,
       "image": [
         "14",
         0
