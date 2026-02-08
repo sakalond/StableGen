@@ -497,8 +497,16 @@ def project_image(context, to_project, mat_id, stop_index=1000000):
             # Add script nodes (Angle)
             script_angle = nodes.new("ShaderNodeScript")
             script_angle.location = (-400, (-800) * i)
-            script_angle.mode = 'EXTERNAL'
-            script_angle.filepath = os.path.join(os.path.dirname(__file__), "raycast.osl")
+            
+            # Load OSL script into internal text block for portability
+            raycast_osl_text = get_or_create_osl_text("raycast.osl")
+            if raycast_osl_text:
+                script_angle.mode = 'INTERNAL'
+                script_angle.script = raycast_osl_text
+            else:
+                script_angle.mode = 'EXTERNAL'
+                script_angle.filepath = os.path.join(os.path.dirname(__file__), "raycast.osl")
+
             script_angle.inputs["AngleThreshold"].default_value = context.scene.discard_factor
             script_angle.inputs["Power"].default_value = context.scene.weight_exponent
             script_angle.label = f"Angle-{i}-{mat_id}"
@@ -510,8 +518,15 @@ def project_image(context, to_project, mat_id, stop_index=1000000):
                 # Add Feather script
                 script_feather = nodes.new("ShaderNodeScript")
                 script_feather.location = (-400, (-800) * i - 200) # Offset slightly
-                script_feather.mode = 'EXTERNAL'
-                script_feather.filepath = os.path.join(os.path.dirname(__file__), "feather.osl")
+                
+                # Load OSL script into internal text block for portability
+                feather_osl_text = get_or_create_osl_text("feather.osl")
+                if feather_osl_text:
+                    script_feather.mode = 'INTERNAL'
+                    script_feather.script = feather_osl_text
+                else:
+                    script_feather.mode = 'EXTERNAL'
+                    script_feather.filepath = os.path.join(os.path.dirname(__file__), "feather.osl")
                 
                 if context.scene.visibility_vignette: # Only set if feathering is active
                     script_feather.inputs["EdgeFeather"].default_value = context.scene.visibility_vignette_width
@@ -720,6 +735,37 @@ def simple_project_bake(context, camera_id, obj, mat_id):
 
     # Remove the temporary material
     bpy.ops.object.material_slot_remove()
+
+
+def get_or_create_osl_text(filename):
+    """
+    Loads an OSL script into a Blender internal text block.
+    This ensures the script is embedded in the .blend file (portable).
+    """
+    filepath = os.path.join(os.path.dirname(__file__), filename)
+    if not os.path.exists(filepath):
+        print(f"Error: OSL script not found at {filepath}")
+        return None
+
+    # Check if text block exists
+    text = bpy.data.texts.get(filename)
+    
+    try:
+        with open(filepath, 'r') as f:
+            content = f.read()
+
+        if text:
+            # Update content to match the current file on disk
+            text.clear()
+            text.write(content)
+        else:
+            text = bpy.data.texts.new(name=filename)
+            text.write(content)
+    except Exception as e:
+        print(f"Error reading OSL file {filepath}: {e}")
+        return None
+        
+    return text
 
 
 def get_or_load_image(filepath, force_reload=False):
