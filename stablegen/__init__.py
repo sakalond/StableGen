@@ -1803,7 +1803,9 @@ def register():
         description="The type of guidance map to use for Qwen Image Edit",
         items=[
             ('depth', 'Depth Map', 'Use depth map for structural guidance'),
-            ('normal', 'Normal Map', 'Use normal map for structural guidance')
+            ('normal', 'Normal Map', 'Use normal map for structural guidance'),
+            ('workbench', 'Workbench Render', 'Use workbench render for structural guidance'),
+            ('viewport', 'Viewport Render', 'Use viewport render (OpenGL) for structural guidance')
         ],
         default='depth',
         update=update_parameters

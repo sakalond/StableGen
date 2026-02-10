@@ -237,6 +237,8 @@ def get_generation_dirs(context):
 			"depth": os.path.join(revision_dir, "controlnet", "depth"),
 			"canny": os.path.join(revision_dir, "controlnet", "canny"),
 			"normal": os.path.join(revision_dir, "controlnet", "normal"),
+			"workbench": os.path.join(revision_dir, "controlnet", "workbench"),
+			"viewport": os.path.join(revision_dir, "controlnet", "viewport"),
 		},
 		"generated": os.path.join(revision_dir, "generated"),
 		"generated_baked": os.path.join(revision_dir, "generated_baked"),
@@ -306,6 +308,10 @@ def get_file_path(context, file_type, subtype=None, filename=None, camera_id=Non
 				filename = f"canny{camera_id}0001" if camera_id is not None else "canny_grid"
 			elif subtype == "normal":
 				filename = f"normal_map{camera_id}0001" if camera_id is not None else "normal_grid"
+			elif subtype == "workbench":
+				filename = f"render{camera_id}0001" if camera_id is not None else "render_grid"
+			elif subtype == "viewport":
+				filename = f"viewport{camera_id}" if camera_id is not None else "viewport_grid"
 		return os.path.join(base_dir, f"{filename}.png")
 	
 	elif file_type == "generated":

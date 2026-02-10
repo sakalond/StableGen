@@ -550,12 +550,14 @@ def export_emit_image(context, to_export, camera_id=None, bg_color=(0.5, 0.5, 0.
         print(f"Emmision render saved to: {os.path.join(output_dir, output_file)}.png")
 
 
-def export_render(context, camera_id=None):
+def export_render(context, camera_id=None, output_dir=None, filename=None):
     """
     Renders the scene from a camera's perspective using Workbench.
     Creates temporary materials for consistent rendering.
     :param context: Blender context.
     :param camera_id: ID of the camera for the output filename.
+    :param output_dir: Optional output directory.
+    :param filename: Optional filename (without component/frame suffix).
     :return: None
     """
     print("Exporting render using Workbench")
@@ -594,8 +596,13 @@ def export_render(context, camera_id=None):
     context.scene.frame_set(1)
 
     # Setup output path
-    output_dir = get_dir_path(context, "misc")
-    output_file = f"render{camera_id}" if camera_id is not None else "render"
+    if output_dir is None:
+        output_dir = get_dir_path(context, "misc")
+    
+    if filename is None:
+        output_file = f"render{camera_id}" if camera_id is not None else "render"
+    else:
+        output_file = filename
 
     # Store original render settings
     original_engine = context.scene.render.engine
@@ -603,6 +610,8 @@ def export_render(context, camera_id=None):
         'lighting': context.scene.display.shading.light,
         'color_type': context.scene.display.shading.color_type
     }
+    original_render_filepath = context.scene.render.filepath
+    original_image_settings = context.scene.render.image_settings.file_format
 
     # Switch to WORKBENCH render engine and configure settings
     context.scene.render.engine = 'BLENDER_WORKBENCH'
@@ -655,9 +664,105 @@ def export_render(context, camera_id=None):
     context.scene.render.engine = original_engine
     context.scene.display.shading.light = original_workbench_settings['lighting']
     context.scene.display.shading.color_type = original_workbench_settings['color_type']
+    context.scene.render.filepath = original_render_filepath
+    context.scene.render.image_settings.file_format = original_image_settings
 
 
     print(f"Render saved to: {os.path.join(output_dir, output_file)}0001.png") # Blender adds frame number
+
+
+def export_viewport(context, camera_id=None, output_dir=None, filename=None):
+    """
+    Renders the scene using viewport OpenGL render to include overlays.
+    :param context: Blender context.
+    :param camera_id: ID of the camera for the output filename.
+    :param output_dir: Optional output directory.
+    :param filename: Optional filename (without component/frame suffix).
+    :return: None
+    """
+    print("Exporting render using Viewport (OpenGL)")
+
+    # Setup output path
+    if output_dir is None:
+        output_dir = get_dir_path(context, "misc")
+
+    if filename is None:
+        output_file = f"render{camera_id}" if camera_id is not None else "render"
+    else:
+        output_file = filename
+
+    # Store original render settings
+    original_engine = context.scene.render.engine
+    original_render_filepath = context.scene.render.filepath
+    original_image_settings = context.scene.render.image_settings.file_format
+
+    # Switch to WORKBENCH render engine for consistent viewport shading
+    context.scene.render.engine = 'BLENDER_WORKBENCH'
+
+    # Find a viewport
+    viewport_area = None
+    viewport_region = None
+    viewport_space = None
+    viewport_region_3d = None
+    viewport_window = None
+
+    for window in context.window_manager.windows:
+        for area in window.screen.areas:
+            if area.type == 'VIEW_3D':
+                viewport_area = area
+                viewport_window = window
+                for region in area.regions:
+                    if region.type == 'WINDOW':
+                        viewport_region = region
+                        break
+                viewport_space = area.spaces.active
+                viewport_region_3d = viewport_space.region_3d if viewport_space else None
+                break
+        if viewport_area:
+            break
+
+    if not (viewport_area and viewport_region and viewport_space and viewport_region_3d and viewport_window):
+        print("Viewport render failed: no VIEW_3D area found.")
+        context.scene.render.engine = original_engine
+        return
+
+    # Store viewport settings
+    original_view_perspective = viewport_region_3d.view_perspective
+    original_shading_type = viewport_space.shading.type
+    original_overlay_show = viewport_space.overlay.show_overlays
+
+    # Configure viewport for camera render with overlays
+    viewport_region_3d.view_perspective = 'CAMERA'
+    viewport_space.shading.type = 'RENDERED'
+    viewport_space.overlay.show_overlays = True
+
+    # Configure output filepath
+    context.scene.render.filepath = os.path.join(output_dir, f"{output_file}.png")
+    context.scene.render.image_settings.file_format = 'PNG'
+
+    override = {
+        'window': viewport_window,
+        'screen': viewport_window.screen,
+        'area': viewport_area,
+        'region': viewport_region,
+        'scene': context.scene,
+        'space_data': viewport_space,
+        'region_data': viewport_region_3d,
+    }
+    with bpy.context.temp_override(**override):
+        bpy.ops.render.opengl(write_still=True, view_context=True)
+
+    # Restore viewport settings
+    viewport_region_3d.view_perspective = original_view_perspective
+    viewport_space.shading.type = original_shading_type
+    viewport_space.overlay.show_overlays = original_overlay_show
+
+    # Restore original render settings
+    context.scene.render.engine = original_engine
+    context.scene.render.filepath = original_render_filepath
+    context.scene.render.image_settings.file_format = original_image_settings
+
+    print(f"Viewport render saved to: {os.path.join(output_dir, output_file)}.png")
 
 def export_canny(context, camera_id=None, low_threshold=0, high_threshold=80):
     """

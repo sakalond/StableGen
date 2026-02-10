@@ -17,7 +17,7 @@ import colorsys
 from PIL import Image, ImageEnhance
 
 from .util.helpers import prompt_text, prompt_text_img2img, prompt_text_qwen_image_edit # pylint: disable=relative-beyond-top-level
-from .render_tools import export_emit_image, export_visibility, export_canny, bake_texture, prepare_baking, unwrap # pylint: disable=relative-beyond-top-level
+from .render_tools import export_emit_image, export_visibility, export_canny, bake_texture, prepare_baking, unwrap, export_render, export_viewport # pylint: disable=relative-beyond-top-level
 from .utils import get_last_material_index, get_generation_dirs, get_file_path, get_dir_path, remove_empty_dirs # pylint: disable=relative-beyond-top-level
 from .project import project_image, reinstate_compare_nodes # pylint: disable=relative-beyond-top-level
 from .workflows import WorkflowManager
@@ -575,7 +575,7 @@ class ComfyUIGenerate(bpy.types.Operator):
                 self._cameras.append(camera)
                 bpy.context.scene.collection.objects.link(camera)
 
-        if context.scene.generation_mode == 'standard':
+        if context.scene.generation_mode == 'standard' or context.scene.generation_mode == 'regenerate_selected':
             # If there is depth controlnet unit
             if any(unit["unit_type"] == "depth" for unit in controlnet_units) or (context.scene.use_flux_lora and context.scene.model_architecture == 'flux1') or (context.scene.model_architecture == 'qwen_image_edit' and context.scene.qwen_guidance_map_type == 'depth') or (context.scene.model_architecture.startswith('qwen') and context.scene.qwen_generation_method == 'refine' and context.scene.qwen_refine_use_depth):
                 if context.scene.generation_method != 'uv_inpaint':
@@ -603,6 +603,30 @@ class ComfyUIGenerate(bpy.types.Operator):
                         self.export_normal(context, camera_id=i)
                     if context.scene.generation_method == 'grid':
                         self.combine_maps(context, self._cameras, type="normal")
+
+            # If Qwen guidance using Workbench
+            if context.scene.model_architecture == 'qwen_image_edit' and context.scene.qwen_guidance_map_type == 'workbench':
+                if context.scene.generation_method != 'uv_inpaint':
+                    # Export workbench render for each camera
+                    # We need to target the directory that get_file_path(..., subtype="workbench") expects
+                    workbench_dir = get_dir_path(context, "controlnet")["workbench"]
+                    for i, camera in enumerate(self._cameras):
+                        bpy.context.scene.camera = camera
+                        # Filename logic must match get_file_path: "render{camera_id}" -> "render{camera_id}0001.png"
+                        export_render(context, camera_id=i, output_dir=workbench_dir, filename=f"render{i}")
+                    if context.scene.generation_method == 'grid':
+                        self.combine_maps(context, self._cameras, type="workbench")
+            # If Qwen guidance using Viewport
+            elif context.scene.model_architecture == 'qwen_image_edit' and context.scene.qwen_guidance_map_type == 'viewport':
+                if context.scene.generation_method != 'uv_inpaint':
+                    # Export viewport render for each camera
+                    viewport_dir = get_dir_path(context, "controlnet")["viewport"]
+                    for i, camera in enumerate(self._cameras):
+                        bpy.context.scene.camera = camera
+                        # Filename logic must match get_file_path: "viewport{camera_id}.png"
+                        export_viewport(context, camera_id=i, output_dir=viewport_dir, filename=f"viewport{i}")
+                    if context.scene.generation_method == 'grid':
+                        self.combine_maps(context, self._cameras, type="viewport")
 
         # Prepare for generating
         if context.scene.generation_method == 'grid':
@@ -1418,6 +1442,10 @@ class ComfyUIGenerate(bpy.types.Operator):
             grid_image_path = get_file_path(context, "controlnet", subtype="canny", camera_id=None, material_id=self._material_id)
         elif type == 'normal':
             grid_image_path = get_file_path(context, "controlnet", subtype="normal", camera_id=None, material_id=self._material_id)
+        elif type == 'workbench':
+            grid_image_path = get_file_path(context, "controlnet", subtype="workbench", camera_id=None, material_id=self._material_id)
+        elif type == 'viewport':
+            grid_image_path = get_file_path(context, "controlnet", subtype="viewport", camera_id=None, material_id=self._material_id)
 
         # Render depth maps for each camera and combine them into a grid
         depth_maps = []
@@ -1429,6 +1457,10 @@ class ComfyUIGenerate(bpy.types.Operator):
                 depth_map_path = get_file_path(context, "controlnet", subtype="canny", camera_id=i, material_id=self._material_id)
             elif type == 'normal':
                 depth_map_path = get_file_path(context, "controlnet", subtype="normal", camera_id=i, material_id=self._material_id)
+            elif type == 'workbench':
+                depth_map_path = get_file_path(context, "controlnet", subtype="workbench", camera_id=i, material_id=self._material_id)
+            elif type == 'viewport':
+                depth_map_path = get_file_path(context, "controlnet", subtype="viewport", camera_id=i, material_id=self._material_id)
             depth_maps.append(depth_map_path)
 
         # Combine depth maps into a grid
