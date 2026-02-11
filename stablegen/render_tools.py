@@ -8,7 +8,7 @@ import time
 import mathutils
 from mathutils import Matrix
 import blf
-from .utils import get_file_path, get_dir_path, remove_empty_dirs
+from .utils import get_file_path, get_dir_path, remove_empty_dirs, get_compositor_node_tree, configure_output_node_paths, get_eevee_engine_id
 import tempfile
 import shutil
 from PIL import Image
@@ -411,6 +411,9 @@ def export_emit_image(context, to_export, camera_id=None, bg_color=(0.5, 0.5, 0.
                     output = node
                     break
 
+            if not output or not output.inputs[0].links:
+                continue
+
                 # Check the type of the node which connects to output
             before_output = output.inputs[0].links[0].from_node
             if before_output.type == 'BSDF_PRINCIPLED':
@@ -425,12 +428,26 @@ def export_emit_image(context, to_export, camera_id=None, bg_color=(0.5, 0.5, 0.
                 # Set color 2 to fallback color
                 if not "visibility" in str(camera_id):
                     color_mix.inputs["Color2"].default_value = (fallback_color[0], fallback_color[1], fallback_color[2], 1.0)
+
+                # Blender 5.0+: Wrap color output with Emission shader so the Emit pass picks it up
+                if bpy.app.version >= (5, 0, 0):
+                    emission_node = nodes.new("ShaderNodeEmission")
+                    emission_node.location = (output.location.x - 200, output.location.y)
+                    links.new(color_mix.outputs[0], emission_node.inputs["Color"])
+                    links.new(emission_node.outputs[0], output.inputs["Surface"])
                 continue
 
             # Find the last color mix node
             color_mix = output.inputs[0].links[0].from_node.inputs[0].links[0].from_node
             # Connect the color mix node directly to the output
-            links.new(color_mix.outputs[0], output.inputs[0])
+            if bpy.app.version >= (5, 0, 0):
+                # Blender 5.0+: Wrap in Emission shader for Emit pass
+                emission_node = nodes.new("ShaderNodeEmission")
+                emission_node.location = (output.location.x - 200, output.location.y)
+                links.new(color_mix.outputs[0], emission_node.inputs["Color"])
+                links.new(emission_node.outputs[0], output.inputs["Surface"])
+            else:
+                links.new(color_mix.outputs[0], output.inputs[0])
 
         output_dir = get_dir_path(context, "inpaint")["visibility"] if "visibility" in str(camera_id) else get_dir_path(context, "inpaint")["render"]
         output_file = f"render{camera_id}" if camera_id is not None else "render"
@@ -445,17 +462,39 @@ def export_emit_image(context, to_export, camera_id=None, bg_color=(0.5, 0.5, 0.
         original_engine = context.scene.render.engine
         original_film_transparent = context.scene.render.film_transparent
         original_use_nodes = world.use_nodes
-        original_color = world.color.copy() if not world.use_nodes else None
+        original_color = world.color.copy()
+        original_bg_node_color = None
+        original_bg_node_strength = None
+        if world.use_nodes and world.node_tree:
+            for wn in world.node_tree.nodes:
+                if wn.type == 'BACKGROUND':
+                    original_bg_node_color = tuple(wn.inputs["Color"].default_value)
+                    original_bg_node_strength = wn.inputs["Strength"].default_value
+                    break
 
-        # Now setting the world color should work
-        world.color = bg_color
-        # Disable world nodes temporarily
-        world.use_nodes = False
-        # Switch to CYCLES render engine and configure settings
+        # Set world background color
+        if bpy.app.version >= (5, 0, 0):
+            # Blender 5.0+: Use shader nodes for world background (required for Environment pass)
+            world.use_nodes = True
+            if world.node_tree:
+                for wn in world.node_tree.nodes:
+                    if wn.type == 'BACKGROUND':
+                        wn.inputs["Color"].default_value = (*bg_color[:3], 1.0)
+                        wn.inputs["Strength"].default_value = 1.0
+                        break
+        else:
+            world.color = bg_color
+            world.use_nodes = False
+
+        # Switch to CYCLES render engine (needed for emission pass rendering)
         context.scene.render.engine = 'CYCLES'
-        # Enable OSL
-        context.scene.cycles.use_osl = True
-        context.scene.cycles.device = 'CPU'
+        # Force CPU + OSL only for Blender < 5.1 (native Raycast nodes don't need it)
+        if bpy.app.version < (5, 1, 0):
+            if hasattr(context.scene.cycles, 'shading_system'):
+                context.scene.cycles.shading_system = True
+            else:
+                context.scene.cycles.use_osl = True
+            context.scene.cycles.device = 'CPU'
         context.scene.render.film_transparent = False
         # Change color management to standard
         bpy.context.scene.display_settings.display_device = 'sRGB'
@@ -474,26 +513,34 @@ def export_emit_image(context, to_export, camera_id=None, bg_color=(0.5, 0.5, 0.
         view_layer.use_pass_environment = True
 
 
-        # Set up nodes for diffuse-only output
+        # Set up compositor nodes
         context.scene.use_nodes = True
-        nodes = context.scene.node_tree.nodes
-        links = context.scene.node_tree.links
+        node_tree = get_compositor_node_tree(context.scene)
+        nodes = node_tree.nodes
+        links = node_tree.links
 
         # Clear existing nodes
         nodes.clear()
 
         # Create nodes
         render_layers = nodes.new('CompositorNodeRLayers')
-        mix_node = nodes.new('CompositorNodeMixRGB')
+        try:
+            mix_node = nodes.new('CompositorNodeMixRGB')
+        except:
+            mix_node = nodes.new('ShaderNodeMixRGB')
         mix_node.blend_type = 'ADD'
         mix_node.inputs[0].default_value = 1
         output_node = nodes.new('CompositorNodeOutputFile')
-        output_node.base_path = output_dir
-        output_node.file_slots[0].path = output_file
+        configure_output_node_paths(output_node, output_dir, output_file)
 
         # Connect emission to output
-        links.new(render_layers.outputs['Emit'], mix_node.inputs[1])
-        links.new(render_layers.outputs['Env'], mix_node.inputs[2])
+        # Blender 5.0+ renamed pass names: Emit -> Emission, Env -> Environment
+        if bpy.app.version < (5, 0, 0):
+            links.new(render_layers.outputs['Emit'], mix_node.inputs[1])
+            links.new(render_layers.outputs['Env'], mix_node.inputs[2])
+        else:
+            links.new(render_layers.outputs['Emission'], mix_node.inputs[1])
+            links.new(render_layers.outputs['Environment'], mix_node.inputs[2])
         links.new(mix_node.outputs[0], output_node.inputs[0])
 
         # Render
@@ -501,12 +548,11 @@ def export_emit_image(context, to_export, camera_id=None, bg_color=(0.5, 0.5, 0.
 
         # Post-processing for visibility masks
         if "visibility" in str(camera_id):
-            # Load the rendered image
-            image_path = os.path.join(output_dir, f"{output_file}.png")
-            # Blender output node might append frame number, e.g. render0001.png
-            # But here we assume standard naming or handle it if needed.
-            # The original code replaced .png with 0001.png, let's stick to that pattern if it matches
-            final_path = image_path.replace(".png", "0001.png")
+            # Determine the actual file path (Blender 4.x appends 0001, 5.x does not)
+            if bpy.app.version >= (5, 0, 0):
+                final_path = os.path.join(output_dir, f"{output_file}.png")
+            else:
+                final_path = os.path.join(output_dir, f"{output_file}0001.png")
 
             if context.scene.visibility_vignette and context.scene.generation_method == 'refine' and context.scene.refine_preserve:
                 # Smooth edge feathering, no blocky mask
@@ -526,10 +572,14 @@ def export_emit_image(context, to_export, camera_id=None, bg_color=(0.5, 0.5, 0.
         # Restore original settings
         context.scene.render.engine = original_engine
         context.scene.render.film_transparent = original_film_transparent
-        if original_use_nodes:
-            world.use_nodes = True
-        elif original_color:
-            world.color = original_color
+        world.use_nodes = original_use_nodes
+        world.color = original_color
+        if original_bg_node_color is not None and world.node_tree:
+            for wn in world.node_tree.nodes:
+                if wn.type == 'BACKGROUND':
+                    wn.inputs["Color"].default_value = original_bg_node_color
+                    wn.inputs["Strength"].default_value = original_bg_node_strength
+                    break
         bpy.context.scene.view_settings.view_transform = 'Standard'
 
         # Restore original materials
@@ -627,14 +677,14 @@ def export_render(context, camera_id=None, output_dir=None, filename=None):
 
     # Set up output nodes (Compositor setup remains the same)
     context.scene.use_nodes = True
-    nodes = context.scene.node_tree.nodes
-    links = context.scene.node_tree.links
+    node_tree = get_compositor_node_tree(context.scene)
+    nodes = node_tree.nodes
+    links = node_tree.links
     nodes.clear()
 
     render_layers = nodes.new('CompositorNodeRLayers')
     output_node = nodes.new('CompositorNodeOutputFile')
-    output_node.base_path = output_dir
-    output_node.file_slots[0].path = output_file
+    configure_output_node_paths(output_node, output_dir, output_file)
     links.new(render_layers.outputs['Image'], output_node.inputs[0])
 
     # Render
@@ -779,7 +829,9 @@ def export_canny(context, camera_id=None, low_threshold=0, high_threshold=80):
     # Load the rendered image
     output_dir_render = get_dir_path(context, "misc")
     output_dir_canny = get_dir_path(context, "controlnet")["canny"]
-    output_file = f"render{camera_id}0001" if camera_id is not None else "render"
+    # Blender 4.x appends 0001 frame suffix, 5.x does not
+    frame_suffix = "0001" if bpy.app.version < (5, 0, 0) else ""
+    output_file = f"render{camera_id}{frame_suffix}" if camera_id is not None else "render"
     image_path = os.path.join(output_dir_render, f"{output_file}.png")
     image = cv2.imread(image_path, cv2.IMREAD_GRAYSCALE)
 
@@ -787,7 +839,7 @@ def export_canny(context, camera_id=None, low_threshold=0, high_threshold=80):
     edges = cv2.Canny(image, low_threshold, high_threshold)
 
     # Save the edge detection image
-    output_file = f"canny{camera_id}0001" if camera_id is not None else "canny"
+    output_file = f"canny{camera_id}{frame_suffix}" if camera_id is not None else "canny"
     cv2.imwrite(os.path.join(output_dir_canny, f"{output_file}.png"), edges)
 
     print(f"Canny edge detection saved to: {os.path.join(output_dir_canny, output_file)}.png")
@@ -926,6 +978,9 @@ def export_visibility(context, to_export, obj=None, camera_visibility=None):
         if not output:
             return False
         
+        if not output.inputs[0].links:
+            return False
+        
         # Determine which input to used based on existence of BSDF node before the output
         if output.inputs[0].links and output.inputs[0].links[0].from_node.type == 'BSDF_PRINCIPLED':
             color_mix = output.inputs[0].links[0].from_node.inputs[0].links[0].from_node
@@ -989,6 +1044,12 @@ def export_visibility(context, to_export, obj=None, camera_visibility=None):
                     node.inputs["Power"].default_value = context.scene.weight_exponent if context.scene.weight_exponent_mask else 1.0
                 except Exception as e:
                     print(f"  - Warning: Failed to set Power for node '{node.name}'. Error: {e}")
+            # Also handle native Raycast path (Blender 5.1+) where power is a MATH POWER node
+            elif node.type == 'MATH' and node.operation == 'POWER' and node.label == 'power_weight':
+                try:
+                    node.inputs[1].default_value = context.scene.weight_exponent if context.scene.weight_exponent_mask else 1.0
+                except Exception as e:
+                    print(f"  - Warning: Failed to set Power for native node '{node.name}'. Error: {e}")
                
         return True
     
@@ -1448,8 +1509,13 @@ class SwitchMaterial(bpy.types.Operator):
     
 def prepare_baking(context):
     bpy.context.scene.render.engine = 'CYCLES'
-    bpy.context.scene.cycles.use_osl = True
-    bpy.context.scene.cycles.device = 'CPU'
+    # Force CPU + OSL only for Blender < 5.1 (native Raycast nodes don't need it)
+    if bpy.app.version < (5, 1, 0):
+        if hasattr(bpy.context.scene.cycles, 'shading_system'):
+            bpy.context.scene.cycles.shading_system = True
+        else:
+            bpy.context.scene.cycles.use_osl = True
+        bpy.context.scene.cycles.device = 'CPU'
 
     # Set bake type to diffuse and contributions to color only
     bpy.context.scene.cycles.bake_type = 'DIFFUSE'
@@ -1508,11 +1574,19 @@ def unwrap(obj, method, overlap_only):
                 return
             
             # Check for ANY selected UV elements
-            has_overlap = any(
-                loop[uv_layer].select 
-                for face in bm.faces 
-                for loop in face.loops
-            )
+            if bpy.app.version >= (5, 0, 0):
+                # Blender 5.0+ uses loop.uv_select_vert
+                has_overlap = any(
+                    loop.uv_select_vert
+                    for face in bm.faces 
+                    for loop in face.loops
+                )
+            else:
+                has_overlap = any(
+                    loop[uv_layer].select 
+                    for face in bm.faces 
+                    for loop in face.loops
+                )
 
             if not has_overlap:
                 bpy.ops.object.mode_set(mode='OBJECT')
@@ -1989,7 +2063,7 @@ class ExportOrbitGIF(bpy.types.Operator):
         description="Render engine to use",
         items=[
             ('BLENDER_WORKBENCH', "Workbench", "Use Workbench render engine"),
-            ('BLENDER_EEVEE_NEXT', "Eevee", "Use Eevee render engine"),
+            ('EEVEE', "Eevee", "Use Eevee render engine"),
             ('CYCLES', "Cycles", "Use Cycles render engine")
         ],
         default='CYCLES'
@@ -2117,12 +2191,22 @@ class ExportOrbitGIF(bpy.types.Operator):
 
         # Set Interpolation to Linear for smooth rotation
         if self._temp_empty.animation_data and self._temp_empty.animation_data.action:
-            for fcurve in self._temp_empty.animation_data.action.fcurves:
-                if fcurve.data_path == "rotation_euler" and fcurve.array_index == 2: # Z rotation
-                    for kf_point in fcurve.keyframe_points:
-                        kf_point.interpolation = 'LINEAR'
-                    # Ensure extrapolation is also linear if needed (usually default)
-                    fcurve.extrapolation = 'LINEAR'
+            action = self._temp_empty.animation_data.action
+            # Blender 5.0+ uses slots/channelbags API for fcurves
+            if hasattr(action, 'slots') and action.slots:
+                slot = action.slots[0]
+                for channelbag in slot.channelbags:
+                    for fcurve in channelbag.fcurves:
+                        if fcurve.data_path == "rotation_euler" and fcurve.array_index == 2:
+                            for kf_point in fcurve.keyframe_points:
+                                kf_point.interpolation = 'LINEAR'
+                            fcurve.extrapolation = 'LINEAR'
+            else:
+                for fcurve in action.fcurves:
+                    if fcurve.data_path == "rotation_euler" and fcurve.array_index == 2:
+                        for kf_point in fcurve.keyframe_points:
+                            kf_point.interpolation = 'LINEAR'
+                        fcurve.extrapolation = 'LINEAR'
 
 
     def execute(self, context):
@@ -2149,7 +2233,7 @@ class ExportOrbitGIF(bpy.types.Operator):
             'color_type': scene.display.shading.color_type # Store original shading color type
         }
 
-        scene.render.engine = self.engine # Use selected engine
+        scene.render.engine = get_eevee_engine_id() if self.engine == 'EEVEE' else self.engine
         
         if scene.render.engine == 'BLENDER_WORKBENCH':
             context.scene.display.shading.light = 'STUDIO'

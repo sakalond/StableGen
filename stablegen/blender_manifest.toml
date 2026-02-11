@@ -25,12 +25,14 @@ wheels = [
   "./wheels/imageio_ffmpeg-0.6.0-py3-none-win_amd64.whl",
   "./wheels/opencv_python_headless-4.11.0.86-cp37-abi3-win_amd64.whl",
   "./wheels/pillow-11.2.1-cp311-cp311-win_amd64.whl",
+  "./wheels/pillow-11.2.1-cp313-cp313-win_amd64.whl",
 
   # Linux specific
 
   "./wheels/imageio_ffmpeg-0.6.0-py3-none-manylinux2014_x86_64.whl",
   "./wheels/opencv_python_headless-4.11.0.86-cp37-abi3-manylinux_2_17_x86_64.manylinux2014_x86_64.whl",
-  "./wheels/pillow-11.2.1-cp311-cp311-manylinux_2_17_x86_64.manylinux2014_x86_64.whl"
+  "./wheels/pillow-11.2.1-cp311-cp311-manylinux_2_17_x86_64.manylinux2014_x86_64.whl",
+  "./wheels/pillow-11.2.1-cp313-cp313-manylinux_2_17_x86_64.manylinux2014_x86_64.whl"
 ]
 
 [permissions]

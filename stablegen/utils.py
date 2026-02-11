@@ -282,7 +282,7 @@ def ensure_dirs_exist(dirs_dict):
 	# Create misc directory
 	os.makedirs(dirs_dict["misc"], exist_ok=True)
 
-def get_file_path(context, file_type, subtype=None, filename=None, camera_id=None, object_name=None, material_id=None):
+def get_file_path(context, file_type, subtype=None, filename=None, camera_id=None, object_name=None, material_id=None, legacy=False):
 	"""
 	Generate the full file path for saving images based on the type of file and other parameters.
 	:param context: Blender context
@@ -292,9 +292,15 @@ def get_file_path(context, file_type, subtype=None, filename=None, camera_id=Non
 	:param camera_id: Optional camera ID for camera-specific files
 	:param object_name: Optional object name for object-specific files
 	:param material_id: Optional material ID for material-specific files
+	:param legacy: If True, always include frame suffix (0001) regardless of Blender version.
+	               Used for filenames written by CompositorNodeOutputFile which appends
+	               0001 on Blender 4.x but not on 5.x+.
 	:return: The full file path
 	"""
 	dirs = get_generation_dirs(context)
+
+	# Determine frame suffix: Blender 5.x compositor output nodes no longer append "0001"
+	frame_suffix = "0001" if legacy or bpy.app.version < (5, 0, 0) else ""
  
 	# Ensure the directories exist
 	ensure_dirs_exist(dirs)
@@ -303,13 +309,13 @@ def get_file_path(context, file_type, subtype=None, filename=None, camera_id=Non
 		base_dir = dirs["controlnet"][subtype]
 		if not filename:
 			if subtype == "depth":
-				filename = f"depth_map{camera_id}0001" if camera_id is not None else "depth_map_grid"
+				filename = f"depth_map{camera_id}{frame_suffix}" if camera_id is not None else "depth_map_grid"
 			elif subtype == "canny":  
-				filename = f"canny{camera_id}0001" if camera_id is not None else "canny_grid"
+				filename = f"canny{camera_id}{frame_suffix}" if camera_id is not None else "canny_grid"
 			elif subtype == "normal":
-				filename = f"normal_map{camera_id}0001" if camera_id is not None else "normal_grid"
+				filename = f"normal_map{camera_id}{frame_suffix}" if camera_id is not None else "normal_grid"
 			elif subtype == "workbench":
-				filename = f"render{camera_id}0001" if camera_id is not None else "render_grid"
+				filename = f"render{camera_id}{frame_suffix}" if camera_id is not None else "render_grid"
 			elif subtype == "viewport":
 				filename = f"viewport{camera_id}" if camera_id is not None else "viewport_grid"
 		return os.path.join(base_dir, f"{filename}.png")
@@ -334,9 +340,9 @@ def get_file_path(context, file_type, subtype=None, filename=None, camera_id=Non
 	elif file_type == "inpaint" and subtype:
 		base_dir = dirs["inpaint"][subtype]
 		if subtype == "render":
-			filename = f"render{camera_id}0001" if not filename else filename
+			filename = f"render{camera_id}{frame_suffix}" if not filename else filename
 		elif subtype == "visibility":
-			filename = f"render{camera_id}_visibility0001" if not filename else filename
+			filename = f"render{camera_id}_visibility{frame_suffix}" if not filename else filename
 		return os.path.join(base_dir, f"{filename}.png")
 
 	elif file_type == "uv_inpaint" and subtype:
@@ -393,3 +399,75 @@ def remove_empty_dirs(context, dirs_obj = None):
 			else:
 				if os.path.exists(value) and not os.listdir(value):
 					os.rmdir(value)
+
+
+def get_compositor_node_tree(scene):
+	"""
+	Get the compositor node tree, handling API differences between Blender versions.
+	Blender 5.0+ uses scene.compositing_node_group, older versions use scene.node_tree.
+	In 5.0+ the group may be None on first use, so we create it.
+	"""
+	if hasattr(scene, 'compositing_node_group'):
+		if scene.compositing_node_group is None:
+			new_tree = bpy.data.node_groups.new(name="Compositing", type='CompositorNodeTree')
+			scene.compositing_node_group = new_tree
+		return scene.compositing_node_group
+	if hasattr(scene, 'node_tree'):
+		return scene.node_tree
+	return None
+
+
+def configure_output_node_paths(node, directory, filename):
+	"""Configure output node paths using Blender 5.0+ image-mode semantics with 4.x fallback."""
+
+	# 1. Force single-image mode so format enums unlock in Blender 5
+	if hasattr(node.format, "media_type"):
+		node.format.media_type = 'IMAGE'
+
+	# 2. Set PNG format
+	node.format.file_format = "PNG"
+
+	# 3. Configure directory/base path
+	if hasattr(node, "directory"):
+		node.directory = directory
+	else:
+		node.base_path = directory
+
+	# 4. Clear prefix
+	if hasattr(node, "file_name"):
+		node.file_name = ""
+
+	# 5. Update the visible slot label/path for both APIs
+	slot = None
+	if hasattr(node, "file_output_items"):
+		items = node.file_output_items
+		if items and len(items) > 0:
+			slot = items[0]
+			slot.name = filename
+			if hasattr(slot, "path"):
+				slot.path = filename
+		else:
+			slot = items.new(name=filename, socket_type='RGBA')
+			if hasattr(slot, "path"):
+				slot.path = filename
+	elif hasattr(node, "file_slots"):
+		slots = node.file_slots
+		if slots and len(slots) > 0:
+			slot = slots[0]
+			if hasattr(slot, "path"):
+				slot.path = filename
+		else:
+			slot = slots.new(filename)
+	else:
+		print("Warning: Output node API lacks slot accessors; output may fail.")
+	return slot
+
+
+def get_eevee_engine_id():
+	"""
+	Return the correct Eevee engine identifier for the current Blender version.
+	Blender 5.0+ uses 'BLENDER_EEVEE', older versions use 'BLENDER_EEVEE_NEXT'.
+	"""
+	if bpy.app.version >= (5, 0, 0):
+		return 'BLENDER_EEVEE'
+	return 'BLENDER_EEVEE_NEXT'

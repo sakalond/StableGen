@@ -1,10 +1,507 @@
 import bpy
 import os
-from math import atan, tan
+from math import atan, tan, pi
 
 from .utils import get_last_material_index, get_file_path, get_dir_path
 from .render_tools import prepare_baking, bake_texture, unwrap
 from mathutils import Vector
+
+
+def create_native_raycast_visibility(nodes, links, camera, geometry, context, i, mat_id, stop_index):
+    """
+    Creates a visibility weight node group using the native Raycast shader node (Blender 5.1+).
+    Replicates the OSL raycast.osl shader logic:
+      1. Frustum check (is the surface within the camera FOV)
+      2. Occlusion check (Raycast from camera, compare Hit Distance with expected distance)
+      3. Angle check (surface normal vs ray direction)
+      4. Weight = pow(orthogonality, Power)
+    
+    Returns: (weight_output_node, subtract_node, normalize_node, length_node,
+              camera_loc_node, camera_fov_node, camera_aspect_node, camera_dir_node, camera_up_node)
+    """
+    x_base = -400
+    y_base = (-800) * i
+
+    # --- Camera location (CombineXYZ) ---
+    add_camera_loc = nodes.new("ShaderNodeCombineXYZ")
+    add_camera_loc.location = (-600, 200 + 300 * i)
+    add_camera_loc.inputs[0].default_value = camera.location.x
+    add_camera_loc.inputs[1].default_value = camera.location.y
+    add_camera_loc.inputs[2].default_value = camera.location.z
+
+    # --- Direction: Geometry.Position - CameraLoc ---
+    subtract = nodes.new("ShaderNodeVectorMath")
+    subtract.operation = 'SUBTRACT'
+    subtract.location = (x_base, -300 + y_base)
+    subtract.inputs[1].default_value = camera.location
+
+    normalize_node = nodes.new("ShaderNodeVectorMath")
+    normalize_node.operation = 'NORMALIZE'
+    normalize_node.location = (x_base, -500 + y_base)
+
+    links.new(geometry.outputs["Position"], subtract.inputs[0])
+    links.new(subtract.outputs["Vector"], normalize_node.inputs[0])
+
+    # --- Length (camera-to-surface distance) ---
+    length_node = nodes.new("ShaderNodeVectorMath")
+    length_node.operation = 'LENGTH'
+    length_node.location = (x_base, 200 * (i + 1))
+    links.new(subtract.outputs["Vector"], length_node.inputs[0])
+
+    # --- Camera FOV ---
+    camera_fov_node = nodes.new("ShaderNodeValue")
+    camera_fov_node.location = (-800, 200 + 300 * i)
+    fov = camera.data.angle_x
+    if context.scene.render.resolution_y > context.scene.render.resolution_x:
+        fov = 2 * atan(tan(fov / 2) * context.scene.render.resolution_x / context.scene.render.resolution_y)
+    camera_fov_node.outputs[0].default_value = fov
+
+    # --- Camera aspect ratio ---
+    camera_aspect_node = nodes.new("ShaderNodeValue")
+    camera_aspect_node.location = (-800, 100 + 300 * i)
+    camera_aspect_node.outputs[0].default_value = context.scene.render.resolution_x / context.scene.render.resolution_y
+
+    # --- Camera direction (CombineXYZ) ---
+    cam_dir_vec = camera.matrix_world.to_quaternion() @ Vector((0, 0, -1))
+    camera_dir_node = nodes.new("ShaderNodeCombineXYZ")
+    camera_dir_node.location = (-800, 0 + 300 * i)
+    camera_dir_node.inputs[0].default_value = cam_dir_vec.x
+    camera_dir_node.inputs[1].default_value = cam_dir_vec.y
+    camera_dir_node.inputs[2].default_value = cam_dir_vec.z
+
+    # --- Camera up (CombineXYZ) ---
+    cam_up_vec = camera.matrix_world.to_quaternion() @ Vector((0, 1, 0))
+    camera_up_node = nodes.new("ShaderNodeCombineXYZ")
+    camera_up_node.location = (-800, -100 + 300 * i)
+    camera_up_node.inputs[0].default_value = cam_up_vec.x
+    camera_up_node.inputs[1].default_value = cam_up_vec.y
+    camera_up_node.inputs[2].default_value = cam_up_vec.z
+
+    # ========================================
+    # FRUSTUM CHECK (using vector math nodes)
+    # ========================================
+    norm_forward = nodes.new("ShaderNodeVectorMath")
+    norm_forward.operation = 'NORMALIZE'
+    norm_forward.location = (-700, y_base - 100)
+    links.new(camera_dir_node.outputs["Vector"], norm_forward.inputs[0])
+
+    cross_fwd_up = nodes.new("ShaderNodeVectorMath")
+    cross_fwd_up.operation = 'CROSS_PRODUCT'
+    cross_fwd_up.location = (-700, y_base - 200)
+    links.new(norm_forward.outputs["Vector"], cross_fwd_up.inputs[0])
+    links.new(camera_up_node.outputs["Vector"], cross_fwd_up.inputs[1])
+
+    norm_right = nodes.new("ShaderNodeVectorMath")
+    norm_right.operation = 'NORMALIZE'
+    norm_right.location = (-600, y_base - 200)
+    links.new(cross_fwd_up.outputs["Vector"], norm_right.inputs[0])
+
+    cross_right_fwd = nodes.new("ShaderNodeVectorMath")
+    cross_right_fwd.operation = 'CROSS_PRODUCT'
+    cross_right_fwd.location = (-700, y_base - 300)
+    links.new(norm_right.outputs["Vector"], cross_right_fwd.inputs[0])
+    links.new(norm_forward.outputs["Vector"], cross_right_fwd.inputs[1])
+
+    norm_up_vec = nodes.new("ShaderNodeVectorMath")
+    norm_up_vec.operation = 'NORMALIZE'
+    norm_up_vec.location = (-600, y_base - 300)
+    links.new(cross_right_fwd.outputs["Vector"], norm_up_vec.inputs[0])
+
+    neg_forward = nodes.new("ShaderNodeVectorMath")
+    neg_forward.operation = 'SCALE'
+    neg_forward.location = (-600, y_base - 400)
+    neg_forward.inputs["Scale"].default_value = -1.0
+    links.new(norm_forward.outputs["Vector"], neg_forward.inputs[0])
+
+    dot_d_right = nodes.new("ShaderNodeVectorMath")
+    dot_d_right.operation = 'DOT_PRODUCT'
+    dot_d_right.location = (-400, y_base - 200)
+    links.new(normalize_node.outputs["Vector"], dot_d_right.inputs[0])
+    links.new(norm_right.outputs["Vector"], dot_d_right.inputs[1])
+
+    dot_d_up = nodes.new("ShaderNodeVectorMath")
+    dot_d_up.operation = 'DOT_PRODUCT'
+    dot_d_up.location = (-400, y_base - 300)
+    links.new(normalize_node.outputs["Vector"], dot_d_up.inputs[0])
+    links.new(norm_up_vec.outputs["Vector"], dot_d_up.inputs[1])
+
+    dot_d_neg_fwd = nodes.new("ShaderNodeVectorMath")
+    dot_d_neg_fwd.operation = 'DOT_PRODUCT'
+    dot_d_neg_fwd.location = (-400, y_base - 400)
+    links.new(normalize_node.outputs["Vector"], dot_d_neg_fwd.inputs[0])
+    links.new(neg_forward.outputs["Vector"], dot_d_neg_fwd.inputs[1])
+
+    cam_z_check = nodes.new("ShaderNodeMath")
+    cam_z_check.operation = 'LESS_THAN'
+    cam_z_check.location = (-200, y_base - 400)
+    cam_z_check.inputs[1].default_value = 0.0
+    links.new(dot_d_neg_fwd.outputs["Value"], cam_z_check.inputs[0])
+
+    fov_half = nodes.new("ShaderNodeMath")
+    fov_half.operation = 'MULTIPLY'
+    fov_half.location = (-400, y_base - 500)
+    fov_half.inputs[1].default_value = 0.5
+    links.new(camera_fov_node.outputs[0], fov_half.inputs[0])
+
+    filmw = nodes.new("ShaderNodeMath")
+    filmw.operation = 'TANGENT'
+    filmw.location = (-300, y_base - 500)
+    links.new(fov_half.outputs[0], filmw.inputs[0])
+
+    filmh = nodes.new("ShaderNodeMath")
+    filmh.operation = 'DIVIDE'
+    filmh.location = (-200, y_base - 500)
+    links.new(filmw.outputs[0], filmh.inputs[0])
+    links.new(camera_aspect_node.outputs[0], filmh.inputs[1])
+
+    neg_cam_z = nodes.new("ShaderNodeMath")
+    neg_cam_z.operation = 'MULTIPLY'
+    neg_cam_z.location = (-200, y_base - 600)
+    neg_cam_z.inputs[1].default_value = -1.0
+    links.new(dot_d_neg_fwd.outputs["Value"], neg_cam_z.inputs[0])
+
+    x_proj = nodes.new("ShaderNodeMath")
+    x_proj.operation = 'DIVIDE'
+    x_proj.location = (-100, y_base - 200)
+    links.new(dot_d_right.outputs["Value"], x_proj.inputs[0])
+    links.new(neg_cam_z.outputs[0], x_proj.inputs[1])
+
+    y_proj = nodes.new("ShaderNodeMath")
+    y_proj.operation = 'DIVIDE'
+    y_proj.location = (-100, y_base - 300)
+    links.new(dot_d_up.outputs["Value"], y_proj.inputs[0])
+    links.new(neg_cam_z.outputs[0], y_proj.inputs[1])
+
+    abs_x = nodes.new("ShaderNodeMath")
+    abs_x.operation = 'ABSOLUTE'
+    abs_x.location = (0, y_base - 200)
+    links.new(x_proj.outputs[0], abs_x.inputs[0])
+
+    x_in_bounds = nodes.new("ShaderNodeMath")
+    x_in_bounds.operation = 'LESS_THAN'
+    x_in_bounds.location = (100, y_base - 200)
+    links.new(abs_x.outputs[0], x_in_bounds.inputs[0])
+    links.new(filmw.outputs[0], x_in_bounds.inputs[1])
+
+    abs_y = nodes.new("ShaderNodeMath")
+    abs_y.operation = 'ABSOLUTE'
+    abs_y.location = (0, y_base - 300)
+    links.new(y_proj.outputs[0], abs_y.inputs[0])
+
+    y_in_bounds = nodes.new("ShaderNodeMath")
+    y_in_bounds.operation = 'LESS_THAN'
+    y_in_bounds.location = (100, y_base - 300)
+    links.new(abs_y.outputs[0], y_in_bounds.inputs[0])
+    links.new(filmh.outputs[0], y_in_bounds.inputs[1])
+
+    frustum_xy = nodes.new("ShaderNodeMath")
+    frustum_xy.operation = 'MINIMUM'
+    frustum_xy.location = (200, y_base - 250)
+    links.new(x_in_bounds.outputs[0], frustum_xy.inputs[0])
+    links.new(y_in_bounds.outputs[0], frustum_xy.inputs[1])
+
+    frustum_ok = nodes.new("ShaderNodeMath")
+    frustum_ok.operation = 'MINIMUM'
+    frustum_ok.location = (300, y_base - 300)
+    links.new(cam_z_check.outputs[0], frustum_ok.inputs[0])
+    links.new(frustum_xy.outputs[0], frustum_ok.inputs[1])
+
+    # ========================================
+    # RAYCAST NODE (occlusion check)
+    # ========================================
+    raycast = nodes.new("ShaderNodeRaycast")
+    raycast.location = (x_base + 200, y_base)
+    links.new(add_camera_loc.outputs["Vector"], raycast.inputs["Position"])
+    links.new(normalize_node.outputs["Vector"], raycast.inputs["Direction"])
+    threshold_plus = nodes.new("ShaderNodeMath")
+    threshold_plus.operation = 'ADD'
+    threshold_plus.location = (x_base + 100, y_base + 100)
+    threshold_plus.inputs[1].default_value = 0.01
+    links.new(length_node.outputs["Value"], threshold_plus.inputs[0])
+    links.new(threshold_plus.outputs[0], raycast.inputs["Length"])
+
+    hit_dist_plus = nodes.new("ShaderNodeMath")
+    hit_dist_plus.operation = 'ADD'
+    hit_dist_plus.location = (x_base + 400, y_base + 50)
+    hit_dist_plus.inputs[1].default_value = 0.001
+    links.new(raycast.outputs["Hit Distance"], hit_dist_plus.inputs[0])
+
+    dist_check = nodes.new("ShaderNodeMath")
+    dist_check.operation = 'LESS_THAN'
+    dist_check.location = (x_base + 500, y_base + 50)
+    links.new(length_node.outputs["Value"], dist_check.inputs[0])
+    links.new(hit_dist_plus.outputs[0], dist_check.inputs[1])
+
+    occlusion_ok = nodes.new("ShaderNodeMath")
+    occlusion_ok.operation = 'MINIMUM'
+    occlusion_ok.location = (x_base + 600, y_base + 50)
+    links.new(raycast.outputs["Is Hit"], occlusion_ok.inputs[0])
+    links.new(dist_check.outputs[0], occlusion_ok.inputs[1])
+
+    # ========================================
+    # ANGLE CHECK + WEIGHT
+    # ========================================
+    dot_d_normal = nodes.new("ShaderNodeVectorMath")
+    dot_d_normal.operation = 'DOT_PRODUCT'
+    dot_d_normal.location = (x_base + 300, y_base - 150)
+    links.new(normalize_node.outputs["Vector"], dot_d_normal.inputs[0])
+    links.new(geometry.outputs["Normal"], dot_d_normal.inputs[1])
+
+    clamp_dot = nodes.new("ShaderNodeMath")
+    clamp_dot.operation = 'MAXIMUM'
+    clamp_dot.location = (x_base + 400, y_base - 150)
+    clamp_dot.inputs[1].default_value = -1.0
+    links.new(dot_d_normal.outputs["Value"], clamp_dot.inputs[0])
+
+    clamp_dot2 = nodes.new("ShaderNodeMath")
+    clamp_dot2.operation = 'MINIMUM'
+    clamp_dot2.location = (x_base + 500, y_base - 150)
+    clamp_dot2.inputs[1].default_value = 1.0
+    links.new(clamp_dot.outputs[0], clamp_dot2.inputs[0])
+
+    abs_dot = nodes.new("ShaderNodeMath")
+    abs_dot.operation = 'ABSOLUTE'
+    abs_dot.location = (x_base + 600, y_base - 150)
+    links.new(clamp_dot2.outputs[0], abs_dot.inputs[0])
+
+    acos_node = nodes.new("ShaderNodeMath")
+    acos_node.operation = 'ARCCOSINE'
+    acos_node.location = (x_base + 700, y_base - 150)
+    links.new(abs_dot.outputs[0], acos_node.inputs[0])
+
+    to_degrees = nodes.new("ShaderNodeMath")
+    to_degrees.operation = 'MULTIPLY'
+    to_degrees.location = (x_base + 800, y_base - 150)
+    to_degrees.inputs[1].default_value = 180.0 / pi
+    links.new(acos_node.outputs[0], to_degrees.inputs[0])
+
+    angle_check = nodes.new("ShaderNodeMath")
+    angle_check.operation = 'LESS_THAN'
+    angle_check.location = (x_base + 900, y_base - 150)
+    angle_check.inputs[1].default_value = context.scene.discard_factor
+    angle_check.label = f"AngleThreshold-{i}-{mat_id}"
+    links.new(to_degrees.outputs[0], angle_check.inputs[0])
+
+    power_node = nodes.new("ShaderNodeMath")
+    power_node.operation = 'POWER'
+    power_node.location = (x_base + 700, y_base - 250)
+    power_node.inputs[1].default_value = context.scene.weight_exponent
+    power_node.label = 'power_weight'
+    links.new(abs_dot.outputs[0], power_node.inputs[0])
+
+    # ========================================
+    # COMBINE ALL: frustum_ok * occlusion_ok * angle_ok * weight
+    # ========================================
+    combine1 = nodes.new("ShaderNodeMath")
+    combine1.operation = 'MULTIPLY'
+    combine1.location = (x_base + 800, y_base)
+    links.new(frustum_ok.outputs[0], combine1.inputs[0])
+    links.new(occlusion_ok.outputs[0], combine1.inputs[1])
+
+    combine2 = nodes.new("ShaderNodeMath")
+    combine2.operation = 'MULTIPLY'
+    combine2.location = (x_base + 900, y_base)
+    links.new(combine1.outputs[0], combine2.inputs[0])
+    links.new(angle_check.outputs[0], combine2.inputs[1])
+
+    final_weight = nodes.new("ShaderNodeMath")
+    final_weight.operation = 'MULTIPLY'
+    final_weight.location = (x_base + 1000, y_base)
+    final_weight.label = f"Angle-{i}-{mat_id}"
+    links.new(combine2.outputs[0], final_weight.inputs[0])
+    links.new(power_node.outputs[0], final_weight.inputs[1])
+
+    return (final_weight, subtract, normalize_node, length_node,
+            add_camera_loc, camera_fov_node, camera_aspect_node,
+            camera_dir_node, camera_up_node)
+
+
+def create_native_feather(nodes, links, normalize_node, camera_fov_node, camera_aspect_node,
+                          camera_dir_node, camera_up_node, context, i, mat_id):
+    """
+    Creates a native node equivalent of feather.osl for Blender 5.1+.
+    Computes edge feathering based on distance to camera frustum border.
+    
+    Returns the feather output node (ShaderNodeMath).
+    """
+    x_base = -400
+    y_base = (-800) * i - 400  # Offset below the raycast nodes
+
+    # Build camera basis (reuse from raycast, but we need the forward/right/up)
+    norm_forward = nodes.new("ShaderNodeVectorMath")
+    norm_forward.operation = 'NORMALIZE'
+    norm_forward.location = (x_base - 300, y_base)
+    links.new(camera_dir_node.outputs["Vector"], norm_forward.inputs[0])
+
+    cross_fwd_up = nodes.new("ShaderNodeVectorMath")
+    cross_fwd_up.operation = 'CROSS_PRODUCT'
+    cross_fwd_up.location = (x_base - 300, y_base - 100)
+    links.new(norm_forward.outputs["Vector"], cross_fwd_up.inputs[0])
+    links.new(camera_up_node.outputs["Vector"], cross_fwd_up.inputs[1])
+
+    norm_right = nodes.new("ShaderNodeVectorMath")
+    norm_right.operation = 'NORMALIZE'
+    norm_right.location = (x_base - 200, y_base - 100)
+    links.new(cross_fwd_up.outputs["Vector"], norm_right.inputs[0])
+
+    cross_right_fwd = nodes.new("ShaderNodeVectorMath")
+    cross_right_fwd.operation = 'CROSS_PRODUCT'
+    cross_right_fwd.location = (x_base - 300, y_base - 200)
+    links.new(norm_right.outputs["Vector"], cross_right_fwd.inputs[0])
+    links.new(norm_forward.outputs["Vector"], cross_right_fwd.inputs[1])
+
+    norm_up_vec = nodes.new("ShaderNodeVectorMath")
+    norm_up_vec.operation = 'NORMALIZE'
+    norm_up_vec.location = (x_base - 200, y_base - 200)
+    links.new(cross_right_fwd.outputs["Vector"], norm_up_vec.inputs[0])
+
+    neg_forward = nodes.new("ShaderNodeVectorMath")
+    neg_forward.operation = 'SCALE'
+    neg_forward.location = (x_base - 200, y_base - 300)
+    neg_forward.inputs["Scale"].default_value = -1.0
+    links.new(norm_forward.outputs["Vector"], neg_forward.inputs[0])
+
+    # cam_x = dot(d, right)
+    dot_d_right = nodes.new("ShaderNodeVectorMath")
+    dot_d_right.operation = 'DOT_PRODUCT'
+    dot_d_right.location = (x_base, y_base - 100)
+    links.new(normalize_node.outputs["Vector"], dot_d_right.inputs[0])
+    links.new(norm_right.outputs["Vector"], dot_d_right.inputs[1])
+
+    # cam_y = dot(d, upVec)
+    dot_d_up = nodes.new("ShaderNodeVectorMath")
+    dot_d_up.operation = 'DOT_PRODUCT'
+    dot_d_up.location = (x_base, y_base - 200)
+    links.new(normalize_node.outputs["Vector"], dot_d_up.inputs[0])
+    links.new(norm_up_vec.outputs["Vector"], dot_d_up.inputs[1])
+
+    # cam_z = dot(d, -forward)
+    dot_d_neg_fwd = nodes.new("ShaderNodeVectorMath")
+    dot_d_neg_fwd.operation = 'DOT_PRODUCT'
+    dot_d_neg_fwd.location = (x_base, y_base - 300)
+    links.new(normalize_node.outputs["Vector"], dot_d_neg_fwd.inputs[0])
+    links.new(neg_forward.outputs["Vector"], dot_d_neg_fwd.inputs[1])
+
+    # cam_z >= 0 check (behind camera -> result = 0)
+    cam_z_check = nodes.new("ShaderNodeMath")
+    cam_z_check.operation = 'LESS_THAN'
+    cam_z_check.location = (x_base + 100, y_base - 300)
+    cam_z_check.inputs[1].default_value = 0.0
+    links.new(dot_d_neg_fwd.outputs["Value"], cam_z_check.inputs[0])
+
+    # filmw = tan(FOV * 0.5)
+    fov_half = nodes.new("ShaderNodeMath")
+    fov_half.operation = 'MULTIPLY'
+    fov_half.location = (x_base, y_base - 400)
+    fov_half.inputs[1].default_value = 0.5
+    links.new(camera_fov_node.outputs[0], fov_half.inputs[0])
+
+    filmw = nodes.new("ShaderNodeMath")
+    filmw.operation = 'TANGENT'
+    filmw.location = (x_base + 100, y_base - 400)
+    links.new(fov_half.outputs[0], filmw.inputs[0])
+
+    # filmh = filmw / CameraAspect
+    filmh = nodes.new("ShaderNodeMath")
+    filmh.operation = 'DIVIDE'
+    filmh.location = (x_base + 200, y_base - 400)
+    links.new(filmw.outputs[0], filmh.inputs[0])
+    links.new(camera_aspect_node.outputs[0], filmh.inputs[1])
+
+    # neg_cam_z = -cam_z
+    neg_cam_z = nodes.new("ShaderNodeMath")
+    neg_cam_z.operation = 'MULTIPLY'
+    neg_cam_z.location = (x_base + 100, y_base - 500)
+    neg_cam_z.inputs[1].default_value = -1.0
+    links.new(dot_d_neg_fwd.outputs["Value"], neg_cam_z.inputs[0])
+
+    # x_proj = cam_x / -cam_z
+    x_proj = nodes.new("ShaderNodeMath")
+    x_proj.operation = 'DIVIDE'
+    x_proj.location = (x_base + 200, y_base - 100)
+    links.new(dot_d_right.outputs["Value"], x_proj.inputs[0])
+    links.new(neg_cam_z.outputs[0], x_proj.inputs[1])
+
+    # y_proj = cam_y / -cam_z
+    y_proj = nodes.new("ShaderNodeMath")
+    y_proj.operation = 'DIVIDE'
+    y_proj.location = (x_base + 200, y_base - 200)
+    links.new(dot_d_up.outputs["Value"], y_proj.inputs[0])
+    links.new(neg_cam_z.outputs[0], y_proj.inputs[1])
+
+    # nx = abs(x_proj) / filmw
+    abs_x = nodes.new("ShaderNodeMath")
+    abs_x.operation = 'ABSOLUTE'
+    abs_x.location = (x_base + 300, y_base - 100)
+    links.new(x_proj.outputs[0], abs_x.inputs[0])
+
+    nx = nodes.new("ShaderNodeMath")
+    nx.operation = 'DIVIDE'
+    nx.location = (x_base + 400, y_base - 100)
+    links.new(abs_x.outputs[0], nx.inputs[0])
+    links.new(filmw.outputs[0], nx.inputs[1])
+
+    # ny = abs(y_proj) / filmh
+    abs_y = nodes.new("ShaderNodeMath")
+    abs_y.operation = 'ABSOLUTE'
+    abs_y.location = (x_base + 300, y_base - 200)
+    links.new(y_proj.outputs[0], abs_y.inputs[0])
+
+    ny = nodes.new("ShaderNodeMath")
+    ny.operation = 'DIVIDE'
+    ny.location = (x_base + 400, y_base - 200)
+    links.new(abs_y.outputs[0], ny.inputs[0])
+    links.new(filmh.outputs[0], ny.inputs[1])
+
+    # edge = max(nx, ny)
+    edge = nodes.new("ShaderNodeMath")
+    edge.operation = 'MAXIMUM'
+    edge.location = (x_base + 500, y_base - 150)
+    links.new(nx.outputs[0], edge.inputs[0])
+    links.new(ny.outputs[0], edge.inputs[1])
+
+    # Get feather parameters
+    if context.scene.visibility_vignette:
+        feather_val = context.scene.visibility_vignette_width
+        gamma_val = context.scene.visibility_vignette_softness
+    else:
+        feather_val = 0.0
+        gamma_val = 1.0
+
+    feather_val = max(0.0, min(feather_val, 0.49))
+
+    if feather_val > 0.0:
+        # edge_factor = 1.0 - smoothstep(1.0 - feather, 1.0, edge)
+        # Approximate smoothstep using a Map Range node with SMOOTHSTEP interpolation
+        map_range = nodes.new("ShaderNodeMapRange")
+        map_range.location = (x_base + 600, y_base - 150)
+        map_range.interpolation_type = 'SMOOTHSTEP'
+        map_range.inputs["From Min"].default_value = 1.0 - feather_val
+        map_range.inputs["From Max"].default_value = 1.0
+        map_range.inputs["To Min"].default_value = 1.0  # Invert: edge=low -> factor=1
+        map_range.inputs["To Max"].default_value = 0.0  # edge=high -> factor=0
+        links.new(edge.outputs[0], map_range.inputs["Value"])
+
+        # edge_factor = pow(smoothstep_result, gamma)
+        pow_node = nodes.new("ShaderNodeMath")
+        pow_node.operation = 'POWER'
+        pow_node.location = (x_base + 700, y_base - 150)
+        pow_node.inputs[1].default_value = max(0.01, gamma_val)
+        links.new(map_range.outputs[0], pow_node.inputs[0])
+
+        # Multiply by cam_z_check (0 if behind camera)
+        final_feather = nodes.new("ShaderNodeMath")
+        final_feather.operation = 'MULTIPLY'
+        final_feather.location = (x_base + 800, y_base - 150)
+        final_feather.label = f"Feather-{i}-{mat_id}"
+        links.new(cam_z_check.outputs[0], final_feather.inputs[0])
+        links.new(pow_node.outputs[0], final_feather.inputs[1])
+    else:
+        # No feathering: result = cam_z_check (1 if in front, 0 behind)
+        final_feather = cam_z_check
+        final_feather.label = f"Feather-{i}-{mat_id}"
+
+    return final_feather
 
 def project_image(context, to_project, mat_id, stop_index=1000000):
     """     
@@ -300,6 +797,10 @@ def project_image(context, to_project, mat_id, stop_index=1000000):
                 uv_project_mod.aspect_x = aspect_ratio if aspect_ratio > 1 else 1
                 uv_project_mod.aspect_y = 1 / aspect_ratio if aspect_ratio < 1 else 1
 
+                # Set the new UV map as active so the modifier writes to it
+                # (Blender 5.0+ ignores uv_layer and writes to the active UV map)
+                obj.data.uv_layers.active = uv_map
+
                 # Apply the modifier
                 bpy.ops.object.modifier_apply(modifier=uv_project_mod.name)
 
@@ -317,10 +818,15 @@ def project_image(context, to_project, mat_id, stop_index=1000000):
                     simple_project_bake(context, i, obj, mat_id)
                 obj.data.uv_layers.remove(obj.data.uv_layers[-1]) # Remove the last UV map
 
-    # Switch to Cycles for OSL support
-    context.scene.render.engine = 'CYCLES'
-    context.scene.cycles.device = 'CPU'
-    context.scene.cycles.shading_system = True
+    # Switch to Cycles + CPU + OSL for OSL support (only needed for Blender < 5.1)
+    # On 5.1+ native Raycast shader nodes work with any engine/device
+    if bpy.app.version < (5, 1, 0):
+        context.scene.render.engine = 'CYCLES'
+        context.scene.cycles.device = 'CPU'
+        if hasattr(context.scene.cycles, 'shading_system'):
+            context.scene.cycles.shading_system = True
+        else:
+            context.scene.cycles.use_osl = True
 
     processed_materials = set()
 
@@ -375,8 +881,9 @@ def project_image(context, to_project, mat_id, stop_index=1000000):
             # We just need to remove the compare nodes which are connected to script node at stop_index
             script_node = None
             # First find all script nodes with label Angle-{stop_index}-{mat_id} or {stop_index}-{mat_id} (legacy)
+            # Also match native MATH MULTIPLY nodes (Blender 5.1+ native raycast path)
             for node in nodes:
-                if node.type == 'SCRIPT' and (node.label == f"Angle-{stop_index}-{mat_id}" or node.label == f"{stop_index}-{mat_id}"):
+                if (node.type == 'SCRIPT' or (node.type == 'MATH' and node.operation == 'MULTIPLY')) and (node.label == f"Angle-{stop_index}-{mat_id}" or node.label == f"{stop_index}-{mat_id}"):
                     script_node = node
                     break
             compare_output_sockets = set()
@@ -436,6 +943,8 @@ def project_image(context, to_project, mat_id, stop_index=1000000):
         geometry = nodes.new("ShaderNodeNewGeometry")
         geometry.location = (-600, 0)
 
+        use_native_raycast = bpy.app.version >= (5, 1, 0)
+
         tex_image_nodes = []
         uv_map_nodes = []
         subtract_nodes = []
@@ -483,128 +992,174 @@ def project_image(context, to_project, mat_id, stop_index=1000000):
             
             # Compute the dot product of the direction vector and geometry normal
 
-            subtract = nodes.new("ShaderNodeVectorMath")
-            subtract.operation = 'SUBTRACT'
-            subtract.location = (-400, -300 + (-800) * i)
-            subtract.inputs[1].default_value = camera.location
-            subtract_nodes.append(subtract)
+            if use_native_raycast:
+                # ── Native Raycast path (Blender 5.1+) ──
+                result = create_native_raycast_visibility(
+                    nodes, links, camera, geometry, context, i, mat_id, stop_index
+                )
+                angle_weight = result[0]
+                # Destructure result for create_native_feather
+                _, _, normalize_node, length_node, camera_loc_node, camera_fov_node, camera_aspect_node, camera_dir_node, camera_up_node = result
 
-            normalize = nodes.new("ShaderNodeVectorMath")
-            normalize.operation = 'NORMALIZE'
-            normalize.location = (-400, -500 + (-800) * (i))
-            normalize_nodes.append(normalize)
+                scripts_to_connect = []  # No OSL scripts to connect
+                final_weight_node = None
 
-            # Add script nodes (Angle)
-            script_angle = nodes.new("ShaderNodeScript")
-            script_angle.location = (-400, (-800) * i)
-            
-            # Load OSL script into internal text block for portability
-            raycast_osl_text = get_or_create_osl_text("raycast.osl")
-            if raycast_osl_text:
-                script_angle.mode = 'INTERNAL'
-                script_angle.script = raycast_osl_text
+                is_refine = (context.scene.generation_method == 'refine' or (context.scene.model_architecture.startswith('qwen') and context.scene.qwen_generation_method == 'refine')) and context.scene.refine_preserve
+                if is_refine:
+                    feather_weight = create_native_feather(
+                        nodes, links, normalize_node, camera_fov_node, camera_aspect_node,
+                        camera_dir_node, camera_up_node, context, i, mat_id
+                    )
+                    final_weight_node = (angle_weight, feather_weight)
+                else:
+                    final_weight_node = angle_weight
+
+                script_nodes.append(scripts_to_connect)
+
+                if i > stop_index:
+                    less_than = nodes.new("ShaderNodeMath")
+                    less_than.operation = 'LESS_THAN'
+                    less_than.location = (-200, (-800) * i)
+                    less_than.inputs[1].default_value = -1
+                    source_node = final_weight_node[0] if isinstance(final_weight_node, tuple) else final_weight_node
+                    links.new(source_node.outputs[0], less_than.inputs[0])
+                    script_nodes_outputs.append(less_than)
+                else:
+                    script_nodes_outputs.append(final_weight_node)
+
+                # Append None to node lists (connections handled inside create functions)
+                subtract_nodes.append(None)
+                normalize_nodes.append(None)
+                add_camera_loc_nodes.append(None)
+                length_nodes.append(None)
+                camera_fov_nodes.append(None)
+                camera_aspect_ratio_nodes.append(None)
+                camera_direction_nodes.append(None)
+                camera_up_nodes.append(None)
             else:
-                script_angle.mode = 'EXTERNAL'
-                script_angle.filepath = os.path.join(os.path.dirname(__file__), "raycast.osl")
+                # ── OSL path (Blender < 5.1) ──
+                subtract = nodes.new("ShaderNodeVectorMath")
+                subtract.operation = 'SUBTRACT'
+                subtract.location = (-400, -300 + (-800) * i)
+                subtract.inputs[1].default_value = camera.location
+                subtract_nodes.append(subtract)
 
-            script_angle.inputs["AngleThreshold"].default_value = context.scene.discard_factor
-            script_angle.inputs["Power"].default_value = context.scene.weight_exponent
-            script_angle.label = f"Angle-{i}-{mat_id}"
+                normalize = nodes.new("ShaderNodeVectorMath")
+                normalize.operation = 'NORMALIZE'
+                normalize.location = (-400, -500 + (-800) * (i))
+                normalize_nodes.append(normalize)
 
-            scripts_to_connect = [script_angle]
-            final_weight_node = None
-
-            if (context.scene.generation_method == 'refine' or (context.scene.model_architecture.startswith('qwen') and context.scene.qwen_generation_method == 'refine')) and context.scene.refine_preserve:
-                # Add Feather script
-                script_feather = nodes.new("ShaderNodeScript")
-                script_feather.location = (-400, (-800) * i - 200) # Offset slightly
+                # Add script nodes (Angle)
+                script_angle = nodes.new("ShaderNodeScript")
+                script_angle.location = (-400, (-800) * i)
                 
                 # Load OSL script into internal text block for portability
-                feather_osl_text = get_or_create_osl_text("feather.osl")
-                if feather_osl_text:
-                    script_feather.mode = 'INTERNAL'
-                    script_feather.script = feather_osl_text
+                raycast_osl_text = get_or_create_osl_text("raycast.osl")
+                if raycast_osl_text:
+                    script_angle.mode = 'INTERNAL'
+                    script_angle.script = raycast_osl_text
                 else:
-                    script_feather.mode = 'EXTERNAL'
-                    script_feather.filepath = os.path.join(os.path.dirname(__file__), "feather.osl")
-                
-                if context.scene.visibility_vignette: # Only set if feathering is active
-                    script_feather.inputs["EdgeFeather"].default_value = context.scene.visibility_vignette_width
-                    script_feather.inputs["EdgeGamma"].default_value = context.scene.visibility_vignette_softness
+                    script_angle.mode = 'EXTERNAL'
+                    script_angle.filepath = os.path.join(os.path.dirname(__file__), "raycast.osl")
+
+                script_angle.inputs["AngleThreshold"].default_value = context.scene.discard_factor
+                script_angle.inputs["Power"].default_value = context.scene.weight_exponent
+                script_angle.label = f"Angle-{i}-{mat_id}"
+
+                scripts_to_connect = [script_angle]
+                final_weight_node = None
+
+                if (context.scene.generation_method == 'refine' or (context.scene.model_architecture.startswith('qwen') and context.scene.qwen_generation_method == 'refine')) and context.scene.refine_preserve:
+                    # Add Feather script
+                    script_feather = nodes.new("ShaderNodeScript")
+                    script_feather.location = (-400, (-800) * i - 200) # Offset slightly
+                    
+                    # Load OSL script into internal text block for portability
+                    feather_osl_text = get_or_create_osl_text("feather.osl")
+                    if feather_osl_text:
+                        script_feather.mode = 'INTERNAL'
+                        script_feather.script = feather_osl_text
+                    else:
+                        script_feather.mode = 'EXTERNAL'
+                        script_feather.filepath = os.path.join(os.path.dirname(__file__), "feather.osl")
+                    
+                    if context.scene.visibility_vignette: # Only set if feathering is active
+                        script_feather.inputs["EdgeFeather"].default_value = context.scene.visibility_vignette_width
+                        script_feather.inputs["EdgeGamma"].default_value = context.scene.visibility_vignette_softness
+                    else:
+                        script_feather.inputs["EdgeFeather"].default_value = 0.0
+                        script_feather.inputs["EdgeGamma"].default_value = 1.0
+                    script_feather.label = f"Feather-{i}-{mat_id}"
+                    scripts_to_connect.append(script_feather)
+
+                    # Pass tuple of (Angle, Feather) to build_mix_tree
+                    final_weight_node = (script_angle, script_feather)
                 else:
-                    script_feather.inputs["EdgeFeather"].default_value = 0.0
-                    script_feather.inputs["EdgeGamma"].default_value = 1.0
-                script_feather.label = f"Feather-{i}-{mat_id}"
-                scripts_to_connect.append(script_feather)
+                    # Just use Angle script output directly
+                    final_weight_node = script_angle
 
-                # Pass tuple of (Angle, Feather) to build_mix_tree
-                final_weight_node = (script_angle, script_feather)
-            else:
-                # Just use Angle script output directly
-                final_weight_node = script_angle
+                script_nodes.append(scripts_to_connect)
 
-            script_nodes.append(scripts_to_connect)
+                if i > stop_index:
+                    # Connect a temporary less than node to the script node
+                    less_than = nodes.new("ShaderNodeMath")
+                    less_than.operation = 'LESS_THAN'
+                    less_than.location = (-200, (-800) * i)
+                    less_than.inputs[1].default_value = -1
+                    
+                    # For stop_index check, we use the Angle script output
+                    # (or the first element if it's a tuple)
+                    source_node = final_weight_node[0] if isinstance(final_weight_node, tuple) else final_weight_node
+                    links.new(source_node.outputs[0], less_than.inputs[0])
+                    
+                    script_nodes_outputs.append(less_than)
+                else:
+                    script_nodes_outputs.append(final_weight_node)
 
-            if i > stop_index:
-                # Connect a temporary less than node to the script node
-                less_than = nodes.new("ShaderNodeMath")
-                less_than.operation = 'LESS_THAN'
-                less_than.location = (-200, (-800) * i)
-                less_than.inputs[1].default_value = -1
+                # Add additional add node, which will contain camera's FOV in first default value, and camera's aspect ratio in second default value
+                camera_fov = nodes.new("ShaderNodeValue")
+                camera_fov.location = (-600, 200 + 300 * i)
+                fov = camera.data.angle_x
+                # Correct the FOV for vertical aspect ratio
+                if context.scene.render.resolution_y > context.scene.render.resolution_x:
+                    fov = 2 * atan(tan(fov / 2) * context.scene.render.resolution_x / context.scene.render.resolution_y)
+                camera_fov.outputs[0].default_value = fov
+                camera_fov_nodes.append(camera_fov)
+                camera_aspect_ratio = nodes.new("ShaderNodeValue")
+                camera_aspect_ratio.location = (-600, 200 + 300 * i)
                 
-                # For stop_index check, we use the Angle script output
-                # (or the first element if it's a tuple)
-                source_node = final_weight_node[0] if isinstance(final_weight_node, tuple) else final_weight_node
-                links.new(source_node.outputs[0], less_than.inputs[0])
+                # Add camera direction and up nodes (combine XYZ)
+                camera_direction = nodes.new("ShaderNodeCombineXYZ")
+                camera_direction.location = (-600, 200 + 300 * i)
+                # Get the camera direction vector
+                camera_direction.inputs[0].default_value = (camera.matrix_world.to_quaternion() @ Vector((0, 0, -1))).x
+                camera_direction.inputs[1].default_value = (camera.matrix_world.to_quaternion() @ Vector((0, 0, -1))).y
+                camera_direction.inputs[2].default_value = (camera.matrix_world.to_quaternion() @ Vector((0, 0, -1))).z
+                camera_direction_nodes.append(camera_direction)
+                camera_up = nodes.new("ShaderNodeCombineXYZ")
+                camera_up.location = (-600, 200 + 300 * i)
+                # Get the camera up vector
+                camera_up.inputs[0].default_value = (camera.matrix_world.to_quaternion() @ Vector((0, 1, 0))).x
+                camera_up.inputs[1].default_value = (camera.matrix_world.to_quaternion() @ Vector((0, 1, 0))).y
+                camera_up.inputs[2].default_value = (camera.matrix_world.to_quaternion() @ Vector((0, 1, 0))).z
+                camera_up_nodes.append(camera_up)
                 
-                script_nodes_outputs.append(less_than)
-            else:
-                script_nodes_outputs.append(final_weight_node)
+                camera_aspect_ratio.outputs[0].default_value = context.scene.render.resolution_x / context.scene.render.resolution_y
+                camera_aspect_ratio_nodes.append(camera_aspect_ratio)
 
-            # Add additional add node, which will contain camera's FOV in first default value, and camera's aspect ratio in second default value
-            camera_fov = nodes.new("ShaderNodeValue")
-            camera_fov.location = (-600, 200 + 300 * i)
-            fov = camera.data.angle_x
-            # Correct the FOV for vertical aspect ratio
-            if context.scene.render.resolution_y > context.scene.render.resolution_x:
-                fov = 2 * atan(tan(fov / 2) * context.scene.render.resolution_x / context.scene.render.resolution_y)
-            camera_fov.outputs[0].default_value = fov
-            camera_fov_nodes.append(camera_fov)
-            camera_aspect_ratio = nodes.new("ShaderNodeValue")
-            camera_aspect_ratio.location = (-600, 200 + 300 * i)
-            
-            # Add camera direction and up nodes (combine XYZ)
-            camera_direction = nodes.new("ShaderNodeCombineXYZ")
-            camera_direction.location = (-600, 200 + 300 * i)
-            # Get the camera direction vector
-            camera_direction.inputs[0].default_value = (camera.matrix_world.to_quaternion() @ Vector((0, 0, -1))).x
-            camera_direction.inputs[1].default_value = (camera.matrix_world.to_quaternion() @ Vector((0, 0, -1))).y
-            camera_direction.inputs[2].default_value = (camera.matrix_world.to_quaternion() @ Vector((0, 0, -1))).z
-            camera_direction_nodes.append(camera_direction)
-            camera_up = nodes.new("ShaderNodeCombineXYZ")
-            camera_up.location = (-600, 200 + 300 * i)
-            # Get the camera up vector
-            camera_up.inputs[0].default_value = (camera.matrix_world.to_quaternion() @ Vector((0, 1, 0))).x
-            camera_up.inputs[1].default_value = (camera.matrix_world.to_quaternion() @ Vector((0, 1, 0))).y
-            camera_up.inputs[2].default_value = (camera.matrix_world.to_quaternion() @ Vector((0, 1, 0))).z
-            camera_up_nodes.append(camera_up)
-            
-            camera_aspect_ratio.outputs[0].default_value = context.scene.render.resolution_x / context.scene.render.resolution_y
-            camera_aspect_ratio_nodes.append(camera_aspect_ratio)
+                # Add combine XYZ node
+                add_camera_loc = nodes.new("ShaderNodeCombineXYZ")
+                add_camera_loc.location = (-600, 200 + 300 * i)
+                add_camera_loc.inputs[0].default_value = camera.location.x
+                add_camera_loc.inputs[1].default_value = camera.location.y
+                add_camera_loc.inputs[2].default_value = camera.location.z
+                add_camera_loc_nodes.append(add_camera_loc)
 
-            # Add combine XYZ node
-            add_camera_loc = nodes.new("ShaderNodeCombineXYZ")
-            add_camera_loc.location = (-600, 200 + 300 * i)
-            add_camera_loc.inputs[0].default_value = camera.location.x
-            add_camera_loc.inputs[1].default_value = camera.location.y
-            add_camera_loc.inputs[2].default_value = camera.location.z
-            add_camera_loc_nodes.append(add_camera_loc)
-
-            # Add length node
-            length = nodes.new("ShaderNodeVectorMath")
-            length.operation = 'LENGTH'
-            length.location = (-400, 200 * (i+1))
-            length_nodes.append(length)
+                # Add length node
+                length = nodes.new("ShaderNodeVectorMath")
+                length.operation = 'LENGTH'
+                length.location = (-400, 200 * (i+1))
+                length_nodes.append(length)
 
         # Build mix shader tree
         if not context.scene.bake_texture and mat.name in processed_materials and (context.scene.generation_method == 'refine' or (context.scene.model_architecture.startswith('qwen') and context.scene.qwen_generation_method == 'refine')) and context.scene.refine_preserve:
@@ -624,38 +1179,42 @@ def project_image(context, to_project, mat_id, stop_index=1000000):
         for i, camera in enumerate(cameras):
             tex_image = tex_image_nodes[i]
             uv_map_node = uv_map_nodes[i]
-            subtract = subtract_nodes[i] 
-            normalize = normalize_nodes[i] 
-            scripts = script_nodes[i]
-            add_camera_loc = add_camera_loc_nodes[i] 
-            length = length_nodes[i] 
-            camera_fov = camera_fov_nodes[i]
-            camera_aspect_ratio = camera_aspect_ratio_nodes[i]
-            camera_direction = camera_direction_nodes[i]
-            camera_up = camera_up_nodes[i]
 
-            # Connect common nodes
+            # Connect UV → Texture (needed for both paths)
             links.new(uv_map_node.outputs["UV"], tex_image.inputs["Vector"])
-            links.new(geometry.outputs["Position"], subtract.inputs[0])
-            links.new(subtract.outputs["Vector"], normalize.inputs[0])
-            
-            for script in scripts:
-                links.new(normalize.outputs["Vector"], script.inputs["Direction"])
+
+            if not use_native_raycast:
+                # OSL path: connect subtract, normalize, script inputs, length
+                subtract = subtract_nodes[i] 
+                normalize = normalize_nodes[i] 
+                scripts = script_nodes[i]
+                add_camera_loc = add_camera_loc_nodes[i] 
+                length = length_nodes[i] 
+                camera_fov = camera_fov_nodes[i]
+                camera_aspect_ratio = camera_aspect_ratio_nodes[i]
+                camera_direction = camera_direction_nodes[i]
+                camera_up = camera_up_nodes[i]
+
+                links.new(geometry.outputs["Position"], subtract.inputs[0])
+                links.new(subtract.outputs["Vector"], normalize.inputs[0])
                 
-                if "Origin" in script.inputs:
-                    links.new(add_camera_loc.outputs["Vector"], script.inputs["Origin"])
-                
-                if "threshold" in script.inputs:
-                    links.new(length.outputs["Value"], script.inputs["threshold"])
+                for script in scripts:
+                    links.new(normalize.outputs["Vector"], script.inputs["Direction"])
                     
-                if "SurfaceNormal" in script.inputs:
-                    links.new(geometry.outputs["Normal"], script.inputs["SurfaceNormal"])
-                links.new(camera_fov.outputs[0], script.inputs["CameraFOV"])
-                links.new(camera_aspect_ratio.outputs[0], script.inputs["CameraAspect"])
-                links.new(camera_direction.outputs[0], script.inputs["CameraDir"])
-                links.new(camera_up.outputs[0], script.inputs["CameraUp"])
-            
-            links.new(subtract.outputs["Vector"], length.inputs[0])
+                    if "Origin" in script.inputs:
+                        links.new(add_camera_loc.outputs["Vector"], script.inputs["Origin"])
+                    
+                    if "threshold" in script.inputs:
+                        links.new(length.outputs["Value"], script.inputs["threshold"])
+                        
+                    if "SurfaceNormal" in script.inputs:
+                        links.new(geometry.outputs["Normal"], script.inputs["SurfaceNormal"])
+                    links.new(camera_fov.outputs[0], script.inputs["CameraFOV"])
+                    links.new(camera_aspect_ratio.outputs[0], script.inputs["CameraAspect"])
+                    links.new(camera_direction.outputs[0], script.inputs["CameraDir"])
+                    links.new(camera_up.outputs[0], script.inputs["CameraUp"])
+                
+                links.new(subtract.outputs["Vector"], length.inputs[0])
 
         # Add material index node (subtract node)
         subtract_node = nodes.new("ShaderNodeMath")
@@ -859,8 +1418,13 @@ def reinstate_compare_nodes(context, to_project, stop_id_mat_id_pairs):
         for stop_id, mat_id in stop_id_mat_id_pairs:
             script_node = None
             # Find the script node with the specific label
+            # Also match native MATH MULTIPLY nodes (Blender 5.1+ native raycast path)
             for node in nodes:
-                if node.type == 'SCRIPT' and node.label == f"{stop_id}-{mat_id}":
+                if (node.type == 'SCRIPT' or (node.type == 'MATH' and node.operation == 'MULTIPLY')) and node.label == f"{stop_id}-{mat_id}":
+                    script_node = node
+                    break
+                # Also check Angle-prefixed labels
+                if (node.type == 'SCRIPT' or (node.type == 'MATH' and node.operation == 'MULTIPLY')) and node.label == f"Angle-{stop_id}-{mat_id}":
                     script_node = node
                     break
             

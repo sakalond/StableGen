@@ -18,7 +18,7 @@ from PIL import Image, ImageEnhance
 
 from .util.helpers import prompt_text, prompt_text_img2img, prompt_text_qwen_image_edit # pylint: disable=relative-beyond-top-level
 from .render_tools import export_emit_image, export_visibility, export_canny, bake_texture, prepare_baking, unwrap, export_render, export_viewport # pylint: disable=relative-beyond-top-level
-from .utils import get_last_material_index, get_generation_dirs, get_file_path, get_dir_path, remove_empty_dirs # pylint: disable=relative-beyond-top-level
+from .utils import get_last_material_index, get_generation_dirs, get_file_path, get_dir_path, remove_empty_dirs, get_compositor_node_tree, configure_output_node_paths, get_eevee_engine_id # pylint: disable=relative-beyond-top-level
 from .project import project_image, reinstate_compare_nodes # pylint: disable=relative-beyond-top-level
 from .workflows import WorkflowManager
 from .util.mirror_color import MirrorReproject, _get_viewport_ref_np, _apply_color_match_to_file
@@ -110,10 +110,13 @@ class Regenerate(bpy.types.Operator):
             
             nodes = obj.active_material.node_tree.nodes
             for node in nodes:
-                # Identify the OSL script nodes used for raycasting
-                if node.type == 'SCRIPT' and node.mode == 'EXTERNAL' and 'raycast.osl' in node.filepath:
+                # OSL script nodes (internal or external)
+                if node.type == 'SCRIPT':
                     if 'AngleThreshold' in node.inputs:
                         node.inputs['AngleThreshold'].default_value = new_discard_angle
+                # Native MATH LESS_THAN nodes (Blender 5.1+ native raycast path)
+                elif node.type == 'MATH' and node.operation == 'LESS_THAN' and node.label.startswith('AngleThreshold-'):
+                    node.inputs[1].default_value = new_discard_angle
         # Run the generation operator
         bpy.ops.object.test_stable('INVOKE_DEFAULT')
 
@@ -804,10 +807,13 @@ class ComfyUIGenerate(bpy.types.Operator):
                         
                         nodes = obj.active_material.node_tree.nodes
                         for node in nodes:
-                            # Identify the OSL script nodes used for raycasting
-                            if node.type == 'SCRIPT' and node.mode == 'EXTERNAL' and 'raycast.osl' in node.filepath:
+                            # OSL script nodes (internal or external)
+                            if node.type == 'SCRIPT':
                                 if 'AngleThreshold' in node.inputs:
                                     node.inputs['AngleThreshold'].default_value = new_discard_angle
+                            # Native MATH LESS_THAN nodes (Blender 5.1+ native raycast path)
+                            elif node.type == 'MATH' and node.operation == 'LESS_THAN' and node.label.startswith('AngleThreshold-'):
+                                node.inputs[1].default_value = new_discard_angle
                     
                     print("Discard angle reset complete.")
 
@@ -950,20 +956,26 @@ class ComfyUIGenerate(bpy.types.Operator):
                                 image = self.workflow_manager.generate(context, controlnet_info=controlnet_info, ipadapter_ref_info=ipadapter_ref_info)
                         else:
                             def context_callback():
-                                # Export visibility mask and render for the current camera, we need to use a callback to be in the main thread
-                                export_visibility(context, self._to_texture, camera_visibility=self._cameras[self._current_image - 1]) # Export mask for current view
-                                if context.scene.model_architecture == 'qwen_image_edit': # export custom bg and fallback for Qwen image edit
-                                    fallback_color, background_color = self._get_qwen_context_colors(context)
-                                    export_emit_image(context, self._to_texture, camera_id=self._current_image, bg_color=background_color, fallback_color=fallback_color) # Export render for next view
-                                    self._dilate_qwen_context_fallback(context, self._current_image, fallback_color)
-                                else:
-                                    # Use a gray (neutral) background and fallback for other architectures
-                                    export_emit_image(context, self._to_texture, camera_id=self._current_image, bg_color=(0.5, 0.5, 0.5), fallback_color=(0.5, 0.5, 0.5))
+                                try:
+                                    # Export visibility mask and render for the current camera, we need to use a callback to be in the main thread
+                                    export_visibility(context, self._to_texture, camera_visibility=self._cameras[self._current_image - 1]) # Export mask for current view
+                                    if context.scene.model_architecture == 'qwen_image_edit': # export custom bg and fallback for Qwen image edit
+                                        fallback_color, background_color = self._get_qwen_context_colors(context)
+                                        export_emit_image(context, self._to_texture, camera_id=self._current_image, bg_color=background_color, fallback_color=fallback_color) # Export render for next view
+                                        self._dilate_qwen_context_fallback(context, self._current_image, fallback_color)
+                                    else:
+                                        # Use a gray (neutral) background and fallback for other architectures
+                                        export_emit_image(context, self._to_texture, camera_id=self._current_image, bg_color=(0.5, 0.5, 0.5), fallback_color=(0.5, 0.5, 0.5))
+                                except Exception as e:
+                                    self._error = str(e)
+                                    traceback.print_exc()
                                 self._wait_event.set()
                                 return None
                             bpy.app.timers.register(context_callback)
                             self._wait_event.wait()
                             self._wait_event.clear()
+                            if self._error:
+                                return
                             # Get info for the previous render and mask
                             render_info = self._get_uploaded_image_info(context, "inpaint", subtype="render", camera_id=self._current_image)
                             mask_info = self._get_uploaded_image_info(context, "inpaint", subtype="visibility", camera_id=self._current_image)
@@ -1033,8 +1045,12 @@ class ComfyUIGenerate(bpy.types.Operator):
                      # Sequential mode callback
                     if context.scene.generation_method == 'sequential':
                         def image_project_callback():
-                            redraw_ui(context)
-                            project_image(context, self._to_texture, self._material_id, stop_index=self._current_image)
+                            try:
+                                redraw_ui(context)
+                                project_image(context, self._to_texture, self._material_id, stop_index=self._current_image)
+                            except Exception as e:
+                                self._error = str(e)
+                                traceback.print_exc()
                             # Set the event to signal the end of the process
                             self._wait_event.set()
                             return None
@@ -1042,6 +1058,8 @@ class ComfyUIGenerate(bpy.types.Operator):
                         # Wait for the event to be set
                         self._wait_event.wait()
                         self._wait_event.clear()
+                        if self._error:
+                            return
                         # Update info for the next iteration (if any)
                         if self._current_image < len(self._cameras) - 1:
                             next_camera_id = self._current_image + 1
@@ -1095,6 +1113,7 @@ class ComfyUIGenerate(bpy.types.Operator):
                 
         except Exception as e:
             self._error = str(e)
+            traceback.print_exc()
             return
 
         def image_project_callback():
@@ -1317,8 +1336,9 @@ class ComfyUIGenerate(bpy.types.Operator):
 
         # Use the compositor to save the depth pass
         bpy.context.scene.use_nodes = True
-        nodes = bpy.context.scene.node_tree.nodes
-        links = bpy.context.scene.node_tree.links
+        node_tree = get_compositor_node_tree(bpy.context.scene)
+        nodes = node_tree.nodes
+        links = node_tree.links
         
         # Ensure animation format is not selected
         bpy.context.scene.render.image_settings.file_format = 'PNG'
@@ -1339,14 +1359,14 @@ class ComfyUIGenerate(bpy.types.Operator):
         # Add an invert node to flip the depth map values
         invert_node = nodes.new(type="CompositorNodeInvert")
         invert_node.location = (400, 0)
-        links.new(normalize_node.outputs[0], invert_node.inputs[1])
+        # Blender 5.x uses named "Color" input, 4.x uses index 1
+        color_input = invert_node.inputs["Color"] if "Color" in invert_node.inputs else invert_node.inputs[1]
+        links.new(normalize_node.outputs[0], color_input)
 
         # Add an output file node
         output_node = nodes.new(type="CompositorNodeOutputFile")
         output_node.location = (600, 0)
-        output_node.base_path = output_dir
-        output_node.file_slots[0].path = output_file
-        output_node.format.file_format = "PNG"  # Save as PNG
+        configure_output_node_paths(output_node, output_dir, output_file)
         links.new(invert_node.outputs[0], output_node.inputs[0])
 
         # Render the scene
@@ -1387,14 +1407,15 @@ class ComfyUIGenerate(bpy.types.Operator):
         original_view_transform = bpy.context.scene.view_settings.view_transform
         original_film_transparent = bpy.context.scene.render.film_transparent
 
-        bpy.context.scene.render.engine = 'BLENDER_EEVEE_NEXT'
+        bpy.context.scene.render.engine = get_eevee_engine_id()
         bpy.context.scene.view_settings.view_transform = 'Raw'
         bpy.context.scene.render.film_transparent = True
         bpy.context.scene.use_nodes = True
 
         # Clear existing nodes.
-        nodes = bpy.context.scene.node_tree.nodes
-        links = bpy.context.scene.node_tree.links
+        node_tree = get_compositor_node_tree(bpy.context.scene)
+        nodes = node_tree.nodes
+        links = node_tree.links
         for node in nodes:
             nodes.remove(node)
 
@@ -1417,9 +1438,7 @@ class ComfyUIGenerate(bpy.types.Operator):
         # Create the Output File node.
         output_node = nodes.new(type="CompositorNodeOutputFile")
         output_node.location = (400, 0)
-        output_node.base_path = output_dir
-        output_node.file_slots[0].path = output_file
-        output_node.format.file_format = "PNG"
+        configure_output_node_paths(output_node, output_dir, output_file)
         links.new(alpha_over_node.outputs[0], output_node.inputs[0])
         links.new(render_layers_node.outputs["Alpha"], alpha_over_node.inputs[0])
 
