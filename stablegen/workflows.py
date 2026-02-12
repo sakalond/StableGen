@@ -586,7 +586,7 @@ class WorkflowManager:
         
         base_prompt_text = context.scene.comfyui_prompt
         # Camera Prompt Injection
-        if context.scene.use_camera_prompts and context.scene.generation_method in ['separate', 'sequential', 'refine'] and self.operator._cameras and self.operator._current_image < len(self.operator._cameras):
+        if context.scene.use_camera_prompts and context.scene.generation_method in ['separate', 'sequential', 'refine', 'local_edit'] and self.operator._cameras and self.operator._current_image < len(self.operator._cameras):
             current_camera_name = self.operator._cameras[self.operator._current_image].name
             # Find the prompt in the collection
             prompt_item = next((item for item in context.scene.camera_prompts if item.name == current_camera_name), None)
@@ -1066,7 +1066,7 @@ class WorkflowManager:
         
         base_prompt_text = context.scene.comfyui_prompt
         # Camera Prompt Injection
-        if context.scene.use_camera_prompts and context.scene.generation_method in ['separate', 'sequential', 'refine', 'grid'] and self.operator._cameras and self.operator._current_image < len(self.operator._cameras):
+        if context.scene.use_camera_prompts and context.scene.generation_method in ['separate', 'sequential', 'refine', 'local_edit'] and self.operator._cameras and self.operator._current_image < len(self.operator._cameras):
             current_camera_name = self.operator._cameras[self.operator._current_image].name
             # Find the prompt in the collection
             prompt_item = next((item for item in context.scene.camera_prompts if item.name == current_camera_name), None)
@@ -1076,7 +1076,7 @@ class WorkflowManager:
                 base_prompt_text = f"{view_desc}, {base_prompt_text}"
         
         # Set positive prompt based on generation method
-        if context.scene.generation_method in ['refine', 'uv_inpaint', 'sequential']:
+        if context.scene.generation_method in ['refine', 'local_edit', 'uv_inpaint', 'sequential']:
             prompt[NODES['pos_prompt']]["inputs"]["text"] = base_prompt_text
         else:
             prompt[NODES['pos_prompt']]["inputs"]["text"] = context.scene.refine_prompt if context.scene.refine_prompt != "" else context.scene.comfyui_prompt
@@ -1090,7 +1090,7 @@ class WorkflowManager:
         prompt[NODES['sampler']]["inputs"]["cfg"] = context.scene.refine_cfg if context.scene.generation_method == 'grid' else context.scene.cfg
         prompt[NODES['sampler']]["inputs"]["sampler_name"] = context.scene.refine_sampler if context.scene.generation_method == 'grid' else context.scene.sampler
         prompt[NODES['sampler']]["inputs"]["scheduler"] = context.scene.refine_scheduler if context.scene.generation_method == 'grid' else context.scene.scheduler
-        if context.scene.generation_method == 'grid' or context.scene.generation_method == 'refine':
+        if context.scene.generation_method in ('grid', 'refine', 'local_edit'):
             prompt[NODES['sampler']]["inputs"]["denoise"] = context.scene.denoise
         else:
             prompt[NODES['sampler']]["inputs"]["denoise"] = 1.0
@@ -1130,7 +1130,7 @@ class WorkflowManager:
             prompt[NODES['ipadapter_loader']]["inputs"]["model"] = current_model_out
             current_model_out = [NODES['ipadapter'], 0]
 
-        if context.scene.differential_diffusion and NODES['differential_diffusion'] in prompt and not context.scene.generation_method == 'refine':
+        if context.scene.differential_diffusion and NODES['differential_diffusion'] in prompt and context.scene.generation_method not in ('refine', 'local_edit'):
             # Set model input for differential diffusion
             prompt[NODES['differential_diffusion']]["inputs"]["model"] = current_model_out
             current_model_out = [NODES['differential_diffusion'], 0]
@@ -1143,7 +1143,7 @@ class WorkflowManager:
     def _configure_refinement_mode(self, prompt, context, render_info, mask_info, NODES):
         """Configures the prompt based on the specific refinement mode."""
         # Configure based on generation method
-        if context.scene.generation_method == 'refine':
+        if context.scene.generation_method in ('refine', 'local_edit'):
             prompt[NODES['vae_encode']]["inputs"]["pixels"] = [NODES['render_image'], 0]  # Use render directly
         
         elif context.scene.generation_method == 'uv_inpaint' or context.scene.generation_method == 'sequential':
@@ -1209,7 +1209,7 @@ class WorkflowManager:
     def _configure_ipadapter_refine(self, prompt, context, ipadapter_ref_info, NODES):
         """Configures IPAdapter settings for refinement mode."""
         # Connect IPAdapter output to the appropriate node
-        if context.scene.differential_diffusion and context.scene.generation_method != 'refine':
+        if context.scene.differential_diffusion and context.scene.generation_method not in ('refine', 'local_edit'):
             prompt[NODES['differential_diffusion']]["inputs"]["model"] = [NODES['ipadapter'], 0]
         else:
             prompt[NODES['sampler']]["inputs"]["model"] = [NODES['ipadapter'], 0]
@@ -1252,9 +1252,9 @@ class WorkflowManager:
         """Builds the ControlNet chain for refinement process."""
         # Determine inputs for ControlNet chain
         pos_input = NODES['pos_prompt'] if (not context.scene.differential_diffusion or 
-                                context.scene.generation_method in ["grid", "refine"]) else NODES['inpaint_conditioning']
+                                context.scene.generation_method in ["grid", "refine", "local_edit"]) else NODES['inpaint_conditioning']
         neg_input = NODES['neg_prompt'] if (not context.scene.differential_diffusion or 
-                                context.scene.generation_method in ["grid", "refine"]) else NODES['inpaint_conditioning']
+                                context.scene.generation_method in ["grid", "refine", "local_edit"]) else NODES['inpaint_conditioning']
         vae_input = NODES['checkpoint']
         
         # Build the ControlNet chain
@@ -1293,7 +1293,7 @@ class WorkflowManager:
         
         base_prompt_text = context.scene.comfyui_prompt
         # Camera Prompt Injection
-        if context.scene.use_camera_prompts and context.scene.generation_method in ['separate', 'sequential', 'refine'] and self.operator._cameras and self.operator._current_image < len(self.operator._cameras):
+        if context.scene.use_camera_prompts and context.scene.generation_method in ['separate', 'sequential', 'refine', 'local_edit'] and self.operator._cameras and self.operator._current_image < len(self.operator._cameras):
             current_camera_name = self.operator._cameras[self.operator._current_image].name
             # Find the prompt in the collection
             prompt_item = next((item for item in context.scene.camera_prompts if item.name == current_camera_name), None)
@@ -1494,7 +1494,7 @@ class WorkflowManager:
         
         base_prompt_text = context.scene.comfyui_prompt
         # Camera Prompt Injection
-        if context.scene.use_camera_prompts and context.scene.generation_method in ['separate', 'sequential', 'refine', 'grid'] and self.operator._cameras and self.operator._current_image < len(self.operator._cameras):
+        if context.scene.use_camera_prompts and context.scene.generation_method in ['separate', 'sequential', 'refine', 'local_edit', 'grid'] and self.operator._cameras and self.operator._current_image < len(self.operator._cameras):
             current_camera_name = self.operator._cameras[self.operator._current_image].name
             # Find the prompt in the collection
             prompt_item = next((item for item in context.scene.camera_prompts if item.name == current_camera_name), None)
@@ -1509,7 +1509,7 @@ class WorkflowManager:
         # Configure sampler parameters
         prompt[NODES['noise']]["inputs"]["noise_seed"] = context.scene.seed
         prompt[NODES['scheduler']]["inputs"]["steps"] = context.scene.refine_steps if context.scene.generation_method == 'grid' else context.scene.steps
-        prompt[NODES['scheduler']]["inputs"]["denoise"] = context.scene.denoise if context.scene.generation_method in ['grid', 'refine'] else 1.0
+        prompt[NODES['scheduler']]["inputs"]["denoise"] = context.scene.denoise if context.scene.generation_method in ['grid', 'refine', 'local_edit'] else 1.0
         prompt[NODES['flux_guidance']]["inputs"]["guidance"] = context.scene.refine_cfg if context.scene.generation_method == 'grid' else context.scene.cfg
         prompt[NODES['ksampler']]["inputs"]["sampler_name"] = context.scene.refine_sampler if context.scene.generation_method == 'grid' else context.scene.sampler
         prompt[NODES['scheduler']]["inputs"]["scheduler"] = context.scene.refine_scheduler if context.scene.generation_method == 'grid' else context.scene.scheduler
@@ -1644,7 +1644,7 @@ class WorkflowManager:
     def _configure_refinement_mode_flux(self, prompt, context, render_info, mask_info, ipadapter_ref_info, NODES):
         """Configures the prompt based on the specific refinement mode for Flux."""
         # Configure based on generation method
-        if context.scene.generation_method == 'refine':
+        if context.scene.generation_method in ('refine', 'local_edit'):
             # Configure for refine mode - load render directly
             if render_info:
                 prompt[NODES['render_image']]["inputs"]["image"] = render_info['name']

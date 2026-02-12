@@ -556,7 +556,8 @@ def project_image(context, to_project, mat_id, stop_index=1000000):
         A tuple (final_shader, final_weight_node).
         """
         # Compute offsets based on recursion level
-        if context.scene.refine_preserve:
+        is_local_edit = (context.scene.generation_method == 'local_edit' or (context.scene.model_architecture.startswith('qwen') and context.scene.qwen_generation_method == 'local_edit'))
+        if is_local_edit:
             last_node_x = last_node.location[0] if last_node else 0
             x_offset = 1000 + level * 800 + last_node_x + 200 if context.scene.early_priority else 1000 + level * 600 + last_node_x + 200
         else:
@@ -575,7 +576,7 @@ def project_image(context, to_project, mat_id, stop_index=1000000):
                 links.new(last_node.outputs[0], final_mix.inputs["Color2"])
             # Create a compare node to drive the mix factor
             
-            if (context.scene.generation_method == 'refine' or (context.scene.model_architecture.startswith('qwen') and context.scene.qwen_generation_method == 'refine')) and context.scene.refine_preserve:
+            if is_local_edit:
                 w_node = weight_nodes[0]
                 if isinstance(w_node, tuple):
                     angle_node, feather_node = w_node
@@ -621,7 +622,7 @@ def project_image(context, to_project, mat_id, stop_index=1000000):
                     # Fallback if not tuple (e.g. stop_index logic used LessThan node)
                     # If it's a sum of processed weights (from multi-camera recursion), we need to invert it
                     # to get the Mix Factor (1 - TotalVis)
-                    if (context.scene.generation_method == 'refine' or (context.scene.model_architecture.startswith('qwen') and context.scene.qwen_generation_method == 'refine')) and context.scene.refine_preserve:
+                    if is_local_edit:
                         invert = nodes_collection.new("ShaderNodeMath")
                         invert.operation = 'SUBTRACT'
                         invert.location = (x_offset - 150, y_offset)
@@ -649,7 +650,7 @@ def project_image(context, to_project, mat_id, stop_index=1000000):
                  
             # Add a principle shader for the mixed color
             should_add_principled = True
-            if (context.scene.generation_method == 'refine' or (context.scene.model_architecture.startswith('qwen') and context.scene.qwen_generation_method == 'refine')) and context.scene.refine_preserve:
+            if is_local_edit:
                 # Final principled is at last_node's output if it is BSDF
                 final_principled = last_node.outputs[0].links[0].to_node
                 if final_principled.type == 'BSDF_PRINCIPLED':
@@ -764,7 +765,7 @@ def project_image(context, to_project, mat_id, stop_index=1000000):
     for i, camera in enumerate(cameras):
         for x, obj in enumerate(to_project):
             # We can skip the UV Projection step in sequential mode for i > 0
-            if context.scene.generation_method != 'sequential' or stop_index == 0 or context.scene.bake_texture:
+            if context.scene.generation_method != 'sequential' or stop_index == 0:
                 # Deselect all objects
                 bpy.ops.object.select_all(action='DESELECT')
                 # Select object as active (needed for applying the modifier)
@@ -790,11 +791,6 @@ def project_image(context, to_project, mat_id, stop_index=1000000):
                 buffer_uv = obj.data.uv_layers.get(_SG_BUFFER_UV_NAME)
                 if not buffer_uv:
                     buffer_uv = obj.data.uv_layers.new(name=_SG_BUFFER_UV_NAME)
-
-                # If the object has no UV map other than the buffer and we are baking, create one
-                non_buffer_uvs = [uv for uv in obj.data.uv_layers if uv.name != _SG_BUFFER_UV_NAME]
-                if not non_buffer_uvs and context.scene.bake_texture:
-                    obj.data.uv_layers.new(name="BakeUV")
 
                 # Add the UV Project Modifier
                 uv_project_mod = obj.modifiers.new(name="UVProject", type='UV_PROJECT')
@@ -831,21 +827,6 @@ def project_image(context, to_project, mat_id, stop_index=1000000):
                     original_uv_map = obj.data.uv_layers[1]
                 obj.data.uv_layers.active = original_uv_map
 
-                # If we are running in sequential mode, we already have baked textures for i < stop_index
-            if context.scene.bake_texture:
-                if (stop_index > 0 and context.scene.generation_method == 'sequential'):
-                    # Deselect all objects
-                    bpy.ops.object.select_all(action='DESELECT')
-                    # Select object as active (needed for applying the modifier)
-                    context.view_layer.objects.active = obj
-                    obj.select_set(True)
-                if i <= stop_index and (not context.scene.generation_method == 'sequential' or i == stop_index):
-                    simple_project_bake(context, i, obj, mat_id)
-                # Remove the projection attribute (data is now baked into texture)
-                attr = obj.data.attributes.get(f"ProjectionUV_{i}_{mat_id}")
-                if attr:
-                    obj.data.attributes.remove(attr)
-
     # Clean up buffer UV map from all objects
     for obj in to_project:
         buffer_uv = obj.data.uv_layers.get(_SG_BUFFER_UV_NAME)
@@ -873,12 +854,13 @@ def project_image(context, to_project, mat_id, stop_index=1000000):
 
         # Create the material
         to_switch = False
-        if (context.scene.generation_method == "refine" or (context.scene.model_architecture.startswith('qwen') and context.scene.qwen_generation_method == 'refine')) and context.scene.refine_preserve and not context.scene.overwrite_material:
+        is_local_edit = (context.scene.generation_method == 'local_edit' or (context.scene.model_architecture.startswith('qwen') and context.scene.qwen_generation_method == 'local_edit'))
+        if is_local_edit and not context.scene.overwrite_material:
             # Copy active material
             mat = obj.active_material.copy()
             obj.data.materials.append(mat)
             to_switch = True
-        elif obj.active_material and (context.scene.overwrite_material or ((context.scene.generation_method == "refine" or (context.scene.model_architecture.startswith('qwen') and context.scene.qwen_generation_method == 'refine')) and context.scene.refine_preserve) \
+        elif obj.active_material and (context.scene.overwrite_material or is_local_edit \
                                       or (context.scene.generation_method == 'sequential' and stop_index > 0) or context.scene.generation_mode == 'regenerate_selected'):
             # Use active material
             mat = obj.active_material
@@ -944,14 +926,10 @@ def project_image(context, to_project, mat_id, stop_index=1000000):
             # We also need to set the generated image to the texture node with label {stop_index}-{mat_id}
             for node in nodes:
                 if node.type == 'TEX_IMAGE' and node.label == f"{stop_index}-{mat_id}":
-                    if not context.scene.bake_texture:
-                        image_path = get_file_path(context, "generated", camera_id=stop_index, material_id=mat_id)
-                        if (context.scene.generation_method == 'sequential' or context.scene.generation_method == 'separate') and context.scene.sequential_ipadapter and context.scene.sequential_ipadapter_regenerate \
-                        and not context.scene.use_ipadapter and stop_index == 0 and context.scene.sequential_ipadapter_mode == 'first':
-                            image_path = get_file_path(context, "generated", camera_id=stop_index, material_id=mat_id).replace(".png", "_ipadapter.png")
-                    else:
-                        # Use baked texture
-                        image_path = get_file_path(context, "generated_baked", camera_id=stop_index, material_id=mat_id, object_name=obj.name)
+                    image_path = get_file_path(context, "generated", camera_id=stop_index, material_id=mat_id)
+                    if (context.scene.generation_method == 'sequential' or context.scene.generation_method == 'separate') and context.scene.sequential_ipadapter and context.scene.sequential_ipadapter_regenerate \
+                    and not context.scene.use_ipadapter and stop_index == 0 and context.scene.sequential_ipadapter_mode == 'first':
+                        image_path = get_file_path(context, "generated", camera_id=stop_index, material_id=mat_id).replace(".png", "_ipadapter.png")
 
                     image = get_or_load_image(image_path, force_reload=context.scene.overwrite_material)
                     if image:
@@ -960,7 +938,7 @@ def project_image(context, to_project, mat_id, stop_index=1000000):
             # Now we can continue to the next object
             continue
                         
-        elif not context.scene.refine_preserve or not (context.scene.generation_method == 'refine' or (context.scene.model_architecture.startswith('qwen') and context.scene.qwen_generation_method == 'refine')):
+        elif not is_local_edit:
             # Clear existing nodes
             for node in nodes:
                 nodes.remove(node)
@@ -977,7 +955,7 @@ def project_image(context, to_project, mat_id, stop_index=1000000):
                 else:
                     previous_node = output.inputs[0].links[0].from_node
             
-        if not ((context.scene.generation_method == 'refine' or (context.scene.model_architecture.startswith('qwen') and context.scene.qwen_generation_method == 'refine')) and context.scene.refine_preserve):
+        if not is_local_edit:
             output = nodes.new("ShaderNodeOutputMaterial")
             output.location = (3000, 0)
         
@@ -1003,14 +981,10 @@ def project_image(context, to_project, mat_id, stop_index=1000000):
             # Add image texture node
             tex_image = nodes.new("ShaderNodeTexImage")
             if i <= stop_index:
-                if not context.scene.bake_texture:
-                    image_path = get_file_path(context, "generated", camera_id=i, material_id=mat_id)
-                    if (context.scene.generation_method == 'sequential' or context.scene.generation_method == 'separate') and context.scene.sequential_ipadapter and context.scene.sequential_ipadapter_regenerate \
-                    and not context.scene.use_ipadapter and i == 0 and context.scene.sequential_ipadapter_mode == 'first':
-                        image_path = get_file_path(context, "generated", camera_id=i, material_id=mat_id).replace(".png", "_ipadapter.png")
-                else:
-                    # Use baked texture
-                    image_path = get_file_path(context, "generated_baked", camera_id=i, material_id=mat_id, object_name=obj.name)
+                image_path = get_file_path(context, "generated", camera_id=i, material_id=mat_id)
+                if (context.scene.generation_method == 'sequential' or context.scene.generation_method == 'separate') and context.scene.sequential_ipadapter and context.scene.sequential_ipadapter_regenerate \
+                and not context.scene.use_ipadapter and i == 0 and context.scene.sequential_ipadapter_mode == 'first':
+                    image_path = get_file_path(context, "generated", camera_id=i, material_id=mat_id).replace(".png", "_ipadapter.png")
 
                 image = get_or_load_image(image_path, force_reload=context.scene.overwrite_material)
                 if image:
@@ -1022,15 +996,10 @@ def project_image(context, to_project, mat_id, stop_index=1000000):
             tex_image_nodes.append(tex_image)
                 
             # Add UV map / attribute node
-            if not context.scene.bake_texture:
-                # Use ShaderNodeAttribute to read from the corner-domain attribute
-                uv_map_node = nodes.new("ShaderNodeAttribute")
-                uv_map_node.attribute_name = f"ProjectionUV_{i}_{mat_id}"
-                uv_map_node.attribute_type = 'GEOMETRY'
-            else:
-                # Baked textures use the original UV map
-                uv_map_node = nodes.new("ShaderNodeUVMap")
-                uv_map_node.uv_map = original_uv_map.name
+            # Use ShaderNodeAttribute to read from the corner-domain attribute
+            uv_map_node = nodes.new("ShaderNodeAttribute")
+            uv_map_node.attribute_name = f"ProjectionUV_{i}_{mat_id}"
+            uv_map_node.attribute_type = 'GEOMETRY'
             uv_map_node.location = (-200, -200 * (i+1))
             uv_map_nodes.append(uv_map_node)
             
@@ -1048,8 +1017,8 @@ def project_image(context, to_project, mat_id, stop_index=1000000):
                 scripts_to_connect = []  # No OSL scripts to connect
                 final_weight_node = None
 
-                is_refine = (context.scene.generation_method == 'refine' or (context.scene.model_architecture.startswith('qwen') and context.scene.qwen_generation_method == 'refine')) and context.scene.refine_preserve
-                if is_refine:
+                is_local_edit_mode = (context.scene.generation_method == 'local_edit' or (context.scene.model_architecture.startswith('qwen') and context.scene.qwen_generation_method == 'local_edit'))
+                if is_local_edit_mode:
                     feather_weight = create_native_feather(
                         nodes, links, normalize_node, camera_fov_node, camera_aspect_node,
                         camera_dir_node, camera_up_node, context, i, mat_id
@@ -1113,7 +1082,7 @@ def project_image(context, to_project, mat_id, stop_index=1000000):
                 scripts_to_connect = [script_angle]
                 final_weight_node = None
 
-                if (context.scene.generation_method == 'refine' or (context.scene.model_architecture.startswith('qwen') and context.scene.qwen_generation_method == 'refine')) and context.scene.refine_preserve:
+                if (context.scene.generation_method == 'local_edit' or (context.scene.model_architecture.startswith('qwen') and context.scene.qwen_generation_method == 'local_edit')):
                     # Add Feather script
                     script_feather = nodes.new("ShaderNodeScript")
                     script_feather.location = (-400, (-800) * i - 200) # Offset slightly
@@ -1206,7 +1175,7 @@ def project_image(context, to_project, mat_id, stop_index=1000000):
                 length_nodes.append(length)
 
         # Build mix shader tree
-        if not context.scene.bake_texture and mat.name in processed_materials and (context.scene.generation_method == 'refine' or (context.scene.model_architecture.startswith('qwen') and context.scene.qwen_generation_method == 'refine')) and context.scene.refine_preserve:
+        if mat.name in processed_materials and is_local_edit:
             # If we already processed this material, we don't need to rebuild the mix tree
             # But we still need to connect the nodes for the current object (done in the loop below)
             # We need to find the existing mix node to position the output node
@@ -1268,79 +1237,6 @@ def project_image(context, to_project, mat_id, stop_index=1000000):
         subtract_node.location = (-1000, 0)
     return True
     
-def simple_project_bake(context, camera_id, obj, mat_id):
-    # Create a temporary material for the projection
-    mat = bpy.data.materials.new(name="ProjectionMaterialTemp")
-    obj.data.materials.append(mat)
-
-    # Switch the active material to the new material (Switch to edit mode, select all, assign the material)
-    obj.active_material_index = len(obj.material_slots) - 1
-    bpy.context.view_layer.objects.active = obj
-    bpy.ops.object.mode_set(mode='EDIT')
-    bpy.ops.mesh.select_all(action='DESELECT')
-    bpy.ops.mesh.select_all(action='SELECT')
-    bpy.ops.object.material_slot_assign()
-    bpy.ops.object.mode_set(mode='OBJECT')
-
-    # Unwrap (only for the first camera)
-    if camera_id == 0:
-        unwrap(obj, context.scene.bake_unwrap_method, context.scene.bake_unwrap_overlap_only)
-
-    # Enable use of nodes
-    mat.use_nodes = True
-    nodes = mat.node_tree.nodes
-    links = mat.node_tree.links
-
-    # Clear existing nodes
-    for node in nodes:
-        nodes.remove(node)
-
-    # Add image texture node
-    tex_image = nodes.new("ShaderNodeTexImage")
-    
-    file_path = get_file_path(context, "generated", camera_id=camera_id, material_id=mat_id)
-    if (context.scene.generation_method == 'sequential' or context.scene.generation_method == 'separate') and context.scene.sequential_ipadapter and context.scene.sequential_ipadapter_regenerate \
-        and not context.scene.use_ipadapter and camera_id == 0 and context.scene.sequential_ipadapter_mode == 'first':
-        file_path = get_file_path(context, "generated", camera_id=camera_id, material_id=mat_id).replace(".png", "_ipadapter.png")
-    
-    image = get_or_load_image(file_path, force_reload=context.scene.overwrite_material)
-    if image:
-        tex_image.image = image
-
-    # Add UV attribute node (reads from corner-domain attribute)
-    uv_map_node = nodes.new("ShaderNodeAttribute")
-    uv_map_node.attribute_name = f"ProjectionUV_{camera_id}_{mat_id}"
-    uv_map_node.attribute_type = 'GEOMETRY'
-    
-    # Add BSDF node
-    bsdf = nodes.new("ShaderNodeBsdfPrincipled")
-    bsdf.inputs["Roughness"].default_value = 1.0
-
-    # Add output node
-    output = nodes.new("ShaderNodeOutputMaterial")
-    links.new(uv_map_node.outputs["Vector"], tex_image.inputs["Vector"])
-    # Connect the nodes
-    if context.scene.apply_bsdf:
-        links.new(tex_image.outputs["Color"], bsdf.inputs["Base Color"])
-        links.new(bsdf.outputs["BSDF"], output.inputs["Surface"])
-    else:
-        links.new(tex_image.outputs["Color"], output.inputs["Surface"])
- 
-    # Bake texture using BakeTextures.bake_texture
-    texture_size = context.scene.bake_texture_size
-    original_engine = context.scene.render.engine
-    prepare_baking(context)
-    
-    # If the object has no UV map, create one
-    if not obj.data.uv_layers:
-        obj.data.uv_layers.new(name="UVMap")
-    
-    bake_texture(context, obj, texture_size, suffix=f"{camera_id}-{mat_id}", output_dir=get_dir_path(context, "generated_baked"))
-    context.scene.render.engine = original_engine
-
-    # Remove the temporary material
-    bpy.ops.object.material_slot_remove()
-
 
 def get_or_create_osl_text(filename):
     """

@@ -1369,7 +1369,8 @@ def register():
             ('separate', 'Generate Separately', 'Generates images one by one for each viewpoint. Each image is generated independently using only its own control signals (e.g., depth map) without context from other views. All images are applied at the end.'),
             ('sequential', 'Generate Sequentially', 'Generates images viewpoint by viewpoint. After the first view, each subsequent view is generated using inpainting, guided by a visibility mask and an RGB render of the texture projected from previous viewpoints to maintain consistency.'),
             ('grid', 'Generate Using Grid', 'Combines control signals from all viewpoints into a single grid, generates a single image, then splits it back into individual viewpoint textures. Faster but lower resolution per view. Includes an optional second pass to refine each split image individually at full resolution for improved quality.'),
-            ('refine', 'Refine/Restyle Texture (Img2Img)', 'Uses the current rendered texture appearance as input for an img2img generation pass.\n\nBehavior depends on "Preserve Original Textures" (Advanced Parameters -> Generation Mode Specifics):\n\nON: Layers new details over the existing texture (preserves uncovered areas).\n - Works only with StableGen generated textures.\n\nOFF: Replaces the previous material with the new result (good for restyling).\n - Works on any existing material setup.'),
+            ('refine', 'Refine/Restyle Texture (Img2Img)', 'Uses the current rendered texture appearance as input for an img2img generation pass. Replaces the previous material with the new result. Good for restyling or globally changing the look of an existing texture. Works on any existing material setup.'),
+            ('local_edit', 'Local Edit', 'Make localized changes to an existing texture. Point cameras at areas you want to modify — the new generation blends over the original using angle and vignette-based feathering, preserving untouched areas. Works only with StableGen generated textures.'),
             ('uv_inpaint', 'UV Inpaint Missing Areas', 'Identifies untextured areas on a standard UV map using a visibility calculation. Performs baking if not baked already. Performs diffusion inpainting directly on the UV texture map to fill only these missing regions, using the surrounding texture as context.'),
         ],
         default='sequential',
@@ -1380,7 +1381,8 @@ def register():
         description="Choose the mode for generating images with Qwen",
         items=[
             ('generate', 'Generate', 'Standard generation mode'),
-            ('refine', 'Refine', 'Refine existing image'),
+            ('refine', 'Refine', 'Refine/restyle the entire texture using Qwen Image Edit. Replaces the existing material with the new result. Describe the desired look in the prompt — you can completely change the style, color scheme, or overall appearance.'),
+            ('local_edit', 'Local Edit', 'Make targeted changes to specific areas of the texture. Point cameras at what you want to change and describe the edit — you can change colors, add details, sharpen, alter text, or restyle selected parts. Untouched areas are preserved.'),
         ],
         default='generate',
         update=update_parameters
@@ -1498,12 +1500,6 @@ def register():
         default=True,
         update=update_parameters
     )
-    bpy.types.Scene.refine_preserve = bpy.props.BoolProperty(
-        name="Preserve Original Texture",
-        description="Preserve the original textures when refining in places where the new texture isn't available",
-        default=False,
-        update=update_parameters
-    )
     bpy.types.Scene.discard_factor = bpy.props.FloatProperty(
         name="Discard Factor",
         description="If the texture is facing the camera at an angle greater than this value, it will be discarded. This is useful for preventing artifacts from the very edge of the generated texture appearing when keeping high discard factor (use ~65 for best results when generating textures around an object)",
@@ -1563,39 +1559,6 @@ def register():
         default=3.0,
         min=0.1,
         max=1000.0,
-        update=update_parameters
-    )
-    bpy.types.Scene.bake_texture = bpy.props.BoolProperty(
-        name="Bake Texture",
-        description="Bake the texture to the model. This is forced if there are more than 8 cameras. Use this to prevent UV map slot limit errors.",
-        default=False,
-        update=update_parameters
-    )
-    bpy.types.Scene.bake_texture_size = bpy.props.IntProperty(
-        name="Bake Texture Size",
-        description="Size of the baked texture",
-        default=2048,
-        min=256,
-        max=8192,
-        update=update_parameters
-    )
-    bpy.types.Scene.bake_unwrap_method = bpy.props.EnumProperty(
-        name="Bake Unwrap Method",
-        description="Method for unwrapping the model for baking",
-        items=[
-            ('none', 'None', ''),
-            ('smart', 'Smart UV Project', ''),
-            ('basic', 'Unwrap', ''),
-            ('lightmap', 'Lightmap Pack', ''),
-            ('pack', 'Pack Islands', '')
-        ],
-        default='none',
-        update=update_parameters
-    )
-    bpy.types.Scene.bake_unwrap_overlap_only = bpy.props.BoolProperty(
-        name="Ony Unwrap Overlapping UVs",
-        description="Only unwrap UVs that overlap",
-        default=True,
         update=update_parameters
     )
     bpy.types.Scene.allow_modify_existing_textures = bpy.props.BoolProperty(
@@ -1712,7 +1675,7 @@ def register():
     bpy.types.Scene.visibility_vignette_softness = bpy.props.FloatProperty(
         name="Vignette Softness",
         description="Exponent shaping feather falloff (<1 = softer, >1 = sharper)",
-        default=1.0,
+        default=0.5,
         min=0.1,
         max=5.0,
         update=update_parameters,
@@ -2140,15 +2103,10 @@ def unregister():
     del bpy.types.Scene.generation_status
     del bpy.types.Scene.generation_progress
     del bpy.types.Scene.overwrite_material
-    del bpy.types.Scene.refine_preserve
     del bpy.types.Scene.discard_factor
     del bpy.types.Scene.discard_factor_generation_only
     del bpy.types.Scene.discard_factor_after_generation
     del bpy.types.Scene.weight_exponent
-    del bpy.types.Scene.bake_texture
-    del bpy.types.Scene.bake_texture_size
-    del bpy.types.Scene.bake_unwrap_method
-    del bpy.types.Scene.bake_unwrap_overlap_only
     del bpy.types.Scene.allow_modify_existing_textures
     del bpy.types.Scene.ask_object_prompts
     del bpy.types.Scene.fallback_color

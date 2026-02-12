@@ -203,7 +203,7 @@ class MirrorReproject(bpy.types.Operator):
 
     def _do_refine_mirror(self, context, to_texture):
         """
-        Special path for generation_method == 'refine' and refine_preserve == True.
+        Special path for generation_method == 'local_edit' (or qwen_generation_method == 'local_edit').
 
         For each selected axis (X / Y / Z), we:
         - Duplicate & mirror the active camera around that axis.
@@ -517,8 +517,8 @@ class MirrorReproject(bpy.types.Operator):
             self.report({'ERROR'}, "No mesh objects found for texturing.")
             return {'CANCELLED'}
 
-        # Branch: refine+preserve vs everything else
-        if scene.generation_method == 'refine' and getattr(scene, "refine_preserve", False):
+        # Branch: local_edit vs everything else
+        if scene.generation_method == 'local_edit' or (scene.model_architecture.startswith('qwen') and scene.qwen_generation_method == 'local_edit'):
             return self._do_refine_mirror(context, to_texture)
         else:
             return self._do_standard_mirror(context, to_texture)

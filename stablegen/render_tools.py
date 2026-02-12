@@ -249,7 +249,7 @@ def flatten_projection_material_for_refine(context, obj, baked_image_path):
     Replace the StableGen ProjectionMaterial on this object with a minimal
     baked-base material that still matches the expectations of:
       - export_emit_image / _setup_emit_material
-      - project_image refine_preserve logic
+      - project_image local_edit logic
 
     Final graph:
         UV Map -> Baked Image -> MixRGB -> Principled BSDF -> Output
@@ -554,7 +554,7 @@ def export_emit_image(context, to_export, camera_id=None, bg_color=(0.5, 0.5, 0.
             else:
                 final_path = os.path.join(output_dir, f"{output_file}0001.png")
 
-            if context.scene.visibility_vignette and context.scene.generation_method == 'refine' and context.scene.refine_preserve:
+            if context.scene.visibility_vignette and (context.scene.generation_method == 'local_edit' or (context.scene.model_architecture.startswith('qwen') and context.scene.qwen_generation_method == 'local_edit')):
                 # Smooth edge feathering, no blocky mask
                 apply_vignette_to_mask(
                     final_path,
@@ -1078,7 +1078,7 @@ def export_visibility(context, to_export, obj=None, camera_visibility=None):
         # Save the image
         cv2.imwrite(image_path, image)
 
-        if context.scene.visibility_vignette and context.scene.generation_method == 'refine' and context.scene.refine_preserve:
+        if context.scene.visibility_vignette and (context.scene.generation_method == 'local_edit' or (context.scene.model_architecture.startswith('qwen') and context.scene.qwen_generation_method == 'local_edit')):
             apply_vignette_to_mask(
                 image_path,
                 feather_width=context.scene.visibility_vignette_width,

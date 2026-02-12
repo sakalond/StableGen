@@ -543,7 +543,7 @@ class ComfyUIGenerate(bpy.types.Operator):
                 ComfyUIGenerate._is_running = False
                 return {'CANCELLED'}
 
-        if not context.scene.overwrite_material or self._material_id == -1 or ((context.scene.generation_method == 'refine' or (context.scene.model_architecture.startswith('qwen') and context.scene.qwen_generation_method == 'refine')) and context.scene.refine_preserve):
+        if not context.scene.overwrite_material or self._material_id == -1 or (context.scene.generation_method == 'local_edit' or (context.scene.model_architecture.startswith('qwen') and context.scene.qwen_generation_method == 'local_edit')):
             self._material_id += 1
 
         if context.scene.generation_method == 'sequential' and context.scene.sequential_custom_camera_order != "":
@@ -571,7 +571,7 @@ class ComfyUIGenerate(bpy.types.Operator):
 
         if context.scene.generation_mode == 'standard' or context.scene.generation_mode == 'regenerate_selected':
             # If there is depth controlnet unit
-            if any(unit["unit_type"] == "depth" for unit in controlnet_units) or (context.scene.use_flux_lora and context.scene.model_architecture == 'flux1') or (context.scene.model_architecture == 'qwen_image_edit' and context.scene.qwen_guidance_map_type == 'depth') or (context.scene.model_architecture.startswith('qwen') and context.scene.qwen_generation_method == 'refine' and context.scene.qwen_refine_use_depth):
+            if any(unit["unit_type"] == "depth" for unit in controlnet_units) or (context.scene.use_flux_lora and context.scene.model_architecture == 'flux1') or (context.scene.model_architecture == 'qwen_image_edit' and context.scene.qwen_guidance_map_type == 'depth') or (context.scene.model_architecture.startswith('qwen') and context.scene.qwen_generation_method in ('refine', 'local_edit') and context.scene.qwen_refine_use_depth):
                 if context.scene.generation_method != 'uv_inpaint':
                     # Export depth maps for each camera
                     for i, camera in enumerate(self._cameras):
@@ -639,8 +639,8 @@ class ComfyUIGenerate(bpy.types.Operator):
                     self._original_visibility[obj.name] = obj.hide_render
                     obj.hide_render = True
 
-        # Refine mode preparation
-        if context.scene.generation_method == 'refine' or (context.scene.model_architecture.startswith('qwen') and context.scene.qwen_generation_method == 'refine'):
+        # Refine/Local Edit mode preparation
+        if context.scene.generation_method in ('refine', 'local_edit') or (context.scene.model_architecture.startswith('qwen') and context.scene.qwen_generation_method in ('refine', 'local_edit')):
             for i, camera in enumerate(self._cameras):
                 bpy.context.scene.camera = camera
                 export_emit_image(context, self._to_texture, camera_id=i)
@@ -894,7 +894,7 @@ class ComfyUIGenerate(bpy.types.Operator):
                         render_info = self._get_uploaded_image_info(context, "baked", object_name=current_obj_name)
 
                     # Get info for refine/sequential render/mask inputs
-                    if context.scene.generation_method == 'refine':
+                    if context.scene.generation_method in ('refine', 'local_edit'):
                         render_info = self._get_uploaded_image_info(context, "inpaint", subtype="render", camera_id=camera_id)
                     elif context.scene.generation_method == 'sequential' and self._current_image > 0:
                         render_info = self._get_uploaded_image_info(context, "inpaint", subtype="render", camera_id=self._current_image)
@@ -912,7 +912,7 @@ class ComfyUIGenerate(bpy.types.Operator):
                     # End Prepare Image Info
 
                     # Generate image without ControlNet if needed
-                    if context.scene.generation_mode == 'standard' and camera_id == 0 and (context.scene.generation_method == 'sequential' or context.scene.generation_method == 'refine')\
+                    if context.scene.generation_mode == 'standard' and camera_id == 0 and (context.scene.generation_method == 'sequential' or context.scene.generation_method in ('refine', 'local_edit'))\
                             and context.scene.sequential_ipadapter and context.scene.sequential_ipadapter_regenerate and not context.scene.use_ipadapter and context.scene.sequential_ipadapter_mode == 'first':
                         self._stage = "Generating Reference Image"
                         # Don't use ControlNet for the first image if sequential_ipadapter_regenerate_wo_controlnet is enabled
@@ -925,12 +925,12 @@ class ComfyUIGenerate(bpy.types.Operator):
                     self._progress = 0
                     
                     # Generate the image
-                    if context.scene.generation_method == 'refine':
+                    if context.scene.generation_method in ('refine', 'local_edit'):
                         if context.scene.model_architecture == 'flux1':
                             image = self.workflow_manager.refine_flux(context, controlnet_info=controlnet_info, render_info=render_info, ipadapter_ref_info=ipadapter_ref_info)
                         else:
                             image = self.workflow_manager.refine(context, controlnet_info=controlnet_info, render_info=render_info, ipadapter_ref_info=ipadapter_ref_info)
-                    elif context.scene.model_architecture.startswith('qwen') and context.scene.qwen_generation_method == 'refine':
+                    elif context.scene.model_architecture.startswith('qwen') and context.scene.qwen_generation_method in ('refine', 'local_edit'):
                         image = self.workflow_manager.generate_qwen_refine(context, camera_id=camera_id)
                     elif context.scene.generation_method == 'uv_inpaint':
                         if context.scene.model_architecture == 'flux1':
@@ -1007,7 +1007,7 @@ class ComfyUIGenerate(bpy.types.Operator):
 
                         
                     # Use hack to re-generate the image using IPAdapter to match IPAdapter style
-                    if camera_id == 0 and (context.scene.generation_method == 'sequential' or context.scene.generation_method == 'separate' or context.scene.generation_method == 'refine')\
+                    if camera_id == 0 and (context.scene.generation_method == 'sequential' or context.scene.generation_method == 'separate' or context.scene.generation_method in ('refine', 'local_edit'))\
                             and context.scene.sequential_ipadapter and context.scene.sequential_ipadapter_regenerate and not context.scene.use_ipadapter and context.scene.sequential_ipadapter_mode == 'first':
                                 
                         # Restore original strengths
@@ -1019,12 +1019,12 @@ class ComfyUIGenerate(bpy.types.Operator):
                         context.scene.ipadapter_image = image_path
                         ipadapter_ref_info = self._get_uploaded_image_info(context, "custom", filename=image_path)
                         if context.scene.model_architecture == "sdxl":
-                            if context.scene.generation_method == "refine":
+                            if context.scene.generation_method in ("refine", "local_edit"):
                                 image = self.workflow_manager.refine(context, controlnet_info=controlnet_info, render_info=render_info, mask_info=mask_info, ipadapter_ref_info=ipadapter_ref_info)
                             else:
                                 image = self.workflow_manager.generate(context, controlnet_info=controlnet_info, ipadapter_ref_info=ipadapter_ref_info)
                         elif context.scene.model_architecture == "flux1":
-                            if context.scene.generation_method == "refine":
+                            if context.scene.generation_method in ("refine", "local_edit"):
                                 image = self.workflow_manager.refine_flux(context, controlnet_info=controlnet_info, render_info=render_info, mask_info=mask_info, ipadapter_ref_info=ipadapter_ref_info)
                             else:
                                 image = self.workflow_manager.generate_flux(context, controlnet_info=controlnet_info, ipadapter_ref_info=ipadapter_ref_info)
@@ -1058,7 +1058,7 @@ class ComfyUIGenerate(bpy.types.Operator):
                 else: # steps == 0, skip generation
                     pass # No image generation needed
 
-                if context.scene.generation_method == 'separate' or context.scene.generation_method == 'refine' or context.scene.generation_method == 'sequential' or (context.scene.model_architecture.startswith('qwen') and context.scene.qwen_generation_method == 'refine'):
+                if context.scene.generation_method in ('separate', 'refine', 'local_edit', 'sequential') or (context.scene.model_architecture.startswith('qwen') and context.scene.qwen_generation_method in ('refine', 'local_edit')):
                     self._current_image += 1
                     self._threads_left -= 1
                     if self._threads_left > 0:
@@ -1111,8 +1111,6 @@ class ComfyUIGenerate(bpy.types.Operator):
             if context.scene.generation_method == 'sequential':
                 return None
             self._stage = "Projecting Image"
-            if context.scene.bake_texture:
-                self._stage = "Baking Textures & Projecting"
             redraw_ui(context)
             if context.scene.generation_method != 'uv_inpaint':
                 project_image(context, self._to_texture, self._material_id)
