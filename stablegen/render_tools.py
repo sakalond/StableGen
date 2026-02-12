@@ -1006,7 +1006,7 @@ def export_visibility(context, to_export, obj=None, camera_visibility=None):
         elif not context.scene.allow_modify_existing_textures or context.scene.generation_method == 'sequential':
             equal.operation = 'COMPARE'
             equal.inputs[1].default_value = 1
-            equal.inputs[2].default_value = context.scene.sequential_factor if context.scene.generation_method == 'sequential' else 0.0
+            equal.inputs[2].default_value = context.scene.sequential_factor if context.scene.generation_method == 'sequential' else (1e-5 if bpy.app.version >= (5, 1, 0) else 0.0) # Small epsilon needed for blender 5.1+
             equal.location = (color_mix.location[0], color_mix.location[1])
             links.new(color_mix.outputs[0], equal.inputs[0])
             links.new(equal.outputs[0], input)
@@ -1544,7 +1544,7 @@ def unwrap(obj, method, overlap_only):
 
         is_new = False
 
-        # If all UN maps are ProjectionUV, add new one
+        # If all UV maps are ProjectionUV, add new one
         if all(["ProjectionUV" in uv.name for uv in obj.data.uv_layers]):
             # Add a new UV map
             obj.data.uv_layers.new(name=f"BakeUV")
@@ -1552,6 +1552,12 @@ def unwrap(obj, method, overlap_only):
             obj.data.uv_layers.active_index = len(obj.data.uv_layers) - 1
             # Set it for rendering
             obj.data.uv_layers.active = obj.data.uv_layers[-1]
+        else:
+            # Ensure the active UV is a non-ProjectionUV map
+            for uv_layer in obj.data.uv_layers:
+                if "ProjectionUV" not in uv_layer.name:
+                    obj.data.uv_layers.active = uv_layer
+                    break
         
         bpy.ops.object.mode_set(mode='EDIT')
 
@@ -1657,6 +1663,12 @@ def bake_texture(context, obj, texture_resolution, suffix = "", view_transform =
         obj.select_set(True)
         # Set the image node as the active bake target
         nodes.active = tex_image    
+
+        # Ensure the active UV is a non-ProjectionUV map for correct baking
+        for uv_layer in obj.data.uv_layers:
+            if "ProjectionUV" not in uv_layer.name:
+                obj.data.uv_layers.active = uv_layer
+                break
         
         # Check if there is a BSDF node before the output node
         output = None
