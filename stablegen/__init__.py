@@ -1237,6 +1237,38 @@ def register():
         default=True,
         update=update_parameters
     )
+    bpy.types.Scene.qwen_rescale_alignment = bpy.props.BoolProperty(
+        name="Qwen VL-Aligned Rescale",
+        description="Round resolution to multiples of 112 instead of 8 when auto-rescaling. "
+                    "112 is the window size used by the Qwen2.5-VL vision encoder "
+                    "(LCM of VAE factor 8, ViT patch 14, spatial merge 28). "
+                    "The official diffusers pipeline rounds to 32; using 112 is stricter "
+                    "and may reduce subtle zoom / pixel-shift artifacts in some cases",
+        default=True,
+        update=update_parameters
+    )
+    bpy.types.Scene.auto_rescale_target_mp = bpy.props.FloatProperty(
+        name="Target Megapixels",
+        description=(
+            "Target total megapixels when auto-rescaling the render resolution.\n\n"
+            "Default: 1.0 MP (~1024\u00d71024). This is the native resolution for SDXL "
+            "and the recommended default for Qwen Image Edit.\n\n"
+            "For SDXL / Flux models 1.0 MP is a safe default that matches "
+            "the training resolution. Higher values are possible if your "
+            "model and hardware support it, but may reduce quality or cause "
+            "out-of-memory issues.\n\n"
+            "For Qwen Image Edit the vision encoder becomes unreliable above "
+            "~1.4 MP and the model often fails to follow the prompt above "
+            "~1.2 MP. Values below ~0.3 MP also cause failures.\n\n"
+            "Adjust with care \u2013 staying close to 1.0 MP works best for most setups"
+        ),
+        default=1.0,
+        min=0.1,
+        max=4.0,
+        step=10,
+        precision=2,
+        update=update_parameters
+    )
     bpy.types.Scene.use_ipadapter = bpy.props.BoolProperty(
         name="Use IPAdapter",
         description="""Use IPAdapter for image generation. Requires an external reference image. Can improve consistency, can be useful for generating images with similar styles.\n\n - Has priority over mode specific IPAdapter.""",
@@ -2093,6 +2125,8 @@ def unregister():
     del bpy.types.Scene.show_advanced_params
     del bpy.types.Scene.show_generation_params
     del bpy.types.Scene.auto_rescale
+    del bpy.types.Scene.qwen_rescale_alignment
+    del bpy.types.Scene.auto_rescale_target_mp
     del bpy.types.Scene.generation_method
     del bpy.types.Scene.use_ipadapter
     del bpy.types.Scene.refine_images

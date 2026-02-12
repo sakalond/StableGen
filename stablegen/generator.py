@@ -459,17 +459,31 @@ class ComfyUIGenerate(bpy.types.Operator):
         resolution_y = render.resolution_y
         total_pixels = resolution_x * resolution_y
 
-        if context.scene.auto_rescale and ((total_pixels > 1_200_000 or total_pixels < 800_000) or (resolution_x % 8 != 0 or resolution_y % 8 != 0)):
-            scale_factor = (1_000_000 / total_pixels) ** 0.5
+        # Qwen Image Edit benefits from 112-aligned resolution (LCM of VAE=8,
+        # ViT patch=14, spatial merge=2×14=28, ViT window=112) to avoid
+        # subtle pixel shifts between the latent, VAE and CLIP grids.
+        use_qwen_alignment = (
+            context.scene.model_architecture.startswith('qwen')
+            and getattr(context.scene, 'qwen_rescale_alignment', False)
+        )
+        align_step = 112 if use_qwen_alignment else 8
+
+        target_px = int(getattr(context.scene, 'auto_rescale_target_mp', 1.0) * 1_000_000)
+        upper_bound = int(target_px * 1.2)
+        lower_bound = int(target_px * 0.8)
+
+        if context.scene.auto_rescale and ((total_pixels > upper_bound or total_pixels < lower_bound) or (resolution_x % align_step != 0 or resolution_y % align_step != 0)):
+            scale_factor = (target_px / total_pixels) ** 0.5
             render.resolution_x = int(resolution_x * scale_factor)
             render.resolution_y = int(resolution_y * scale_factor)
-            # ComfyUI requires resolution to be divisible by 8
-            render.resolution_x -= render.resolution_x % 8
-            render.resolution_y -= render.resolution_y % 8
+            # Round down to nearest multiple of align_step
+            render.resolution_x -= render.resolution_x % align_step
+            render.resolution_y -= render.resolution_y % align_step
             self.report({'INFO'}, f"Resolution automatically rescaled to {render.resolution_x}x{render.resolution_y}.")
 
-        elif total_pixels > 1_200_000:  # 1MP + 20%
-            self.report({'WARNING'}, "High resolution detected. Resolutions above 1MP may reduce performance and quality.")
+        elif total_pixels > upper_bound:
+            target_mp = target_px / 1_000_000
+            self.report({'WARNING'}, f"High resolution detected. Resolutions above {target_mp:.1f} MP may reduce performance and quality.")
         
         self._cameras = [obj for obj in bpy.context.scene.objects if obj.type == 'CAMERA']
         if not self._cameras:
