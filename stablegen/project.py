@@ -804,7 +804,10 @@ def project_image(context, to_project, mat_id, stop_index=1000000):
                 # Apply the modifier
                 bpy.ops.object.modifier_apply(modifier=uv_project_mod.name)
 
+                # Restore active UV to the original map so subsequent baking
+                # doesn't accidentally target a ProjectionUV
                 original_uv_map = obj.data.uv_layers[0]
+                obj.data.uv_layers.active = original_uv_map
 
                 # If we are running in sequential mode, we already have baked textures for i < stop_index
             if context.scene.bake_texture:
@@ -818,10 +821,10 @@ def project_image(context, to_project, mat_id, stop_index=1000000):
                     simple_project_bake(context, i, obj, mat_id)
                 obj.data.uv_layers.remove(obj.data.uv_layers[-1]) # Remove the last UV map
 
-    # Switch to Cycles + CPU + OSL for OSL support (only needed for Blender < 5.1)
-    # On 5.1+ native Raycast shader nodes work with any engine/device
+    # Switch to Cycles (needed for Raycast shader node on all versions)
+    context.scene.render.engine = 'CYCLES'
+    # Force CPU + OSL only for Blender < 5.1 (native Raycast nodes don't need it)
     if bpy.app.version < (5, 1, 0):
-        context.scene.render.engine = 'CYCLES'
         context.scene.cycles.device = 'CPU'
         if hasattr(context.scene.cycles, 'shading_system'):
             context.scene.cycles.shading_system = True
