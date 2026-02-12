@@ -908,7 +908,14 @@ def project_image(context, to_project, mat_id, stop_index=1000000):
         previous_node = None
         output = None
 
+        # Get the original UV map (needed for bake path).
+        # If the mesh has no UV maps at all, create one so baking / node
+        # setup doesn't crash.
+        if len(obj.data.uv_layers) == 0:
+            obj.data.uv_layers.new(name="UVMap")
         original_uv_map = obj.data.uv_layers[0]
+        if original_uv_map.name == _SG_BUFFER_UV_NAME and len(obj.data.uv_layers) > 1:
+            original_uv_map = obj.data.uv_layers[1]
 
 
         if (context.scene.generation_method == 'sequential' and stop_index > 0) or context.scene.generation_mode == 'regenerate_selected':
