@@ -1,7 +1,7 @@
 """ This script registers the addon. """
 import bpy # pylint: disable=import-error
 from .stablegen import StableGenPanel, ApplyPreset, SavePreset, DeletePreset, get_preset_items, update_parameters, ResetQwenPrompt
-from .render_tools import BakeTextures, AddCameras, CloneCamera, MirrorCamera, ToggleCameraLabels, SwitchMaterial, ExportOrbitGIF, CollectCameraPrompts, CameraPromptItem
+from .render_tools import BakeTextures, AddCameras, CloneCamera, MirrorCamera, ToggleCameraLabels, SwitchMaterial, ExportOrbitGIF, CollectCameraPrompts, CameraPromptItem, CameraOrderItem, SG_UL_CameraOrderList, SyncCameraOrder, MoveCameraOrder, ApplyCameraOrderPreset
 from .debug_tools import debug_classes as _debug_classes
 from .utils import AddHDRI, ApplyModifiers, CurvesToMesh
 from .generator import ComfyUIGenerate, Reproject, Regenerate, MirrorReproject
@@ -15,7 +15,7 @@ bl_info = {
     "name": "StableGen",
     "category": "Object",
     "author": "Ondrej Sakala",
-    "version": (0, 1, 1),
+    "version": (0, 2, 0),
     'blender': (4, 2, 0)
 }
 
@@ -34,6 +34,11 @@ classes = [
     ExportOrbitGIF,
     CollectCameraPrompts,
     CameraPromptItem,
+    CameraOrderItem,
+    SG_UL_CameraOrderList,
+    SyncCameraOrder,
+    MoveCameraOrder,
+    ApplyCameraOrderPreset,
     AddHDRI,
     ApplyModifiers,
     CurvesToMesh,
@@ -1071,6 +1076,19 @@ def load_handler(dummy):
     if bpy.context.scene:
         scene = bpy.context.scene
         addon_prefs = bpy.context.preferences.addons[__package__].preferences
+
+        # Re-register aspect-ratio crop overlays if any cameras have
+        # per-camera resolutions stored.  GPU draw handlers do not
+        # survive file loads so they must be re-created here.
+        try:
+            from .render_tools import _sg_ensure_crop_overlay
+            for obj in scene.objects:
+                if obj.type == 'CAMERA' and 'sg_display_crop' in obj:
+                    _sg_ensure_crop_overlay()
+                    break
+        except Exception:
+            pass
+
         if hasattr(scene, "controlnet_units") and not scene.controlnet_units:
             default_unit = scene.controlnet_units.add()
             default_unit.unit_type = 'depth'
@@ -1363,14 +1381,24 @@ def register():
         default=False,
         update=update_parameters
     )
+    def _get_ipadapter_mode_items(self, context):
+        items = [
+            ('first', 'Use first generated image', '', 0),
+            ('recent', 'Use most recent generated image', '', 1),
+        ]
+        if context:
+            is_local_edit = (
+                context.scene.generation_method == 'local_edit'
+                or (context.scene.model_architecture.startswith('qwen')
+                    and context.scene.qwen_generation_method == 'local_edit')
+            )
+            if is_local_edit:
+                items.append(('original_render', 'Use original render', 'Uses the existing texture render from each camera viewpoint as IPAdapter reference', 2))
+        return items
     bpy.types.Scene.sequential_ipadapter_mode = bpy.props.EnumProperty(
         name="IPAdapter Mode",
         description="Mode for IPAdapter in sequential generation",
-        items=[
-            ('first', 'Use first generated image', ''),
-            ('recent', 'Use most recent generated image', ''),
-        ],
-        default='first',
+        items=_get_ipadapter_mode_items,
         update=update_parameters
     )
     bpy.types.Scene.sequential_desaturate_factor = bpy.props.FloatProperty(
@@ -1436,6 +1464,14 @@ def register():
     bpy.types.Scene.qwen_refine_use_depth = bpy.props.BoolProperty(
         name="Use Depth Map",
         description="Include depth map as an additional reference image (Image 3)",
+        default=False,
+        update=update_parameters
+    )
+    bpy.types.Scene.qwen_timestep_zero_ref = bpy.props.BoolProperty(
+        name="Timestep-Zero References",
+        description="Tell the model that reference images are fully clean (timestep 0) instead of noisy. "
+                    "Reduces color shift and over-saturation, especially with Qwen 2511. "
+                    "Requires the FluxKontextMultiReferenceLatentMethod node in ComfyUI",
         default=False,
         update=update_parameters
     )
@@ -1560,6 +1596,20 @@ def register():
         default=90.0,
         min=0.0,
         max=180.0,
+        update=update_parameters
+    )
+    bpy.types.Scene.weight_exponent_generation_only = bpy.props.BoolProperty(
+        name="Reset Exponent After Generation",
+        description="If enabled, the Weight Exponent will be reset to a specified value after generation completes. Useful for Voronoi projection mode where a high exponent produces sharp segmentation during generation but softer blending is preferred for the final result",
+        default=False,
+        update=update_parameters
+    )
+    bpy.types.Scene.weight_exponent_after_generation = bpy.props.FloatProperty(
+        name="Exponent After Generation",
+        description="The value to set the Weight Exponent to after generation is complete",
+        default=15.0,
+        min=0.01,
+        max=1000.0,
         update=update_parameters
     )
     bpy.types.Scene.view_blend_use_color_match = bpy.props.BoolProperty(
@@ -1714,7 +1764,7 @@ def register():
     bpy.types.Scene.visibility_vignette_softness = bpy.props.FloatProperty(
         name="Vignette Softness",
         description="Exponent shaping feather falloff (<1 = sharper transition, >1 = softer/wider transition)",
-        default=0.5,
+        default=1.0,
         min=0.1,
         max=5.0,
         update=update_parameters,
@@ -1730,7 +1780,7 @@ def register():
     bpy.types.Scene.refine_angle_ramp_active = bpy.props.BoolProperty(
         name="Use Angle Ramp",
         description="Blend refinement based on surface angle",
-        default=False,
+        default=True,
         update=update_parameters
     )
     bpy.types.Scene.refine_angle_ramp_pos_0 = bpy.props.FloatProperty(
@@ -1744,7 +1794,7 @@ def register():
     bpy.types.Scene.refine_angle_ramp_pos_1 = bpy.props.FloatProperty(
         name="Angle Ramp White Point",
         description="Position of the white point (Visible) for the angle ramp",
-        default=0.6,
+        default=0.05,
         min=0.0,
         max=1.0,
         update=update_parameters
@@ -1772,7 +1822,7 @@ def register():
                     "silhouette boundary as an additional multiplier on top of the "
                     "angle×feather weight. Interior surfaces keep full strength; "
                     "only the geometric edge is softened",
-        default=False,
+        default=True,
         update=update_parameters
     )
     bpy.types.Scene.refine_edge_feather_width = bpy.props.IntProperty(
@@ -2033,6 +2083,23 @@ def register():
         default=True,
         update=update_parameters
     )
+
+    bpy.types.Scene.sg_camera_order = bpy.props.CollectionProperty(
+        type=CameraOrderItem,
+        name="Camera Generation Order",
+        description="Defines the order in which cameras are processed during generation"
+    ) # type: ignore
+    bpy.types.Scene.sg_camera_order_index = bpy.props.IntProperty(
+        name="Active Camera Order Index",
+        default=0
+    )
+    bpy.types.Scene.sg_use_custom_camera_order = bpy.props.BoolProperty(
+        name="Use Custom Camera Order",
+        description="When enabled, generation uses the custom camera order list instead of alphabetical sorting",
+        default=False,
+        update=update_parameters
+    )
+
     bpy.types.Scene.show_core_settings = bpy.props.BoolProperty(
         name="Core Generation Settings",
         description="Parameters used for the image generation process. Also includes LoRAs for faster generation.",
@@ -2043,6 +2110,13 @@ def register():
     bpy.types.Scene.show_lora_settings = bpy.props.BoolProperty(
         name="LoRA Settings",
         description="Settings for custom LoRA management.",
+        default=False,
+        update=update_parameters
+    )
+
+    bpy.types.Scene.show_camera_options = bpy.props.BoolProperty(
+        name="Camera Settings",
+        description="Camera prompt and generation order settings.",
         default=False,
         update=update_parameters
     )
@@ -2192,6 +2266,8 @@ def unregister():
     del bpy.types.Scene.discard_factor_generation_only
     del bpy.types.Scene.discard_factor_after_generation
     del bpy.types.Scene.weight_exponent
+    del bpy.types.Scene.weight_exponent_generation_only
+    del bpy.types.Scene.weight_exponent_after_generation
     del bpy.types.Scene.allow_modify_existing_textures
     del bpy.types.Scene.ask_object_prompts
     del bpy.types.Scene.fallback_color
@@ -2235,8 +2311,12 @@ def unregister():
     del bpy.types.Scene.output_timestamp
     del bpy.types.Scene.camera_prompts
     del bpy.types.Scene.use_camera_prompts
+    del bpy.types.Scene.sg_camera_order
+    del bpy.types.Scene.sg_camera_order_index
+    del bpy.types.Scene.sg_use_custom_camera_order
     del bpy.types.Scene.show_core_settings
     del bpy.types.Scene.show_lora_settings
+    del bpy.types.Scene.show_camera_options
     del bpy.types.Scene.show_scene_understanding_settings
     del bpy.types.Scene.show_output_material_settings
     del bpy.types.Scene.show_image_guidance_settings
@@ -2263,6 +2343,7 @@ def unregister():
     del bpy.types.Scene.qwen_context_cleanup_hue_tolerance
     del bpy.types.Scene.qwen_context_cleanup_value_adjust
     del bpy.types.Scene.qwen_context_fallback_dilation
+    del bpy.types.Scene.qwen_timestep_zero_ref
 
     for cls in reversed(classes):
         bpy.utils.unregister_class(cls)

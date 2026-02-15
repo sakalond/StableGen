@@ -1391,7 +1391,7 @@ prompt_text_qwen_image_edit = """
   "8": {
     "inputs": {
       "pixels": [
-        "10",
+        "14",
         0
       ],
       "vae": [
@@ -1404,21 +1404,6 @@ prompt_text_qwen_image_edit = """
       "title": "VAE Encode"
     }
   },
-  "10": {
-    "inputs": {
-      "upscale_method": "lanczos",
-      "megapixels": 1,
-      "resolution_steps": 1,
-      "image": [
-        "14",
-        0
-      ]
-    },
-    "class_type": "ImageScaleToTotalPixels",
-    "_meta": {
-      "title": "Scale Image to Total Pixels"
-    }
-  },
   "11": {
     "inputs": {
       "prompt": "",
@@ -1426,12 +1411,8 @@ prompt_text_qwen_image_edit = """
         "3",
         0
       ],
-      "vae": [
-        "4",
-        0
-      ],
       "image1": [
-        "10",
+        "14",
         0
       ],
       "image2": [
@@ -1455,12 +1436,8 @@ prompt_text_qwen_image_edit = """
         "3",
         0
       ],
-      "vae": [
-        "4",
-        0
-      ],
       "image1": [
-        "10",
+        "14",
         0
       ],
       "image2": [

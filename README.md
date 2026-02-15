@@ -1,7 +1,7 @@
 # StableGen: AI-Powered 3D Texturing in Blender ✨
 
 [![License: GPL v3](https://img.shields.io/badge/License-GPLv3-blue.svg)](https://www.gnu.org/licenses/gpl-3.0)
-[![Blender Version](https://img.shields.io/badge/Blender-4.2%2B-orange.svg)](#system-requirements)
+[![Blender Version](https://img.shields.io/badge/Blender-4.2+%20%7C%205.1%2B-orange.svg)](#system-requirements)
 [![GitHub All Releases](https://img.shields.io/github/downloads/sakalond/stablegen/total?color=brightgreen&label=Downloads)](https://github.com/sakalond/stablegen/releases)
 
 **Transform your 3D texturing workflow with the power of generative AI, directly within Blender!**
@@ -44,6 +44,16 @@ StableGen empowers 3D artists by bringing cutting-edge AI texturing capabilities
     * **Sequential Mode:** Generates textures viewpoint by viewpoint on each mesh, using inpainting and visibility masks for high consistency across complex surfaces.
     * **Grid Mode:** Processes multiple viewpoints for all meshes simultaneously for faster previews. Includes an optional refinement pass.
     * Sophisticated weighted blending ensures smooth transitions between views.
+* 📷 **Advanced Camera Placement:**
+    * **7 placement strategies:** Orbit Ring, Fan Arc, Hemisphere, PCA-Axis, Normal-Weighted K-means, Greedy Occlusion Coverage, and Interactive Visibility-Weighted placement.
+    * **Per-camera optimal aspect ratios** — each camera gets its own resolution computed from the mesh's silhouette, so no pixels are wasted on letterboxing.
+    * **Unlimited cameras** — no more 8-camera limit.
+    * **Camera generation order** — drag-and-drop reorder list with 6 preset strategies to control the processing order in Sequential mode.
+    * Camera cloning, mirroring, and floating viewport prompt labels.
+* 🎯 **Local Edit Mode:**
+    * Point cameras at specific areas to modify — new texture blends seamlessly over the original using angle-based and vignette-based feathering.
+    * Separate angle ramp and silhouette edge feathering controls for precise blending.
+    * Works with all architectures (SDXL, Flux, Qwen Image Edit).
 * 📐 **Precise Geometric Control with ControlNet:**
     * Leverage multiple ControlNet units (Depth, Canny, Normal) simultaneously to ensure generated textures respect your model's geometry.
     * Fine-tune strength, start/end steps for each ControlNet unit.
@@ -56,13 +66,16 @@ StableGen empowers 3D artists by bringing cutting-edge AI texturing capabilities
     * Connects to your existing ComfyUI installation, allowing you to use your preferred SDXL checkpoints, custom LoRAs, and the new Qwen Image Edit workflow alongside experimental FLUX.1-dev support.
     * Offloads heavy computation to the ComfyUI server, keeping Blender mostly responsive.
 * ✨ **Advanced Inpainting & Refinement:**
-    * **Refine Mode (Img2Img):** Re-style, enhance, or add detail to existing textures (StableGen generated or otherwise) using an image-to-image process. Choose to preserve original textures for localized refinement.
+    * **Refine Mode (Img2Img):** Re-style, enhance, or add detail to existing textures (StableGen generated or otherwise) using an image-to-image process.
+    * **Local Edit Mode:** Selectively modify specific areas while preserving the rest, with independent angle and vignette feathering controls.
     * **UV Inpaint Mode:** Intelligently fills untextured areas directly on your model's UV map using surrounding texture context.
+    * **Color Matching:** Match each generated view's colors to the current texture before blending, using multiple algorithms (MKL, Reinhard, Histogram, MVGD).
 * 🛠️ **Integrated Workflow Tools:**
-    * **Camera Setup:** Quickly add and arrange multiple cameras around your subject.
+    * **Camera Setup:** Quickly add and arrange multiple cameras with 7 placement strategies, per-camera aspect ratios, interactive occlusion preview, and customizable generation order.
     * **View-Specific Prompts:** Assign unique text prompts to individual camera viewpoints for targeted details.
-    * **Texture Baking:** Convert complex procedural StableGen materials into standard UV image textures.
-    * **HDRI Setup, Modifier Application, Curve Conversion, GIF/MP4 Export & Reproject.**
+    * **Texture Baking:** Convert complex procedural StableGen materials into standard UV image textures. "Flatten for Refine" option lets you bake and continue editing.
+    * **Debug Tools:** Visualize projection coverage, UV alignment, and weight blending without running AI generation.
+    * **HDRI Setup, Modifier Application, Curve Conversion, GIF/MP4 Export & Reproject.****
 * 📋 **Preset System:**
     * Get started quickly with built-in presets for common scenarios (e.g., "Default", "Characters", "Quick Draft").
     * Save and manage your own custom parameter configurations for repeatable workflows.
@@ -133,8 +146,8 @@ StableGen acts as an intuitive interface within Blender that communicates with a
 
 ## 💻 System Requirements
 
-* **Blender:** Version 4.2 or newer. *Note: Blender 5.x is not supported yet (work in progress).*
-* **Operating System:** Windows 10/11 or Linux.
+* **Blender:** Version 4.2 – 4.5 (OSL projection) or Blender 5.1+ (GPU-accelerated projection via native Raycast nodes). **Blender 5.0 is not supported** (OSL is broken and native Raycast was not yet available).
+* **Operating System:** Windows 10/11, Linux, or macOS (Apple Silicon).
 * **GPU:** **NVIDIA GPU with CUDA is recommended** for ComfyUI. For further details, check ComfyUI's github page: [https://github.com/comfyanonymous/ComfyUI](https://github.com/comfyanonymous/ComfyUI).
     * At least 8 GB of VRAM is required to run SDXL at a usable speed; plan for 16 GB or more when running FLUX.1-dev or the Qwen-Image-Edit pipeline.
 * **ComfyUI:** A working installation of ComfyUI. StableGen uses this as its backend.
@@ -245,7 +258,7 @@ These are the main operational buttons and initial setup tools, generally found 
 
 * **Generate / Cancel Generation (Main Button):** This is the primary button to start the AI texture generation process for meshe objects based on your current settings. It communicates with the ComfyUI backend. While processing, the button changes to "Cancel Generation," allowing you to stop the current task. Progress bars will appear below this button during generation.
 * **Bake Textures:** Converts the dynamic, multi-projection material StableGen creates on your meshes into a single, standard UV-mapped image texture per object. This is essential for exporting or simplifying scenes. You can set the resolution and UV unwrapping method for the bake. This option is crucial for finalizing your AI-generated textures into a portable format.
-* **Add Cameras:** Helps you quickly set up multiple viewpoints. It creates a circular array of Blender cameras around the active object (if "Object" center type is chosen) or the current 3D view center. You can specify the number of cameras and interactively adjust their positions before finalizing.
+* **Add Cameras:** Set up multiple viewpoints using one of 7 placement strategies — from simple orbit rings to geometry-aware occlusion-optimized placement with per-camera aspect ratios. Use the interactive preview to fine-tune placement before confirming.
 * **Collect Camera Prompts:** Cycles through all cameras in your scene, allowing you to type a specific descriptive text prompt for each viewpoint (e.g., "front view," "close-up on face"). These per-camera prompts are used in conjunction with the main prompt if `Use camera prompts` is enabled in `Viewpoint Blending Settings`.
 
 ### Preset Management
@@ -268,6 +281,7 @@ These are your primary controls for defining the generation:
     * `Generate Sequentially`: Viewpoints generate one by one, using inpainting from previous views for consistency.
     * `Generate Using Grid`: Combines all views into a grid for a single generation pass, with an optional refinement step.
     * `Refine/Restyle Texture (Img2Img)`: Uses the current texture as input for an image-to-image process.
+    * `Local Edit`: Selectively modify specific areas by pointing cameras at them — new texture blends over the original with feathered edges.
     * `UV Inpaint Missing Areas`: Fills untextured areas on a UV map via inpainting.
 * **Target Objects:** Choose whether to texture all visible mesh objects or only selected ones.
 
@@ -277,7 +291,7 @@ Click the arrow next to each title to expand and access detailed settings:
 
 * **Core Generation Settings:** Control diffusion basics like Seed, Steps, CFG, Negative Prompt, Sampler, Scheduler and Clip Skip.
 * **LoRA Management:** Add and configure LoRAs (Low-Rank Adaptation) for additional style or content guidance. You can set the model and clip strength for each LoRA.
-* **Viewpoint Blending Settings:** Manage how textures from different camera views are combined, including camera-specific prompts, discard angles, and blending weight exponents.
+* **Viewpoint Blending Settings:** Manage how textures from different camera views are combined, including camera-specific prompts, discard angles, blending weight exponents, camera generation order, and post-generation exponent reset.
 * **Output & Material Settings:** Define fallback color, material properties (BSDF), automatic resolution scaling, and options for baking textures during generation which enables generating with more than 8 viewpoints.
 * **Image Guidance (IPAdapter & ControlNet):** Configure IPAdapter for style transfer using external images and set up multiple ControlNet units (Depth, Canny, etc.) for precise structural control.
 * **Inpainting Options:** Fine-tune masking and blending for `Sequential` and `UV Inpaint` modes (e.g., differential diffusion, mask blurring/growing).
@@ -408,11 +422,10 @@ Here are some features we plan to implement in the future (in no particular orde
 * **Advanced IPAdapter support:** Support for custom IPAdapter models, support for advanced IPAdapter parameters.
 * **Upscaling:** Support for upscaling generated textures.
 * **Custom VAE, CLIP model selection:** Ability to select custom VAE and CLIP models in addition to custom ControlNet and LoRA models.
-* **Qwen workflow refinements:** Deeper integration for Qwen Image Edit, including UV inpainting and refine modes.
-* **Automatic camera placement improvements:** More advanced camera placement algorithms (e.g., based on model geometry).
-* **Refine mode improvements:** Features like brush based inpainting, and better blending for "Preserve Original Textures" mode.
+* **Refine mode improvements:** Features like brush based inpainting.
 * **Z-Image support** (and eventual Z-Image editing model support)
 * **Mesh generation:** Integration of mesh generation capabilities.
+* **Brush-based inpainting:** Paint masks directly on the viewport for targeted local edits.
 
 If you have any suggestions, please feel free to open an issue!
 
@@ -425,4 +438,4 @@ Ondřej Sakala
 * X/Twitter: `@sakalond`
 
 ---
-*Last Updated: December 15, 2025*
+*Last Updated: February 14, 2026*

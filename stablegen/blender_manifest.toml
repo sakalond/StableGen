@@ -1,6 +1,6 @@
 schema_version = "1.0.0"
 id = "stablegen"
-version = "0.1.1"
+version = "0.2.0"
 name = "StableGen"
 tagline = "AI-Powered Texturing"
 maintainer = "Ondrej Sakala <sakalaondrej@gmail.com>"

@@ -119,6 +119,128 @@ class WorkflowManager:
         img_out.save(out_buf, format="PNG")
         return out_buf.getvalue()
 
+    def _build_qwen_reference_latent_chain(self, prompt, NODES, start_node_id=700):
+        """
+        Build VAEEncode + ReferenceLatent chain for the Qwen unzoom fix.
+
+        When the VAE input is disconnected from TextEncodeQwenImageEditPlus,
+        the node no longer creates reference latents (and no longer forces
+        a 1 MP rescale).  We replicate the reference-latent injection
+        manually so the latents match the actual output resolution.
+
+        For each active image (image1 / image2 / image3) still present in
+        the positive text-encode node, a VAEEncode node is created and a
+        ReferenceLatent node is chained onto both positive and negative
+        conditioning.  The KSampler inputs are then updated to point at
+        the tail of the chain.
+
+        When ``qwen_timestep_zero_ref`` is enabled on the scene, a
+        FluxKontextMultiReferenceLatentMethod node is appended with
+        ``index_timestep_zero`` so the model treats reference latents as
+        fully-denoised tokens, reducing color shift / over-saturation.
+        """
+        pos_node = NODES['pos_prompt']
+        neg_node = NODES['neg_prompt']
+        sampler_node = NODES['sampler']
+        vae_ref = ["4", 0]  # VAELoader node
+
+        # Collect active image references from the pos text-encode node.
+        # image1 is always present; image2/image3 may have been deleted.
+        active_refs = []
+        pos_inputs = prompt[pos_node]['inputs']
+        for key in ('image1', 'image2', 'image3'):
+            if key in pos_inputs:
+                active_refs.append(pos_inputs[key])
+
+        if not active_refs:
+            return
+
+        node_id = start_node_id
+        # Avoid collisions with existing dynamic nodes
+        while str(node_id) in prompt:
+            node_id += 1
+
+        pos_cond_ref = [pos_node, 0]
+        neg_cond_ref = [neg_node, 0]
+
+        for i, img_ref in enumerate(active_refs):
+            # --- VAEEncode for this image ---
+            # For image1 we can reuse the existing node 8 which already
+            # encodes the same image (also used as KSampler latent_image).
+            if i == 0:
+                vae_enc_ref = ["8", 0]
+            else:
+                vae_enc_id = str(node_id)
+                node_id += 1
+                prompt[vae_enc_id] = {
+                    "inputs": {
+                        "pixels": img_ref,
+                        "vae": vae_ref
+                    },
+                    "class_type": "VAEEncode",
+                    "_meta": {"title": f"VAE Encode (Ref {i + 1})"}
+                }
+                vae_enc_ref = [vae_enc_id, 0]
+
+            # --- ReferenceLatent for positive ---
+            ref_pos_id = str(node_id)
+            node_id += 1
+            prompt[ref_pos_id] = {
+                "inputs": {
+                    "conditioning": pos_cond_ref,
+                    "latent": vae_enc_ref
+                },
+                "class_type": "ReferenceLatent",
+                "_meta": {"title": f"Reference Latent Pos {i + 1}"}
+            }
+            pos_cond_ref = [ref_pos_id, 0]
+
+            # --- ReferenceLatent for negative ---
+            ref_neg_id = str(node_id)
+            node_id += 1
+            prompt[ref_neg_id] = {
+                "inputs": {
+                    "conditioning": neg_cond_ref,
+                    "latent": vae_enc_ref
+                },
+                "class_type": "ReferenceLatent",
+                "_meta": {"title": f"Reference Latent Neg {i + 1}"}
+            }
+            neg_cond_ref = [ref_neg_id, 0]
+
+        # Point KSampler at the final chained conditioning
+        prompt[sampler_node]['inputs']['positive'] = pos_cond_ref
+        prompt[sampler_node]['inputs']['negative'] = neg_cond_ref
+
+        # ── Timestep-zero reference method (colour-shift reduction) ─────
+        context = bpy.context
+        if getattr(context.scene, 'qwen_timestep_zero_ref', False):
+            # Positive conditioning
+            tz_pos_id = str(node_id)
+            node_id += 1
+            prompt[tz_pos_id] = {
+                "inputs": {
+                    "conditioning": pos_cond_ref,
+                    "reference_latents_method": "index_timestep_zero"
+                },
+                "class_type": "FluxKontextMultiReferenceLatentMethod",
+                "_meta": {"title": "Ref Method (Pos)"}
+            }
+            prompt[sampler_node]['inputs']['positive'] = [tz_pos_id, 0]
+
+            # Negative conditioning
+            tz_neg_id = str(node_id)
+            node_id += 1
+            prompt[tz_neg_id] = {
+                "inputs": {
+                    "conditioning": neg_cond_ref,
+                    "reference_latents_method": "index_timestep_zero"
+                },
+                "class_type": "FluxKontextMultiReferenceLatentMethod",
+                "_meta": {"title": "Ref Method (Neg)"}
+            }
+            prompt[sampler_node]['inputs']['negative'] = [tz_neg_id, 0]
+
     def _get_qwen_default_prompts(self, context, is_initial_image):
         """Gets the default Qwen prompts based on the current context."""
         # Check if we are in a real generation context vs. just resetting a prompt
@@ -244,6 +366,9 @@ class WorkflowManager:
             final_prompt += ". Use image3 as depth map reference."
         
         prompt[NODES['pos_prompt']]['inputs']['prompt'] = final_prompt
+
+        # --- Reference Latent chain (Qwen unzoom fix) ---
+        self._build_qwen_reference_latent_chain(prompt, NODES)
         
         # --- Save and Execute ---
         self._save_prompt_to_file(prompt, revision_dir)
@@ -320,7 +445,6 @@ class WorkflowManager:
         context_render_info = None
         context_mode = context.scene.qwen_context_render_mode
         remove_context = False
-        style_requires_scaling = False
 
         # --- Camera Prompt Injection ---
         if context.scene.use_camera_prompts and self.operator._cameras and self.operator._current_image < len(self.operator._cameras):
@@ -377,7 +501,6 @@ class WorkflowManager:
             if not style_image_info:
                 self.operator._error = "External style image enabled, but file not found or could not be uploaded."
                 return {"error": "conn_failed"}
-            style_requires_scaling = True
             if context_mode != 'ADDITIONAL':
                 if context.scene.qwen_use_custom_prompts:
                     pos_prompt_text = (context.scene.qwen_custom_prompt_initial if is_initial_image else context.scene.qwen_custom_prompt_seq_none).format(main_prompt=user_prompt)
@@ -402,7 +525,12 @@ class WorkflowManager:
                     pos_prompt_text = self._get_qwen_default_prompts(context, is_initial_image).format(main_prompt=user_prompt)
                 prompt[NODES['pos_prompt']]['inputs']['prompt'] = pos_prompt_text
             elif context.scene.sequential_ipadapter: # Use previous generated image
-                ref_cam_id = 0 if context.scene.sequential_ipadapter_mode == 'first' else self.operator._current_image - 1
+                if context.scene.sequential_ipadapter_mode == 'original_render':
+                    # For original_render in Qwen context, fall back to first mode since
+                    # the render is already used as the guidance map (Image 1).
+                    ref_cam_id = 0
+                else:
+                    ref_cam_id = 0 if context.scene.sequential_ipadapter_mode == 'first' else self.operator._current_image - 1
                 style_image_info = self.operator._get_uploaded_image_info(context, "generated", camera_id=ref_cam_id, material_id=self.operator._material_id)
                 if not style_image_info:
                     self.operator._error = f"Sequential mode error: Could not find previous image for camera {ref_cam_id} to use as style."
@@ -429,7 +557,11 @@ class WorkflowManager:
         else:
             # A style image is provided, so set the loader input.
             prompt[NODES['style_map_loader']]['inputs']['image'] = style_image_info['name']
-            if style_requires_scaling:
+            # External user-selected images can be arbitrarily large (10+ MP).
+            # Scale them down to ~1 MP so the VAEEncode in the reference
+            # latent chain doesn't blow up VRAM.  StableGen's own renders
+            # are already roughly 1 MP and don't need this.
+            if use_external_this_frame:
                 scale_node_int = 600
                 while str(scale_node_int) in prompt:
                     scale_node_int += 1
@@ -443,11 +575,16 @@ class WorkflowManager:
                     },
                     "class_type": "ImageScaleToTotalPixels",
                     "_meta": {
-                        "title": "Scale Image to Total Pixels"
+                        "title": "Scale External Style to 1MP"
                     }
                 }
+                # Point text-encode image2 at the scaled version so both
+                # VL processing and the reference latent chain see ~1 MP.
                 prompt[NODES['pos_prompt']]['inputs']['image2'] = [scale_node_key, 0]
                 prompt[NODES['neg_prompt']]['inputs']['image2'] = [scale_node_key, 0]
+
+        # --- Reference Latent chain (Qwen unzoom fix) ---
+        self._build_qwen_reference_latent_chain(prompt, NODES)
 
         # --- Configure Sampler ---
         prompt[NODES['sampler']]['inputs']['seed'] = context.scene.seed
@@ -1125,7 +1262,12 @@ class WorkflowManager:
         prompt[NODES['clip_skip']]["inputs"]["clip"] = final_lora_clip_out
 
         # If using IPAdapter, set the model input
-        if (context.scene.use_ipadapter or (context.scene.sequential_ipadapter and self.operator._current_image > 0)) and context.scene.generation_method != 'uv_inpaint':
+        _is_original_render_ipadapter = (
+            context.scene.sequential_ipadapter
+            and context.scene.sequential_ipadapter_mode == 'original_render'
+            and context.scene.generation_method == 'local_edit'
+        )
+        if (context.scene.use_ipadapter or _is_original_render_ipadapter or (context.scene.sequential_ipadapter and self.operator._current_image > 0)) and context.scene.generation_method != 'uv_inpaint':
             # Set the model input for IPAdapter
             prompt[NODES['ipadapter_loader']]["inputs"]["model"] = current_model_out
             current_model_out = [NODES['ipadapter'], 0]
@@ -1396,7 +1538,12 @@ class WorkflowManager:
             prompt[NODES['sampler']]["inputs"]["latent_image"] = [NODES['instruct_pix'], 2]
 
             # If using ipadapter, set the apply_ipadapter_flux node to use the flux_lora_image
-            if context.scene.use_ipadapter or (context.scene.generation_method == 'separate' and context.scene.sequential_ipadapter and self.operator._current_image > 0):
+            _is_original_render_ipadapter = (
+                context.scene.sequential_ipadapter
+                and context.scene.sequential_ipadapter_mode == 'original_render'
+                and context.scene.generation_method == 'local_edit'
+            )
+            if context.scene.use_ipadapter or _is_original_render_ipadapter or (context.scene.generation_method == 'separate' and context.scene.sequential_ipadapter and self.operator._current_image > 0):
                 prompt[NODES['ipadapter']]["inputs"]["model"] = [NODES['flux_lora'], 0]
             else:
                 prompt[NODES['guider']]["inputs"]["model"] = [NODES['flux_lora'], 0]

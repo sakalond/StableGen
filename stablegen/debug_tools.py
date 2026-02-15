@@ -391,6 +391,19 @@ class SG_OT_DebugCoverageHeatmap(bpy.types.Operator):
     bl_label = "Project Coverage Heatmap"
     bl_options = {'REGISTER', 'UNDO'}
 
+    mode: bpy.props.EnumProperty(
+        name="Mode",
+        items=[
+            ('AVERAGE', "Average",
+             "Sum all camera weights and divide by camera count. "
+             "Shows mean coverage across all cameras"),
+            ('MAX', "Best Camera",
+             "Take the maximum single-camera weight at each point. "
+             "Shows the best coverage available, ignoring overlap"),
+        ],
+        default='AVERAGE',
+    )  # type: ignore
+
     @classmethod
     def poll(cls, context):
         return _common_poll(cls, context)
@@ -428,8 +441,8 @@ class SG_OT_DebugCoverageHeatmap(bpy.types.Operator):
 
             use_native = bpy.app.version >= (5, 1, 0)
 
-            # Sum angle weights from all cameras
-            sum_node = None
+            # Accumulate angle weights from all cameras
+            accum_node = None
             for i, cam in enumerate(cameras):
                 if use_native:
                     result = create_native_raycast_visibility(
@@ -440,44 +453,115 @@ class SG_OT_DebugCoverageHeatmap(bpy.types.Operator):
                     w_node.outputs[0].default_value = 1.0
                     w_node.location = (-400, -800 * i)
 
-                if sum_node is None:
-                    sum_node = w_node
+                if accum_node is None:
+                    accum_node = w_node
                 else:
-                    add = nodes.new("ShaderNodeMath")
-                    add.operation = 'ADD'
-                    add.location = (600 + i * 100, -100 * i)
-                    links.new(sum_node.outputs[0], add.inputs[0])
-                    links.new(w_node.outputs[0], add.inputs[1])
-                    sum_node = add
+                    combine = nodes.new("ShaderNodeMath")
+                    combine.operation = ('MAXIMUM'
+                                         if self.mode == 'MAX' else 'ADD')
+                    combine.location = (600 + i * 100, -100 * i)
+                    links.new(accum_node.outputs[0], combine.inputs[0])
+                    links.new(w_node.outputs[0], combine.inputs[1])
+                    accum_node = combine
 
-            # Normalise by camera count
-            div = nodes.new("ShaderNodeMath")
-            div.operation = 'DIVIDE'
-            div.location = (1200, 0)
-            div.inputs[1].default_value = max(len(cameras), 1)
-            links.new(sum_node.outputs[0], div.inputs[0])
+            # Normalise: divide by camera count (average) or clamp to 1 (max)
+            if self.mode == 'MAX':
+                norm = nodes.new("ShaderNodeMath")
+                norm.operation = 'MINIMUM'
+                norm.location = (1200, 0)
+                norm.inputs[1].default_value = 1.0
+                links.new(accum_node.outputs[0], norm.inputs[0])
+            else:
+                norm = nodes.new("ShaderNodeMath")
+                norm.operation = 'DIVIDE'
+                norm.location = (1200, 0)
+                norm.inputs[1].default_value = max(len(cameras), 1)
+                links.new(accum_node.outputs[0], norm.inputs[0])
 
-            # Color ramp: 0 → red, 0.5 → yellow, 1 → green
+            # ── Log-scale to spread out low-coverage differences ──
+            # Formula: log(1 + value * 9) / log(10)
+            # Maps 0→0, 1→1 but stretches the low end significantly.
+            scale9 = nodes.new("ShaderNodeMath")
+            scale9.operation = 'MULTIPLY'
+            scale9.location = (1300, -100)
+            scale9.inputs[1].default_value = 9.0
+            links.new(norm.outputs[0], scale9.inputs[0])
+
+            add1 = nodes.new("ShaderNodeMath")
+            add1.operation = 'ADD'
+            add1.location = (1400, -100)
+            add1.inputs[1].default_value = 1.0
+            links.new(scale9.outputs[0], add1.inputs[0])
+
+            log_node = nodes.new("ShaderNodeMath")
+            log_node.operation = 'LOGARITHM'
+            log_node.location = (1500, -100)
+            log_node.inputs[1].default_value = 10.0
+            links.new(add1.outputs[0], log_node.inputs[0])
+
+            # ── Detect zero coverage (sum == 0) for distinct color ──
+            is_zero = nodes.new("ShaderNodeMath")
+            is_zero.operation = 'LESS_THAN'
+            is_zero.location = (1300, 200)
+            is_zero.inputs[1].default_value = 0.001
+            links.new(accum_node.outputs[0], is_zero.inputs[0])
+
+            # Non-linear color ramp with more low-end stops:
+            # 0.0  → dark red   (very low coverage)
+            # 0.15 → red
+            # 0.30 → orange
+            # 0.50 → yellow
+            # 0.75 → yellow-green
+            # 1.0  → green      (excellent coverage)
             ramp = nodes.new("ShaderNodeValToRGB")
-            ramp.location = (1400, 0)
+            ramp.location = (1700, 0)
             ramp.color_ramp.interpolation = 'LINEAR'
             elements = ramp.color_ramp.elements
+            # Stop 0: dark red
             elements[0].position = 0.0
-            elements[0].color = (1.0, 0.0, 0.0, 1.0)  # red
-            elements[1].position = 1.0
-            elements[1].color = (0.0, 1.0, 0.0, 1.0)  # green
-            mid = elements.new(0.5)
-            mid.color = (1.0, 1.0, 0.0, 1.0)  # yellow
+            elements[0].color = (0.4, 0.0, 0.0, 1.0)
+            # Stop 1: bright red
+            elements[1].position = 0.15
+            elements[1].color = (1.0, 0.0, 0.0, 1.0)
+            # Stop 2: orange
+            s2 = elements.new(0.30)
+            s2.color = (1.0, 0.5, 0.0, 1.0)
+            # Stop 3: yellow
+            s3 = elements.new(0.50)
+            s3.color = (1.0, 1.0, 0.0, 1.0)
+            # Stop 4: yellow-green
+            s4 = elements.new(0.75)
+            s4.color = (0.5, 1.0, 0.0, 1.0)
+            # Stop 5 (already at 1.0 from elements[1] which got pushed):
+            # Ensure last element is green at 1.0
+            last = ramp.color_ramp.elements[-1]
+            last.position = 1.0
+            last.color = (0.0, 1.0, 0.0, 1.0)
 
-            links.new(div.outputs[0], ramp.inputs["Fac"])
+            links.new(log_node.outputs[0], ramp.inputs["Fac"])
+
+            # Mix: if zero coverage → magenta, else → ramp color
+            zero_color = nodes.new("ShaderNodeRGB")
+            zero_color.location = (1700, 300)
+            zero_color.outputs[0].default_value = (0.8, 0.0, 0.8, 1.0)  # magenta
+
+            mix = nodes.new("ShaderNodeMixRGB")
+            mix.location = (1900, 100)
+            mix.blend_type = 'MIX'
+            links.new(is_zero.outputs[0], mix.inputs["Fac"])
+            links.new(ramp.outputs["Color"], mix.inputs["Color1"])
+            links.new(zero_color.outputs[0], mix.inputs["Color2"])
 
             # Emission so it's visible in solid mode too
             emit = nodes.new("ShaderNodeEmission")
-            emit.location = (1700, 0)
-            links.new(ramp.outputs["Color"], emit.inputs["Color"])
+            emit.location = (2100, 0)
+            links.new(mix.outputs["Color"], emit.inputs["Color"])
             links.new(emit.outputs[0], output.inputs["Surface"])
 
-        self.report({'INFO'}, f"Coverage heatmap applied ({len(cameras)} cameras)")
+        mode_label = 'best-camera' if self.mode == 'MAX' else 'average'
+        self.report({'INFO'},
+                    f"Coverage heatmap applied ({len(cameras)} cameras, "
+                    f"{mode_label} mode)")
         return {'FINISHED'}
 
 

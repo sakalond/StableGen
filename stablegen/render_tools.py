@@ -2234,11 +2234,20 @@ def _resolution_from_aspect(aspect, total_px, align=8):
     return new_x, new_y
 
 
+def _get_resolution_align(context):
+    """Return the resolution alignment step: 112 for Qwen with alignment
+    enabled, 8 otherwise."""
+    if (context.scene.model_architecture.startswith('qwen')
+            and getattr(context.scene, 'qwen_rescale_alignment', False)):
+        return 112
+    return 8
+
+
 def _apply_auto_aspect(directions_np, context, verts_world):
     """Adjust scene render resolution to match the mesh's average apparent
     aspect ratio across the given camera *directions_np*.  This is the
     'shared' mode — all cameras use the same resolution.
-    Keeps total pixel count approximately constant and snaps to 8 px.
+    Keeps total pixel count approximately constant and snaps to alignment step.
     Returns (new_res_x, new_res_y)."""
     center = verts_world.mean(axis=0)
     aspects = [_compute_per_camera_aspect(d, verts_world, center)
@@ -2247,7 +2256,8 @@ def _apply_auto_aspect(directions_np, context, verts_world):
 
     render = context.scene.render
     total_px = render.resolution_x * render.resolution_y
-    new_x, new_y = _resolution_from_aspect(avg_aspect, total_px)
+    align = _get_resolution_align(context)
+    new_x, new_y = _resolution_from_aspect(avg_aspect, total_px, align=align)
     render.resolution_x = new_x
     render.resolution_y = new_y
     return new_x, new_y
@@ -2305,6 +2315,11 @@ def _sg_draw_crop_overlays():
     camera's pyramid to visualise the actual (non-square) crop region."""
     context = bpy.context
     scene = context.scene
+
+    # Respect Blender's overlay toggle
+    space = context.space_data
+    if space and hasattr(space, 'overlay') and not space.overlay.show_overlays:
+        return
 
     shader = gpu.shader.from_builtin('UNIFORM_COLOR')
 
@@ -2375,6 +2390,11 @@ def _sg_draw_view_labels():
     region = context.region
     rv3d = context.region_data
     if region is None or rv3d is None:
+        return
+
+    # Respect Blender's overlay toggle
+    space = context.space_data
+    if space and hasattr(space, 'overlay') and not space.overlay.show_overlays:
         return
 
     from bpy_extras.view3d_utils import location_3d_to_region_2d
@@ -3426,8 +3446,9 @@ class AddCameras(bpy.types.Operator):
             d_unit = d_np / np.linalg.norm(d_np)
 
             # --- Pass 1: orthographic aspect as initial estimate ---
+            align = _get_resolution_align(context)
             aspect = _compute_per_camera_aspect(d_unit, verts_world, center_for_aspect)
-            res_x, res_y = _resolution_from_aspect(aspect, total_px)
+            res_x, res_y = _resolution_from_aspect(aspect, total_px, align=align)
             fov_x, fov_y = _get_fov(cam_settings, context, res_x, res_y)
             dist, aim_off = _compute_silhouette_distance(
                 verts_world, center_np, d_np, fov_x, fov_y)
@@ -3436,7 +3457,7 @@ class AddCameras(bpy.types.Operator):
             aim_point_np = center_np + aim_off
             cam_pos_np = aim_point_np + d_unit * dist
             aspect = _perspective_aspect(verts_world, cam_pos_np, d_np)
-            res_x, res_y = _resolution_from_aspect(aspect, total_px)
+            res_x, res_y = _resolution_from_aspect(aspect, total_px, align=align)
             fov_x, fov_y = _get_fov(cam_settings, context, res_x, res_y)
             dist, aim_off = _compute_silhouette_distance(
                 verts_world, center_np, d_np, fov_x, fov_y)
@@ -3949,6 +3970,242 @@ class CameraPromptItem(bpy.types.PropertyGroup):
         name="View Description",
         description="Description of the view from this camera"
     ) # type: ignore
+
+# ── Camera Generation Order ──────────────────────────────────────────────────
+
+class CameraOrderItem(bpy.types.PropertyGroup):
+    """One entry in the generation-order list. Stores the Blender camera name."""
+    name: bpy.props.StringProperty(
+        name="Camera Name",
+        description="Name of the camera object"
+    ) # type: ignore
+
+
+class SG_UL_CameraOrderList(bpy.types.UIList):
+    """UIList that shows cameras in their current generation order."""
+    bl_idname = "SG_UL_CameraOrderList"
+
+    def draw_item(self, _context, layout, _data, item, _icon,
+                  _active_data, _active_propname, index):
+        cam_obj = bpy.data.objects.get(item.name)
+        if cam_obj is None:
+            layout.label(text=f"{item.name} (missing)", icon='ERROR')
+            return
+        # Show index, camera icon, name, and prompt if any
+        row = layout.row(align=True)
+        row.label(text=f"{index + 1}.")
+        row.label(text=item.name, icon='CAMERA_DATA')
+        # Show prompt preview if one exists
+        prompt_item = next(
+            (p for p in _context.scene.camera_prompts if p.name == item.name), None)
+        if prompt_item and prompt_item.prompt:
+            sub = row.row()
+            sub.scale_x = 1.5
+            sub.label(text=prompt_item.prompt, icon='SHORTDISPLAY')
+
+
+class SyncCameraOrder(bpy.types.Operator):
+    """Rebuild the generation order list from all cameras in the scene (sorted alphabetically)"""
+    bl_idname = "stablegen.sync_camera_order"
+    bl_label = "Sync Camera Order"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    def execute(self, context):
+        scene = context.scene
+        cameras = sorted(
+            [obj for obj in scene.objects if obj.type == 'CAMERA'],
+            key=lambda x: x.name)
+        scene.sg_camera_order.clear()
+        for cam in cameras:
+            item = scene.sg_camera_order.add()
+            item.name = cam.name
+        scene.sg_camera_order_index = 0
+        self.report({'INFO'}, f"Synced {len(cameras)} cameras to generation order list.")
+        return {'FINISHED'}
+
+
+class MoveCameraOrder(bpy.types.Operator):
+    """Move the selected camera up or down in the generation order"""
+    bl_idname = "stablegen.move_camera_order"
+    bl_label = "Move Camera"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    direction: bpy.props.EnumProperty(
+        items=[('UP', "Up", ""), ('DOWN', "Down", "")],
+        name="Direction"
+    ) # type: ignore
+
+    def execute(self, context):
+        scene = context.scene
+        idx = scene.sg_camera_order_index
+        total = len(scene.sg_camera_order)
+        if total < 2:
+            return {'CANCELLED'}
+        new_idx = idx - 1 if self.direction == 'UP' else idx + 1
+        if new_idx < 0 or new_idx >= total:
+            return {'CANCELLED'}
+        scene.sg_camera_order.move(idx, new_idx)
+        scene.sg_camera_order_index = new_idx
+        return {'FINISHED'}
+
+
+class ApplyCameraOrderPreset(bpy.types.Operator):
+    """Sort the generation order list using a preset strategy.
+    Cameras are first synced from the scene, then reordered."""
+    bl_idname = "stablegen.apply_camera_order_preset"
+    bl_label = "Apply Camera Order Preset"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    strategy: bpy.props.EnumProperty(
+        name="Strategy",
+        items=[
+            ('ALPHABETICAL', "Alphabetical (Original)",
+             "Sort cameras alphabetically by name (original order for auto-generated cameras)"),
+            ('FRONT_FIRST', "Front → Back → Sides",
+             "Front-facing cameras first, then back, then sides. "
+             "Prioritises the main view for sequential inpainting"),
+            ('BACK_FIRST', "Back → Front → Sides",
+             "Back-facing cameras first, then front, then sides"),
+            ('ALTERNATING', "Alternating (Opposites)",
+             "Alternate between opposing cameras (front, back, left, right…) "
+             "for maximum context spread between consecutive views"),
+            ('TOP_DOWN', "Top → Bottom",
+             "Cameras sorted from highest elevation to lowest"),
+            ('REVERSE', "Reverse Current",
+             "Reverse the current generation order"),
+        ],
+        default='FRONT_FIRST'
+    ) # type: ignore
+
+    def execute(self, context):
+        scene = context.scene
+
+        # Always sync from scene first (picks up new/removed cameras)
+        cameras = sorted(
+            [obj for obj in scene.objects if obj.type == 'CAMERA'],
+            key=lambda x: x.name)
+
+        if not cameras:
+            self.report({'ERROR'}, "No cameras in the scene.")
+            return {'CANCELLED'}
+
+        if self.strategy == 'REVERSE':
+            # Reverse whatever is currently in the list
+            names = [item.name for item in scene.sg_camera_order]
+            if not names:
+                names = [c.name for c in cameras]
+            names.reverse()
+        elif self.strategy == 'ALPHABETICAL':
+            names = [c.name for c in cameras]
+        else:
+            # Compute mesh centre for direction classification
+            mesh_objects = [obj for obj in scene.objects
+                           if obj.type == 'MESH' and not obj.hide_get()]
+            if mesh_objects:
+                centres = [obj.matrix_world @ (
+                    sum((mathutils.Vector(v.co) for v in obj.data.vertices),
+                        mathutils.Vector()) / max(len(obj.data.vertices), 1))
+                    for obj in mesh_objects]
+                mesh_center = sum(centres, mathutils.Vector()) / len(centres)
+            else:
+                mesh_center = mathutils.Vector((0, 0, 0))
+
+            mc = np.array(mesh_center, dtype=float)
+
+            # Use the first camera (alphabetically) as the reference
+            # "front" direction — avoids assuming any world axis is front.
+            ref_pos = np.array(cameras[0].location, dtype=float)
+            ref_d = ref_pos - mc
+            ref_d_xy = ref_d[:2]
+            ref_xy_len = np.linalg.norm(ref_d_xy)
+            if ref_xy_len < 1e-8:
+                ref_d_xy = np.array([0.0, 1.0])
+            else:
+                ref_d_xy = ref_d_xy / ref_xy_len
+
+            # Compute direction angles for each camera
+            cam_data = []
+            for cam in cameras:
+                pos = np.array(cam.location, dtype=float)
+                d = pos - mc
+                norm = np.linalg.norm(d)
+                if norm < 1e-8:
+                    d = np.array([0, 1, 0], dtype=float)
+                else:
+                    d /= norm
+                # Elevation (angle above XY plane)
+                elev = math.degrees(math.asin(np.clip(d[2], -1, 1)))
+                # Azimuth relative to the first camera's XY direction
+                d_xy = d[:2]
+                d_xy_len = np.linalg.norm(d_xy)
+                if d_xy_len < 1e-8:
+                    azimuth = 0.0
+                else:
+                    d_xy = d_xy / d_xy_len
+                    cos_a = float(np.clip(np.dot(d_xy, ref_d_xy), -1, 1))
+                    cross = float(ref_d_xy[0] * d_xy[1]
+                                  - ref_d_xy[1] * d_xy[0])
+                    azimuth = math.degrees(math.atan2(cross, cos_a))
+                cam_data.append((cam.name, elev, azimuth))
+
+            if self.strategy == 'FRONT_FIRST':
+                # Priority: front (small |azimuth|), then back (large |azimuth|), then sides
+                def _front_key(item):
+                    _name, _elev, az = item
+                    abs_az = abs(az)
+                    if abs_az <= 45:
+                        bucket = 0  # front
+                    elif abs_az >= 135:
+                        bucket = 1  # back
+                    else:
+                        bucket = 2  # sides
+                    return (bucket, abs_az, -_elev)
+                cam_data.sort(key=_front_key)
+
+            elif self.strategy == 'BACK_FIRST':
+                def _back_key(item):
+                    _name, _elev, az = item
+                    abs_az = abs(az)
+                    if abs_az >= 135:
+                        bucket = 0  # back
+                    elif abs_az <= 45:
+                        bucket = 1  # front
+                    else:
+                        bucket = 2  # sides
+                    return (bucket, -abs_az, -_elev)
+                cam_data.sort(key=_back_key)
+
+            elif self.strategy == 'ALTERNATING':
+                # Sort by azimuth, then pick from alternating ends
+                cam_data.sort(key=lambda x: x[2])
+                alternated = []
+                left, right = 0, len(cam_data) - 1
+                pick_left = True
+                while left <= right:
+                    if pick_left:
+                        alternated.append(cam_data[left])
+                        left += 1
+                    else:
+                        alternated.append(cam_data[right])
+                        right -= 1
+                    pick_left = not pick_left
+                cam_data = alternated
+
+            elif self.strategy == 'TOP_DOWN':
+                cam_data.sort(key=lambda x: -x[1])  # highest elevation first
+
+            names = [item[0] for item in cam_data]
+
+        # Apply to collection
+        scene.sg_camera_order.clear()
+        for n in names:
+            item = scene.sg_camera_order.add()
+            item.name = n
+        scene.sg_camera_order_index = 0
+        self.report({'INFO'},
+                    f"Applied '{self.strategy}' order to {len(names)} cameras.")
+        return {'FINISHED'}
+
 
 class CollectCameraPrompts(bpy.types.Operator):
     """Cycles through cameras and prompts for a viewpoint description for each. This can help when specific perspectives fail to generate correctly.
@@ -4663,6 +4920,16 @@ class ExportOrbitGIF(bpy.types.Operator):
         default='CYCLES'
     ) # type: ignore
 
+    interpolation: bpy.props.EnumProperty(
+        name="Rotation Curve",
+        description="Keyframe interpolation for the orbit rotation",
+        items=[
+            ('LINEAR', "Linear", "Constant speed throughout the orbit"),
+            ('BEZIER', "Ease In/Out", "Smooth acceleration and deceleration"),
+        ],
+        default='LINEAR'
+    ) # type: ignore
+
     _timer = None
     _rendering = False
     _cancelled = False # Added flag to track cancellation
@@ -4728,6 +4995,48 @@ class ExportOrbitGIF(bpy.types.Operator):
 
         return context.window_manager.invoke_props_dialog(self)
 
+    @staticmethod
+    def _force_fcurve_interpolation(obj, interpolation_type):
+        """Set interpolation on all keyframe points of *obj*'s fcurves.
+
+        Works on Blender 4.x (action.fcurves) and 5.x+ (layered actions
+        with slots / channelbags).
+        """
+        anim = obj.animation_data
+        if not anim or not anim.action:
+            return
+
+        action = anim.action
+        fcurves = []
+
+        # Blender 5.x layered-action API (slots → channelbags → fcurves)
+        action_slot = getattr(anim, "action_slot", None)
+        if action_slot is not None:
+            # Try the helper shipped in bpy_extras first
+            try:
+                from bpy_extras.anim_utils import action_get_channelbag_for_slot
+                bag = action_get_channelbag_for_slot(action, action_slot)
+                if bag is not None:
+                    fcurves = list(bag.fcurves)
+            except Exception:
+                pass
+            # Manual fallback: iterate channelbags on the *action*
+            if not fcurves:
+                for attr in ("channelbags", "channel_bags"):
+                    bags = getattr(action, attr, None)
+                    if bags is not None:
+                        for bag in bags:
+                            fcurves.extend(bag.fcurves)
+                        break
+
+        # Blender 4.x legacy path
+        if not fcurves and hasattr(action, "fcurves"):
+            fcurves = list(action.fcurves)
+
+        for fc in fcurves:
+            for kf in fc.keyframe_points:
+                kf.interpolation = interpolation_type
+
     def setup_animation(self, context):
         obj = context.active_object
         scene = context.scene
@@ -4776,31 +5085,23 @@ class ExportOrbitGIF(bpy.types.Operator):
         scene.render.fps = self.frame_rate
 
         # Animate Empty's Rotation
-        self._temp_empty.rotation_euler = (0, 0, 0)
-        self._temp_empty.keyframe_insert(data_path="rotation_euler", index=2, frame=1) # Keyframe Z rotation at frame 1
+        # Set keyframe interpolation type before inserting so keyframes
+        # are created with the correct curve.
+        prefs = bpy.context.preferences.edit
+        prev_interp = prefs.keyframe_new_interpolation_type
+        prefs.keyframe_new_interpolation_type = self.interpolation
+        try:
+            self._temp_empty.rotation_euler = (0, 0, 0)
+            self._temp_empty.keyframe_insert(data_path="rotation_euler", index=2, frame=1)
 
-        self._temp_empty.rotation_euler = (0, 0, math.radians(360))
-        # Keyframe Z rotation at end frame + 1 for full circle and correct interpolation
-        self._temp_empty.keyframe_insert(data_path="rotation_euler", index=2, frame=total_frames + 1)
+            self._temp_empty.rotation_euler = (0, 0, math.radians(360))
+            self._temp_empty.keyframe_insert(data_path="rotation_euler", index=2, frame=total_frames + 1)
+        finally:
+            prefs.keyframe_new_interpolation_type = prev_interp
 
-        # Set Interpolation to Linear for smooth rotation
-        if self._temp_empty.animation_data and self._temp_empty.animation_data.action:
-            action = self._temp_empty.animation_data.action
-            # Blender 5.0+ uses slots/channelbags API for fcurves
-            if hasattr(action, 'slots') and action.slots:
-                slot = action.slots[0]
-                for channelbag in slot.channelbags:
-                    for fcurve in channelbag.fcurves:
-                        if fcurve.data_path == "rotation_euler" and fcurve.array_index == 2:
-                            for kf_point in fcurve.keyframe_points:
-                                kf_point.interpolation = 'LINEAR'
-                            fcurve.extrapolation = 'LINEAR'
-            else:
-                for fcurve in action.fcurves:
-                    if fcurve.data_path == "rotation_euler" and fcurve.array_index == 2:
-                        for kf_point in fcurve.keyframe_points:
-                            kf_point.interpolation = 'LINEAR'
-                        fcurve.extrapolation = 'LINEAR'
+        # Post-insert: force the chosen interpolation on all keyframe points.
+        # The preference alone doesn't always take effect on Blender 5.x.
+        self._force_fcurve_interpolation(self._temp_empty, self.interpolation)
 
 
     def execute(self, context):
@@ -4824,7 +5125,8 @@ class ExportOrbitGIF(bpy.types.Operator):
             'engine': scene.render.engine, # Store original engine
             'film_transparent': render.film_transparent, # Store original film transparency
             'light': scene.display.shading.light, # Store original shading light
-            'color_type': scene.display.shading.color_type # Store original shading color type
+            'color_type': scene.display.shading.color_type, # Store original shading color type
+            'use_compositing': render.use_compositing, # Store compositor pipeline state
         }
 
         scene.render.engine = get_eevee_engine_id() if self.engine == 'EEVEE' else self.engine
@@ -4832,6 +5134,13 @@ class ExportOrbitGIF(bpy.types.Operator):
         if scene.render.engine == 'BLENDER_WORKBENCH':
             context.scene.display.shading.light = 'STUDIO'
             context.scene.display.shading.color_type = 'SINGLE'
+
+        # Disable compositing in the render pipeline so Blender writes
+        # the raw ViewLayer result to render.filepath. StableGen's
+        # compositor uses File Output nodes without a Composite node,
+        # which causes the Composite output (and thus saved frames) to be
+        # blank/transparent.
+        render.use_compositing = False
 
         # Apply Render Settings for PNG sequence
         render.filepath = os.path.join(self._temp_dir, "frame_") # Base path for frames
@@ -4955,6 +5264,8 @@ class ExportOrbitGIF(bpy.types.Operator):
                     setattr(render, key, value)
                 elif key == 'film_transparent': # Restore film transparency
                     setattr(render, key, value)
+                elif key == 'use_compositing': # Restore compositor pipeline state
+                    render.use_compositing = value
                 elif hasattr(render, key):
                     setattr(render, key, value)
                 elif hasattr(scene, key):

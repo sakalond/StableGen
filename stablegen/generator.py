@@ -494,6 +494,20 @@ class ComfyUIGenerate(bpy.types.Operator):
         # Sort cameras by name
         self._cameras.sort(key=lambda x: x.name)
 
+        # Apply custom generation order if enabled (non-destructive reorder)
+        if context.scene.sg_use_custom_camera_order and len(context.scene.sg_camera_order) > 0:
+            order_names = [item.name for item in context.scene.sg_camera_order]
+            cam_by_name = {cam.name: cam for cam in self._cameras}
+            ordered = []
+            for name in order_names:
+                if name in cam_by_name:
+                    ordered.append(cam_by_name.pop(name))
+            # Append any cameras not in the order list (newly added cameras)
+            for cam in self._cameras:
+                if cam.name in cam_by_name:
+                    ordered.append(cam)
+            self._cameras = ordered
+
         # Hide crop and label overlays during generation
         _sg_remove_crop_overlay()
         _sg_hide_label_overlay()
@@ -564,29 +578,6 @@ class ComfyUIGenerate(bpy.types.Operator):
 
         if not context.scene.overwrite_material or self._material_id == -1 or (context.scene.generation_method == 'local_edit' or (context.scene.model_architecture.startswith('qwen') and context.scene.qwen_generation_method == 'local_edit')):
             self._material_id += 1
-
-        if context.scene.generation_method == 'sequential' and context.scene.sequential_custom_camera_order != "":
-            # The format is: index1,index2,index3,...,indexN
-            camera_order = context.scene.sequential_custom_camera_order.split(',')
-            # Check if there is index for each camera
-            if len(camera_order) != len(self._cameras):
-                self.report({'ERROR'}, "The number of indices in the custom camera order must match the number of cameras.")
-                context.scene.generation_status = 'idle'
-                ComfyUIGenerate._is_running = False
-                return {'CANCELLED'}
-            # Make a backup of all cameras, remove and then add them in the custom order
-            cameras = self._cameras.copy()
-            cameras_backup = [camera.copy() for camera in cameras]
-            for camera in cameras:
-                bpy.data.objects.remove(camera)
-            self._cameras = []
-            # Re-add the cameras in the custom order
-            for i, index in enumerate(camera_order):
-                camera = cameras_backup[int(index)]
-                # Rename the camera to match the index
-                camera.name = f"Camera_{i}"
-                self._cameras.append(camera)
-                bpy.context.scene.collection.objects.link(camera)
 
         if context.scene.generation_mode == 'standard' or context.scene.generation_mode == 'regenerate_selected':
             # If there is depth controlnet unit
@@ -766,12 +757,22 @@ class ComfyUIGenerate(bpy.types.Operator):
 
         # Regenerate mode preparation
         if context.scene.generation_mode == 'regenerate_selected':
-            # Reset weights for selected viewpoints
-            # Prepare list of camera_ids and material_ids to reset weights for
-            ids = []
-            for camera_id in self._selected_camera_ids:
-                ids.append((camera_id, self._material_id))
-            reinstate_compare_nodes(context, self._to_texture, ids)
+            if context.scene.generation_method == 'sequential':
+                # Sequential regeneration: reset all cameras from the first
+                # selected onward so the projection sequence replays correctly.
+                # Non-selected cameras reuse their existing images but still
+                # get reprojected, keeping subsequent cameras' context intact.
+                first_selected = min(self._selected_camera_ids)
+                ids = [(cid, self._material_id)
+                       for cid in range(first_selected, len(self._cameras))]
+                reinstate_compare_nodes(context, self._to_texture, ids)
+                self._current_image = first_selected
+                self._threads_left = len(self._cameras) - first_selected
+            else:
+                # Non-sequential modes: only reset selected cameras
+                ids = [(cid, self._material_id)
+                       for cid in self._selected_camera_ids]
+                reinstate_compare_nodes(context, self._to_texture, ids)
 
         # Add modal timer
         context.window_manager.modal_handler_add(self)
@@ -780,7 +781,8 @@ class ComfyUIGenerate(bpy.types.Operator):
         if context.scene.generation_method == 'grid':
             self._thread = threading.Thread(target=self.async_generate, args=(context,))
         else:
-            self._thread = threading.Thread(target=self.async_generate, args=(context, 0))
+            _start_cam = self._current_image  # 0 normally, first_selected for sequential regen
+            self._thread = threading.Thread(target=self.async_generate, args=(context, _start_cam))
         
         self._thread.start()
 
@@ -847,6 +849,29 @@ class ComfyUIGenerate(bpy.types.Operator):
                                 node.inputs[1].default_value = new_discard_angle
                     
                     print("Discard angle reset complete.")
+
+                # Reset weight exponent if enabled
+                if (context.scene.weight_exponent_generation_only and
+                        (self._generation_method_on_start == 'sequential' or context.scene.model_architecture == 'qwen_image_edit')):
+                    
+                    new_exponent = context.scene.weight_exponent_after_generation
+                    print(f"Resetting weight exponent in material nodes to {new_exponent}...")
+
+                    for obj in self._to_texture:
+                        if not obj.active_material or not obj.active_material.use_nodes:
+                            continue
+                        
+                        nodes = obj.active_material.node_tree.nodes
+                        for node in nodes:
+                            # OSL script nodes: update 'Power' input
+                            if node.type == 'SCRIPT':
+                                if 'Power' in node.inputs:
+                                    node.inputs['Power'].default_value = new_exponent
+                            # Native MATH POWER nodes (Blender 5.1+ native path)
+                            elif node.type == 'MATH' and node.operation == 'POWER' and node.label == 'power_weight':
+                                node.inputs[1].default_value = new_exponent
+                    
+                    print("Weight exponent reset complete.")
 
                 # If viewport rendering mode is 'Rendered' and mode is 'regenerate_selected', switch to 'Solid' and then back to 'Rendered' to refresh the viewport
                 if context.scene.generation_mode == 'regenerate_selected' and context.area.spaces.active.shading.type == 'RENDERED':
@@ -941,7 +966,36 @@ class ComfyUIGenerate(bpy.types.Operator):
                     if self._error:
                         return
 
-                if context.scene.steps != 0 and not (context.scene.generation_mode == 'regenerate_selected' and camera_id not in self._selected_camera_ids):
+                # Sequential regeneration: non-selected cameras skip AI
+                # generation but still reproject their existing image so
+                # subsequent cameras see the correct incremental texture state.
+                _is_seq_reproject = (
+                    context.scene.generation_mode == 'regenerate_selected'
+                    and camera_id not in self._selected_camera_ids
+                    and context.scene.generation_method == 'sequential'
+                )
+
+                if _is_seq_reproject:
+                    self._stage = "Reprojecting Image"
+                    self._progress = 0
+                    # project_image patches the material tree for this camera,
+                    # loading the existing generated image from disk.
+                    def image_reproject_callback():
+                        try:
+                            redraw_ui(context)
+                            project_image(context, self._to_texture, self._material_id, stop_index=self._current_image)
+                        except Exception as e:
+                            self._error = str(e)
+                            traceback.print_exc()
+                        self._wait_event.set()
+                        return None
+                    bpy.app.timers.register(image_reproject_callback)
+                    self._wait_event.wait()
+                    self._wait_event.clear()
+                    if self._error:
+                        return
+
+                elif context.scene.steps != 0 and not (context.scene.generation_mode == 'regenerate_selected' and camera_id not in self._selected_camera_ids):
                     # Prepare Image Info for Upload
                     controlnet_info = {}
                     mask_info = None
@@ -968,6 +1022,9 @@ class ComfyUIGenerate(bpy.types.Operator):
                     # Get info for IPAdapter reference image
                     if context.scene.use_ipadapter:
                         ipadapter_ref_info = self._get_uploaded_image_info(context, "custom", filename=bpy.path.abspath(context.scene.ipadapter_image))
+                    elif context.scene.sequential_ipadapter and context.scene.sequential_ipadapter_mode == 'original_render' and context.scene.generation_method == 'local_edit':
+                        # Use the existing texture render from this camera's viewpoint as IPAdapter reference
+                        ipadapter_ref_info = self._get_uploaded_image_info(context, "inpaint", subtype="render", camera_id=camera_id)
                     elif context.scene.sequential_ipadapter and self._current_image > 0:
                         cam_id = 0 if context.scene.sequential_ipadapter_mode == 'first' else self._current_image - 1
                         ipadapter_ref_info = self._get_uploaded_image_info(context, "generated", camera_id=cam_id, material_id=self._material_id)
