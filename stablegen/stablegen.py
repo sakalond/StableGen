@@ -270,66 +270,178 @@ class StableGenPanel(bpy.types.Panel):
         elif not addon_prefs.server_online:
             config_error_message = "Cannot reach server"
 
+        # Determine if we are in TRELLIS.2 mode (used by generate button & later sections)
+        _arch_mode = getattr(scene, 'architecture_mode', 'sdxl')
+        _is_trellis2_mode = (_arch_mode == 'trellis2')
+
         action_row = layout.row()
         action_row.scale_y = 2.0 # Scale the row vertically
 
-        if config_error_message:
-            # Split the row to have the error message/disabled button and the refresh button
-            if config_error_message == "Cannot reach server":
-                split = action_row.split(factor=0.85, align=True) # Adjust factor as needed
-                split.operator("object.test_stable", text="Cannot generate: " + config_error_message, icon="ERROR") # Use ERROR icon
-                # Use the operator from __init__.py
-                split.operator("stablegen.check_server_status", text="", icon='FILE_REFRESH')
-            else:
-                action_row.operator("object.test_stable", text="Cannot generate: " + config_error_message, icon="ERROR")
-                action_row.enabled = False
-        else:
-            action_row.enabled = True
-            if not bpy.app.online_access:
-                action_row.operator("object.test_stable", text="Enable online access in preferences", icon="ERROR")
-                action_row.enabled = False
-            elif not scene.model_name or scene.model_name == "NONE_FOUND":
-                action_row.operator("object.test_stable", text="Cannot generate: Model Directory Empty", icon="ERROR")
-                action_row.enabled = False
-            elif scene.generation_status == 'idle':
-                # Check if any cameras are selected and if there is existing output
-                selected_cameras = [obj for obj in context.selected_objects if obj.type == 'CAMERA']
-                if not selected_cameras or scene.get("output_timestamp") == "":
-                    action_row.operator("object.test_stable", text="Generate", icon="PLAY")
+        if _is_trellis2_mode:
+            # --- TRELLIS.2 Generate Button ---
+            trellis2_op = next(
+                (op for win in context.window_manager.windows
+                 for op in win.modal_operators
+                 if op.bl_idname == 'OBJECT_OT_trellis2_generate'),
+                None
+            )
+            # Also look for ComfyUIGenerate running as the texturing phase
+            comfy_tex_op = next(
+                (op for win in context.window_manager.windows
+                 for op in win.modal_operators
+                 if op.bl_idname == 'OBJECT_OT_test_stable'),
+                None
+            ) if not trellis2_op else None
+
+            if config_error_message:
+                if config_error_message == "Cannot reach server":
+                    split = action_row.split(factor=0.85, align=True)
+                    split.operator("object.trellis2_generate", text="Cannot generate: " + config_error_message, icon="ERROR")
+                    split.operator("stablegen.check_server_status", text="", icon='FILE_REFRESH')
                 else:
-                    # Use the regenerate operator
-                    action_row.operator("object.stablegen_regenerate", text="Regenerate Selected Views", icon="PLAY")
-            elif scene.generation_status == 'running':
-                action_row.operator("object.test_stable", text="Cancel Generation", icon="CANCEL")
+                    action_row.operator("object.trellis2_generate", text="Cannot generate: " + config_error_message, icon="ERROR")
+                    action_row.enabled = False
 
-                operator_instance = next((op for win in context.window_manager.windows for op in win.modal_operators if op.bl_idname == 'OBJECT_OT_test_stable'), None)
-                if operator_instance:
-                    progress_col = layout.column()
-                    progress_text = f"{getattr(operator_instance, '_stage', 'Generating')} ({getattr(operator_instance, '_progress', 0):.0f}%)"
-                    progress_factor = getattr(operator_instance, '_progress', 0) / 100.0
-                    progress_col.progress(text=progress_text, factor=max(0.0, min(progress_factor, 1.0))) # Ensure factor is <= 1.0 (logic maintained)
+            elif trellis2_op:
+                # ── Phases 1 & 2: Trellis2Generate is alive ──
+                action_row.operator("object.trellis2_generate", text="Cancel TRELLIS.2", icon="CANCEL")
+                progress_col = layout.column()
 
-                    total_images = getattr(operator_instance, '_total_images', 0)
-                    if total_images > 1:
-                        current_image_idx = getattr(operator_instance, '_current_image', 0)
-                        current_image_decimal_progress = max(0.0, min(progress_factor, 1.0))
-                        
-                        # Ensure total_images is not zero to prevent division by zero
-                        overall_progress_factor = (current_image_idx + current_image_decimal_progress) / total_images if total_images > 0 else 0
-                        overall_progress_factor_clamped = max(0.0, min(overall_progress_factor, 1.0))
+                # Bar 1 — Overall
+                overall_pct = getattr(trellis2_op, '_overall_progress', 0)
+                overall_label = getattr(trellis2_op, '_overall_stage', 'Initializing')
+                progress_col.progress(
+                    text=f"{overall_label} ({overall_pct:.0f}%)",
+                    factor=max(0.0, min(overall_pct / 100.0, 1.0))
+                )
 
-                        current_img = min(current_image_idx + 1, total_images)  # Clamp to total_images
+                # Bar 2 — Phase
+                phase_pct = getattr(trellis2_op, '_phase_progress', 0)
+                phase_label = getattr(trellis2_op, '_phase_stage', '')
+                if phase_label:
+                    progress_col.progress(
+                        text=f"{phase_label} ({phase_pct:.0f}%)",
+                        factor=max(0.0, min(phase_pct / 100.0, 1.0))
+                    )
 
-                        progress_col.progress(
-                            text=f"Overall: Image {current_img}/{total_images}",
-                            factor=overall_progress_factor_clamped # Ensure factor is <= 1.0 (logic maintained)
-                        )
-                        
-            elif context.scene.generation_status == 'waiting':
-                action_row.operator("object.test_stable", text="Waiting for Cancellation", icon="TIME")
-            else:
-                action_row.operator("object.test_stable", text="Fix Issues to Generate", icon="ERROR")
+                # Bar 3 — Detail (only when there's actual sampler progress)
+                detail_pct = getattr(trellis2_op, '_detail_progress', 0)
+                detail_label = getattr(trellis2_op, '_detail_stage', '')
+                if detail_label and detail_pct > 0:
+                    progress_col.progress(
+                        text=f"{detail_label} ({detail_pct:.0f}%)",
+                        factor=max(0.0, min(detail_pct / 100.0, 1.0))
+                    )
+
+            elif comfy_tex_op and getattr(scene, 'trellis2_pipeline_active', False):
+                # ── Phase 3: Texturing via ComfyUIGenerate ──
+                action_row.operator("object.test_stable", text="Cancel Texturing", icon="CANCEL")
+                progress_col = layout.column()
+
+                # Compute overall from scene pipeline props + ComfyUI progress
+                phase_start = getattr(scene, 'trellis2_pipeline_phase_start_pct', 65.0)
+                phase_weight = 100.0 - phase_start
+                comfy_progress = getattr(comfy_tex_op, '_progress', 0) / 100.0
+                total_imgs = getattr(comfy_tex_op, '_total_images', 0)
+                cur_img_idx = getattr(comfy_tex_op, '_current_image', 0)
+                if total_imgs > 1:
+                    comfy_overall = (cur_img_idx + comfy_progress) / total_imgs
+                else:
+                    comfy_overall = comfy_progress
+                overall_pct = phase_start + comfy_overall * phase_weight
+                overall_pct = max(0.0, min(overall_pct, 100.0))
+
+                total_phases = getattr(scene, 'trellis2_pipeline_total_phases', 3)
+                # Bar 1 — Overall
+                progress_col.progress(
+                    text=f"Phase {total_phases}/{total_phases}: Texturing ({overall_pct:.0f}%)",
+                    factor=max(0.0, min(overall_pct / 100.0, 1.0))
+                )
+
+                # Bar 2 — Per-image (same as normal ComfyUI bar)
+                stage = getattr(comfy_tex_op, '_stage', 'Generating')
+                img_pct = getattr(comfy_tex_op, '_progress', 0)
+                progress_col.progress(
+                    text=f"{stage} ({img_pct:.0f}%)",
+                    factor=max(0.0, min(img_pct / 100.0, 1.0))
+                )
+
+                # Bar 3 — Image N/M (same as normal ComfyUI overall bar)
+                if total_imgs > 1:
+                    cur_img = min(cur_img_idx + 1, total_imgs)
+                    img_overall = max(0.0, min(comfy_overall, 1.0))
+                    progress_col.progress(
+                        text=f"Overall: Image {cur_img}/{total_imgs}",
+                        factor=img_overall
+                    )
+
+            elif scene.trellis2_generate_from == 'image' and not scene.trellis2_input_image:
+                action_row.operator("object.trellis2_generate", text="Select an image first", icon="ERROR")
                 action_row.enabled = False
+            elif not getattr(scene, 'trellis2_available', False):
+                action_row.operator("object.trellis2_generate", text="TRELLIS.2 nodes not found on server", icon="ERROR")
+                action_row.enabled = False
+            else:
+                action_row.operator("object.trellis2_generate", text="Generate 3D Mesh", icon="MESH_ICOSPHERE")
+        else:
+            # --- Standard Diffusion Generate Button ---
+            if config_error_message:
+                # Split the row to have the error message/disabled button and the refresh button
+                if config_error_message == "Cannot reach server":
+                    split = action_row.split(factor=0.85, align=True) # Adjust factor as needed
+                    split.operator("object.test_stable", text="Cannot generate: " + config_error_message, icon="ERROR") # Use ERROR icon
+                    # Use the operator from __init__.py
+                    split.operator("stablegen.check_server_status", text="", icon='FILE_REFRESH')
+                else:
+                    action_row.operator("object.test_stable", text="Cannot generate: " + config_error_message, icon="ERROR")
+                    action_row.enabled = False
+            else:
+                action_row.enabled = True
+                if not bpy.app.online_access:
+                    action_row.operator("object.test_stable", text="Enable online access in preferences", icon="ERROR")
+                    action_row.enabled = False
+                elif not scene.model_name or scene.model_name == "NONE_FOUND":
+                    action_row.operator("object.test_stable", text="Cannot generate: Model Directory Empty", icon="ERROR")
+                    action_row.enabled = False
+                elif scene.generation_status == 'idle':
+                    # Check if any cameras are selected and if there is existing output
+                    selected_cameras = [obj for obj in context.selected_objects if obj.type == 'CAMERA']
+                    if not selected_cameras or scene.get("output_timestamp") == "":
+                        action_row.operator("object.test_stable", text="Generate", icon="PLAY")
+                    else:
+                        # Use the regenerate operator
+                        action_row.operator("object.stablegen_regenerate", text="Regenerate Selected Views", icon="PLAY")
+                elif scene.generation_status == 'running':
+                    action_row.operator("object.test_stable", text="Cancel Generation", icon="CANCEL")
+
+                    operator_instance = next((op for win in context.window_manager.windows for op in win.modal_operators if op.bl_idname == 'OBJECT_OT_test_stable'), None)
+                    if operator_instance:
+                        progress_col = layout.column()
+                        progress_text = f"{getattr(operator_instance, '_stage', 'Generating')} ({getattr(operator_instance, '_progress', 0):.0f}%)"
+                        progress_factor = getattr(operator_instance, '_progress', 0) / 100.0
+                        progress_col.progress(text=progress_text, factor=max(0.0, min(progress_factor, 1.0))) # Ensure factor is <= 1.0 (logic maintained)
+
+                        total_images = getattr(operator_instance, '_total_images', 0)
+                        if total_images > 1:
+                            current_image_idx = getattr(operator_instance, '_current_image', 0)
+                            current_image_decimal_progress = max(0.0, min(progress_factor, 1.0))
+                            
+                            # Ensure total_images is not zero to prevent division by zero
+                            overall_progress_factor = (current_image_idx + current_image_decimal_progress) / total_images if total_images > 0 else 0
+                            overall_progress_factor_clamped = max(0.0, min(overall_progress_factor, 1.0))
+
+                            current_img = min(current_image_idx + 1, total_images)  # Clamp to total_images
+
+                            progress_col.progress(
+                                text=f"Overall: Image {current_img}/{total_images}",
+                                factor=overall_progress_factor_clamped # Ensure factor is <= 1.0 (logic maintained)
+                            )
+                            
+                elif context.scene.generation_status == 'waiting':
+                    action_row.operator("object.test_stable", text="Waiting for Cancellation", icon="TIME")
+                else:
+                    action_row.operator("object.test_stable", text="Fix Issues to Generate", icon="ERROR")
+                    action_row.enabled = False
         
         bake_row = layout.row()
         if config_error_message:
@@ -378,6 +490,10 @@ class StableGenPanel(bpy.types.Panel):
         # --- Main Parameters section ---
         if not hasattr(scene, 'show_generation_params'): 
             scene.show_generation_params = True
+
+        is_trellis2 = getattr(scene, 'architecture_mode', 'sdxl') == 'trellis2'
+        trellis2_tex_mode = getattr(scene, 'trellis2_texture_mode', 'native')
+        trellis2_diffusion_texturing = is_trellis2 and trellis2_tex_mode in ('sdxl', 'flux1', 'qwen_image_edit')
             
         main_params_box = layout.box()
         main_params_col = main_params_box.column()
@@ -388,32 +504,74 @@ class StableGenPanel(bpy.types.Panel):
             split = params_container.split(factor=0.25)
             split.label(text="Prompt:")
             split.prop(scene, "comfyui_prompt", text="")
-            
-            # Split for model name
-            split = params_container.split(factor=0.25)
-            split.label(text="Checkpoint:")
-            row = split.row(align=True)
-            row.prop(scene, "model_name", text="")
-            row.operator("stablegen.refresh_checkpoint_list", text="", icon='FILE_REFRESH')
-                
 
-            # Split for model architecture
+            # Architecture selector (architecture_mode — includes TRELLIS.2)
             split = params_container.split(factor=0.5)
             split.label(text="Architecture:")
-            split.prop(scene, "model_architecture", text="")
-            
-            # Split for generation method
-            split = params_container.split(factor=0.5)
-            split.label(text="Generation Mode:")
-            if scene.model_architecture.startswith("qwen"):
-                split.prop(scene, "qwen_generation_method", text="")
-            else:
-                split.prop(scene, "generation_method", text="")
+            split.prop(scene, "architecture_mode", text="")
 
-            # Split for object selection
-            split = params_container.split(factor=0.5)
-            split.label(text="Target Objects:")
-            split.prop(scene, "texture_objects", text="")
+            if is_trellis2:
+                # --- TRELLIS.2 specific layout ---
+                # Warning if TRELLIS.2 nodes not detected
+                if not getattr(scene, 'trellis2_available', False):
+                    warn_row = params_container.row()
+                    warn_row.alert = True
+                    warn_row.label(text="TRELLIS.2 nodes not detected on server", icon="ERROR")
+
+                # Generate From toggle (Image / Prompt)
+                split = params_container.split(factor=0.5)
+                split.label(text="Generate From:")
+                split.prop(scene, "trellis2_generate_from", text="")
+
+                # Input image picker (only when generate_from = image)
+                if scene.trellis2_generate_from == 'image':
+                    split = params_container.split(factor=0.25)
+                    split.label(text="Input Image:")
+                    split.prop(scene, "trellis2_input_image", text="")
+
+                # Texture Generation Mode
+                split = params_container.split(factor=0.5)
+                split.label(text="Texture Mode:")
+                split.prop(scene, "trellis2_texture_mode", text="")
+
+                # When diffusion texturing: show checkpoint, generation mode, camera count
+                if trellis2_diffusion_texturing:
+                    split = params_container.split(factor=0.25)
+                    split.label(text="Checkpoint:")
+                    row = split.row(align=True)
+                    row.prop(scene, "model_name", text="")
+                    row.operator("stablegen.refresh_checkpoint_list", text="", icon='FILE_REFRESH')
+
+                    split = params_container.split(factor=0.5)
+                    split.label(text="Generation Mode:")
+                    if scene.model_architecture.startswith("qwen"):
+                        split.prop(scene, "qwen_generation_method", text="")
+                    else:
+                        split.prop(scene, "generation_method", text="")
+
+                    row = params_container.row()
+                    row.prop(scene, "trellis2_camera_count", text="Camera Count")
+            else:
+                # --- Standard diffusion layout ---
+                # Split for model name
+                split = params_container.split(factor=0.25)
+                split.label(text="Checkpoint:")
+                row = split.row(align=True)
+                row.prop(scene, "model_name", text="")
+                row.operator("stablegen.refresh_checkpoint_list", text="", icon='FILE_REFRESH')
+
+                # Split for generation method
+                split = params_container.split(factor=0.5)
+                split.label(text="Generation Mode:")
+                if scene.model_architecture.startswith("qwen"):
+                    split.prop(scene, "qwen_generation_method", text="")
+                else:
+                    split.prop(scene, "generation_method", text="")
+
+                # Split for object selection
+                split = params_container.split(factor=0.5)
+                split.label(text="Target Objects:")
+                split.prop(scene, "texture_objects", text="")
 
         # Helper to create collapsible sections
         def draw_collapsible_section(parent_layout, toggle_prop_name, title, icon="NONE"):
@@ -443,10 +601,92 @@ class StableGenPanel(bpy.types.Panel):
         advanced_params_box = advanced_params_box.column()
         advanced_params_box.prop(scene, "show_advanced_params", text="Advanced Parameters", icon="TRIA_DOWN" if scene.show_advanced_params else "TRIA_RIGHT", emboss=False)
         if context.scene.show_advanced_params:
-        
+
+            # --- TRELLIS.2: Mesh Generation Settings ---
+            if is_trellis2:
+                content_box = draw_collapsible_section(advanced_params_box, "show_trellis2_mesh_settings", "Mesh Generation Settings", icon="MESH_DATA")
+                if content_box:
+                    # Core mesh params
+                    row = content_box.row()
+                    row.prop(scene, "trellis2_seed", text="Seed")
+                    row = content_box.row()
+                    row.prop(scene, "trellis2_decimation", text="Decimation Target")
+                    row = content_box.row()
+                    row.prop(scene, "trellis2_remesh", text="Remesh")
+
+                    content_box.separator()
+
+                    # Model settings
+                    content_box.label(text="Model:", icon="SETTINGS")
+                    split = content_box.split(factor=0.4)
+                    split.label(text="Resolution:")
+                    split.prop(scene, "trellis2_resolution", text="")
+
+                    split = content_box.split(factor=0.4)
+                    split.label(text="VRAM Mode:")
+                    split.prop(scene, "trellis2_vram_mode", text="")
+
+                    split = content_box.split(factor=0.4)
+                    split.label(text="Attention:")
+                    split.prop(scene, "trellis2_attn_backend", text="")
+
+                    content_box.separator()
+
+                    # Shape generation
+                    content_box.label(text="Shape Generation:", icon="MESH_ICOSPHERE")
+                    row = content_box.row(align=True)
+                    row.prop(scene, "trellis2_ss_guidance", text="SS Guidance")
+                    row.prop(scene, "trellis2_ss_steps", text="SS Steps")
+                    row = content_box.row(align=True)
+                    row.prop(scene, "trellis2_shape_guidance", text="Shape Guidance")
+                    row.prop(scene, "trellis2_shape_steps", text="Shape Steps")
+                    row = content_box.row()
+                    row.prop(scene, "trellis2_max_tokens", text="Max Tokens (VRAM)")
+
+                    content_box.separator()
+
+                    # Conditioning
+                    content_box.label(text="Conditioning:", icon="IMAGE_DATA")
+                    split = content_box.split(factor=0.4)
+                    split.label(text="Background:")
+                    split.prop(scene, "trellis2_background_color", text="")
+                    row = content_box.row()
+                    row.prop(scene, "trellis2_include_1024", text="Include 1024 Conditioning")
+
+                    content_box.separator()
+
+                    # Shape-only extras
+                    content_box.label(text="Post-processing:", icon="OUTLINER_OB_MESH")
+                    row = content_box.row()
+                    row.prop(scene, "trellis2_fill_holes", text="Fill Holes")
+
+                    content_box.separator()
+
+                    # Misc
+                    content_box.label(text="Misc:", icon="PREFERENCES")
+                    row = content_box.row()
+                    row.prop(scene, "trellis2_low_vram", text="Low VRAM Background Removal")
+
+            # --- TRELLIS.2: Native Texture Settings ---
+            if is_trellis2 and trellis2_tex_mode == 'native':
+                content_box = draw_collapsible_section(advanced_params_box, "show_trellis2_texture_settings", "Texture Settings (TRELLIS.2 Native)", icon="TEXTURE")
+                if content_box:
+                    row = content_box.row(align=True)
+                    row.prop(scene, "trellis2_tex_guidance", text="Tex Guidance")
+                    row.prop(scene, "trellis2_tex_steps", text="Tex Steps")
+                    row = content_box.row()
+                    row.prop(scene, "trellis2_texture_size", text="Texture Size")
+
+            # --- Diffusion-based advanced sections ---
+            # Each is individually guarded: shown for standard arches or TRELLIS.2 with diffusion texturing
+            _show_diffusion_sections = not is_trellis2 or trellis2_diffusion_texturing
+
             # --- Core Generation Settings ---
             
-            content_box = draw_collapsible_section(advanced_params_box, "show_core_settings", "Core Generation Settings", icon="SETTINGS")
+            if _show_diffusion_sections:
+                content_box = draw_collapsible_section(advanced_params_box, "show_core_settings", "Core Generation Settings", icon="SETTINGS")
+            else:
+                content_box = None
             if content_box:
                 row = content_box.row()
                 row.prop(scene, "seed", text="Seed")
@@ -477,7 +717,10 @@ class StableGenPanel(bpy.types.Panel):
                 row.prop(scene, "clip_skip", text="Clip Skip")
 
            # --- LoRA Settings ---
-            content_box = draw_collapsible_section(advanced_params_box, "show_lora_settings", "LoRA Management", icon="MODIFIER")
+            if _show_diffusion_sections:
+                content_box = draw_collapsible_section(advanced_params_box, "show_lora_settings", "LoRA Management", icon="MODIFIER")
+            else:
+                content_box = None
             if content_box:
                 row = content_box.row()
                 row.alignment = 'CENTER'
@@ -518,7 +761,10 @@ class StableGenPanel(bpy.types.Panel):
                     btn_row_lora.operator("stablegen.remove_lora_unit", text="Remove Selected", icon="REMOVE")
 
             # --- Camera Options ---
-            content_box = draw_collapsible_section(advanced_params_box, "show_camera_options", "Camera Settings", icon="CAMERA_DATA")
+            if _show_diffusion_sections:
+                content_box = draw_collapsible_section(advanced_params_box, "show_camera_options", "Camera Settings", icon="CAMERA_DATA")
+            else:
+                content_box = None
             if content_box:
                 row = content_box.row(align=True)
                 row.prop(scene, "use_camera_prompts", text="Use Camera Prompts", toggle=True, icon="OUTLINER_OB_CAMERA")
@@ -553,7 +799,10 @@ class StableGenPanel(bpy.types.Panel):
                     op.direction = 'DOWN'
 
             # --- Viewpoint Blending Settings ---
-            content_box = draw_collapsible_section(advanced_params_box, "show_scene_understanding_settings", "Viewpoint Blending Settings", icon="ZOOM_IN")
+            if _show_diffusion_sections:
+                content_box = draw_collapsible_section(advanced_params_box, "show_scene_understanding_settings", "Viewpoint Blending Settings", icon="ZOOM_IN")
+            else:
+                content_box = None
             if content_box:
                 # Row 1: Discard-Over Angle | Weight Exponent
                 split = content_box.split(factor=0.5, align=True)
@@ -585,7 +834,10 @@ class StableGenPanel(bpy.types.Panel):
                 
 
             # --- Output & Material Settings ---
-            content_box = draw_collapsible_section(advanced_params_box, "show_output_material_settings", "Output & Material Settings", icon="MATERIAL")
+            if _show_diffusion_sections:
+                content_box = draw_collapsible_section(advanced_params_box, "show_output_material_settings", "Output & Material Settings", icon="MATERIAL")
+            else:
+                content_box = None
             if content_box:
                 split = content_box.split(factor=0.5)
                 split.label(text="Fallback Color:")
@@ -608,10 +860,13 @@ class StableGenPanel(bpy.types.Panel):
                 row.prop(scene, "overwrite_material", text="Overwrite Material", toggle=True, icon="FILE_REFRESH")
 
             # --- Image Guidance (IPAdapter & ControlNet) ---
-            if scene.model_architecture in ['sdxl', 'flux1']:
-                content_box = draw_collapsible_section(advanced_params_box, "show_image_guidance_settings", "Image Guidance (IPAdapter & ControlNet)", icon="MODIFIER")
-            else: # Qwen Image Edit
-                content_box = draw_collapsible_section(advanced_params_box, "show_image_guidance_settings", "Qwen-Image-Edit Guidance", icon="MODIFIER")
+            if _show_diffusion_sections:
+                if scene.model_architecture in ['sdxl', 'flux1']:
+                    content_box = draw_collapsible_section(advanced_params_box, "show_image_guidance_settings", "Image Guidance (IPAdapter & ControlNet)", icon="MODIFIER")
+                else: # Qwen Image Edit
+                    content_box = draw_collapsible_section(advanced_params_box, "show_image_guidance_settings", "Qwen-Image-Edit Guidance", icon="MODIFIER")
+            else:
+                content_box = None
             if content_box:
                 if scene.model_architecture == 'qwen_image_edit':
                     if scene.qwen_generation_method == 'generate':
@@ -621,6 +876,11 @@ class StableGenPanel(bpy.types.Panel):
 
                         row = content_box.row()
                         row.prop(scene, "qwen_use_external_style_image", text="Use External Image as Style", toggle=True, icon="FILE_IMAGE")
+
+                        # TRELLIS.2 input as style (only in trellis2 architecture mode)
+                        if getattr(scene, 'architecture_mode', '') == 'trellis2':
+                            row = content_box.row()
+                            row.prop(scene, "qwen_use_trellis2_style", text="Use TRELLIS.2 Input as Style", toggle=True, icon="MESH_MONKEY")
 
                         if scene.qwen_use_external_style_image:
                             style_box = content_box.box()
@@ -667,6 +927,11 @@ class StableGenPanel(bpy.types.Panel):
                         
                         row = content_box.row()
                         row.prop(scene, "qwen_use_external_style_image", text="Use External Image as Style", toggle=True, icon="FILE_IMAGE")
+
+                        # TRELLIS.2 input as style (only in trellis2 architecture mode)
+                        if getattr(scene, 'architecture_mode', '') == 'trellis2':
+                            row = content_box.row()
+                            row.prop(scene, "qwen_use_trellis2_style", text="Use TRELLIS.2 Input as Style", toggle=True, icon="MESH_MONKEY")
 
                         if scene.qwen_use_external_style_image:
                             style_box = content_box.box()
@@ -809,7 +1074,7 @@ class StableGenPanel(bpy.types.Panel):
                             cn_box.operator("stablegen.add_controlnet_unit", text="Add ControlNet Unit", icon="ADD")
                             cn_box.operator("stablegen.remove_controlnet_unit", text="Remove Last ControlNet Unit", icon="REMOVE")
 
-            if not scene.model_architecture == 'qwen_image_edit':
+            if _show_diffusion_sections and not scene.model_architecture == 'qwen_image_edit':
                 # --- Inpainting Options (Conditional) ---
                 if scene.generation_method == 'uv_inpaint' or scene.generation_method == 'sequential':
                     content_box = draw_collapsible_section(advanced_params_box, "show_masking_inpainting_settings", "Inpainting Options", icon="MOD_MASK")
@@ -842,7 +1107,10 @@ class StableGenPanel(bpy.types.Panel):
 
 
             # --- Generation Mode Specifics ---
-            mode_specific_outer_box = draw_collapsible_section(advanced_params_box, "show_mode_specific_settings", "Generation Mode Specifics", icon="OPTIONS")
+            if _show_diffusion_sections:
+                mode_specific_outer_box = draw_collapsible_section(advanced_params_box, "show_mode_specific_settings", "Generation Mode Specifics", icon="OPTIONS")
+            else:
+                mode_specific_outer_box = None
             if mode_specific_outer_box: # This is the box where all mode-specific UIs should go
                 
                 # Qwen Local Edit Mode Parameters

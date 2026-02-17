@@ -14,6 +14,317 @@ try:
 except ImportError:
     TQDM_AVAILABLE = False
 
+# --- Compatibility Patches ---
+# Polyfill for Path.is_junction() which requires Python 3.12+.
+# comfy_env uses it but many ComfyUI installs still run Python 3.10/3.11.
+_PATCH_PY310_IS_JUNCTION = (
+    "# -- StableGen patch: Path.is_junction polyfill for Python < 3.12 --\n"
+    "import pathlib as _pathlib\n"
+    "if not hasattr(_pathlib.Path, 'is_junction'):\n"
+    "    import os as _os, stat as _stat\n"
+    "    def _is_junction(self):\n"
+    "        try:\n"
+    "            return bool(\n"
+    "                _os.lstat(str(self)).st_file_attributes\n"
+    "                & _stat.FILE_ATTRIBUTE_REPARSE_POINT\n"
+    "            )\n"
+    "        except (OSError, AttributeError):\n"
+    "            return False\n"
+    "    _pathlib.Path.is_junction = _is_junction\n"
+    "# -- End StableGen patch --\n\n"
+)
+
+# Patch for lazy_manager.py: Add attn_backend to config comparison.
+# Without this, switching attention backend (e.g. xformers -> flash_attn)
+# doesn't recreate the model manager, leaving stale config.
+_PATCH_TRELLIS_ATTN_CMP_ANCHOR = (
+    "    elif (_LAZY_MANAGER.model_name != model_name or\n"
+    "          _LAZY_MANAGER.resolution != resolution or\n"
+    "          _LAZY_MANAGER.vram_mode != vram_mode):\n"
+    "        # Config changed, recreate manager\n"
+    "        _LAZY_MANAGER.cleanup()\n"
+)
+
+_PATCH_TRELLIS_ATTN_CMP_REPLACE = (
+    "    elif (_LAZY_MANAGER.model_name != model_name or\n"
+    "          _LAZY_MANAGER.resolution != resolution or\n"
+    "          _LAZY_MANAGER.vram_mode != vram_mode or\n"
+    "          _LAZY_MANAGER.attn_backend != attn_backend):\n"
+    "        # Config changed, recreate manager\n"
+    "        print(f\"[TRELLIS2] Config changed, recreating model manager...\", file=sys.stderr)\n"
+    "        _LAZY_MANAGER.cleanup()\n"
+)
+
+# Patch for stages.py: Wrap DinoV3 feature extraction in torch.no_grad().
+# Without this, autograd retains ViT-L intermediate activations on GPU,
+# leaking ~5-9 GB between runs in the persistent comfy-env worker.
+_PATCH_TRELLIS_NOGRAD_ANCHOR = (
+    "    # Load DinoV3 and extract features\n"
+    "    model = manager.get_dinov3(device)\n"
+    "\n"
+    "    # Get 512px conditioning\n"
+    "    model.image_size = 512\n"
+    "    cond_512 = model([pil_image])\n"
+    "\n"
+    "    # Get 1024px conditioning if requested\n"
+    "    cond_1024 = None\n"
+    "    if include_1024:\n"
+    "        model.image_size = 1024\n"
+    "        cond_1024 = model([pil_image])\n"
+    "\n"
+    "    # Unload DinoV3 immediately\n"
+    "    manager.unload_dinov3()\n"
+    "\n"
+    "    # Create negative conditioning\n"
+    "    neg_cond = torch.zeros_like(cond_512)\n"
+    "\n"
+    "    conditioning = {\n"
+    "        'cond_512': cond_512.cpu(),\n"
+    "        'neg_cond': neg_cond.cpu(),\n"
+    "    }\n"
+    "    if cond_1024 is not None:\n"
+    "        conditioning['cond_1024'] = cond_1024.cpu()\n"
+)
+
+_PATCH_TRELLIS_NOGRAD_REPLACE = (
+    "    # Load DinoV3 and extract features\n"
+    "    model = manager.get_dinov3(device)\n"
+    "\n"
+    "    # Use no_grad to prevent autograd from retaining intermediate activations\n"
+    "    # on GPU. Without this, the computation graph keeps ViT-L activations alive\n"
+    "    # in the comfy-env worker, leaking ~5-9 GB between runs.\n"
+    "    with torch.no_grad():\n"
+    "        # Get 512px conditioning\n"
+    "        model.image_size = 512\n"
+    "        cond_512 = model([pil_image])\n"
+    "\n"
+    "        # Get 1024px conditioning if requested\n"
+    "        cond_1024 = None\n"
+    "        if include_1024:\n"
+    "            model.image_size = 1024\n"
+    "            cond_1024 = model([pil_image])\n"
+    "\n"
+    "    # Unload DinoV3 immediately\n"
+    "    manager.unload_dinov3()\n"
+    "\n"
+    "    # Create negative conditioning\n"
+    "    neg_cond = torch.zeros_like(cond_512)\n"
+    "\n"
+    "    # .detach() breaks any remaining graph references before moving to CPU\n"
+    "    conditioning = {\n"
+    "        'cond_512': cond_512.detach().cpu(),\n"
+    "        'neg_cond': neg_cond.detach().cpu(),\n"
+    "    }\n"
+    "    if cond_1024 is not None:\n"
+    "        conditioning['cond_1024'] = cond_1024.detach().cpu()\n"
+    "\n"
+    "    # Free the GPU originals immediately\n"
+    "    del cond_512, cond_1024, neg_cond\n"
+    "    gc.collect()\n"
+    "    torch.cuda.empty_cache()\n"
+)
+
+# ---------------------------------------------------------------------------
+# comfy-env VRAM leak fix patches
+# ---------------------------------------------------------------------------
+# comfy-env hooks torch.nn.Module.to() and .cuda() to auto-register every
+# model that lands on CUDA in a permanent _model_registry (with no unregister
+# API).  Between ComfyUI node calls the model manager issues
+# "Requested to load SubprocessModel" which calls model_to_device("cuda"),
+# moving ALL registered models back to GPU.  This leaks ~7 GB of model
+# weights between runs.  The fix: unregister from the registry before
+# moving models to CPU / deleting them.
+# ---------------------------------------------------------------------------
+
+# -- base.py _unload_model: unregister from comfy-env + model.cpu() before del
+_PATCH_TRELLIS_UNLOAD_CPU_ANCHOR = (
+    "            # Delete the model entirely\n"
+    "            self.models[model_key] = None\n"
+    "            del model\n"
+)
+
+_PATCH_TRELLIS_UNLOAD_CPU_REPLACE = (
+    "            # Unregister from comfy-env's model registry BEFORE moving to CPU.\n"
+    "            # comfy-env auto-registers every nn.Module that lands on CUDA via\n"
+    "            # hooked Module.to(). Without unregistering, the registry keeps a\n"
+    "            # permanent reference and ComfyUI's model manager re-loads the model\n"
+    "            # to GPU between calls, leaking the full model weights per run.\n"
+    "            # Replace with zero-param dummy so host's model_to_device succeeds\n"
+    "            # but consumes 0 VRAM.  Registry accessed via closure on\n"
+    "            # sys.modules['comfy_worker'].register_model.\n"
+    "            try:\n"
+    "                _cw = sys.modules.get('comfy_worker')\n"
+    "                if _cw is not None:\n"
+    "                    _reg_fn = getattr(_cw, 'register_model', None)\n"
+    "                    if _reg_fn is not None and hasattr(_reg_fn, '__closure__'):\n"
+    "                        _fv = _reg_fn.__code__.co_freevars\n"
+    "                        _cl = _reg_fn.__closure__\n"
+    "                        _by_obj = _cl[_fv.index('_model_id_by_obj')].cell_contents\n"
+    "                        _registry = _cl[_fv.index('_model_registry')].cell_contents\n"
+    "                        _meta = _cl[_fv.index('_model_registry_meta')].cell_contents\n"
+    "                        obj_id = id(model)\n"
+    "                        if obj_id in _by_obj:\n"
+    "                            ce_model_id = _by_obj.pop(obj_id)\n"
+    "                            dummy = torch.nn.Module()\n"
+    "                            _registry[ce_model_id] = dummy\n"
+    "                            _meta[ce_model_id] = {'size': 0, 'kind': 'other'}\n"
+    "                            _by_obj[id(dummy)] = ce_model_id\n"
+    '                            print(f"[TRELLIS2] Unregistered {model_key} from comfy-env registry (id={ce_model_id})", file=sys.stderr, flush=True)\n'
+    "            except Exception:\n"
+    "                pass\n"
+    "            # Force all parameters and buffers off GPU.\n"
+    "            try:\n"
+    "                model.cpu()\n"
+    "            except Exception:\n"
+    "                pass\n"
+    "            # Delete the model entirely\n"
+    "            self.models[model_key] = None\n"
+    "            del model\n"
+)
+
+# -- lazy_manager.py: insert _unregister_from_comfy_env helper function
+_PATCH_TRELLIS_COMFY_HELPER_ANCHOR = (
+    "# Global model manager instance\n"
+    '_LAZY_MANAGER: Optional["LazyModelManager"] = None\n'
+)
+
+_PATCH_TRELLIS_COMFY_HELPER_REPLACE = (
+    "\n"
+    "def _unregister_from_comfy_env(model, label: str = \"\"):\n"
+    '    """Remove an nn.Module from comfy-env\'s worker-side model registry.\n'
+    "\n"
+    "    comfy-env hooks Module.to() to auto-register every model that lands on\n"
+    "    CUDA.  The registry keeps a permanent reference, and ComfyUI's model\n"
+    "    manager will re-load the model to GPU between calls via\n"
+    "    'Requested to load SubprocessModel'.  We replace the model with a\n"
+    "    zero-param dummy so the host's model_to_device succeeds (no-op) but\n"
+    "    no VRAM is consumed.  Registry accessed via closure on\n"
+    "    sys.modules['comfy_worker'].register_model.\n"
+    '    """\n'
+    "    try:\n"
+    "        _cw = sys.modules.get('comfy_worker')\n"
+    "        if _cw is None:\n"
+    "            return\n"
+    "        _reg_fn = getattr(_cw, 'register_model', None)\n"
+    "        if _reg_fn is None or not hasattr(_reg_fn, '__closure__'):\n"
+    "            return\n"
+    "        _fv = _reg_fn.__code__.co_freevars\n"
+    "        _cl = _reg_fn.__closure__\n"
+    "        _by_obj = _cl[_fv.index('_model_id_by_obj')].cell_contents\n"
+    "        _registry = _cl[_fv.index('_model_registry')].cell_contents\n"
+    "        _meta = _cl[_fv.index('_model_registry_meta')].cell_contents\n"
+    "        obj_id = id(model)\n"
+    "        if obj_id in _by_obj:\n"
+    "            model_id = _by_obj.pop(obj_id)\n"
+    "            dummy = torch.nn.Module()\n"
+    "            _registry[model_id] = dummy\n"
+    "            _meta[model_id] = {'size': 0, 'kind': 'other'}\n"
+    "            _by_obj[id(dummy)] = model_id\n"
+    '            print(f"[TRELLIS2] Unregistered {label} from comfy-env registry (id={model_id})", file=sys.stderr)\n'
+    "    except Exception:\n"
+    "        pass\n"
+    "\n"
+    "\n"
+    "# Global model manager instance\n"
+    '_LAZY_MANAGER: Optional["LazyModelManager"] = None\n'
+)
+
+# -- lazy_manager.py unload_dinov3: add comfy-env unregistration
+_PATCH_TRELLIS_UNLOAD_DINOV3_ANCHOR = (
+    "    def unload_dinov3(self):\n"
+    '        """Unload DinoV3 to free VRAM."""\n'
+    "        if self.dinov3_model is not None:\n"
+    "            self.dinov3_model.cpu()\n"
+    "            self.dinov3_model = None\n"
+    "            gc.collect()\n"
+    "            torch.cuda.empty_cache()\n"
+    '            print(f"[TRELLIS2] DinoV3 offloaded", file=sys.stderr)\n'
+)
+
+_PATCH_TRELLIS_UNLOAD_DINOV3_REPLACE = (
+    "    def unload_dinov3(self):\n"
+    '        """Unload DinoV3 to free VRAM."""\n'
+    "        if self.dinov3_model is not None:\n"
+    "            # Unregister the inner nn.Module (DINOv3ViTModel) from comfy-env.\n"
+    "            # DinoV3FeatureExtractor is a plain class; comfy-env hooks on the\n"
+    "            # inner .model which is the actual nn.Module that got .to(cuda).\n"
+    "            inner = getattr(self.dinov3_model, 'model', self.dinov3_model)\n"
+    '            _unregister_from_comfy_env(inner, "dinov3")\n'
+    "            self.dinov3_model.cpu()\n"
+    "            self.dinov3_model = None\n"
+    "            gc.collect()\n"
+    "            torch.cuda.empty_cache()\n"
+    '            print(f"[TRELLIS2] DinoV3 offloaded", file=sys.stderr)\n'
+)
+
+# -- lazy_manager.py unload_shape_pipeline: iterate models + comfy-env unreg
+_PATCH_TRELLIS_UNLOAD_SHAPE_ANCHOR = (
+    "    def unload_shape_pipeline(self):\n"
+    '        """Unload shape pipeline to free VRAM."""\n'
+    "        if self.shape_pipeline is not None:\n"
+    "            self.shape_pipeline = None\n"
+    "            gc.collect()\n"
+    "            torch.cuda.empty_cache()\n"
+    '            print(f"[TRELLIS2] Shape pipeline offloaded", file=sys.stderr)\n'
+)
+
+_PATCH_TRELLIS_UNLOAD_SHAPE_REPLACE = (
+    "    def unload_shape_pipeline(self):\n"
+    '        """Unload shape pipeline to free VRAM."""\n'
+    "        if self.shape_pipeline is not None:\n"
+    "            # Force any remaining models off GPU before dropping pipeline\n"
+    "            if hasattr(self.shape_pipeline, 'models'):\n"
+    "                for key in list(self.shape_pipeline.models.keys()):\n"
+    "                    model = self.shape_pipeline.models[key]\n"
+    "                    if model is not None:\n"
+    '                        _unregister_from_comfy_env(model, f"shape/{key}")\n'
+    "                        try:\n"
+    "                            model.cpu()\n"
+    "                        except Exception:\n"
+    "                            pass\n"
+    "                        self.shape_pipeline.models[key] = None\n"
+    "                        del model\n"
+    "                self.shape_pipeline.models.clear()\n"
+    "            self.shape_pipeline = None\n"
+    "            gc.collect()\n"
+    "            torch.cuda.empty_cache()\n"
+    '            print(f"[TRELLIS2] Shape pipeline offloaded", file=sys.stderr)\n'
+)
+
+# -- lazy_manager.py unload_texture_pipeline: iterate models + comfy-env unreg
+_PATCH_TRELLIS_UNLOAD_TEX_ANCHOR = (
+    "    def unload_texture_pipeline(self):\n"
+    '        """Unload texture pipeline to free VRAM."""\n'
+    "        if self.texture_pipeline is not None:\n"
+    "            self.texture_pipeline = None\n"
+    "            gc.collect()\n"
+    "            torch.cuda.empty_cache()\n"
+    '            print(f"[TRELLIS2] Texture pipeline offloaded", file=sys.stderr)\n'
+)
+
+_PATCH_TRELLIS_UNLOAD_TEX_REPLACE = (
+    "    def unload_texture_pipeline(self):\n"
+    '        """Unload texture pipeline to free VRAM."""\n'
+    "        if self.texture_pipeline is not None:\n"
+    "            # Force any remaining models off GPU before dropping pipeline\n"
+    "            if hasattr(self.texture_pipeline, 'models'):\n"
+    "                for key in list(self.texture_pipeline.models.keys()):\n"
+    "                    model = self.texture_pipeline.models[key]\n"
+    "                    if model is not None:\n"
+    '                        _unregister_from_comfy_env(model, f"texture/{key}")\n'
+    "                        try:\n"
+    "                            model.cpu()\n"
+    "                        except Exception:\n"
+    "                            pass\n"
+    "                        self.texture_pipeline.models[key] = None\n"
+    "                        del model\n"
+    "                self.texture_pipeline.models.clear()\n"
+    "            self.texture_pipeline = None\n"
+    "            gc.collect()\n"
+    "            torch.cuda.empty_cache()\n"
+    '            print(f"[TRELLIS2] Texture pipeline offloaded", file=sys.stderr)\n'
+)
+
 # --- Configuration: Dependencies Data ---
 # Sizes are in MB.
 DEPENDENCIES: Dict[str, Dict[str, Any]] = {
@@ -174,6 +485,80 @@ DEPENDENCIES: Dict[str, Dict[str, Any]] = {
         "target_path_relative": "models/diffusion_models", "filename": "svdq-int4_r128-qwen-image-edit-2509-lightning-4steps-251115.safetensors",
         "license": "Apache 2.0", "size_mb": 12700, "packages": ["qwen_nunchaku"]
     },
+    # --- TRELLIS.2 ---
+    "cn_trellis2": {
+        "id": "cn_trellis2", "type": "node", "name": "ComfyUI TRELLIS.2",
+        "git_url": "https://github.com/PozzettiAndrea/ComfyUI-TRELLIS2.git",
+        "commit": "6b0b2148f45bbafa0b86bfd25c63602b63a7aae0",
+        "target_dir_relative": "custom_nodes",
+        "repo_name": "ComfyUI-TRELLIS2",
+        "license": "MIT", "packages": ["trellis2"],
+        "pip_packages": ["comfy-env==0.2.0"],
+        "run_install_script": True,
+        "post_clone_patches": [
+            {
+                "file": "__init__.py",
+                "marker": "StableGen patch: Path.is_junction",
+                "anchor": "from comfy_env import",
+                "patch": _PATCH_PY310_IS_JUNCTION,
+            },
+            {
+                "file": "prestartup_script.py",
+                "marker": "StableGen patch: Path.is_junction",
+                "anchor": "from comfy_env import",
+                "patch": _PATCH_PY310_IS_JUNCTION,
+            },
+            {
+                "file": "nodes/trellis_utils/lazy_manager.py",
+                "marker": "_LAZY_MANAGER.attn_backend != attn_backend",
+                "anchor": _PATCH_TRELLIS_ATTN_CMP_ANCHOR,
+                "patch": _PATCH_TRELLIS_ATTN_CMP_REPLACE,
+                "mode": "replace",
+            },
+            {
+                "file": "nodes/trellis_utils/stages.py",
+                "marker": "# Use no_grad to prevent autograd",
+                "anchor": _PATCH_TRELLIS_NOGRAD_ANCHOR,
+                "patch": _PATCH_TRELLIS_NOGRAD_REPLACE,
+                "mode": "replace",
+            },
+            {
+                "file": "nodes/trellis2/pipelines/base.py",
+                "marker": "_model_id_by_obj",
+                "anchor": _PATCH_TRELLIS_UNLOAD_CPU_ANCHOR,
+                "patch": _PATCH_TRELLIS_UNLOAD_CPU_REPLACE,
+                "mode": "replace",
+            },
+            {
+                "file": "nodes/trellis_utils/lazy_manager.py",
+                "marker": "_unregister_from_comfy_env",
+                "anchor": _PATCH_TRELLIS_COMFY_HELPER_ANCHOR,
+                "patch": _PATCH_TRELLIS_COMFY_HELPER_REPLACE,
+                "mode": "replace",
+            },
+            {
+                "file": "nodes/trellis_utils/lazy_manager.py",
+                "marker": '_unregister_from_comfy_env(self.dinov3_model',
+                "anchor": _PATCH_TRELLIS_UNLOAD_DINOV3_ANCHOR,
+                "patch": _PATCH_TRELLIS_UNLOAD_DINOV3_REPLACE,
+                "mode": "replace",
+            },
+            {
+                "file": "nodes/trellis_utils/lazy_manager.py",
+                "marker": '_unregister_from_comfy_env(model, f"shape/',
+                "anchor": _PATCH_TRELLIS_UNLOAD_SHAPE_ANCHOR,
+                "patch": _PATCH_TRELLIS_UNLOAD_SHAPE_REPLACE,
+                "mode": "replace",
+            },
+            {
+                "file": "nodes/trellis_utils/lazy_manager.py",
+                "marker": '_unregister_from_comfy_env(model, f"texture/',
+                "anchor": _PATCH_TRELLIS_UNLOAD_TEX_ANCHOR,
+                "patch": _PATCH_TRELLIS_UNLOAD_TEX_REPLACE,
+                "mode": "replace",
+            },
+        ]
+    },
 }
 
 # Define what items each menu option entails by listing package tags
@@ -206,7 +591,11 @@ MENU_PACKAGES: Dict[str, Dict[str, Any]] = {
     '7': {"name": "[QWEN NUNCHAKU] Nunchaku Nodes + Model",
         "tags": ["qwen_core", "qwen_nunchaku"],
         "size_gb": 33.0,
-        "description_suffix": "*Installs Qwen Core components plus Nunchaku nodes and the Int4 quantized model (12.7GB).*"}
+        "description_suffix": "*Installs Qwen Core components plus Nunchaku nodes and the Int4 quantized model (12.7GB).*"},
+    '8': {"name": "[TRELLIS.2] Image-to-3D Node",
+        "tags": ["trellis2"],
+        "size_gb": 0.1,
+        "description_suffix": "*Installs ComfyUI-TRELLIS2 custom node. Models are downloaded automatically on first use by the node.*"},
 }
 
 # --- Helper Functions ---
@@ -235,6 +624,136 @@ def get_comfyui_path_from_args() -> Path:
         print(f"Error: '{comfyui_path}' does not look like a valid ComfyUI directory (missing 'models' or 'custom_nodes' subfolder).")
         sys.exit(1)
     return comfyui_path
+
+def find_comfyui_python(comfyui_path: Path) -> str:
+    """Detect the Python executable used by ComfyUI.
+
+    Checks (in order):
+      1. Windows portable: python_embedded/python.exe
+      2. Virtual-env:      venv/Scripts/python.exe  or  venv/bin/python
+      3. Fallback:         the Python running this script (sys.executable)
+    """
+    # Windows portable build
+    embedded = comfyui_path / "python_embedded" / "python.exe"
+    if embedded.is_file():
+        return str(embedded)
+    # venv (Windows)
+    venv_win = comfyui_path / "venv" / "Scripts" / "python.exe"
+    if venv_win.is_file():
+        return str(venv_win)
+    # venv (Linux / macOS)
+    venv_unix = comfyui_path / "venv" / "bin" / "python"
+    if venv_unix.is_file():
+        return str(venv_unix)
+    # Fallback
+    return sys.executable
+
+
+def install_pip_packages(pip_packages: List[str], comfyui_path: Path):
+    """Install pip packages into ComfyUI's Python environment."""
+    python_exe = find_comfyui_python(comfyui_path)
+    print(f"  Installing pip packages into ComfyUI Python: {python_exe}")
+    for pkg in pip_packages:
+        print(f"    pip install {pkg} ...")
+        try:
+            subprocess.run(
+                [python_exe, "-m", "pip", "install", pkg],
+                check=True,
+            )
+            print(f"    Successfully installed '{pkg}'.")
+        except subprocess.CalledProcessError as e:
+            print(f"    ERROR: Failed to install '{pkg}' (exit code {e.returncode}).")
+            print(f"    You may need to install it manually: pip install {pkg}")
+        except FileNotFoundError:
+            print(f"    ERROR: Python executable not found at '{python_exe}'.")
+            print(f"    Please install '{pkg}' manually into your ComfyUI Python environment.")
+            break
+
+
+def run_node_install_script(item_details: Dict[str, Any], comfyui_path: Path):
+    """Run a custom node's install.py to resolve all its dependencies.
+
+    Some nodes (e.g. ComfyUI-TRELLIS2) use comfy_env which manages CUDA
+    wheel installation from custom indices.  Running their install.py
+    after cloning lets comfy_env handle everything automatically.
+    """
+    repo_path = comfyui_path / item_details["target_dir_relative"] / item_details["repo_name"]
+    install_script = repo_path / "install.py"
+    if not install_script.is_file():
+        print(f"  WARNING: No install.py found in '{repo_path}'. Skipping dependency install.")
+        return
+
+    python_exe = find_comfyui_python(comfyui_path)
+    print(f"  Running install.py for {item_details['name']}...")
+    print(f"    {python_exe} {install_script}")
+    try:
+        subprocess.run(
+            [python_exe, str(install_script)],
+            check=True,
+            cwd=str(repo_path),
+        )
+        print(f"  Successfully ran install.py for '{item_details['name']}'.")
+    except subprocess.CalledProcessError as e:
+        print(f"  ERROR: install.py failed (exit code {e.returncode}).")
+        print(f"  You may need to run it manually:")
+        print(f"    cd {repo_path}")
+        print(f"    {python_exe} install.py")
+    except FileNotFoundError:
+        print(f"  ERROR: Python executable not found at '{python_exe}'.")
+
+
+def apply_post_clone_patches(item_details: Dict[str, Any], comfyui_path: Path):
+    """Apply compatibility patches to a cloned custom node repository.
+
+    Patches are defined in the dependency entry under 'post_clone_patches'.
+    Each patch dict has:
+      file    – relative path inside the repo
+      marker  – string checked to avoid re-applying
+      mode    – 'insert' (default) or 'replace'
+
+    Insert mode (default):
+      anchor  – text before which the patch is inserted
+      patch   – code string to insert
+
+    Replace mode:
+      anchor  – exact text to replace
+      patch   – replacement text
+    """
+    patches = item_details.get("post_clone_patches")
+    if not patches:
+        return
+
+    repo_path = (comfyui_path / item_details["target_dir_relative"]
+                 / item_details["repo_name"])
+
+    for p in patches:
+        target_file = repo_path / p["file"]
+        if not target_file.is_file():
+            print(f"  WARNING: Patch target '{p['file']}' not found. Skipping.")
+            continue
+
+        content = target_file.read_text(encoding="utf-8")
+
+        # Already patched?
+        marker = p.get("marker", "")
+        if marker and marker in content:
+            print(f"  Compat patch already applied to '{p['file']}'.")
+            continue
+
+        anchor = p.get("anchor", "")
+        patch_code = p.get("patch", "")
+        mode = p.get("mode", "insert")
+
+        if anchor and anchor in content:
+            if mode == "replace":
+                content = content.replace(anchor, patch_code, 1)
+            else:
+                content = content.replace(anchor, patch_code + anchor, 1)
+            target_file.write_text(content, encoding="utf-8")
+            print(f"  Applied compat patch ({mode}) to '{p['file']}'.")
+        else:
+            print(f"  WARNING: Anchor not found in '{p['file']}'. Patch skipped.")
+
 
 def create_dir_if_not_exists(path: Path):
     path.mkdir(parents=True, exist_ok=True)
@@ -316,20 +835,48 @@ def clone_git_repo(item_details: Dict[str, Any], comfyui_path: Path):
     target_parent_dir = comfyui_path / item_details["target_dir_relative"]
     repo_name = item_details["repo_name"]
     final_repo_path = target_parent_dir / repo_name
+    pinned_commit = item_details.get("commit")
 
     if final_repo_path.is_dir():
-        print(f"INFO: Custom node directory '{repo_name}' already exists at '{final_repo_path}'. Skipping clone.")
-        print(f"      Please ensure it's the correct repository and up-to-date if you encounter issues (License: {item_details['license']}).")
+        # If a commit is pinned, verify the checkout matches
+        if pinned_commit:
+            try:
+                result = subprocess.run(
+                    ['git', 'rev-parse', 'HEAD'], capture_output=True, text=True,
+                    check=True, cwd=str(final_repo_path)
+                )
+                current = result.stdout.strip()
+                if current != pinned_commit:
+                    print(f"  Pinning '{repo_name}' to verified commit {pinned_commit[:12]}...")
+                    subprocess.run(['git', 'fetch', 'origin'], check=True, cwd=str(final_repo_path))
+                    subprocess.run(['git', 'checkout', pinned_commit], check=True, cwd=str(final_repo_path))
+                    print(f"  Successfully pinned to {pinned_commit[:12]}.")
+                else:
+                    print(f"INFO: '{repo_name}' already at pinned commit {pinned_commit[:12]}. Skipping.")
+            except Exception as e:
+                print(f"  WARNING: Could not verify/pin commit for '{repo_name}': {e}")
+        else:
+            print(f"INFO: Custom node directory '{repo_name}' already exists at '{final_repo_path}'. Skipping clone.")
+            print(f"      Please ensure it's the correct repository and up-to-date if you encounter issues (License: {item_details['license']}).")
         return
 
     create_dir_if_not_exists(target_parent_dir)
     print(f"  Cloning: {item_details['name']} - License: {item_details['license']}")
     print(f"  From: {git_url}")
     print(f"  To:   {final_repo_path}")
+    if pinned_commit:
+        print(f"  Pinned commit: {pinned_commit[:12]}")
 
     try:
         subprocess.run(['git', 'clone', git_url, str(final_repo_path)], check=True, cwd=str(target_parent_dir))
-        print(f"  Successfully cloned '{repo_name}'.")
+
+        # Checkout pinned commit if specified
+        if pinned_commit:
+            subprocess.run(['git', 'checkout', pinned_commit], check=True, cwd=str(final_repo_path))
+            print(f"  Successfully cloned and pinned '{repo_name}' to {pinned_commit[:12]}.")
+        else:
+            print(f"  Successfully cloned '{repo_name}'.")
+
         print(f"  IMPORTANT: Restart ComfyUI if it was running to load this new custom node.")
     except subprocess.CalledProcessError as e:
         print(f"  ERROR cloning {item_details['name']}: Git command failed with exit code {e.returncode}")
@@ -389,7 +936,7 @@ def main():
 
     while True:
         display_menu(comfyui_base_path)
-        choice = input("Enter your choice (1-6, or q to quit): ").strip().lower()
+        choice = input("Enter your choice (1-8, or q to quit): ").strip().lower()
 
         if choice == 'q':
             print("Exiting installer.")
@@ -437,6 +984,15 @@ def main():
             if item_details["type"] == "node":
                 target_full_path = comfyui_base_path / item_details["target_dir_relative"] / item_details["repo_name"]
                 clone_git_repo(item_details, comfyui_base_path)
+                # Install pip dependencies required by this custom node
+                if item_details.get("pip_packages"):
+                    install_pip_packages(item_details["pip_packages"], comfyui_base_path)
+                # Apply compatibility patches (e.g. Python 3.10 polyfills)
+                if item_details.get("post_clone_patches"):
+                    apply_post_clone_patches(item_details, comfyui_base_path)
+                # Run node's install.py for full dependency resolution (e.g. CUDA wheels)
+                if item_details.get("run_install_script"):
+                    run_node_install_script(item_details, comfyui_base_path)
             elif item_details["type"] == "model":
                 target_full_path = comfyui_base_path / item_details["target_path_relative"] / item_details["filename"]
                 download_file(item_details, comfyui_base_path)

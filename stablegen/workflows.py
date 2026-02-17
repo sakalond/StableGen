@@ -2,11 +2,13 @@ import bpy
 import os
 import json
 import uuid
+import random
 import websocket
 import socket
 import urllib.request
+from datetime import datetime, timedelta
 
-from .util.helpers import prompt_text_qwen_image_edit
+from .util.helpers import prompt_text_qwen_image_edit, prompt_text_trellis2, prompt_text_trellis2_shape_only
 from .utils import get_generation_dirs
 
 from io import BytesIO
@@ -339,6 +341,14 @@ class WorkflowManager:
                  if style_image_info:
                      prompt[NODES['style_map_loader']]['inputs']['image'] = style_image_info['name']
             
+            # Fallback to TRELLIS.2 input image as style
+            if not style_image_info and getattr(context.scene, 'qwen_use_trellis2_style', False):
+                t2_path = getattr(context.scene, 'trellis2_last_input_image', '')
+                if t2_path and os.path.exists(bpy.path.abspath(t2_path)):
+                    style_image_info = self.operator._get_uploaded_image_info(context, "custom", filename=bpy.path.abspath(t2_path))
+                    if style_image_info:
+                        prompt[NODES['style_map_loader']]['inputs']['image'] = style_image_info['name']
+            
             # If still no style image, remove Image 2 inputs
             if not style_image_info:
                 del prompt[NODES['style_map_loader']]
@@ -510,6 +520,18 @@ class WorkflowManager:
             else: # Additional mode
                 if context.scene.qwen_use_custom_prompts:
                     pos_prompt_text = ()
+                else:
+                    pos_prompt_text = self._get_qwen_default_prompts(context, is_initial_image).format(main_prompt=user_prompt)
+                prompt[NODES['pos_prompt']]['inputs']['prompt'] = pos_prompt_text
+
+        # Case 1b: TRELLIS.2 input image as style (when no external style configured)
+        elif getattr(context.scene, 'qwen_use_trellis2_style', False) and is_initial_image:
+            t2_path = getattr(context.scene, 'trellis2_last_input_image', '')
+            if t2_path and os.path.exists(bpy.path.abspath(t2_path)):
+                style_image_info = self.operator._get_uploaded_image_info(context, "custom", filename=bpy.path.abspath(t2_path))
+            if style_image_info:
+                if context.scene.qwen_use_custom_prompts:
+                    pos_prompt_text = (context.scene.qwen_custom_prompt_initial).format(main_prompt=user_prompt)
                 else:
                     pos_prompt_text = self._get_qwen_default_prompts(context, is_initial_image).format(main_prompt=user_prompt)
                 prompt[NODES['pos_prompt']]['inputs']['prompt'] = pos_prompt_text
@@ -688,6 +710,818 @@ class WorkflowManager:
         # Return the generated image from the save_image node
         return images[NODES['save_image']][0]
 
+    def _check_server_alive(self, server_address, timeout=5):
+        """Return True if the ComfyUI server responds to a lightweight request."""
+        try:
+            req = urllib.request.Request(
+                f"http://{server_address}/system_stats",
+                method='GET'
+            )
+            urllib.request.urlopen(req, timeout=timeout)
+            return True
+        except Exception:
+            return False
+
+    def _get_vram_stats(self, server_address):
+        """Return (vram_free, vram_total) in MB from ComfyUI /system_stats."""
+        try:
+            req = urllib.request.Request(
+                f"http://{server_address}/system_stats", method='GET'
+            )
+            resp = json.loads(urllib.request.urlopen(req, timeout=5).read())
+            dev = resp.get("devices", [{}])[0]
+            vram_free = dev.get("vram_free", 0) / (1024 * 1024)
+            vram_total = dev.get("vram_total", 0) / (1024 * 1024)
+            return vram_free, vram_total
+        except Exception:
+            return None, None
+
+    def _flush_comfyui_vram(self, server_address, retries=3, label="Post-generation"):
+        """Unload all models and free VRAM on the ComfyUI server.
+
+        The ``/free`` endpoint only **sets flags** on the prompt queue; the
+        actual unloading happens asynchronously in ComfyUI's execution loop.
+        This method therefore:
+          1. Sends ``/free`` (unload models + free memory).
+          2. Clears the execution cache history and queue.
+          3. Sends ``/free`` *again* — the first round triggers model unloads
+             whose CUDA tensors may still reside in PyTorch's cache; the
+             second round triggers ``soft_empty_cache`` which calls
+             ``torch.cuda.empty_cache()`` on the now-freed allocations.
+          4. Polls ``/system_stats`` waiting for VRAM to increase.
+        Retries the whole sequence up to *retries* times.
+        """
+        import time
+
+        vram_before, vram_total = self._get_vram_stats(server_address)
+        if vram_before is not None:
+            print(f"[TRELLIS2] {label} VRAM before flush: {vram_before:.0f} MB free / {vram_total:.0f} MB total")
+
+        def _send_free():
+            d = json.dumps({"unload_models": True, "free_memory": True}).encode('utf-8')
+            r = urllib.request.Request(
+                f"http://{server_address}/free", data=d,
+                headers={'Content-Type': 'application/json'}, method='POST'
+            )
+            urllib.request.urlopen(r, timeout=10)
+
+        def _clear_history():
+            d = json.dumps({"clear": True}).encode('utf-8')
+            r = urllib.request.Request(
+                f"http://{server_address}/history", data=d,
+                headers={'Content-Type': 'application/json'}, method='POST'
+            )
+            urllib.request.urlopen(r, timeout=10)
+
+        def _clear_queue():
+            d = json.dumps({"clear": True}).encode('utf-8')
+            r = urllib.request.Request(
+                f"http://{server_address}/queue", data=d,
+                headers={'Content-Type': 'application/json'}, method='POST'
+            )
+            urllib.request.urlopen(r, timeout=10)
+
+        for attempt in range(1, retries + 1):
+            try:
+                # Round 1: Unload models
+                _send_free()
+                time.sleep(1)
+
+                # Clear caches
+                try:
+                    _clear_history()
+                except Exception:
+                    pass
+                try:
+                    _clear_queue()
+                except Exception:
+                    pass
+
+                # Round 2: Free the now-released CUDA allocations
+                _send_free()
+
+                # Poll VRAM (up to 8s)
+                for check in range(8):
+                    time.sleep(1)
+                    vram_after, _ = self._get_vram_stats(server_address)
+                    if vram_after is not None:
+                        print(f"[TRELLIS2] {label} VRAM after flush (check {check+1}): {vram_after:.0f} MB free")
+                        if vram_before is not None and vram_after > vram_before + 500:
+                            print(f"[TRELLIS2] {label} flush verified: freed {vram_after - vram_before:.0f} MB")
+                            return True
+                        if vram_total is not None and vram_after > vram_total * 0.7:
+                            print(f"[TRELLIS2] {label} flush OK: >70% VRAM free")
+                            return True
+
+                print(f"[TRELLIS2] {label} flush attempt {attempt}/{retries}: VRAM didn't free enough — retrying")
+            except Exception as e:
+                print(f"[TRELLIS2] {label} flush attempt {attempt}/{retries} failed: {e}")
+
+            if attempt < retries:
+                time.sleep(2)
+
+        print(f"[TRELLIS2] Warning: {label} VRAM flush unverified after {retries} attempts")
+        return False
+
+    # ------------------------------------------------------------------
+    #  Txt2Img — lightweight single-image generation for prompt-to-image
+    # ------------------------------------------------------------------
+
+    def generate_txt2img(self, context):
+        """Generate a single image from the scene prompt and checkpoint.
+
+        Builds a minimal txt2img ComfyUI workflow (with LoRA support) and
+        returns the generated image as raw PNG bytes delivered via the
+        ``SaveImageWebsocket`` node.
+
+        Returns:
+            bytes: Raw image data on success.
+            dict:  ``{"error": "..."}`` on failure.
+        """
+        server_address = context.preferences.addons[__package__].preferences.server_address
+        client_id = str(uuid.uuid4())
+        scene = context.scene
+        architecture = scene.model_architecture  # synced from texture_mode
+
+        if architecture == 'qwen_image_edit':
+            prompt, save_node = self._build_qwen_txt2img(context)
+        elif architecture == 'flux1':
+            prompt, save_node = self._build_flux_txt2img(context)
+        else:
+            prompt, save_node = self._build_sdxl_txt2img(context)
+
+        ws = self._connect_to_websocket(server_address, client_id)
+        if ws is None:
+            return {"error": "WebSocket connection failed"}
+
+        try:
+            images = self._execute_prompt_and_get_images(
+                ws, prompt, client_id, server_address, {"save_image": save_node}
+            )
+        finally:
+            try:
+                ws.close()
+            except Exception:
+                pass
+
+        if images is None or not isinstance(images, dict) or not images:
+            return {"error": "txt2img generation failed"}
+
+        if save_node not in images or not images[save_node]:
+            return {"error": "No image received from txt2img"}
+
+        return images[save_node][0]
+
+    def _build_sdxl_txt2img(self, context):
+        """Return (prompt_dict, save_node_id) for a minimal SDXL txt2img with LoRA support."""
+        scene = context.scene
+        prompt = {
+            "1": {
+                "class_type": "CheckpointLoaderSimple",
+                "inputs": {"ckpt_name": scene.model_name}
+            },
+            "2": {
+                "class_type": "CLIPTextEncode",
+                "inputs": {"text": scene.comfyui_prompt, "clip": ["1", 1]}
+            },
+            "3": {
+                "class_type": "CLIPTextEncode",
+                "inputs": {"text": scene.comfyui_negative_prompt, "clip": ["1", 1]}
+            },
+            "4": {
+                "class_type": "EmptyLatentImage",
+                "inputs": {"width": 1024, "height": 1024, "batch_size": 1}
+            },
+            "5": {
+                "class_type": "KSampler",
+                "inputs": {
+                    "model": ["1", 0],
+                    "positive": ["2", 0],
+                    "negative": ["3", 0],
+                    "latent_image": ["4", 0],
+                    "seed": scene.seed if scene.seed != 0 else random.randint(0, 2**31),
+                    "steps": scene.steps,
+                    "cfg": scene.cfg,
+                    "sampler_name": scene.sampler,
+                    "scheduler": scene.scheduler,
+                    "denoise": 1.0
+                }
+            },
+            "6": {
+                "class_type": "VAEDecode",
+                "inputs": {"samples": ["5", 0], "vae": ["1", 2]}
+            },
+            "7": {
+                "class_type": "SaveImageWebsocket",
+                "inputs": {"images": ["6", 0]}
+            }
+        }
+
+        # LoRA chain (LoraLoader): model + clip
+        prompt, final_model, final_clip = self._build_lora_chain(
+            prompt, context,
+            initial_model_input=["1", 0],
+            initial_clip_input=["1", 1],
+            start_node_id=300,
+            lora_class_type="LoraLoader"
+        )
+        prompt["5"]["inputs"]["model"] = final_model
+        prompt["2"]["inputs"]["clip"] = final_clip
+        prompt["3"]["inputs"]["clip"] = final_clip
+
+        return prompt, "7"
+
+    def _build_flux_txt2img(self, context):
+        """Return (prompt_dict, save_node_id) for a minimal Flux txt2img with LoRA support."""
+        scene = context.scene
+        unet_name = scene.model_name
+        is_gguf = ".gguf" in unet_name.lower()
+        unet_loader_class = "UnetLoaderGGUF" if is_gguf else "UNETLoader"
+
+        prompt = {
+            "10": {
+                "class_type": "VAELoader",
+                "inputs": {"vae_name": "ae.sft"}
+            },
+            "11": {
+                "class_type": "DualCLIPLoader",
+                "inputs": {
+                    "clip_name1": "t5xxl_fp8_e4m3fn.safetensors",
+                    "clip_name2": "clip_l.safetensors",
+                    "type": "flux",
+                    "device": "default"
+                }
+            },
+            "12": {
+                "class_type": unet_loader_class,
+                "inputs": {"unet_name": unet_name}
+            },
+            "6": {
+                "class_type": "CLIPTextEncode",
+                "inputs": {"text": scene.comfyui_prompt, "clip": ["11", 0]}
+            },
+            "26": {
+                "class_type": "FluxGuidance",
+                "inputs": {"guidance": scene.cfg, "conditioning": ["6", 0]}
+            },
+            "25": {
+                "class_type": "RandomNoise",
+                "inputs": {"noise_seed": scene.seed if scene.seed != 0 else random.randint(0, 2**31)}
+            },
+            "16": {
+                "class_type": "KSamplerSelect",
+                "inputs": {"sampler_name": scene.sampler}
+            },
+            "17": {
+                "class_type": "BasicScheduler",
+                "inputs": {
+                    "scheduler": scene.scheduler,
+                    "steps": scene.steps,
+                    "denoise": 1.0,
+                    "model": ["12", 0]
+                }
+            },
+            "22": {
+                "class_type": "BasicGuider",
+                "inputs": {"model": ["12", 0], "conditioning": ["26", 0]}
+            },
+            "30": {
+                "class_type": "EmptyLatentImage",
+                "inputs": {"width": 1024, "height": 1024, "batch_size": 1}
+            },
+            "13": {
+                "class_type": "SamplerCustomAdvanced",
+                "inputs": {
+                    "noise": ["25", 0],
+                    "guider": ["22", 0],
+                    "sampler": ["16", 0],
+                    "sigmas": ["17", 0],
+                    "latent_image": ["30", 0]
+                }
+            },
+            "8": {
+                "class_type": "VAEDecode",
+                "inputs": {"samples": ["13", 0], "vae": ["10", 0]}
+            },
+            "7": {
+                "class_type": "SaveImageWebsocket",
+                "inputs": {"images": ["8", 0]}
+            }
+        }
+
+        # LoRA chain (LoraLoaderModelOnly): model only, no clip
+        prompt, final_model, _ = self._build_lora_chain(
+            prompt, context,
+            initial_model_input=["12", 0],
+            initial_clip_input=["12", 0],   # dummy, not used by LoraLoaderModelOnly
+            start_node_id=300,
+            lora_class_type="LoraLoaderModelOnly"
+        )
+        prompt["17"]["inputs"]["model"] = final_model
+        prompt["22"]["inputs"]["model"] = final_model
+
+        return prompt, "7"
+
+    def _build_qwen_txt2img(self, context):
+        """Return (prompt_dict, save_node_id) for a minimal Qwen txt2img.
+
+        Qwen-Image-Edit can generate images from text alone when no input
+        images are provided to the ``TextEncodeQwenImageEditPlus`` nodes.
+        """
+        scene = context.scene
+        unet_name = scene.model_name
+        is_gguf = ".gguf" in unet_name.lower()
+        unet_loader_class = "UnetLoaderGGUF" if is_gguf else "UNETLoader"
+
+        prompt = {
+            "3": {
+                "class_type": "CLIPLoader",
+                "inputs": {
+                    "clip_name": "qwen_2.5_vl_7b_fp8_scaled.safetensors",
+                    "type": "qwen_image",
+                    "device": "default"
+                }
+            },
+            "4": {
+                "class_type": "VAELoader",
+                "inputs": {"vae_name": "qwen_image_vae.safetensors"}
+            },
+            "13": {
+                "class_type": unet_loader_class,
+                "inputs": {"unet_name": unet_name}
+            },
+            "6": {
+                "class_type": "ModelSamplingAuraFlow",
+                "inputs": {"shift": 3, "model": ["13", 0]}
+            },
+            "9": {
+                "class_type": "CFGNorm",
+                "inputs": {"strength": 1, "model": ["6", 0]}
+            },
+            "12": {
+                "class_type": "TextEncodeQwenImageEditPlus",
+                "inputs": {
+                    "prompt": scene.comfyui_prompt,
+                    "clip": ["3", 0]
+                }
+            },
+            "11": {
+                "class_type": "TextEncodeQwenImageEditPlus",
+                "inputs": {
+                    "prompt": "",
+                    "clip": ["3", 0]
+                }
+            },
+            "30": {
+                "class_type": "EmptyLatentImage",
+                "inputs": {"width": 1024, "height": 1024, "batch_size": 1}
+            },
+            "1": {
+                "class_type": "KSampler",
+                "inputs": {
+                    "model": ["9", 0],
+                    "positive": ["12", 0],
+                    "negative": ["11", 0],
+                    "latent_image": ["30", 0],
+                    "seed": scene.seed if scene.seed != 0 else random.randint(0, 2**31),
+                    "steps": scene.steps,
+                    "cfg": scene.cfg,
+                    "sampler_name": scene.sampler,
+                    "scheduler": scene.scheduler,
+                    "denoise": 1.0
+                }
+            },
+            "2": {
+                "class_type": "VAEDecode",
+                "inputs": {"samples": ["1", 0], "vae": ["4", 0]}
+            },
+            "7": {
+                "class_type": "SaveImageWebsocket",
+                "inputs": {"images": ["2", 0]}
+            }
+        }
+
+        # LoRA chain: Qwen uses NunchakuQwenImageLoraLoader for nunchaku
+        # models, LoraLoaderModelOnly otherwise
+        is_nunchaku = unet_name.lower().endswith('.safetensors')
+        lora_class = "NunchakuQwenImageLoraLoader" if is_nunchaku else "LoraLoaderModelOnly"
+
+        prompt, final_model, _ = self._build_lora_chain(
+            prompt, context,
+            initial_model_input=["13", 0],
+            initial_clip_input=["13", 0],   # dummy
+            start_node_id=500,
+            lora_class_type=lora_class
+        )
+        # ModelSamplingAuraFlow takes the final LoRA output
+        prompt["6"]["inputs"]["model"] = final_model
+
+        return prompt, "7"
+
+    def generate_trellis2(self, context, input_image_path):
+        """
+        Generates a 3D mesh using TRELLIS.2 via ComfyUI.
+
+        Uploads an input image, runs the TRELLIS.2 pipeline (background removal,
+        conditioning, shape generation, optionally texture generation, GLB export),
+        and downloads the resulting GLB file from the ComfyUI server.
+        VRAM is always flushed before AND after generation.
+
+        Args:
+            context: Blender context.
+            input_image_path: Local path to the input image file.
+
+        Returns:
+            bytes: GLB file binary data on success.
+            dict: {"error": "message"} on failure.
+        """
+        import urllib.parse
+
+        server_address = context.preferences.addons[__package__].preferences.server_address
+        client_id = str(uuid.uuid4())
+
+        # Pre-generation flush: free any loaded diffusion/other models so
+        # TRELLIS.2 has maximum VRAM available.
+        print("[TRELLIS2] Pre-generation VRAM flush — freeing loaded models...")
+        self._flush_comfyui_vram(server_address, label="Pre-generation")
+
+        import time
+        time.sleep(1)  # Brief pause for CUDA memory to be released
+
+        # Verify the server is alive before proceeding
+        if not self._check_server_alive(server_address):
+            return {"error": "ComfyUI server is not responding. Please restart it and try again."}
+
+        # Wrap the entire generation so VRAM is always freed at the end
+        try:
+            return self._generate_trellis2_inner(context, input_image_path, server_address, client_id)
+        finally:
+            self._flush_comfyui_vram(server_address, label="Post-generation")
+
+    def _generate_trellis2_inner(self, context, input_image_path, server_address, client_id):
+        """Inner implementation of generate_trellis2, called within a try/finally VRAM flush."""
+        import urllib.parse
+
+        # Upload the input image to ComfyUI
+        from .generator import upload_image_to_comfyui
+        image_info = upload_image_to_comfyui(server_address, input_image_path)
+        if image_info is None:
+            self.operator._error = f"Failed to upload input image: {input_image_path}"
+            return {"error": self.operator._error}
+
+        scene = context.scene
+        skip_texture = scene.trellis2_skip_texture
+
+        # Load the appropriate workflow template
+        if skip_texture:
+            prompt = json.loads(prompt_text_trellis2_shape_only)
+            NODES = {
+                'input_image': '1',
+                'load_models': '2',
+                'remove_bg': '3',
+                'get_conditioning': '4',
+                'image_to_shape': '5',
+                'simplify': '6',
+                'export_trimesh': '7',
+            }
+            export_node_key = 'export_trimesh'
+        else:
+            prompt = json.loads(prompt_text_trellis2)
+            NODES = {
+                'input_image': '1',
+                'load_models': '2',
+                'remove_bg': '3',
+                'get_conditioning': '4',
+                'image_to_shape': '5',
+                'shape_to_textured_mesh': '6',
+                'export_glb': '7',
+            }
+            export_node_key = 'export_glb'
+
+        # Set input image
+        prompt[NODES['input_image']]["inputs"]["image"] = image_info['name']
+
+        # Configure model settings from scene properties
+        prompt[NODES['load_models']]["inputs"]["resolution"] = scene.trellis2_resolution
+        prompt[NODES['load_models']]["inputs"]["vram_mode"] = scene.trellis2_vram_mode
+        prompt[NODES['load_models']]["inputs"]["attn_backend"] = scene.trellis2_attn_backend
+
+        # Configure remove background
+        prompt[NODES['remove_bg']]["inputs"]["low_vram"] = scene.trellis2_low_vram
+
+        # Configure conditioning
+        prompt[NODES['get_conditioning']]["inputs"]["background_color"] = scene.trellis2_background_color
+        prompt[NODES['get_conditioning']]["inputs"]["include_1024"] = scene.trellis2_include_1024
+
+        # Configure shape generation
+        seed = scene.trellis2_seed
+        prompt[NODES['image_to_shape']]["inputs"]["seed"] = seed
+        prompt[NODES['image_to_shape']]["inputs"]["ss_guidance_strength"] = scene.trellis2_ss_guidance
+        prompt[NODES['image_to_shape']]["inputs"]["ss_sampling_steps"] = scene.trellis2_ss_steps
+        prompt[NODES['image_to_shape']]["inputs"]["shape_guidance_strength"] = scene.trellis2_shape_guidance
+        prompt[NODES['image_to_shape']]["inputs"]["shape_sampling_steps"] = scene.trellis2_shape_steps
+        prompt[NODES['image_to_shape']]["inputs"]["max_tokens"] = scene.trellis2_max_tokens
+
+        # Configure export with unique prefix for identification
+        unique_prefix = f"trellis2_{uuid.uuid4().hex[:8]}"
+
+        if skip_texture:
+            # Configure simplify node
+            prompt[NODES['simplify']]["inputs"]["target_face_count"] = scene.trellis2_decimation
+            prompt[NODES['simplify']]["inputs"]["fill_holes"] = scene.trellis2_fill_holes
+            prompt[NODES['simplify']]["inputs"]["remesh"] = scene.trellis2_remesh
+            prompt[NODES['export_trimesh']]["inputs"]["filename_prefix"] = unique_prefix
+        else:
+            # Configure texture generation
+            prompt[NODES['shape_to_textured_mesh']]["inputs"]["seed"] = seed
+            prompt[NODES['shape_to_textured_mesh']]["inputs"]["tex_guidance_strength"] = scene.trellis2_tex_guidance
+            prompt[NODES['shape_to_textured_mesh']]["inputs"]["tex_sampling_steps"] = scene.trellis2_tex_steps
+
+            # Configure GLB export
+            prompt[NODES['export_glb']]["inputs"]["decimation_target"] = scene.trellis2_decimation
+            prompt[NODES['export_glb']]["inputs"]["texture_size"] = scene.trellis2_texture_size
+            prompt[NODES['export_glb']]["inputs"]["remesh"] = scene.trellis2_remesh
+            prompt[NODES['export_glb']]["inputs"]["filename_prefix"] = unique_prefix
+
+        # Save prompt for debugging
+        revision_dir = get_generation_dirs(context).get("revision", "")
+        if revision_dir:
+            self._save_prompt_to_file(prompt, revision_dir)
+
+        # --- Two-phase VRAM management for textured path ---
+        # NOTE: Two-phase execution (shape first, flush, then texture) was
+        # removed because ComfyUI requires at least one OUTPUT_NODE per prompt
+        # and the shape-only subset has none.  The TRELLIS pipeline stages
+        # handle VRAM management internally (unload_shape_pipeline before
+        # loading texture models), so a single full-prompt submission works.
+
+        # Connect WebSocket
+        ws = self._connect_to_websocket(server_address, client_id)
+        if ws is None:
+            return {"error": "conn_failed"}
+
+        prompt_id = None
+        try:
+            # Queue prompt
+            prompt_id = self._queue_prompt(prompt, client_id, server_address)
+
+            # Node-level progress (isolated subprocess doesn't emit within-node progress)
+            # Weights approximate actual time spent per node
+            if skip_texture:
+                NODE_PROGRESS = {
+                    NODES['input_image']:        2,
+                    NODES['load_models']:        3,
+                    NODES['remove_bg']:         12,
+                    NODES['get_conditioning']:   25,
+                    NODES['image_to_shape']:     80,
+                    NODES['simplify']:           90,
+                    NODES['export_trimesh']:     98,
+                }
+            else:
+                # Full textured pipeline (single submission)
+                NODE_PROGRESS = {
+                    NODES['input_image']:              2,
+                    NODES['load_models']:              3,
+                    NODES['remove_bg']:               10,
+                    NODES['get_conditioning']:         18,
+                    NODES['image_to_shape']:           55,
+                    NODES['shape_to_textured_mesh']:   85,
+                    NODES['export_glb']:               98,
+                }
+
+            # Wait for execution to complete via WebSocket
+            # Also capture 'executed' events which may contain the output path
+            export_node_id = NODES[export_node_key]
+            glb_output_path = None
+
+            while True:
+                try:
+                    out = ws.recv()
+                except (ConnectionError, OSError, Exception) as ws_err:
+                    err_name = type(ws_err).__name__
+                    print(f"[TRELLIS2] WebSocket died ({err_name}): {ws_err}")
+                    return {"error": (
+                        "ComfyUI server crashed during TRELLIS.2 generation "
+                        "(likely VRAM exhaustion). Please restart ComfyUI, "
+                        "reduce max_tokens or resolution, and try again."
+                    )}
+                if isinstance(out, str):
+                    message = json.loads(out)
+
+                    if message['type'] == 'executing':
+                        data = message['data']
+                        if data['prompt_id'] == prompt_id:
+                            if data['node'] is None:
+                                self.operator._phase_progress = 100
+                                self.operator._detail_progress = 100
+                                if hasattr(self.operator, '_update_overall'):
+                                    self.operator._update_overall()
+                                break  # Execution complete
+                            else:
+                                node_id = data['node']
+                                # Map node IDs to readable names for progress
+                                node_names = {v: k for k, v in NODES.items()}
+                                node_label = node_names.get(node_id, node_id)
+                                print(f"[TRELLIS2] Executing: {node_label}")
+                                self.operator._phase_stage = f"TRELLIS.2: {node_label}"
+                                # Update progress based on node weight
+                                if node_id in NODE_PROGRESS:
+                                    self.operator._phase_progress = NODE_PROGRESS[node_id]
+                                    if hasattr(self.operator, '_update_overall'):
+                                        self.operator._update_overall()
+                                self.operator._detail_stage = node_label
+                                self.operator._detail_progress = 0
+
+                    elif message['type'] == 'executed':
+                        # Capture output from export node (newer ComfyUI versions)
+                        data = message.get('data', {})
+                        if data.get('node') == export_node_id:
+                            ws_output = data.get('output', {})
+                            if ws_output:
+                                for key in ['glb_path', 'file_path', 'text', 'string']:
+                                    val = ws_output.get(key)
+                                    if val:
+                                        if isinstance(val, list) and len(val) > 0:
+                                            val = val[0]
+                                        if isinstance(val, str) and val:
+                                            glb_output_path = val
+                                            print(f"[TRELLIS2] Got path from WS executed event: {glb_output_path}")
+                                            break
+                                # Also check any key with a file-like value
+                                if not glb_output_path:
+                                    for key, val in ws_output.items():
+                                        if isinstance(val, list) and len(val) > 0:
+                                            val = val[0]
+                                        if isinstance(val, str) and val.endswith(('.glb', '.obj', '.ply')):
+                                            glb_output_path = val
+                                            print(f"[TRELLIS2] Got path from WS (key={key}): {glb_output_path}")
+                                            break
+
+                    elif message['type'] == 'progress':
+                        # Within-node progress (sampler steps)
+                        progress = (message['data']['value'] / message['data']['max']) * 100
+                        if progress != 0:
+                            self.operator._detail_progress = progress
+                            self.operator._detail_stage = f"Step {message['data']['value']}/{message['data']['max']}"
+                            print(f"[TRELLIS2] Progress: {progress:.1f}%")
+
+                    elif message['type'] == 'execution_error':
+                        error_data = message.get('data', {})
+                        error_msg = error_data.get('exception_message', 'Unknown error')
+                        self.operator._error = f"TRELLIS.2 execution error: {error_msg}"
+                        print(f"[TRELLIS2] Error: {self.operator._error}")
+                        return {"error": self.operator._error}
+        finally:
+            if ws:
+                try:
+                    ws.close()
+                except Exception:
+                    pass
+
+        # ── Retrieve the GLB file ──────────────────────────────────────
+        # Strategy 1: path from WS 'executed' event (already captured above)
+        # Strategy 2: path from history API
+        # Strategy 3: direct file read from disk (local ComfyUI)
+        # Strategy 4: HTTP download via /view endpoint
+        # Strategy 5: scan ComfyUI output dir for our prefix
+
+        glb_source_path = glb_output_path  # May already be set from WS event
+
+        # Strategy 2: Query history for the output path
+        if not glb_source_path:
+            try:
+                history_url = f"http://{server_address}/history/{prompt_id}"
+                history_response = json.loads(urllib.request.urlopen(history_url).read())
+
+                if prompt_id in history_response:
+                    outputs = history_response[prompt_id].get("outputs", {})
+                    export_output = outputs.get(export_node_id, {})
+                    print(f"[TRELLIS2] History output for node {export_node_id}: {export_output}")
+
+                    for key in ['glb_path', 'file_path', 'text', 'string']:
+                        val = export_output.get(key)
+                        if val:
+                            if isinstance(val, list) and len(val) > 0:
+                                val = val[0]
+                            if isinstance(val, str) and val:
+                                glb_source_path = val
+                                print(f"[TRELLIS2] Got path from history (key={key}): {glb_source_path}")
+                                break
+
+                    # Check any key with a path-like value
+                    if not glb_source_path:
+                        for key, val in export_output.items():
+                            if isinstance(val, list) and len(val) > 0:
+                                val = val[0]
+                            if isinstance(val, str) and val.endswith(('.glb', '.obj', '.ply')):
+                                glb_source_path = val
+                                print(f"[TRELLIS2] Got path from history (key={key}): {glb_source_path}")
+                                break
+            except Exception as e:
+                print(f"[TRELLIS2] History query failed: {e}")
+
+        # Strategy 3: Read directly from disk (works when ComfyUI is local)
+        if glb_source_path and os.path.isfile(glb_source_path):
+            try:
+                print(f"[TRELLIS2] Reading GLB directly from disk: {glb_source_path}")
+                with open(glb_source_path, 'rb') as f:
+                    glb_data = f.read()
+                print(f"[TRELLIS2] Read {len(glb_data)} bytes from disk")
+                if glb_data and len(glb_data) > 0:
+                    return glb_data
+            except Exception as e:
+                print(f"[TRELLIS2] Direct file read failed: {e}")
+
+        # Strategy 4: HTTP download via /view endpoint
+        if glb_source_path:
+            glb_filename = os.path.basename(glb_source_path)
+            try:
+                view_url = f"http://{server_address}/view?filename={urllib.parse.quote(glb_filename)}&type=output"
+                print(f"[TRELLIS2] Downloading GLB via HTTP: {view_url}")
+                glb_response = urllib.request.urlopen(view_url)
+                glb_data = glb_response.read()
+                print(f"[TRELLIS2] Downloaded GLB: {len(glb_data)} bytes")
+                if glb_data and len(glb_data) > 0:
+                    return glb_data
+            except Exception as e:
+                print(f"[TRELLIS2] HTTP download failed: {e}")
+
+        # Strategy 5: Scan ComfyUI output directory for files matching our prefix
+        # This handles the case where the export node path wasn't captured via API
+        print(f"[TRELLIS2] Scanning for files with prefix '{unique_prefix}'...")
+
+        # 5a: Try to discover ComfyUI's output directory from the server
+        comfyui_output_dir = None
+        try:
+            system_url = f"http://{server_address}/system_stats"
+            system_response = json.loads(urllib.request.urlopen(system_url).read())
+            # Some ComfyUI versions include directory info
+            comfyui_output_dir = system_response.get("output_dir")
+        except Exception:
+            pass
+
+        # 5b: Try common local paths relative to server
+        if not comfyui_output_dir:
+            # Check if server is localhost - if so, try to find output dir
+            host = server_address.split(':')[0]
+            if host in ('127.0.0.1', 'localhost', '0.0.0.0', '::1'):
+                # Try to discover via the /view endpoint with a known file
+                # Or just check common ComfyUI locations
+                common_paths = [
+                    os.path.join(os.environ.get('COMFYUI_PATH', ''), 'output'),
+                    'E:/tools/ComfyUI/output',
+                    'C:/ComfyUI/output',
+                    os.path.expanduser('~/ComfyUI/output'),
+                ]
+                for candidate in common_paths:
+                    if candidate and os.path.isdir(candidate):
+                        comfyui_output_dir = candidate
+                        break
+
+        if comfyui_output_dir and os.path.isdir(comfyui_output_dir):
+            print(f"[TRELLIS2] Scanning output dir: {comfyui_output_dir}")
+            try:
+                matching_files = sorted(
+                    [f for f in os.listdir(comfyui_output_dir)
+                     if f.startswith(unique_prefix) and f.endswith(('.glb', '.obj', '.ply'))],
+                    key=lambda f: os.path.getmtime(os.path.join(comfyui_output_dir, f)),
+                    reverse=True
+                )
+                if matching_files:
+                    found_path = os.path.join(comfyui_output_dir, matching_files[0])
+                    print(f"[TRELLIS2] Found matching file: {found_path}")
+                    with open(found_path, 'rb') as f:
+                        glb_data = f.read()
+                    print(f"[TRELLIS2] Read {len(glb_data)} bytes from disk")
+                    if glb_data and len(glb_data) > 0:
+                        return glb_data
+            except Exception as e:
+                print(f"[TRELLIS2] Output dir scan failed: {e}")
+
+        # 5c: Try HTTP download with timestamp-based filename guesses
+        # The export nodes use format: {prefix}_{YYYYMMDD_HHMMSS}.glb
+        now = datetime.now()
+        for delta_seconds in range(0, 120):  # Try last 2 minutes of timestamps
+            for delta in [timedelta(seconds=-delta_seconds), timedelta(seconds=delta_seconds)]:
+                candidate_time = now + delta
+                candidate_name = f"{unique_prefix}_{candidate_time.strftime('%Y%m%d_%H%M%S')}.glb"
+                try:
+                    view_url = f"http://{server_address}/view?filename={urllib.parse.quote(candidate_name)}&type=output"
+                    glb_response = urllib.request.urlopen(view_url)
+                    glb_data = glb_response.read()
+                    if glb_data and len(glb_data) > 0:
+                        print(f"[TRELLIS2] Found GLB via timestamp scan: {candidate_name} ({len(glb_data)} bytes)")
+                        return glb_data
+                except Exception:
+                    continue
+
+        self.operator._error = (
+            f"Failed to retrieve GLB from ComfyUI. "
+            f"The workflow completed but the output file could not be located. "
+            f"Prefix: {unique_prefix}"
+        )
+        return {"error": self.operator._error}
+
     def _create_base_prompt(self, context):
         """Creates and configures the base prompt with user settings."""
         from .util.helpers import prompt_text
@@ -765,7 +1599,15 @@ class WorkflowManager:
         prompt[NODES['clip_skip']]["inputs"]["clip"] = final_lora_clip_out
 
         # If using IPAdapter, set the model input
-        if context.scene.use_ipadapter or (context.scene.generation_method == 'separate' and context.scene.sequential_ipadapter and self.operator._current_image > 0):
+        _is_trellis2_input_ipadapter = (
+            context.scene.sequential_ipadapter
+            and context.scene.sequential_ipadapter_mode == 'trellis2_input'
+        )
+        if (context.scene.use_ipadapter
+                or _is_trellis2_input_ipadapter
+                or (context.scene.generation_method == 'separate'
+                    and context.scene.sequential_ipadapter
+                    and self.operator._current_image > 0)):
             # Set the model input for IPAdapter
             prompt[NODES['ipadapter_loader']]["inputs"]["model"] = current_model_out
             current_model_out = [NODES['ipadapter'], 0]
@@ -1048,6 +1890,13 @@ class WorkflowManager:
                     progress = (message['data']['value'] / message['data']['max']) * 100
                     if progress != 0:
                         self.operator._progress = progress  # Update progress for UI
+                        # Also update 3-tier detail when called from Trellis2Generate
+                        if hasattr(self.operator, '_detail_progress'):
+                            self.operator._detail_progress = progress
+                            self.operator._detail_stage = f"Step {message['data']['value']}/{message['data']['max']}"
+                            self.operator._phase_progress = progress
+                            if hasattr(self.operator, '_update_overall'):
+                                self.operator._update_overall()
                         print(f"Progress: {progress:.1f}%")
             else:
                 # Binary data (image)
@@ -1267,7 +2116,11 @@ class WorkflowManager:
             and context.scene.sequential_ipadapter_mode == 'original_render'
             and context.scene.generation_method == 'local_edit'
         )
-        if (context.scene.use_ipadapter or _is_original_render_ipadapter or (context.scene.sequential_ipadapter and self.operator._current_image > 0)) and context.scene.generation_method != 'uv_inpaint':
+        _is_trellis2_input_ipadapter = (
+            context.scene.sequential_ipadapter
+            and context.scene.sequential_ipadapter_mode == 'trellis2_input'
+        )
+        if (context.scene.use_ipadapter or _is_original_render_ipadapter or _is_trellis2_input_ipadapter or (context.scene.sequential_ipadapter and self.operator._current_image > 0)) and context.scene.generation_method != 'uv_inpaint':
             # Set the model input for IPAdapter
             prompt[NODES['ipadapter_loader']]["inputs"]["model"] = current_model_out
             current_model_out = [NODES['ipadapter'], 0]

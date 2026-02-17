@@ -1,5 +1,6 @@
 import os
 import bpy  # pylint: disable=import-error
+import mathutils  # pylint: disable=import-error
 import numpy as np
 import cv2
 
@@ -1022,6 +1023,11 @@ class ComfyUIGenerate(bpy.types.Operator):
                     # Get info for IPAdapter reference image
                     if context.scene.use_ipadapter:
                         ipadapter_ref_info = self._get_uploaded_image_info(context, "custom", filename=bpy.path.abspath(context.scene.ipadapter_image))
+                    elif context.scene.sequential_ipadapter and context.scene.sequential_ipadapter_mode == 'trellis2_input':
+                        # Use the TRELLIS.2 input image as IPAdapter reference
+                        t2_path = getattr(context.scene, 'trellis2_last_input_image', '')
+                        if t2_path and os.path.exists(bpy.path.abspath(t2_path)):
+                            ipadapter_ref_info = self._get_uploaded_image_info(context, "custom", filename=bpy.path.abspath(t2_path))
                     elif context.scene.sequential_ipadapter and context.scene.sequential_ipadapter_mode == 'original_render' and context.scene.generation_method == 'local_edit':
                         # Use the existing texture render from this camera's viewpoint as IPAdapter reference
                         ipadapter_ref_info = self._get_uploaded_image_info(context, "inpaint", subtype="render", camera_id=camera_id)
@@ -1035,7 +1041,8 @@ class ComfyUIGenerate(bpy.types.Operator):
 
                     # Generate image without ControlNet if needed
                     if context.scene.generation_mode == 'standard' and camera_id == 0 and (context.scene.generation_method == 'sequential' or context.scene.generation_method in ('refine', 'local_edit'))\
-                            and context.scene.sequential_ipadapter and context.scene.sequential_ipadapter_regenerate and not context.scene.use_ipadapter and context.scene.sequential_ipadapter_mode == 'first':
+                            and context.scene.sequential_ipadapter and context.scene.sequential_ipadapter_regenerate and not context.scene.use_ipadapter and context.scene.sequential_ipadapter_mode == 'first'\
+                            and context.scene.sequential_ipadapter_mode != 'trellis2_input':
                         self._stage = "Generating Reference Image"
                         # Don't use ControlNet for the first image if sequential_ipadapter_regenerate_wo_controlnet is enabled
                         if context.scene.sequential_ipadapter_regenerate_wo_controlnet:
@@ -1786,3 +1793,402 @@ class ComfyUIGenerate(bpy.types.Operator):
             # If a *required* image fails to upload, the workflow submission
             # will likely fail later when ComfyUI can't find the input.
             return None
+
+
+class Trellis2Generate(bpy.types.Operator):
+    """Generate a 3D mesh from a reference image using TRELLIS.2 via ComfyUI.
+
+    Requires the PozzettiAndrea/ComfyUI-TRELLIS2 custom node pack installed on the ComfyUI server.
+    Uploads the input image, runs the full TRELLIS.2 pipeline (background removal, conditioning,
+    shape generation, texture generation, GLB export), downloads the resulting GLB file, and
+    imports it into the Blender scene."""
+    bl_idname = "object.trellis2_generate"
+    bl_label = "Generate 3D Mesh (TRELLIS.2)"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    _timer = None
+    _thread = None
+    _error = None
+    _glb_data = None
+    _is_running = False
+    _progress = 0.0
+    _stage = "Initializing"
+    workflow_manager: object = None
+
+    # ── 3-tier progress ──────────────────────────────────────────────
+    _overall_progress: float = 0.0
+    _overall_stage: str = "Initializing"
+    _phase_progress: float = 0.0
+    _phase_stage: str = ""
+    _detail_progress: float = 0.0
+    _detail_stage: str = ""
+    _current_phase: int = 0
+    _total_phases: int = 3  # 2 when gen_from == 'image'
+
+    def _update_overall(self):
+        """Recompute *_overall_progress* from current phase + phase progress."""
+        if self._total_phases == 3:
+            starts  = {1: 0,  2: 15, 3: 65}
+            weights = {1: 15, 2: 50, 3: 35}
+        elif self._total_phases == 2:
+            starts  = {1: 0,  2: 65}
+            weights = {1: 65, 2: 35}
+        else:  # Single phase — scale to full 0-100
+            starts  = {1: 0}
+            weights = {1: 100}
+        s = starts.get(self._current_phase, 0)
+        w = weights.get(self._current_phase, 0)
+        self._overall_progress = s + (self._phase_progress / 100.0) * w
+        self._overall_progress = max(0.0, min(self._overall_progress, 100.0))
+        # Keep legacy _progress in sync for any code that reads it
+        self._progress = self._overall_progress
+
+    @classmethod
+    def poll(cls, context):
+        if cls._is_running:
+            return True  # Allow cancellation
+        addon_prefs = context.preferences.addons[__package__].preferences
+        if not addon_prefs.server_address or not addon_prefs.server_online:
+            return False
+        if not os.path.exists(addon_prefs.output_dir):
+            return False
+        if bpy.app.online_access == False:
+            return False
+        # Check that an input image is specified (only required when generate_from = image)
+        gen_from = getattr(context.scene, 'trellis2_generate_from', 'image')
+        if gen_from == 'image' and not context.scene.trellis2_input_image:
+            return False
+        # Check no other generation is running
+        for window in context.window_manager.windows:
+            for op in window.modal_operators:
+                if op.bl_idname in ('OBJECT_OT_test_stable', 'OBJECT_OT_trellis2_generate',
+                                    'OBJECT_OT_bake_textures', 'OBJECT_OT_add_cameras'):
+                    return False
+        return True
+
+    def execute(self, context):
+        if Trellis2Generate._is_running:
+            # Cancel
+            Trellis2Generate._is_running = False
+            self.report({'WARNING'}, "TRELLIS.2 generation cancelled")
+            return {'FINISHED'}
+
+        scene = context.scene
+        gen_from = getattr(scene, 'trellis2_generate_from', 'image')
+        tex_mode = getattr(scene, 'trellis2_texture_mode', 'native')
+
+        # Validate input image (only required in image mode)
+        image_path = None
+        if gen_from == 'image':
+            image_path = bpy.path.abspath(scene.trellis2_input_image)
+            if not os.path.exists(image_path):
+                self.report({'ERROR'}, f"Input image not found: {image_path}")
+                return {'CANCELLED'}
+
+        Trellis2Generate._is_running = True
+        self._error = None
+        self._glb_data = None
+        self._progress = 0.0
+        self._stage = "Initializing"
+        self._texture_mode = tex_mode
+        self.workflow_manager = WorkflowManager(self)
+
+        # 3-tier progress init
+        has_txt2img = (gen_from == 'prompt')
+        has_texturing = (tex_mode in ('sdxl', 'flux1', 'qwen_image_edit'))
+        if has_txt2img and has_texturing:
+            self._total_phases = 3
+        elif has_txt2img or has_texturing:
+            self._total_phases = 2
+        else:
+            self._total_phases = 1
+        self._current_phase = 0
+        self._overall_progress = 0.0
+        self._overall_stage = "Initializing"
+        self._phase_progress = 0.0
+        self._phase_stage = ""
+        self._detail_progress = 0.0
+        self._detail_stage = ""
+
+        # Compute revision directory on the main thread (may write output_timestamp)
+        from .utils import get_generation_dirs
+        gen_dirs = get_generation_dirs(context)
+        revision_dir = gen_dirs.get("revision", "")
+
+        # Start generation in background thread
+        self._thread = threading.Thread(
+            target=self._run_trellis2,
+            args=(context, image_path, gen_from, revision_dir),
+            daemon=True
+        )
+        self._thread.start()
+
+        # Register modal timer
+        context.window_manager.modal_handler_add(self)
+        self._timer = context.window_manager.event_timer_add(0.5, window=context.window)
+
+        return {'RUNNING_MODAL'}
+
+    def modal(self, context, event):
+        if event.type != 'TIMER':
+            return {'PASS_THROUGH'}
+
+        # Redraw UI for progress updates
+        for area in context.screen.areas:
+            area.tag_redraw()
+
+        # Check if thread is still running
+        if self._thread and self._thread.is_alive():
+            return {'RUNNING_MODAL'}
+
+        # Thread finished - clean up timer
+        context.window_manager.event_timer_remove(self._timer)
+        self._timer = None
+        Trellis2Generate._is_running = False
+
+        if self._error:
+            self.report({'ERROR'}, f"TRELLIS.2 error: {self._error}")
+            return {'CANCELLED'}
+
+        if self._glb_data is None or (isinstance(self._glb_data, dict) and "error" in self._glb_data):
+            error_msg = self._glb_data.get("error", "Unknown error") if isinstance(self._glb_data, dict) else "No data received"
+            self.report({'ERROR'}, f"TRELLIS.2 failed: {error_msg}")
+            return {'CANCELLED'}
+
+        # Save GLB to revision directory and import into Blender
+        try:
+            from .utils import get_generation_dirs
+            gen_dirs = get_generation_dirs(context)
+            save_dir = gen_dirs.get("revision", "")
+            if not save_dir:
+                save_dir = context.preferences.addons[__package__].preferences.output_dir
+            os.makedirs(save_dir, exist_ok=True)
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            glb_filename = f"trellis2_{timestamp}.glb"
+            glb_path = os.path.join(save_dir, glb_filename)
+
+            with open(glb_path, 'wb') as f:
+                f.write(self._glb_data)
+
+            # Store the TRELLIS.2 input image path for downstream use (IPAdapter/Qwen style)
+            input_img = getattr(self, '_input_image_path', None)
+            if input_img:
+                context.scene.trellis2_last_input_image = input_img
+
+            print(f"[TRELLIS2] Saved GLB to: {glb_path} ({len(self._glb_data)} bytes)")
+
+            # Import GLB into Blender
+            bpy.ops.import_scene.gltf(filepath=glb_path)
+
+            # --- Phase 3: If diffusion texturing, auto-place cameras + start generation ---
+            tex_mode = getattr(self, '_texture_mode', 'native')
+            if tex_mode in ('sdxl', 'flux1', 'qwen_image_edit'):
+                # Place cameras NOW (while operator context is still valid)
+                camera_count = getattr(context.scene, 'trellis2_camera_count', 8)
+                imported_objects = [obj for obj in context.selected_objects]
+
+                if imported_objects:
+                    bpy.context.view_layer.objects.active = imported_objects[0]
+                    bpy.ops.object.select_all(action='DESELECT')
+                    for obj in imported_objects:
+                        obj.select_set(True)
+
+                # Force viewport to standard front view so AddCameras uses a
+                # consistent reference direction for sorting and auto-prompts.
+                # TRELLIS.2 always imports meshes in standard orientation so the
+                # viewport should match.
+                for area in context.screen.areas:
+                    if area.type == 'VIEW_3D':
+                        for space in area.spaces:
+                            if space.type == 'VIEW_3D':
+                                rv3d = space.region_3d
+                                if rv3d:
+                                    # Blender front view (Numpad 1): -Y looking at +Y
+                                    rv3d.view_rotation = mathutils.Quaternion(
+                                        (0.7071068, 0.7071068, 0.0, 0.0)
+                                    )
+                                    rv3d.view_perspective = 'PERSP'
+                        break
+
+                try:
+                    bpy.ops.object.add_cameras(
+                        placement_mode='normal_weighted',
+                        num_cameras=camera_count,
+                        auto_prompts=True,
+                        review_placement=False,
+                        purge_others=True,
+                        exclude_bottom=True,
+                    )
+                    print(f"[TRELLIS2] Placed {camera_count} cameras (normal-weighted)")
+                except Exception as cam_err:
+                    print(f"[TRELLIS2] Warning: Camera placement failed: {cam_err}")
+                    traceback.print_exc()
+
+                # Defer texture generation so Blender digests the new cameras
+                self._schedule_texture_generation(context)
+                self.report({'INFO'}, f"TRELLIS.2: Mesh imported. Camera placement done, texture generation starting...")
+            else:
+                self.report({'INFO'}, f"TRELLIS.2: Imported 3D mesh from {glb_filename}")
+
+            return {'FINISHED'}
+
+        except Exception as e:
+            self.report({'ERROR'}, f"Failed to import GLB: {e}")
+            traceback.print_exc()
+            return {'CANCELLED'}
+
+    def _schedule_texture_generation(self, context):
+        """Defer texture generation via a timer so Blender can digest the new cameras.
+
+        Camera placement has already happened in ``modal()``.  This only
+        selects all cameras and starts ``object.test_stable``.
+        Sets scene-level pipeline flags so the UI can show the overall
+        progress bar on top of the ComfyUIGenerate bars.
+        """
+        # Compute the overall-% at which texturing begins
+        if self._total_phases == 3:
+            phase_start = 65.0
+        elif self._total_phases == 2:
+            phase_start = 65.0
+        else:
+            phase_start = 0.0
+
+        scene = context.scene
+        scene.trellis2_pipeline_active = True
+        scene.trellis2_pipeline_phase_start_pct = phase_start
+        scene.trellis2_pipeline_total_phases = self._total_phases
+
+        def _deferred_generate():
+            try:
+                # Defensive VRAM flush before loading the diffusion checkpoint.
+                # The TRELLIS post-generation flush should have freed VRAM,
+                # but if it silently failed the models are still resident (Gap C).
+                # Also clear history to release cached node outputs.
+                try:
+                    srv = bpy.context.preferences.addons[__package__].preferences.server_address
+                    # 1. Set unload flags
+                    flush_data = json.dumps({"unload_models": True, "free_memory": True}).encode('utf-8')
+                    flush_req = urllib.request.Request(
+                        f"http://{srv}/free", data=flush_data,
+                        headers={"Content-Type": "application/json"}
+                    )
+                    urllib.request.urlopen(flush_req, timeout=10)
+                    # 2. Clear history/cache
+                    hist_data = json.dumps({"clear": True}).encode('utf-8')
+                    hist_req = urllib.request.Request(
+                        f"http://{srv}/history", data=hist_data,
+                        headers={"Content-Type": "application/json"}
+                    )
+                    urllib.request.urlopen(hist_req, timeout=10)
+                    # 3. Wait for VRAM release
+                    import time
+                    time.sleep(3)
+                    print("[TRELLIS2] Pre-texturing VRAM flush sent (unload+history clear)")
+                except Exception as flush_err:
+                    print(f"[TRELLIS2] Pre-texturing flush warning: {flush_err}")
+
+                bpy.ops.object.select_all(action='DESELECT')
+                for obj in bpy.context.scene.objects:
+                    if obj.type == 'CAMERA':
+                        obj.select_set(True)
+
+                bpy.ops.object.test_stable('INVOKE_DEFAULT')
+                print("[TRELLIS2] Texture generation started")
+            except Exception as e:
+                print(f"[TRELLIS2] Warning: Texture generation failed to start: {e}")
+                traceback.print_exc()
+            return None  # Run once
+
+        def _pipeline_watcher():
+            """Clear the pipeline flag when texturing finishes."""
+            if bpy.context.scene.generation_status == 'idle':
+                bpy.context.scene.trellis2_pipeline_active = False
+                print("[TRELLIS2] Pipeline complete — overall bar removed")
+                return None  # Stop timer
+            return 1.0  # Check again in 1s
+
+        bpy.app.timers.register(_deferred_generate, first_interval=0.5)
+        bpy.app.timers.register(_pipeline_watcher, first_interval=2.0)
+
+    def _run_trellis2(self, context, image_path, gen_from, revision_dir):
+        """Background thread: runs the TRELLIS.2 pipeline.
+
+        If *gen_from* is ``'prompt'`` the method first generates an input
+        image via a lightweight txt2img ComfyUI workflow, saves it to the
+        revision directory and passes that to the TRELLIS.2 mesh workflow.
+        """
+        try:
+            # --- Phase 1: Image acquisition ---
+            if gen_from == 'prompt':
+                self._current_phase = 1
+                self._phase_stage = "Generating Input Image"
+                self._phase_progress = 0
+                self._detail_progress = 0
+                self._detail_stage = "Flushing stale models"
+                self._overall_stage = f"Phase 1/{self._total_phases}: Input Image"
+                self._update_overall()
+
+                # Flush any stale models from prior runs before loading a
+                # diffusion checkpoint for txt2img (Gap A).
+                try:
+                    server_addr = context.preferences.addons[__package__].preferences.server_address
+                    self.workflow_manager._flush_comfyui_vram(server_addr, label="Pre-txt2img")
+                except Exception:
+                    pass
+
+                self._detail_stage = "Starting txt2img"
+
+                img_result = self.workflow_manager.generate_txt2img(context)
+                if isinstance(img_result, dict) and "error" in img_result:
+                    self._error = f"txt2img failed: {img_result['error']}"
+                    return
+
+                # Phase 1 complete
+                self._phase_progress = 100
+                self._update_overall()
+
+                # Save the generated image bytes to the revision directory
+                save_dir = revision_dir if revision_dir else (
+                    context.preferences.addons[__package__].preferences.output_dir
+                )
+                os.makedirs(save_dir, exist_ok=True)
+                timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                image_path = os.path.join(save_dir, f"trellis2_input_{timestamp}.png")
+                with open(image_path, 'wb') as f:
+                    f.write(img_result)
+                print(f"[TRELLIS2] Saved txt2img result to: {image_path}")
+
+                # Flush VRAM so the txt2img model (SDXL/Flux) is evicted
+                # before TRELLIS loads its own models via raw PyTorch.
+                # Without this, both models coexist and OOM on <=16 GB GPUs.
+                # (Gap B – between txt2img and TRELLIS Phase 1)
+                self._detail_stage = "Flushing txt2img models"
+                try:
+                    server_addr = context.preferences.addons[__package__].preferences.server_address
+                    self.workflow_manager._flush_comfyui_vram(server_addr, label="Post-txt2img")
+                except Exception:
+                    pass
+
+            # --- Phase 2 (or 1 if no txt2img): TRELLIS.2 mesh generation ---
+            trellis_phase = 2 if gen_from == 'prompt' else 1
+            self._current_phase = trellis_phase
+            self._phase_stage = "TRELLIS.2 Mesh Generation"
+            self._phase_progress = 0
+            self._detail_progress = 0
+            self._detail_stage = "Uploading image"
+            self._overall_stage = f"Phase {trellis_phase}/{self._total_phases}: 3D Mesh"
+            self._update_overall()
+
+            # Store the final input image path for later use (IPAdapter/Qwen style)
+            self._input_image_path = image_path
+
+            result = self.workflow_manager.generate_trellis2(context, image_path)
+
+            if isinstance(result, dict) and "error" in result:
+                self._error = result["error"]
+            else:
+                self._glb_data = result
+
+        except Exception as e:
+            self._error = str(e)
+            traceback.print_exc()

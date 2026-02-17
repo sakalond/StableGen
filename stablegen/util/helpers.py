@@ -1493,3 +1493,186 @@ prompt_text_qwen_image_edit = """
 }
 """
 
+# Workflow for TRELLIS.2 Image-to-3D generation via PozzettiAndrea/ComfyUI-TRELLIS2 nodes
+# Pipeline: LoadImage → LoadModels → RemoveBackground → GetConditioning → ImageToShape → ShapeToTexturedMesh → ExportGLB
+prompt_text_trellis2 = """
+{
+  "1": {
+    "inputs": {
+      "image": "",
+      "upload": "image"
+    },
+    "class_type": "LoadImage",
+    "_meta": {
+      "title": "Load Input Image"
+    }
+  },
+  "2": {
+    "inputs": {
+      "resolution": "1024_cascade",
+      "attn_backend": "flash_attn",
+      "vram_mode": "disk_offload"
+    },
+    "class_type": "LoadTrellis2Models",
+    "_meta": {
+      "title": "Load TRELLIS.2 Models"
+    }
+  },
+  "3": {
+    "inputs": {
+      "image": ["1", 0],
+      "low_vram": true
+    },
+    "class_type": "Trellis2RemoveBackground",
+    "_meta": {
+      "title": "Remove Background"
+    }
+  },
+  "4": {
+    "inputs": {
+      "model_config": ["2", 0],
+      "image": ["3", 0],
+      "mask": ["3", 1],
+      "include_1024": true,
+      "background_color": "black"
+    },
+    "class_type": "Trellis2GetConditioning",
+    "_meta": {
+      "title": "Get Conditioning"
+    }
+  },
+  "5": {
+    "inputs": {
+      "model_config": ["2", 0],
+      "conditioning": ["4", 0],
+      "seed": 0,
+      "ss_guidance_strength": 7.5,
+      "ss_sampling_steps": 12,
+      "shape_guidance_strength": 7.5,
+      "shape_sampling_steps": 12,
+      "max_tokens": 24576
+    },
+    "class_type": "Trellis2ImageToShape",
+    "_meta": {
+      "title": "Image to Shape"
+    }
+  },
+  "6": {
+    "inputs": {
+      "model_config": ["2", 0],
+      "conditioning": ["4", 0],
+      "shape_result": ["5", 0],
+      "seed": 0,
+      "tex_guidance_strength": 7.5,
+      "tex_sampling_steps": 12
+    },
+    "class_type": "Trellis2ShapeToTexturedMesh",
+    "_meta": {
+      "title": "Shape to Textured Mesh"
+    }
+  },
+  "7": {
+    "inputs": {
+      "voxelgrid_path": ["6", 1],
+      "decimation_target": 100000,
+      "texture_size": 2048,
+      "remesh": true,
+      "filename_prefix": "trellis2"
+    },
+    "class_type": "Trellis2ExportGLB",
+    "_meta": {
+      "title": "Export GLB"
+    }
+  }
+}
+"""
+
+prompt_text_trellis2_shape_only = """
+{
+  "1": {
+    "inputs": {
+      "image": "",
+      "upload": "image"
+    },
+    "class_type": "LoadImage",
+    "_meta": {
+      "title": "Load Input Image"
+    }
+  },
+  "2": {
+    "inputs": {
+      "resolution": "1024_cascade",
+      "attn_backend": "flash_attn",
+      "vram_mode": "disk_offload"
+    },
+    "class_type": "LoadTrellis2Models",
+    "_meta": {
+      "title": "Load TRELLIS.2 Models"
+    }
+  },
+  "3": {
+    "inputs": {
+      "image": ["1", 0],
+      "low_vram": true
+    },
+    "class_type": "Trellis2RemoveBackground",
+    "_meta": {
+      "title": "Remove Background"
+    }
+  },
+  "4": {
+    "inputs": {
+      "model_config": ["2", 0],
+      "image": ["3", 0],
+      "mask": ["3", 1],
+      "include_1024": true,
+      "background_color": "black"
+    },
+    "class_type": "Trellis2GetConditioning",
+    "_meta": {
+      "title": "Get Conditioning"
+    }
+  },
+  "5": {
+    "inputs": {
+      "model_config": ["2", 0],
+      "conditioning": ["4", 0],
+      "seed": 0,
+      "ss_guidance_strength": 7.5,
+      "ss_sampling_steps": 12,
+      "shape_guidance_strength": 7.5,
+      "shape_sampling_steps": 12,
+      "max_tokens": 24576
+    },
+    "class_type": "Trellis2ImageToShape",
+    "_meta": {
+      "title": "Image to Shape"
+    }
+  },
+  "6": {
+    "inputs": {
+      "trimesh": ["5", 1],
+      "target_face_count": 100000,
+      "fill_holes": true,
+      "remesh": false,
+      "remesh_band": 1.0
+    },
+    "class_type": "Trellis2Simplify",
+    "_meta": {
+      "title": "Simplify Mesh"
+    }
+  },
+  "7": {
+    "inputs": {
+      "trimesh": ["6", 0],
+      "filename_prefix": "trellis2",
+      "file_format": "glb"
+    },
+    "class_type": "Trellis2ExportTrimesh",
+    "_meta": {
+      "title": "Export Trimesh"
+    }
+  }
+}
+"""
+

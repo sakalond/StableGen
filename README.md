@@ -8,6 +8,8 @@
 
 StableGen is an open-source Blender plugin designed to seamlessly integrate advanced diffusion models (SDXL, FLUX.1-dev, Qwen Image Edit 2509) into your creative process. Generate complex, coherent, and controllable textures for your 3D models and entire scenes using a flexible ComfyUI backend.
 
+New: **TRELLIS.2 Image-to-3D** — generate textured 3D meshes from a single reference image, powered by [ComfyUI-TRELLIS2](https://github.com/PozzettiAndrea/ComfyUI-TRELLIS2).
+
 ---
 
 <details>
@@ -58,6 +60,11 @@ StableGen empowers 3D artists by bringing cutting-edge AI texturing capabilities
     * Leverage multiple ControlNet units (Depth, Canny, Normal) simultaneously to ensure generated textures respect your model's geometry.
     * Fine-tune strength, start/end steps for each ControlNet unit.
     * Supports custom ControlNet model mapping.
+* 🧊 **TRELLIS.2 Image-to-3D (Experimental):**
+    * Generate a fully textured 3D mesh from a single reference image using TRELLIS.2.
+    * Configurable resolution, VRAM mode (CPU/disk offloading for 16GB cards), guidance strengths, and mesh export settings.
+    * GLB output is automatically imported into the Blender scene.
+    * Requires `ComfyUI-TRELLIS2` custom node (installable via `installer.py`).
 * 🖌️ **Powerful Style Guidance with IPAdapter:**
     * Use external reference images to guide the style, mood, and content of your textures with IPAdapter.
     * Employ IPAdapter without an reference image for enhanced consistency in multi-view generation modes.
@@ -390,6 +397,7 @@ StableGen builds upon the fantastic work of many individuals and communities. Ou
     * Full thesis available at: [https://dspace.cvut.cz/handle/10467/123567](https://dspace.cvut.cz/handle/10467/123567)
 * **Core Technologies & Communities:**
     * **ComfyUI** by ComfyAnonymous ([GitHub](https://github.com/comfyanonymous/ComfyUI)) for the powerful and flexible backend.
+    * **ComfyUI-TRELLIS2** by PozzettiAndrea ([GitHub](https://github.com/PozzettiAndrea/ComfyUI-TRELLIS2)) for the TRELLIS.2 ComfyUI integration.
     * The **Blender Foundation** and its community for the amazing open-source 3D creation suite.
 * **Inspired by following Blender Addons:**
     * **Dream Textures** by Carson Katri et al. ([GitHub](https://github.com/carson-katri/dream-textures))
@@ -424,7 +432,7 @@ Here are some features we plan to implement in the future (in no particular orde
 * **Custom VAE, CLIP model selection:** Ability to select custom VAE and CLIP models in addition to custom ControlNet and LoRA models.
 * **Refine mode improvements:** Features like brush based inpainting.
 * **Z-Image support** (and eventual Z-Image editing model support)
-* **Mesh generation:** Integration of mesh generation capabilities.
+* **Mesh generation:** Integration of mesh generation capabilities (TRELLIS.2 support now available as experimental feature).
 * **Brush-based inpainting:** Paint masks directly on the viewport for targeted local edits.
 
 If you have any suggestions, please feel free to open an issue!

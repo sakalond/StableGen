@@ -4,7 +4,7 @@ from .stablegen import StableGenPanel, ApplyPreset, SavePreset, DeletePreset, ge
 from .render_tools import BakeTextures, AddCameras, CloneCamera, MirrorCamera, ToggleCameraLabels, SwitchMaterial, ExportOrbitGIF, CollectCameraPrompts, CameraPromptItem, CameraOrderItem, SG_UL_CameraOrderList, SyncCameraOrder, MoveCameraOrder, ApplyCameraOrderPreset
 from .debug_tools import debug_classes as _debug_classes
 from .utils import AddHDRI, ApplyModifiers, CurvesToMesh
-from .generator import ComfyUIGenerate, Reproject, Regenerate, MirrorReproject
+from .generator import ComfyUIGenerate, Reproject, Regenerate, MirrorReproject, Trellis2Generate
 import os
 import requests
 import json
@@ -46,6 +46,7 @@ classes = [
     Reproject,
     Regenerate,
     MirrorReproject,
+    Trellis2Generate,
 ]
 
 # Global caches for model lists fetched via API
@@ -53,6 +54,80 @@ _cached_checkpoint_list = [("NONE_AVAILABLE", "None available", "Fetch models fr
 _cached_lora_list = [("NONE_AVAILABLE", "None available", "Fetch models from server")]
 _cached_checkpoint_architecture = None
 _pending_checkpoint_refresh_architecture = None
+
+
+def update_architecture_mode(self, context):
+    """Called when the user changes the architecture_mode dropdown.
+
+    For standard diffusion modes (sdxl / flux1 / qwen_image_edit) the hidden
+    ``model_architecture`` property is synced which in turn triggers the
+    existing ``update_combined`` callback (server check, checkpoint refresh,
+    etc.).
+
+    For trellis2 mode the diffusion backbone is only synced when the
+    active ``trellis2_texture_mode`` is itself a diffusion architecture.
+    """
+    scene = context.scene
+    mode = scene.architecture_mode
+
+    if mode != 'trellis2':
+        # Standard diffusion — sync backbone and let its callback refresh
+        if scene.model_architecture != mode:
+            scene.model_architecture = mode          # triggers update_combined
+    else:
+        # Entering TRELLIS.2 mode — sync backbone only if texture_mode is diffusion
+        tex_mode = getattr(scene, 'trellis2_texture_mode', 'native')
+        if tex_mode in ('sdxl', 'flux1', 'qwen_image_edit'):
+            if scene.model_architecture != tex_mode:
+                scene.model_architecture = tex_mode  # triggers update_combined
+
+
+def update_trellis2_texture_mode(self, context):
+    """Called when the user changes the texture generation mode inside TRELLIS.2.
+
+    * Syncs ``trellis2_skip_texture`` (True when *not* native).
+    * If the chosen mode is a diffusion architecture and differs from the
+      current backbone, syncs ``model_architecture`` (which triggers a
+      checkpoint refresh).
+    * If ``generate_from`` is *prompt* and the user picks ``none`` or
+      ``native`` (no diffusion), auto-switch to ``sdxl`` so there is always
+      a diffusion model available for the image-generation step.
+    """
+    scene = context.scene
+    if getattr(scene, 'architecture_mode', '') != 'trellis2':
+        return
+
+    tex_mode = scene.trellis2_texture_mode
+
+    # When prompt mode, a diffusion backbone is mandatory
+    if getattr(scene, 'trellis2_generate_from', 'image') == 'prompt' and tex_mode in ('none', 'native'):
+        scene.trellis2_texture_mode = 'sdxl'
+        return                                       # re-entrant; callback fires again
+
+    # Sync skip_texture flag used by the workflow code
+    scene.trellis2_skip_texture = (tex_mode != 'native')
+
+    if tex_mode in ('sdxl', 'flux1', 'qwen_image_edit'):
+        if scene.model_architecture != tex_mode:
+            scene.model_architecture = tex_mode      # triggers update_combined
+
+
+def update_trellis2_generate_from(self, context):
+    """Called when the user switches between Image and Prompt input mode.
+
+    If switching to *prompt* while the texture mode is ``none`` or
+    ``native`` (no diffusion model selected), force ``trellis2_texture_mode``
+    to ``sdxl`` so a checkpoint is available for image generation.
+    """
+    scene = context.scene
+    if getattr(scene, 'architecture_mode', '') != 'trellis2':
+        return
+
+    if scene.trellis2_generate_from == 'prompt':
+        tex_mode = getattr(scene, 'trellis2_texture_mode', 'native')
+        if tex_mode in ('none', 'native'):
+            scene.trellis2_texture_mode = 'sdxl'     # triggers update_trellis2_texture_mode
+
 
 def update_combined(self, context):
     # This now primarily updates the preset status and might trigger Enum updates implicitly
@@ -82,6 +157,12 @@ def update_combined(self, context):
         return None
     else:
         context.preferences.addons[__package__].preferences.server_online = True
+
+    # Auto-detect TRELLIS.2 availability
+    trellis2_found = check_trellis2_available(
+        context.preferences.addons[__package__].preferences.server_address, timeout=1.0
+    )
+    context.scene.trellis2_available = trellis2_found
 
     update_parameters(self, context)
     load_handler(None)
@@ -312,6 +393,9 @@ class CheckServerStatus(bpy.types.Operator):
             bpy.ops.stablegen.refresh_lora_list('INVOKE_DEFAULT')
             bpy.ops.stablegen.refresh_controlnet_mappings('INVOKE_DEFAULT')
             load_handler(None)
+            # Auto-detect TRELLIS.2 availability
+            trellis2_found = check_trellis2_available(server_addr)
+            context.scene.trellis2_available = trellis2_found
         else:
             self.report({'ERROR'}, f"ComfyUI server unreachable or timed out at {server_addr}.")
 
@@ -456,6 +540,34 @@ def check_server_availability(server_address, timeout=0.5):
         return False
     except requests.exceptions.ConnectionError:
         print("  Initial server check failed: Connection Error.")
+        return False
+
+
+def check_trellis2_available(server_address, timeout=1.0):
+    """
+    Checks if TRELLIS.2 custom nodes are installed in ComfyUI by querying /object_info.
+
+    Args:
+        server_address (str): The address:port of the ComfyUI server.
+        timeout (float): Timeout in seconds.
+
+    Returns:
+        bool: True if TRELLIS.2 nodes are detected, False otherwise.
+    """
+    if not server_address:
+        return False
+    try:
+        url = f"http://{server_address}/object_info/Trellis2ImageToShape"
+        response = requests.get(url, timeout=timeout)
+        if response.status_code == 200:
+            data = response.json()
+            if 'Trellis2ImageToShape' in data:
+                print("[TRELLIS2] Auto-detect: TRELLIS.2 nodes found in ComfyUI.")
+                return True
+        print("[TRELLIS2] Auto-detect: TRELLIS.2 nodes NOT found in ComfyUI.")
+        return False
+    except Exception as e:
+        print(f"[TRELLIS2] Auto-detect failed: {e}")
         return False
     except requests.exceptions.RequestException as e:
         # Other errors (like 404 on root) might still mean the server is *running*
@@ -1394,6 +1506,10 @@ def register():
             )
             if is_local_edit:
                 items.append(('original_render', 'Use original render', 'Uses the existing texture render from each camera viewpoint as IPAdapter reference', 2))
+            # TRELLIS.2 input image option — only when architecture is trellis2
+            if getattr(context.scene, 'architecture_mode', '') == 'trellis2':
+                items.append(('trellis2_input', 'Use TRELLIS.2 input image',
+                              'Uses the input image from TRELLIS.2 mesh generation as IPAdapter reference', 3))
         return items
     bpy.types.Scene.sequential_ipadapter_mode = bpy.props.EnumProperty(
         name="IPAdapter Mode",
@@ -1913,7 +2029,53 @@ def register():
         default='sdxl',
         update=update_combined
     )
-    
+
+    bpy.types.Scene.architecture_mode = bpy.props.EnumProperty(
+        name="Architecture",
+        description="Select the overall generation architecture",
+        items=[
+            ('sdxl', 'SDXL', 'Stable Diffusion XL'),
+            ('flux1', 'Flux 1', 'Flux 1 architecture'),
+            ('qwen_image_edit', 'Qwen Image Edit', 'Qwen Image Edit architecture'),
+            ('trellis2', 'TRELLIS.2', 'Image to 3D mesh generation with TRELLIS.2'),
+        ],
+        default='sdxl',
+        update=update_architecture_mode
+    )
+
+    bpy.types.Scene.trellis2_generate_from = bpy.props.EnumProperty(
+        name="Generate From",
+        description="Source for the TRELLIS.2 input",
+        items=[
+            ('image', 'Image', 'Use an existing image as input'),
+            ('prompt', 'Prompt', 'Generate an image from the prompt first, then feed to TRELLIS.2'),
+        ],
+        default='image',
+        update=update_trellis2_generate_from
+    )
+
+    bpy.types.Scene.trellis2_texture_mode = bpy.props.EnumProperty(
+        name="Texture Mode",
+        description="How to generate textures for the 3D mesh",
+        items=[
+            ('none', 'None', 'Shape only, no texture generation'),
+            ('native', 'Native (TRELLIS.2)', 'Use TRELLIS.2 built-in texture generation'),
+            ('sdxl', 'SDXL', 'Use SDXL for camera-based texture projection'),
+            ('flux1', 'Flux 1', 'Use Flux 1 for camera-based texture projection'),
+            ('qwen_image_edit', 'Qwen Image Edit', 'Use Qwen for camera-based texture projection'),
+        ],
+        default='native',
+        update=update_trellis2_texture_mode
+    )
+
+    bpy.types.Scene.trellis2_camera_count = bpy.props.IntProperty(
+        name="Camera Count",
+        description="Number of cameras to place around the generated mesh for texture projection",
+        default=8,
+        min=2,
+        max=32
+    )
+
     bpy.types.Scene.qwen_guidance_map_type = bpy.props.EnumProperty(
         name="Guidance Map",
         description="The type of guidance map to use for Qwen Image Edit",
@@ -2223,6 +2385,207 @@ def register():
     bpy.types.Scene.lora_units_index = bpy.props.IntProperty(default=0)
     bpy.app.handlers.load_post.append(load_handler)
 
+    # --- TRELLIS.2 Properties ---
+    bpy.types.Scene.trellis2_available = bpy.props.BoolProperty(
+        name="TRELLIS.2 Available",
+        description="Whether TRELLIS.2 nodes are available on the ComfyUI server (auto-detected)",
+        default=False
+    )
+    bpy.types.Scene.show_trellis2_params = bpy.props.BoolProperty(
+        name="Show TRELLIS.2 Section",
+        description="Toggle TRELLIS.2 Image-to-3D section",
+        default=False
+    )
+    bpy.types.Scene.show_trellis2_advanced = bpy.props.BoolProperty(
+        name="Show TRELLIS.2 Settings",
+        description="Toggle TRELLIS.2 advanced settings",
+        default=False
+    )
+    bpy.types.Scene.show_trellis2_mesh_settings = bpy.props.BoolProperty(
+        name="Show Mesh Generation Settings",
+        description="Toggle TRELLIS.2 mesh generation advanced settings",
+        default=False
+    )
+    bpy.types.Scene.show_trellis2_texture_settings = bpy.props.BoolProperty(
+        name="Show Texture Settings",
+        description="Toggle TRELLIS.2 native texture settings",
+        default=False
+    )
+    bpy.types.Scene.trellis2_last_input_image = bpy.props.StringProperty(
+        name="TRELLIS.2 Last Input Image",
+        description="Path to the image most recently used as TRELLIS.2 input (set automatically after generation)",
+        subtype='FILE_PATH',
+        default=""
+    )
+    bpy.types.Scene.qwen_use_trellis2_style = bpy.props.BoolProperty(
+        name="Use TRELLIS.2 Input as Style",
+        description="Use the TRELLIS.2 input image as the Qwen style reference",
+        default=False
+    )
+    # 3-tier progress pipeline flags (written by Trellis2Generate, read by UI)
+    bpy.types.Scene.trellis2_pipeline_active = bpy.props.BoolProperty(
+        name="TRELLIS.2 Pipeline Active",
+        description="True while the TRELLIS.2 pipeline (incl. texturing) is running",
+        default=False
+    )
+    bpy.types.Scene.trellis2_pipeline_phase_start_pct = bpy.props.FloatProperty(
+        name="Phase Start %",
+        description="Overall-% at which the current texturing phase begins",
+        default=0.0, min=0.0, max=100.0
+    )
+    bpy.types.Scene.trellis2_pipeline_total_phases = bpy.props.IntProperty(
+        name="Total Phases",
+        description="Total number of phases in the TRELLIS.2 pipeline",
+        default=3, min=1, max=3
+    )
+    bpy.types.Scene.trellis2_input_image = bpy.props.StringProperty(
+        name="Input Image",
+        description="Path to the reference image for 3D mesh generation",
+        subtype='FILE_PATH',
+        default=""
+    )
+    bpy.types.Scene.trellis2_resolution = bpy.props.EnumProperty(
+        name="Resolution",
+        description="Model resolution for generation. Higher values use more VRAM",
+        items=[
+            ('512', '512', 'Low resolution, fast, less VRAM'),
+            ('1024_cascade', '1024 Cascade', 'Medium resolution with cascade (recommended)'),
+            ('1536_cascade', '1536 Cascade', 'High resolution with cascade, most VRAM'),
+        ],
+        default='1024_cascade'
+    )
+    bpy.types.Scene.trellis2_vram_mode = bpy.props.EnumProperty(
+        name="VRAM Mode",
+        description="Controls model offloading strategy to manage VRAM usage",
+        items=[
+            ('keep_loaded', 'Keep Loaded', 'Keep all models in VRAM (fastest, ~12GB VRAM)'),
+            ('disk_offload', 'Disk Offload', 'Load models on demand from disk (recommended for <=16GB VRAM)'),
+        ],
+        default='disk_offload'
+    )
+    bpy.types.Scene.trellis2_attn_backend = bpy.props.EnumProperty(
+        name="Attention Backend",
+        description="Attention implementation to use. flash_attn is fastest but requires CUDA",
+        items=[
+            ('flash_attn', 'Flash Attention', 'Fastest (requires flash-attn package)'),
+            ('xformers', 'xFormers', 'Fast (requires xformers package)'),
+            ('sdpa', 'SDPA', 'PyTorch native, always available'),
+            ('sageattn', 'SageAttention', 'SageAttention backend (requires sageattn package)'),
+        ],
+        default='flash_attn'
+    )
+    bpy.types.Scene.trellis2_seed = bpy.props.IntProperty(
+        name="Seed",
+        description="Random seed for generation (0 = random)",
+        default=0,
+        min=0,
+        max=2147483647
+    )
+    bpy.types.Scene.trellis2_ss_guidance = bpy.props.FloatProperty(
+        name="SS Guidance",
+        description="Sparse structure CFG scale. Higher = stronger adherence to input image",
+        default=7.5,
+        min=1.0,
+        max=20.0,
+        step=10
+    )
+    bpy.types.Scene.trellis2_ss_steps = bpy.props.IntProperty(
+        name="SS Steps",
+        description="Sparse structure sampling steps. More steps = better quality but slower",
+        default=12,
+        min=1,
+        max=50
+    )
+    bpy.types.Scene.trellis2_shape_guidance = bpy.props.FloatProperty(
+        name="Shape Guidance",
+        description="Shape CFG scale. Higher = stronger adherence to input image",
+        default=7.5,
+        min=1.0,
+        max=20.0,
+        step=10
+    )
+    bpy.types.Scene.trellis2_shape_steps = bpy.props.IntProperty(
+        name="Shape Steps",
+        description="Shape sampling steps. More steps = better quality but slower",
+        default=12,
+        min=1,
+        max=50
+    )
+    bpy.types.Scene.trellis2_tex_guidance = bpy.props.FloatProperty(
+        name="Texture Guidance",
+        description="Texture CFG scale. Higher = stronger adherence to input image",
+        default=7.5,
+        min=1.0,
+        max=20.0,
+        step=10
+    )
+    bpy.types.Scene.trellis2_tex_steps = bpy.props.IntProperty(
+        name="Texture Steps",
+        description="Texture sampling steps. More steps = better quality but slower",
+        default=12,
+        min=1,
+        max=50
+    )
+    bpy.types.Scene.trellis2_max_tokens = bpy.props.IntProperty(
+        name="Max Tokens",
+        description="Maximum tokens for shape generation. Lower = less VRAM. 24576 (~6GB) recommended for 16GB GPUs",
+        default=24576,
+        min=16384,
+        max=65536,
+        step=4096
+    )
+    bpy.types.Scene.trellis2_texture_size = bpy.props.IntProperty(
+        name="Texture Size",
+        description="Output texture resolution in pixels",
+        default=2048,
+        min=512,
+        max=8192,
+        step=512
+    )
+    bpy.types.Scene.trellis2_decimation = bpy.props.IntProperty(
+        name="Decimation Target",
+        description="Target polygon count for mesh simplification. Lower = simpler mesh",
+        default=100000,
+        min=1000,
+        max=5000000,
+        step=10000
+    )
+    bpy.types.Scene.trellis2_remesh = bpy.props.BoolProperty(
+        name="Remesh",
+        description="Apply remeshing for cleaner topology",
+        default=True
+    )
+    bpy.types.Scene.trellis2_skip_texture = bpy.props.BoolProperty(
+        name="Skip Texture",
+        description="Export shape-only mesh (no PBR textures). Much faster and uses less VRAM",
+        default=False
+    )
+    bpy.types.Scene.trellis2_low_vram = bpy.props.BoolProperty(
+        name="Low VRAM BG Removal",
+        description="Use low VRAM mode for background removal (BiRefNet)",
+        default=True
+    )
+    bpy.types.Scene.trellis2_background_color = bpy.props.EnumProperty(
+        name="Background Color",
+        description="Background color for image conditioning",
+        items=[
+            ('black', 'Black', 'Black background (default)'),
+            ('gray', 'Gray', 'Gray background'),
+            ('white', 'White', 'White background'),
+        ],
+        default='black'
+    )
+    bpy.types.Scene.trellis2_include_1024 = bpy.props.BoolProperty(
+        name="Include 1024 Conditioning",
+        description="Include 1024-resolution conditioning. Disable for lower VRAM usage with 512 resolution",
+        default=True
+    )
+    bpy.types.Scene.trellis2_fill_holes = bpy.props.BoolProperty(
+        name="Fill Holes",
+        description="Fill holes in the mesh during simplification (shape-only mode)",
+        default=True
+    )
+
 def unregister():   
     """     
     Unregisters the addon.         
@@ -2308,6 +2671,7 @@ def unregister():
     del bpy.types.Scene.clip_skip
     del bpy.types.Scene.stablegen_preset
     del bpy.types.Scene.model_architecture
+    del bpy.types.Scene.architecture_mode
     del bpy.types.Scene.output_timestamp
     del bpy.types.Scene.camera_prompts
     del bpy.types.Scene.use_camera_prompts
@@ -2344,6 +2708,26 @@ def unregister():
     del bpy.types.Scene.qwen_context_cleanup_value_adjust
     del bpy.types.Scene.qwen_context_fallback_dilation
     del bpy.types.Scene.qwen_timestep_zero_ref
+
+    # --- TRELLIS.2 Properties ---
+    trellis2_props = [
+        'trellis2_available', 'show_trellis2_params', 'show_trellis2_advanced',
+        'show_trellis2_mesh_settings', 'show_trellis2_texture_settings',
+        'trellis2_last_input_image', 'qwen_use_trellis2_style',
+        'trellis2_pipeline_active', 'trellis2_pipeline_phase_start_pct',
+        'trellis2_pipeline_total_phases',
+        'trellis2_generate_from', 'trellis2_texture_mode', 'trellis2_camera_count',
+        'trellis2_input_image', 'trellis2_resolution', 'trellis2_vram_mode',
+        'trellis2_attn_backend', 'trellis2_seed', 'trellis2_ss_guidance',
+        'trellis2_ss_steps', 'trellis2_shape_guidance', 'trellis2_shape_steps',
+        'trellis2_tex_guidance', 'trellis2_tex_steps', 'trellis2_max_tokens',
+        'trellis2_texture_size', 'trellis2_decimation', 'trellis2_remesh',
+        'trellis2_skip_texture', 'trellis2_low_vram', 'trellis2_background_color',
+        'trellis2_include_1024', 'trellis2_fill_holes',
+    ]
+    for prop in trellis2_props:
+        if hasattr(bpy.types.Scene, prop):
+            delattr(bpy.types.Scene, prop)
 
     for cls in reversed(classes):
         bpy.utils.unregister_class(cls)
