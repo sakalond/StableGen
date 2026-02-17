@@ -609,24 +609,35 @@ class StableGenPanel(bpy.types.Panel):
                     # Core mesh params
                     row = content_box.row()
                     row.prop(scene, "trellis2_seed", text="Seed")
+
+                    content_box.separator()
+
+                    # Post-processing (ComfyUI-side decimation + remesh)
+                    content_box.label(text="Post-Processing:", icon="OUTLINER_OB_MESH")
                     row = content_box.row()
-                    row.prop(scene, "trellis2_decimation", text="Decimation Target")
+                    row.prop(scene, "trellis2_post_processing_enabled", text="Enable Post-Processing", toggle=True, icon="MOD_DECIM")
+
+                    if scene.trellis2_post_processing_enabled:
+                        row = content_box.row()
+                        row.prop(scene, "trellis2_decimation", text="Decimation Target")
+                        row = content_box.row()
+                        row.prop(scene, "trellis2_remesh", text="Remesh", toggle=True, icon="MOD_REMESH")
                     row = content_box.row()
-                    row.prop(scene, "trellis2_remesh", text="Remesh")
+                    row.prop(scene, "trellis2_fill_holes", text="Fill Holes", toggle=True, icon="MESH_GRID")
 
                     content_box.separator()
 
                     # Model settings
                     content_box.label(text="Model:", icon="SETTINGS")
-                    split = content_box.split(factor=0.4)
+                    split = content_box.split(factor=0.5)
                     split.label(text="Resolution:")
                     split.prop(scene, "trellis2_resolution", text="")
 
-                    split = content_box.split(factor=0.4)
+                    split = content_box.split(factor=0.5)
                     split.label(text="VRAM Mode:")
                     split.prop(scene, "trellis2_vram_mode", text="")
 
-                    split = content_box.split(factor=0.4)
+                    split = content_box.split(factor=0.5)
                     split.label(text="Attention:")
                     split.prop(scene, "trellis2_attn_backend", text="")
 
@@ -647,25 +658,18 @@ class StableGenPanel(bpy.types.Panel):
 
                     # Conditioning
                     content_box.label(text="Conditioning:", icon="IMAGE_DATA")
-                    split = content_box.split(factor=0.4)
+                    split = content_box.split(factor=0.5)
                     split.label(text="Background:")
                     split.prop(scene, "trellis2_background_color", text="")
                     row = content_box.row()
-                    row.prop(scene, "trellis2_include_1024", text="Include 1024 Conditioning")
-
-                    content_box.separator()
-
-                    # Shape-only extras
-                    content_box.label(text="Post-processing:", icon="OUTLINER_OB_MESH")
-                    row = content_box.row()
-                    row.prop(scene, "trellis2_fill_holes", text="Fill Holes")
+                    row.prop(scene, "trellis2_include_1024", text="Include 1024 Conditioning", toggle=True, icon="IMAGE_PLANE")
 
                     content_box.separator()
 
                     # Misc
                     content_box.label(text="Misc:", icon="PREFERENCES")
                     row = content_box.row()
-                    row.prop(scene, "trellis2_low_vram", text="Low VRAM Background Removal")
+                    row.prop(scene, "trellis2_low_vram", text="Low VRAM Background Removal", toggle=True, icon="GHOST_ENABLED")
 
             # --- TRELLIS.2: Native Texture Settings ---
             if is_trellis2 and trellis2_tex_mode == 'native':

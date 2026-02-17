@@ -2555,6 +2555,12 @@ def register():
         description="Apply remeshing for cleaner topology",
         default=True
     )
+    bpy.types.Scene.trellis2_post_processing_enabled = bpy.props.BoolProperty(
+        name="Post-Processing",
+        description="Run ComfyUI-side mesh post-processing (decimation + remeshing). "
+                    "Disable to import the raw mesh for manual retopology",
+        default=True
+    )
     bpy.types.Scene.trellis2_skip_texture = bpy.props.BoolProperty(
         name="Skip Texture",
         description="Export shape-only mesh (no PBR textures). Much faster and uses less VRAM",
@@ -2563,7 +2569,7 @@ def register():
     bpy.types.Scene.trellis2_low_vram = bpy.props.BoolProperty(
         name="Low VRAM BG Removal",
         description="Use low VRAM mode for background removal (BiRefNet)",
-        default=True
+        default=False
     )
     bpy.types.Scene.trellis2_background_color = bpy.props.EnumProperty(
         name="Background Color",
@@ -2722,6 +2728,7 @@ def unregister():
         'trellis2_ss_steps', 'trellis2_shape_guidance', 'trellis2_shape_steps',
         'trellis2_tex_guidance', 'trellis2_tex_steps', 'trellis2_max_tokens',
         'trellis2_texture_size', 'trellis2_decimation', 'trellis2_remesh',
+        'trellis2_post_processing_enabled',
         'trellis2_skip_texture', 'trellis2_low_vram', 'trellis2_background_color',
         'trellis2_include_1024', 'trellis2_fill_holes',
     ]

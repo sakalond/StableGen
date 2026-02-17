@@ -1955,6 +1955,13 @@ class Trellis2Generate(bpy.types.Operator):
             self.report({'ERROR'}, f"TRELLIS.2 failed: {error_msg}")
             return {'CANCELLED'}
 
+        # Surface mesh-corruption warning to the user (set by workflows.py
+        # when the GLB validator detects artifacts but recovery failed).
+        _mesh_warning = getattr(self, '_warning', None)
+        if _mesh_warning:
+            self.report({'WARNING'}, _mesh_warning)
+            self._warning = None  # consumed
+
         # Save GLB to revision directory and import into Blender
         try:
             from .utils import get_generation_dirs

@@ -3,9 +3,11 @@ import os
 import json
 import uuid
 import random
+import struct
 import websocket
 import socket
 import urllib.request
+import urllib.parse
 from datetime import datetime, timedelta
 
 from .util.helpers import prompt_text_qwen_image_edit, prompt_text_trellis2, prompt_text_trellis2_shape_only
@@ -51,7 +53,12 @@ class WorkflowManager:
 
         # --- Load image as RGBA without touching color ---
         buf = BytesIO(img_bytes)
-        img = Image.open(buf).convert("RGBA")
+        try:
+            img = Image.open(buf).convert("RGBA")
+        except Exception as e:
+            print(f"[StableGen] _crop_and_vignette: cannot decode image "
+                  f"({len(img_bytes)} bytes): {e}  — returning raw bytes.")
+            return img_bytes
 
         w, h = img.size
         if w <= 2 * border_px or h <= 2 * border_px:
@@ -757,6 +764,11 @@ class WorkflowManager:
         if vram_before is not None:
             print(f"[TRELLIS2] {label} VRAM before flush: {vram_before:.0f} MB free / {vram_total:.0f} MB total")
 
+            # Skip the flush entirely if VRAM is already ≥90% free.
+            if vram_total and vram_before > vram_total * 0.9:
+                print(f"[TRELLIS2] {label} VRAM already ≥90% free — skipping flush.")
+                return True
+
         def _send_free():
             d = json.dumps({"unload_models": True, "free_memory": True}).encode('utf-8')
             r = urllib.request.Request(
@@ -1118,6 +1130,305 @@ class WorkflowManager:
 
         return prompt, "7"
 
+    # ── GLB mesh validation ───────────────────────────────────────────
+    _GLB_VERTEX_THRESHOLD = 10.0    # absolute coordinate cap
+    _GLB_OUTLIER_SIGMA   = 8.0     # for absolute-value outlier check
+    _GLB_LAPLACIAN_SIGMA = 6.0     # Laplacian displacement outlier threshold
+    _GLB_SPIKE_FRACTION  = 0.001   # if > 0.1% of verts are Laplacian outliers → corrupt
+
+    @staticmethod
+    def _validate_glb_mesh(glb_bytes, threshold=None, sigma=None):
+        """
+        GLB mesh integrity check that catches both extreme values and
+        subtle spiky artifacts (the cumesh/Dual Contouring Windows bug).
+
+        Three-layer validation:
+        1. **Hard limits** – NaN, Inf, absolute coordinate > *threshold*.
+        2. **Statistical outliers** – coords beyond *sigma* σ from mean.
+        3. **Laplacian smoothness** – for each vertex, measure displacement
+           from the average of its mesh neighbors.  Vertices displaced by
+           more than ``_GLB_LAPLACIAN_SIGMA`` σ of the mesh-wide Laplacian
+           distribution are flagged.  If more than ``_GLB_SPIKE_FRACTION``
+           of all vertices are flagged, the mesh is considered corrupt.
+
+        Returns ``(True, "")`` on success or ``(False, reason)`` on failure.
+        """
+        if threshold is None:
+            threshold = WorkflowManager._GLB_VERTEX_THRESHOLD
+        if sigma is None:
+            sigma = WorkflowManager._GLB_OUTLIER_SIGMA
+        lap_sigma = WorkflowManager._GLB_LAPLACIAN_SIGMA
+        spike_frac = WorkflowManager._GLB_SPIKE_FRACTION
+
+        if not glb_bytes or len(glb_bytes) < 20:
+            return False, "GLB data too small"
+
+        try:
+            # ── Parse GLB container ──────────────────────────────────
+            magic, version, total_len = struct.unpack_from('<III', glb_bytes, 0)
+            if magic != 0x46546C67:  # 'glTF'
+                return False, "Not a valid GLB (bad magic)"
+
+            json_len, json_type = struct.unpack_from('<II', glb_bytes, 12)
+            if json_type != 0x4E4F534A:  # 'JSON'
+                return False, "First GLB chunk is not JSON"
+            gltf = json.loads(glb_bytes[20:20 + json_len])
+
+            bin_offset = 20 + json_len
+            if bin_offset % 4:
+                bin_offset += 4 - (bin_offset % 4)
+            if bin_offset + 8 > len(glb_bytes):
+                return False, "No binary chunk found"
+            bin_len, bin_type = struct.unpack_from('<II', glb_bytes, bin_offset)
+            bin_data = glb_bytes[bin_offset + 8: bin_offset + 8 + bin_len]
+
+            accessors = gltf.get('accessors', [])
+            buffer_views = gltf.get('bufferViews', [])
+            meshes = gltf.get('meshes', [])
+
+            # ── Collect all primitives (position accessor + index accessor)
+            primitives_info = []
+            for mesh in meshes:
+                for prim in mesh.get('primitives', []):
+                    pos_idx = prim.get('attributes', {}).get('POSITION')
+                    idx_idx = prim.get('indices')
+                    if pos_idx is not None:
+                        primitives_info.append((pos_idx, idx_idx))
+
+            if not primitives_info:
+                return False, "No POSITION accessor found in GLB"
+
+            total_verts = 0
+            total_spikes = 0
+
+            for pos_acc_idx, idx_acc_idx in primitives_info:
+                # ── Read vertex positions ────────────────────────────
+                acc = accessors[pos_acc_idx]
+                bv = buffer_views[acc['bufferView']]
+                off = bv.get('byteOffset', 0) + acc.get('byteOffset', 0)
+                count = acc['count']
+                total_verts += count
+                num_floats = count * 3
+                end = off + num_floats * 4
+                if end > len(bin_data):
+                    return False, (f"POSITION data overflows binary chunk "
+                                   f"(need {end}, have {len(bin_data)})")
+
+                raw = struct.unpack_from(f'<{num_floats}f', bin_data, off)
+
+                # --- Layer 1: hard checks ---
+                for i, v in enumerate(raw):
+                    if v != v:
+                        return False, f"NaN vertex at float index {i}"
+                    if abs(v) == float('inf'):
+                        return False, f"Inf vertex at float index {i}"
+                    if abs(v) > threshold:
+                        return False, (f"Extreme vertex {v:.2e} at float "
+                                       f"index {i} (threshold {threshold})")
+
+                # --- Layer 2: absolute statistical outlier ---
+                if count >= 10:
+                    mean_v = sum(raw) / len(raw)
+                    var_v = sum((v - mean_v) ** 2 for v in raw) / len(raw)
+                    std_v = var_v ** 0.5
+                    if std_v > 1e-9:
+                        for i, v in enumerate(raw):
+                            dev = abs(v - mean_v) / std_v
+                            if dev > sigma:
+                                return False, (
+                                    f"Outlier vertex: {v:.4f} is {dev:.1f}σ "
+                                    f"from mean {mean_v:.4f} at float idx {i}")
+
+                # --- Layer 3: Laplacian smoothness (needs indices) ----
+                if idx_acc_idx is None or count < 10:
+                    continue  # can't do topology check without indices
+
+                # Build positions list as (x, y, z) tuples
+                positions = [(raw[i*3], raw[i*3+1], raw[i*3+2])
+                             for i in range(count)]
+
+                # Read triangle indices
+                idx_acc = accessors[idx_acc_idx]
+                idx_bv = buffer_views[idx_acc['bufferView']]
+                idx_off = idx_bv.get('byteOffset', 0) + idx_acc.get('byteOffset', 0)
+                idx_count = idx_acc['count']
+                comp_type = idx_acc.get('componentType', 5123)
+                # 5121=UNSIGNED_BYTE, 5123=UNSIGNED_SHORT, 5125=UNSIGNED_INT
+                if comp_type == 5121:
+                    fmt, sz = 'B', 1
+                elif comp_type == 5123:
+                    fmt, sz = 'H', 2
+                else:  # 5125
+                    fmt, sz = 'I', 4
+
+                idx_end = idx_off + idx_count * sz
+                if idx_end > len(bin_data):
+                    continue  # skip Laplacian if index data is bad
+                indices = struct.unpack_from(
+                    f'<{idx_count}{fmt}', bin_data, idx_off)
+
+                # Build neighbor sets from triangles
+                neighbors = [set() for _ in range(count)]
+                for t in range(0, idx_count, 3):
+                    if t + 2 >= idx_count:
+                        break
+                    a, b, c = indices[t], indices[t+1], indices[t+2]
+                    if a < count and b < count and c < count:
+                        neighbors[a].update((b, c))
+                        neighbors[b].update((a, c))
+                        neighbors[c].update((a, b))
+
+                # Compute Laplacian displacement magnitudes
+                laplacians = []
+                for vi in range(count):
+                    nbrs = neighbors[vi]
+                    if not nbrs:
+                        continue
+                    px, py, pz = positions[vi]
+                    ax = sum(positions[n][0] for n in nbrs) / len(nbrs)
+                    ay = sum(positions[n][1] for n in nbrs) / len(nbrs)
+                    az = sum(positions[n][2] for n in nbrs) / len(nbrs)
+                    dx, dy, dz = px - ax, py - ay, pz - az
+                    laplacians.append((dx*dx + dy*dy + dz*dz) ** 0.5)
+
+                if len(laplacians) < 10:
+                    continue
+
+                lap_mean = sum(laplacians) / len(laplacians)
+                lap_var = sum((v - lap_mean)**2 for v in laplacians) / len(laplacians)
+                lap_std = lap_var ** 0.5
+
+                if lap_std < 1e-12:
+                    continue  # perfectly smooth mesh, nothing to flag
+
+                spike_count = sum(
+                    1 for v in laplacians
+                    if (v - lap_mean) / lap_std > lap_sigma
+                )
+                total_spikes += spike_count
+
+            # Check overall spike fraction
+            if total_verts > 0 and total_spikes > 0:
+                frac = total_spikes / total_verts
+                if frac > spike_frac:
+                    return False, (
+                        f"Mesh has {total_spikes} Laplacian-outlier vertices "
+                        f"({frac*100:.2f}% of {total_verts} — threshold "
+                        f"{spike_frac*100:.2f}%). Likely cumesh corruption."
+                    )
+
+            print(f"[TRELLIS2] Mesh validation passed "
+                  f"({total_verts} verts, {total_spikes} minor spikes).")
+            return True, ""
+        except (struct.error, json.JSONDecodeError, KeyError, IndexError) as e:
+            return False, f"GLB parse error: {e}"
+
+    @staticmethod
+    def _is_local_server(server_address):
+        """Return True if server_address points to localhost."""
+        host = server_address.split(':')[0].strip()
+        return host in ('127.0.0.1', 'localhost', '0.0.0.0', '::1', '')
+
+    @staticmethod
+    def _clear_triton_cache():
+        """
+        Delete the Triton JIT kernel cache.
+        On Windows this lives at ``%USERPROFILE%\\.triton\\cache``.
+        Returns True if anything was deleted.
+        """
+        import shutil
+        import pathlib
+
+        candidates = []
+        # Standard location
+        home = pathlib.Path.home()
+        candidates.append(home / '.triton' / 'cache')
+        # TRITON_CACHE_DIR env override
+        env_dir = os.environ.get('TRITON_CACHE_DIR')
+        if env_dir:
+            candidates.append(pathlib.Path(env_dir))
+
+        cleared = False
+        for cache_dir in candidates:
+            if cache_dir.is_dir():
+                try:
+                    count = sum(1 for _ in cache_dir.rglob('*') if _.is_file())
+                    shutil.rmtree(cache_dir, ignore_errors=True)
+                    print(f"[TRELLIS2] Cleared Triton cache: {cache_dir} "
+                          f"({count} files)")
+                    cleared = True
+                except Exception as e:
+                    print(f"[TRELLIS2] Failed to clear Triton cache {cache_dir}: {e}")
+        return cleared
+
+    def _reboot_comfyui(self, server_address, poll_timeout=120):
+        """
+        Attempt to reboot ComfyUI via the ComfyUI Manager ``/manager/reboot``
+        endpoint, then wait for the server to come back online.
+
+        Returns True if the server rebooted and is reachable again.
+        Returns False if ComfyUI Manager is not installed (404), the request
+        failed, or the server did not come back within *poll_timeout* seconds.
+        """
+        import time
+
+        reboot_url = f"http://{server_address}/manager/reboot"
+        print(f"[TRELLIS2] Requesting ComfyUI reboot via {reboot_url} ...")
+
+        try:
+            req = urllib.request.Request(reboot_url, method='GET')
+            resp = urllib.request.urlopen(req, timeout=10)
+            status = resp.getcode()
+            if status not in (200, 201, 204):
+                print(f"[TRELLIS2] Reboot endpoint returned unexpected status {status}")
+                return False
+        except urllib.error.HTTPError as e:
+            if e.code == 404:
+                print(f"[TRELLIS2] Reboot endpoint not found (HTTP 404). "
+                      f"ComfyUI Manager may not be installed.")
+                return False
+            # Other HTTP errors (5xx etc.) might mean the server is already
+            # shutting down — treat as potentially successful.
+            print(f"[TRELLIS2] Reboot endpoint returned HTTP {e.code}, "
+                  f"proceeding to poll (server may be restarting)...")
+        except Exception as e:
+            # Connection reset / broken pipe / timeout are EXPECTED when the
+            # server process dies mid-response.  Treat as likely success.
+            print(f"[TRELLIS2] Connection dropped after reboot request "
+                  f"({type(e).__name__}: {e}) — server is likely restarting.")
+
+        print("[TRELLIS2] Reboot request sent. Waiting for server to go down...")
+
+        # Phase 1: Wait for the server to actually go down (up to 15s).
+        # If it never goes down, the reboot may not have taken effect.
+        down_deadline = time.time() + 15
+        went_down = False
+        time.sleep(2)  # give the process a moment to start shutting down
+        while time.time() < down_deadline:
+            if not self._check_server_alive(server_address, timeout=2):
+                went_down = True
+                break
+            time.sleep(1)
+
+        if not went_down:
+            # Server never went down — maybe the reboot was a no-op
+            print("[TRELLIS2] Server did not appear to go down. "
+                  "Continuing anyway (it may have rebooted very quickly).")
+
+        # Phase 2: Poll until the server is back up.
+        print("[TRELLIS2] Waiting for server to come back up...")
+        up_deadline = time.time() + poll_timeout
+        while time.time() < up_deadline:
+            if self._check_server_alive(server_address, timeout=3):
+                print("[TRELLIS2] Server is back online!")
+                # Give it a few extra seconds to finish loading custom nodes
+                time.sleep(5)
+                return True
+            time.sleep(3)
+
+        print(f"[TRELLIS2] Server did not come back within {poll_timeout}s.")
+        return False
+
     def generate_trellis2(self, context, input_image_path):
         """
         Generates a 3D mesh using TRELLIS.2 via ComfyUI.
@@ -1126,6 +1437,15 @@ class WorkflowManager:
         conditioning, shape generation, optionally texture generation, GLB export),
         and downloads the resulting GLB file from the ComfyUI server.
         VRAM is always flushed before AND after generation.
+
+        If the resulting mesh contains degenerate vertices (a known cumesh /
+        Dual Contouring issue on Windows, caused by corrupted Triton JIT
+        cache), the addon will:
+
+        1. Clear the Triton cache (if the server is local).
+        2. Reboot ComfyUI via the ComfyUI Manager ``/manager/reboot``
+           endpoint (works for both local and remote servers).
+        3. Run one final generation attempt with a fresh process.
 
         Args:
             context: Blender context.
@@ -1136,26 +1456,88 @@ class WorkflowManager:
             dict: {"error": "message"} on failure.
         """
         import urllib.parse
+        import time
 
         server_address = context.preferences.addons[__package__].preferences.server_address
-        client_id = str(uuid.uuid4())
 
         # Pre-generation flush: free any loaded diffusion/other models so
         # TRELLIS.2 has maximum VRAM available.
         print("[TRELLIS2] Pre-generation VRAM flush — freeing loaded models...")
         self._flush_comfyui_vram(server_address, label="Pre-generation")
 
-        import time
         time.sleep(1)  # Brief pause for CUDA memory to be released
 
         # Verify the server is alive before proceeding
         if not self._check_server_alive(server_address):
             return {"error": "ComfyUI server is not responding. Please restart it and try again."}
 
-        # Wrap the entire generation so VRAM is always freed at the end
+        is_local = self._is_local_server(server_address)
+        original_seed = context.scene.trellis2_seed
+
         try:
-            return self._generate_trellis2_inner(context, input_image_path, server_address, client_id)
+            # ── First attempt ──────────────────────────────────────────
+            client_id = str(uuid.uuid4())
+            result = self._generate_trellis2_inner(
+                context, input_image_path, server_address, client_id)
+
+            if isinstance(result, dict) and "error" in result:
+                return result
+
+            ok, reason = self._validate_glb_mesh(result)
+            if ok:
+                return result
+
+            # Mesh is corrupt — Triton JIT cache is the most common cause.
+            print(f"[TRELLIS2] Mesh validation FAILED: {reason}")
+            print("[TRELLIS2] Attempting automatic recovery "
+                  "(Triton cache clear + ComfyUI reboot)...")
+
+            # ── Recovery: clear cache + reboot ─────────────────────────
+            if is_local:
+                self._clear_triton_cache()
+
+            rebooted = self._reboot_comfyui(server_address)
+
+            if rebooted:
+                # One final attempt after a clean reboot
+                print("[TRELLIS2] Running final attempt after reboot...")
+                new_seed = random.randint(0, 2**31 - 1)
+                context.scene.trellis2_seed = new_seed
+                client_id = str(uuid.uuid4())
+                result = self._generate_trellis2_inner(
+                    context, input_image_path, server_address, client_id)
+
+                if isinstance(result, dict) and "error" in result:
+                    return result
+
+                ok, reason = self._validate_glb_mesh(result)
+                if ok:
+                    return result
+
+                print(f"[TRELLIS2] Post-reboot attempt also failed: {reason}")
+                # Fall through to the warning below
+
+            # ── Truly exhausted ────────────────────────────────────────
+            if is_local:
+                warning_msg = (
+                    "Mesh has artifacts (corrupt Triton JIT cache). "
+                    f"Cache was cleared and ComfyUI was "
+                    f"{'rebooted' if rebooted else 'NOT rebooted (install ComfyUI Manager for auto-reboot)'}. "
+                    "Try manually restarting ComfyUI."
+                )
+            else:
+                warning_msg = (
+                    "Mesh has artifacts (corrupt Triton JIT cache). "
+                    f"{'ComfyUI was rebooted but issue persists.' if rebooted else 'Could not auto-reboot (ComfyUI Manager not installed?).'} "
+                    "On the ComfyUI host, delete C:\\Users\\<USERNAME>\\.triton\\cache "
+                    "and restart ComfyUI."
+                )
+            print(f"[TRELLIS2] WARNING: {warning_msg}")
+            self.operator._warning = warning_msg
+            return result
         finally:
+            # Restore the original seed so the UI isn't silently changed
+            context.scene.trellis2_seed = original_seed
             self._flush_comfyui_vram(server_address, label="Post-generation")
 
     def _generate_trellis2_inner(self, context, input_image_path, server_address, client_id):
@@ -1225,11 +1607,20 @@ class WorkflowManager:
         # Configure export with unique prefix for identification
         unique_prefix = f"trellis2_{uuid.uuid4().hex[:8]}"
 
+        # When post-processing is disabled, maximize the decimation target
+        # and disable remeshing so the user gets the rawest possible mesh.
+        use_pp = getattr(scene, 'trellis2_post_processing_enabled', True)
+
         if skip_texture:
             # Configure simplify node
-            prompt[NODES['simplify']]["inputs"]["target_face_count"] = scene.trellis2_decimation
+            if use_pp:
+                prompt[NODES['simplify']]["inputs"]["target_face_count"] = scene.trellis2_decimation
+                prompt[NODES['simplify']]["inputs"]["remesh"] = scene.trellis2_remesh
+            else:
+                # Raw mesh — max faces, no remesh
+                prompt[NODES['simplify']]["inputs"]["target_face_count"] = 5000000
+                prompt[NODES['simplify']]["inputs"]["remesh"] = False
             prompt[NODES['simplify']]["inputs"]["fill_holes"] = scene.trellis2_fill_holes
-            prompt[NODES['simplify']]["inputs"]["remesh"] = scene.trellis2_remesh
             prompt[NODES['export_trimesh']]["inputs"]["filename_prefix"] = unique_prefix
         else:
             # Configure texture generation
@@ -1238,9 +1629,13 @@ class WorkflowManager:
             prompt[NODES['shape_to_textured_mesh']]["inputs"]["tex_sampling_steps"] = scene.trellis2_tex_steps
 
             # Configure GLB export
-            prompt[NODES['export_glb']]["inputs"]["decimation_target"] = scene.trellis2_decimation
+            if use_pp:
+                prompt[NODES['export_glb']]["inputs"]["decimation_target"] = scene.trellis2_decimation
+                prompt[NODES['export_glb']]["inputs"]["remesh"] = scene.trellis2_remesh
+            else:
+                prompt[NODES['export_glb']]["inputs"]["decimation_target"] = 5000000
+                prompt[NODES['export_glb']]["inputs"]["remesh"] = False
             prompt[NODES['export_glb']]["inputs"]["texture_size"] = scene.trellis2_texture_size
-            prompt[NODES['export_glb']]["inputs"]["remesh"] = scene.trellis2_remesh
             prompt[NODES['export_glb']]["inputs"]["filename_prefix"] = unique_prefix
 
         # Save prompt for debugging
@@ -1836,6 +2231,44 @@ class WorkflowManager:
         except Exception as e:
             print(f"Failed to save prompt to file: {str(e)}")
 
+    @staticmethod
+    def _validate_image_bytes(img_bytes):
+        """Return True if *img_bytes* can be decoded as an image by PIL."""
+        if not img_bytes:
+            return False
+        try:
+            Image.open(BytesIO(img_bytes)).verify()
+            return True
+        except Exception:
+            return False
+
+    def _get_images_via_http(self, server_address, prompt_id, node_id):
+        """
+        Fallback: fetch output image(s) for *node_id* from ComfyUI's
+        /history + /view HTTP endpoints.  Returns a list of bytes objects,
+        or an empty list on failure.
+        """
+        try:
+            history_url = f"http://{server_address}/history/{prompt_id}"
+            history = json.loads(urllib.request.urlopen(history_url, timeout=30).read())
+            outputs = history.get(prompt_id, {}).get("outputs", {}).get(node_id, {})
+            image_list = outputs.get("images", [])
+            result = []
+            for img_meta in image_list:
+                filename  = img_meta.get("filename", "")
+                subfolder = img_meta.get("subfolder", "")
+                img_type  = img_meta.get("type", "output")
+                view_url  = (f"http://{server_address}/view?"
+                             f"filename={urllib.parse.quote(filename)}"
+                             f"&subfolder={urllib.parse.quote(subfolder)}"
+                             f"&type={urllib.parse.quote(img_type)}")
+                data = urllib.request.urlopen(view_url, timeout=60).read()
+                result.append(data)
+            return result
+        except Exception as e:
+            print(f"[StableGen] HTTP image fallback failed: {e}")
+            return []
+
     def _connect_to_websocket(self, server_address, client_id):
         """Establishes WebSocket connection to ComfyUI server."""
         try:
@@ -1863,8 +2296,45 @@ class WorkflowManager:
             self._error = f"An unexpected error occurred connecting WebSocket: {e}"
             return None
 
+    @staticmethod
+    def _inject_save_image_fallback(prompt, save_ws_node_id):
+        """
+        Inject a regular ``SaveImage`` node into *prompt* that mirrors the
+        input of the ``SaveImageWebsocket`` node.  This ensures the image is
+        also written to disk so it can be retrieved via HTTP if the WebSocket
+        binary transfer is corrupted (e.g. packet loss on a remote network).
+
+        Returns the node-ID of the injected node, or *None* if injection
+        was not possible.
+        """
+        ws_node = prompt.get(save_ws_node_id)
+        if not ws_node:
+            return None
+
+        images_input = ws_node.get("inputs", {}).get("images")
+        if not images_input:
+            return None
+
+        # Pick a node-ID that is guaranteed not to collide
+        fallback_id = f"_sg_fallback_{save_ws_node_id}"
+        prompt[fallback_id] = {
+            "inputs": {
+                "filename_prefix": "StableGen_fallback",
+                "images": images_input,
+            },
+            "class_type": "SaveImage",
+            "_meta": {"title": "StableGen HTTP fallback"},
+        }
+        return fallback_id
+
     def _execute_prompt_and_get_images(self, ws, prompt, client_id, server_address, NODES):
         """Executes the prompt and collects generated images."""
+
+        # Inject a disk-saving fallback node so we can recover via HTTP
+        # if the WebSocket binary data arrives corrupted.
+        fallback_node_id = self._inject_save_image_fallback(
+            prompt, NODES.get('save_image', ''))
+
         # Send the prompt to the queue
         prompt_id = self._queue_prompt(prompt, client_id, server_address)
         
@@ -1905,7 +2375,33 @@ class WorkflowManager:
                     images_output = output_images.get(current_node, [])
                     images_output.append(out[8:])  # Skip the first 8 bytes (header)
                     output_images[current_node] = images_output
-        
+
+        # --- Validate received images; fall back to HTTP if corrupt ----------
+        save_node = NODES.get('save_image')
+        if save_node and save_node in output_images:
+            needs_http = False
+            for img_bytes in output_images[save_node]:
+                if not self._validate_image_bytes(img_bytes):
+                    needs_http = True
+                    break
+
+            if needs_http and fallback_node_id:
+                print("[StableGen] WebSocket image data is corrupt "
+                      "(likely packet loss on remote network). "
+                      "Falling back to HTTP /view download...")
+                http_images = self._get_images_via_http(
+                    server_address, prompt_id, fallback_node_id)
+                if http_images:
+                    output_images[save_node] = http_images
+                    print(f"[StableGen] Successfully retrieved "
+                          f"{len(http_images)} image(s) via HTTP fallback.")
+                else:
+                    print("[StableGen] HTTP fallback also failed. "
+                          "The image data may be unrecoverable.")
+            elif needs_http:
+                print("[StableGen] WebSocket image data is corrupt "
+                      "and no HTTP fallback node was injected.")
+
         return output_images
 
     def _queue_prompt(self, prompt, client_id, server_address):
