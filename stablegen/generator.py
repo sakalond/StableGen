@@ -17,6 +17,10 @@ import math
 import colorsys
 from PIL import Image, ImageEnhance
 
+import gpu  # pylint: disable=import-error
+import blf  # pylint: disable=import-error
+from gpu_extras.batch import batch_for_shader  # pylint: disable=import-error
+
 from .util.helpers import prompt_text, prompt_text_img2img, prompt_text_qwen_image_edit # pylint: disable=relative-beyond-top-level
 from .render_tools import export_emit_image, export_visibility, export_canny, bake_texture, prepare_baking, unwrap, export_render, export_viewport, render_edge_feather_mask, _SGCameraResolution, _get_camera_resolution, _sg_restore_square_display, _sg_remove_crop_overlay, _sg_ensure_crop_overlay, _sg_hide_label_overlay, _sg_restore_label_overlay # pylint: disable=relative-beyond-top-level
 from .utils import get_last_material_index, get_generation_dirs, get_file_path, get_dir_path, remove_empty_dirs, get_compositor_node_tree, configure_output_node_paths, get_eevee_engine_id # pylint: disable=relative-beyond-top-level
@@ -1795,6 +1799,298 @@ class ComfyUIGenerate(bpy.types.Operator):
             return None
 
 
+# ── Preview Gallery helpers ───────────────────────────────────────────
+
+def _draw_rect_2d(x1, y1, x2, y2, color):
+    """Draw a filled rectangle in 2D screen-space."""
+    shader = gpu.shader.from_builtin('UNIFORM_COLOR')
+    batch = batch_for_shader(
+        shader, 'TRIS',
+        {"pos": ((x1, y1), (x2, y1), (x2, y2), (x1, y2))},
+        indices=((0, 1, 2), (0, 2, 3)),
+    )
+    shader.bind()
+    shader.uniform_float("color", color)
+    gpu.state.blend_set('ALPHA')
+    batch.draw(shader)
+    gpu.state.blend_set('NONE')
+
+
+def _draw_texture_2d(texture, x1, y1, x2, y2):
+    """Draw a textured rectangle in 2D screen-space."""
+    shader = gpu.shader.from_builtin('IMAGE')
+    batch = batch_for_shader(
+        shader, 'TRIS',
+        {"pos": ((x1, y1), (x2, y1), (x2, y2), (x1, y2)),
+         "texCoord": ((0, 0), (1, 0), (1, 1), (0, 1))},
+        indices=((0, 1, 2), (0, 2, 3)),
+    )
+    shader.bind()
+    shader.uniform_sampler("image", texture)
+    gpu.state.blend_set('ALPHA')
+    batch.draw(shader)
+    gpu.state.blend_set('NONE')
+
+
+class _PreviewGalleryOverlay:
+    """Viewport overlay that shows N generated images and lets the user pick one.
+
+    Lifecycle:
+    1. ``__init__`` — creates bpy.data.images + GPU textures, registers draw handler.
+    2. ``handle_mouse_move`` / ``handle_click`` — called from Trellis2Generate.modal().
+    3. ``update_images`` — called when "Generate More" produces a new batch.
+    4. ``cleanup`` — removes draw handler and temp images.
+    """
+
+    def __init__(self, pil_images, seeds):
+        """*pil_images*: list[PIL.Image]  *seeds*: list[int]"""
+        self._pil_images = list(pil_images)
+        self._seeds = list(seeds)
+        self._n = len(pil_images)
+        self._hover_idx = -1
+        self._more_hover = False
+        self._cancel_hover = False
+        self._selected_idx = -1
+        self.action = None  # 'select' | 'more' | 'cancel'
+        self._cols = max(1, math.ceil(math.sqrt(self._n)))
+        self._rows = max(1, math.ceil(self._n / self._cols))
+        self._cell_rects: list[tuple] = []
+        self._more_rect: tuple | None = None
+        self._cancel_rect: tuple | None = None
+        self._bpy_images: list = []
+        self._textures: list = []
+        self._setup_textures()
+        self._draw_handle = bpy.types.SpaceView3D.draw_handler_add(
+            self._draw, (), 'WINDOW', 'POST_PIXEL')
+
+    # ── texture management ──
+
+    def _setup_textures(self):
+        self._clear_textures()
+        for i, pil_img in enumerate(self._pil_images):
+            name = f"_sg_gallery_{i}"
+            if name in bpy.data.images:
+                bpy.data.images.remove(bpy.data.images[name])
+            rgba = pil_img.convert('RGBA')
+            w, h = rgba.size
+            bpy_img = bpy.data.images.new(name, w, h, alpha=True)
+            # Mark as Non-Color so gpu.texture.from_image() stores raw
+            # sRGB values — the viewport's own output transform will
+            # apply the single correct sRGB curve on display.
+            bpy_img.colorspace_settings.name = 'Non-Color'
+            # Blender images are stored bottom-to-top; PIL is top-to-bottom
+            flipped = rgba.transpose(Image.FLIP_TOP_BOTTOM)
+            flat = np.array(flipped, dtype=np.float32).ravel() / 255.0
+            bpy_img.pixels.foreach_set(flat)
+            bpy_img.pack()
+            self._bpy_images.append(bpy_img)
+            self._textures.append(gpu.texture.from_image(bpy_img))
+
+    def _clear_textures(self):
+        self._textures.clear()
+        for img in self._bpy_images:
+            if img.name in bpy.data.images:
+                bpy.data.images.remove(img)
+        self._bpy_images.clear()
+
+    def update_images(self, pil_images, seeds):
+        """Replace the gallery with a new batch."""
+        self._pil_images = list(pil_images)
+        self._seeds = list(seeds)
+        self._n = len(pil_images)
+        self._cols = max(1, math.ceil(math.sqrt(self._n)))
+        self._rows = max(1, math.ceil(self._n / self._cols))
+        self._hover_idx = -1
+        self._more_hover = False
+        self._cancel_hover = False
+        self._selected_idx = -1
+        self.action = None
+        self._setup_textures()
+
+    def cleanup(self):
+        if self._draw_handle:
+            bpy.types.SpaceView3D.draw_handler_remove(self._draw_handle, 'WINDOW')
+            self._draw_handle = None
+        self._clear_textures()
+
+    # ── interaction ──
+
+    def handle_mouse_move(self, mx, my):
+        """Update hover state. Returns True if display should redraw."""
+        old = (self._hover_idx, self._more_hover, self._cancel_hover)
+        self._hover_idx = -1
+        self._more_hover = False
+        self._cancel_hover = False
+        for i, rect in enumerate(self._cell_rects):
+            x1, y1, x2, y2 = rect
+            if x1 <= mx <= x2 and y1 <= my <= y2:
+                self._hover_idx = i
+                break
+        if self._more_rect:
+            x1, y1, x2, y2 = self._more_rect
+            if x1 <= mx <= x2 and y1 <= my <= y2:
+                self._more_hover = True
+        if self._cancel_rect:
+            x1, y1, x2, y2 = self._cancel_rect
+            if x1 <= mx <= x2 and y1 <= my <= y2:
+                self._cancel_hover = True
+        return old != (self._hover_idx, self._more_hover, self._cancel_hover)
+
+    def handle_click(self, mx, my):
+        """Returns 'select', 'more', 'cancel', or None."""
+        if self._more_hover:
+            return 'more'
+        if self._cancel_hover:
+            return 'cancel'
+        if self._hover_idx >= 0:
+            self._selected_idx = self._hover_idx
+            return 'select'
+        return None
+
+    @property
+    def selected_seed(self):
+        if 0 <= self._selected_idx < len(self._seeds):
+            return self._seeds[self._selected_idx]
+        return None
+
+    @property
+    def selected_image_bytes(self):
+        """Return PNG bytes of the selected image (for TRELLIS workflow)."""
+        if 0 <= self._selected_idx < len(self._pil_images):
+            buf = io.BytesIO()
+            self._pil_images[self._selected_idx].save(buf, format='PNG')
+            return buf.getvalue()
+        return None
+
+    # ── drawing ──
+
+    def _draw(self):
+        """POST_PIXEL callback — draws the full-screen gallery overlay."""
+        context = bpy.context
+        region = context.region
+        if not region:
+            return
+        vw, vh = region.width, region.height
+        if vw < 100 or vh < 100:
+            return
+
+        # Detect sidebar (N-panel) width so the grid avoids being covered.
+        sidebar_w = 0
+        area = context.area
+        if area:
+            for r in area.regions:
+                if r.type == 'UI' and r.width > 1:
+                    sidebar_w = r.width
+                    break
+
+        # Layout constants
+        pad = 20
+        btn_h = 40
+        title_h = 30
+        bottom_area = btn_h + pad * 2
+        usable_w = vw - sidebar_w  # exclude area behind the N-panel
+
+        # --- dark backdrop ---
+        _draw_rect_2d(0, 0, vw, vh, (0.08, 0.08, 0.08, 0.90))
+
+        # --- title ---
+        blf.size(0, 20)
+        title = "Select an image — or generate more"
+        tw, th = blf.dimensions(0, title)
+        blf.position(0, (usable_w - tw) / 2, vh - pad - th, 0)
+        blf.color(0, 1.0, 1.0, 1.0, 1.0)
+        blf.draw(0, title)
+
+        grid_top = vh - pad - title_h - pad
+        available_w = usable_w - pad * 2
+        available_h = grid_top - bottom_area - pad
+
+        cell_w = max(1, available_w // self._cols)
+        cell_h = max(1, available_h // self._rows)
+
+        # Maintain image aspect ratio
+        if self._pil_images:
+            img_aspect = self._pil_images[0].width / max(1, self._pil_images[0].height)
+            desired_h = cell_w / img_aspect
+            if desired_h > cell_h:
+                cell_w = int(cell_h * img_aspect)
+            else:
+                cell_h = int(desired_h)
+
+        inner = 6
+        total_grid_w = self._cols * cell_w
+        offset_x = (usable_w - total_grid_w) / 2.0
+
+        self._cell_rects.clear()
+
+        for i in range(self._n):
+            row = i // self._cols
+            col = i % self._cols
+            x1 = offset_x + col * cell_w + inner
+            y2 = grid_top - row * cell_h - inner
+            x2 = x1 + cell_w - inner * 2
+            y1 = y2 - cell_h + inner * 2
+            self._cell_rects.append((x1, y1, x2, y2))
+
+            # Hover highlight ring
+            if i == self._hover_idx:
+                _draw_rect_2d(x1 - 3, y1 - 3, x2 + 3, y2 + 3, (0.35, 0.65, 1.0, 0.85))
+
+            # Image texture
+            if i < len(self._textures):
+                _draw_texture_2d(self._textures[i], x1, y1, x2, y2)
+
+            # Number badge
+            blf.size(0, 15)
+            label = str(i + 1)
+            lw, lh = blf.dimensions(0, label)
+            _draw_rect_2d(x1, y2 - lh - 8, x1 + lw + 12, y2, (0.0, 0.0, 0.0, 0.70))
+            blf.position(0, x1 + 6, y2 - lh - 3, 0)
+            blf.color(0, 1.0, 1.0, 1.0, 1.0)
+            blf.draw(0, label)
+
+            # Seed label
+            blf.size(0, 11)
+            seed_txt = f"Seed: {self._seeds[i]}"
+            sw, sh = blf.dimensions(0, seed_txt)
+            _draw_rect_2d(x1, y1, x1 + sw + 10, y1 + sh + 6, (0, 0, 0, 0.6))
+            blf.position(0, x1 + 5, y1 + 3, 0)
+            blf.color(0, 0.7, 0.7, 0.7, 1.0)
+            blf.draw(0, seed_txt)
+
+        # --- buttons ---
+        btn_w = 160
+        btn_y1 = pad
+        btn_y2 = pad + btn_h
+
+        # "Generate More"
+        center_x = usable_w / 2.0
+        mx1 = center_x - btn_w - 10
+        mx2 = center_x - 10
+        c = (0.25, 0.55, 0.85, 0.95) if self._more_hover else (0.20, 0.35, 0.55, 0.85)
+        _draw_rect_2d(mx1, btn_y1, mx2, btn_y2, c)
+        self._more_rect = (mx1, btn_y1, mx2, btn_y2)
+        blf.size(0, 15)
+        mt = "Generate More"
+        mtw, mth = blf.dimensions(0, mt)
+        blf.position(0, (mx1 + mx2 - mtw) / 2, (btn_y1 + btn_y2 - mth) / 2, 0)
+        blf.color(0, 1.0, 1.0, 1.0, 1.0)
+        blf.draw(0, mt)
+
+        # "Cancel"
+        cx1 = center_x + 10
+        cx2 = center_x + btn_w + 10
+        c = (0.75, 0.25, 0.25, 0.95) if self._cancel_hover else (0.45, 0.20, 0.20, 0.85)
+        _draw_rect_2d(cx1, btn_y1, cx2, btn_y2, c)
+        self._cancel_rect = (cx1, btn_y1, cx2, btn_y2)
+        blf.size(0, 15)
+        ct = "Cancel"
+        ctw, cth = blf.dimensions(0, ct)
+        blf.position(0, (cx1 + cx2 - ctw) / 2, (btn_y1 + btn_y2 - cth) / 2, 0)
+        blf.color(0, 1.0, 1.0, 1.0, 1.0)
+        blf.draw(0, ct)
+
+
 class Trellis2Generate(bpy.types.Operator):
     """Generate a 3D mesh from a reference image using TRELLIS.2 via ComfyUI.
 
@@ -1815,6 +2111,15 @@ class Trellis2Generate(bpy.types.Operator):
     _stage = "Initializing"
     workflow_manager: object = None
 
+    # ── Preview gallery state ─────────────────────────────────────────
+    _gallery_overlay: _PreviewGalleryOverlay | None = None
+    _gallery_event: threading.Event | None = None
+    _gallery_ready: bool = False
+    _gallery_action: str | None = None  # 'select' | 'more' | 'cancel'
+    _gallery_selected_bytes: bytes | None = None
+    _gallery_selected_seed: int | None = None
+    _progress_remap: tuple | None = None  # (base, span) for gallery sub-range scaling
+
     # ── 3-tier progress ──────────────────────────────────────────────
     _overall_progress: float = 0.0
     _overall_stage: str = "Initializing"
@@ -1827,12 +2132,16 @@ class Trellis2Generate(bpy.types.Operator):
 
     def _update_overall(self):
         """Recompute *_overall_progress* from current phase + phase progress."""
-        if self._total_phases == 3:
+        layout = getattr(self, '_phase_layout', '')
+        if layout == 'txt2img+trellis+texturing':  # 3 phases
             starts  = {1: 0,  2: 15, 3: 65}
             weights = {1: 15, 2: 50, 3: 35}
-        elif self._total_phases == 2:
+        elif layout == 'trellis+texturing':  # 2 phases: big mesh, then texturing
             starts  = {1: 0,  2: 65}
             weights = {1: 65, 2: 35}
+        elif layout == 'txt2img+trellis':  # 2 phases: quick txt2img, then big mesh+native tex
+            starts  = {1: 0,  2: 15}
+            weights = {1: 15, 2: 85}
         else:  # Single phase — scale to full 0-100
             starts  = {1: 0}
             weights = {1: 100}
@@ -1893,15 +2202,29 @@ class Trellis2Generate(bpy.types.Operator):
         self._texture_mode = tex_mode
         self.workflow_manager = WorkflowManager(self)
 
+        # Gallery state reset
+        self._gallery_overlay = None
+        self._gallery_event = threading.Event()
+        self._gallery_ready = False
+        self._gallery_action = None
+        self._gallery_selected_bytes = None
+        self._gallery_selected_seed = None
+
         # 3-tier progress init
         has_txt2img = (gen_from == 'prompt')
         has_texturing = (tex_mode in ('sdxl', 'flux1', 'qwen_image_edit'))
         if has_txt2img and has_texturing:
             self._total_phases = 3
-        elif has_txt2img or has_texturing:
+            self._phase_layout = 'txt2img+trellis+texturing'
+        elif has_txt2img:
             self._total_phases = 2
+            self._phase_layout = 'txt2img+trellis'
+        elif has_texturing:
+            self._total_phases = 2
+            self._phase_layout = 'trellis+texturing'
         else:
             self._total_phases = 1
+            self._phase_layout = 'trellis_only'
         self._current_phase = 0
         self._overall_progress = 0.0
         self._overall_stage = "Initializing"
@@ -1929,13 +2252,76 @@ class Trellis2Generate(bpy.types.Operator):
 
         return {'RUNNING_MODAL'}
 
+    def _cleanup_gallery(self):
+        """Remove the gallery overlay and free GPU resources."""
+        if self._gallery_overlay:
+            self._gallery_overlay.cleanup()
+            self._gallery_overlay = None
+
     def modal(self, context, event):
+        # ── Gallery mode: intercept mouse + keyboard ──────────────
+        if self._gallery_overlay is not None:
+            if event.type == 'MOUSEMOVE':
+                if self._gallery_overlay.handle_mouse_move(
+                        event.mouse_region_x, event.mouse_region_y):
+                    for area in context.screen.areas:
+                        area.tag_redraw()
+                return {'RUNNING_MODAL'}
+
+            if event.type == 'LEFTMOUSE' and event.value == 'PRESS':
+                action = self._gallery_overlay.handle_click(
+                    event.mouse_region_x, event.mouse_region_y)
+                if action == 'select':
+                    self._gallery_selected_bytes = self._gallery_overlay.selected_image_bytes
+                    self._gallery_selected_seed = self._gallery_overlay.selected_seed
+                    self._gallery_action = 'select'
+                    self._cleanup_gallery()
+                    self._gallery_ready = False
+                    self._gallery_event.set()
+                    return {'RUNNING_MODAL'}
+                elif action == 'more':
+                    self._gallery_action = 'more'
+                    self._cleanup_gallery()
+                    self._gallery_ready = False
+                    self._gallery_event.set()
+                    return {'RUNNING_MODAL'}
+                elif action == 'cancel':
+                    self._gallery_action = 'cancel'
+                    self._cleanup_gallery()
+                    self._gallery_ready = False
+                    self._gallery_event.set()
+                    return {'RUNNING_MODAL'}
+                return {'RUNNING_MODAL'}
+
+            if event.type == 'ESC' and event.value == 'PRESS':
+                self._gallery_action = 'cancel'
+                self._cleanup_gallery()
+                self._gallery_ready = False
+                self._gallery_event.set()
+                return {'RUNNING_MODAL'}
+
+            if event.type == 'TIMER':
+                for area in context.screen.areas:
+                    area.tag_redraw()
+            return {'RUNNING_MODAL'}
+
+        # ── Normal mode ───────────────────────────────────────────
         if event.type != 'TIMER':
             return {'PASS_THROUGH'}
 
         # Redraw UI for progress updates
         for area in context.screen.areas:
             area.tag_redraw()
+
+        # Check if gallery is ready (thread waiting for user input)
+        if self._gallery_ready and self._gallery_overlay is None:
+            gallery_data = getattr(self, '_gallery_data', None)
+            if gallery_data:
+                pil_imgs, seeds = gallery_data
+                self._gallery_overlay = _PreviewGalleryOverlay(pil_imgs, seeds)
+                for area in context.screen.areas:
+                    area.tag_redraw()
+            return {'RUNNING_MODAL'}
 
         # Check if thread is still running
         if self._thread and self._thread.is_alive():
@@ -1945,6 +2331,7 @@ class Trellis2Generate(bpy.types.Operator):
         context.window_manager.event_timer_remove(self._timer)
         self._timer = None
         Trellis2Generate._is_running = False
+        self._cleanup_gallery()
 
         if self._error:
             self.report({'ERROR'}, f"TRELLIS.2 error: {self._error}")
@@ -1987,8 +2374,46 @@ class Trellis2Generate(bpy.types.Operator):
             # Import GLB into Blender
             bpy.ops.import_scene.gltf(filepath=glb_path)
 
-            # --- Phase 3: If diffusion texturing, auto-place cameras + start generation ---
+            # --- Normalise imported mesh to a reasonable Blender-unit size ---
+            target_bu = getattr(context.scene, 'trellis2_import_scale', 2.0)
+            if target_bu > 0:
+                imported_objects = [obj for obj in context.selected_objects]
+                if imported_objects:
+                    # Compute combined world-space bounding box across all
+                    # imported objects (meshes, empties, armatures …).
+                    all_corners = []
+                    for obj in imported_objects:
+                        for corner in obj.bound_box:
+                            all_corners.append(obj.matrix_world @ mathutils.Vector(corner))
+                    if all_corners:
+                        xs = [c.x for c in all_corners]
+                        ys = [c.y for c in all_corners]
+                        zs = [c.z for c in all_corners]
+                        extent = max(
+                            max(xs) - min(xs),
+                            max(ys) - min(ys),
+                            max(zs) - min(zs),
+                        )
+                        if extent > 1e-6:
+                            scale_factor = target_bu / extent
+                            # Find the root objects (those without an imported parent)
+                            roots = [o for o in imported_objects if o.parent not in imported_objects]
+                            for root in roots:
+                                root.scale *= scale_factor
+                            # Apply scale so downstream code sees unit scale
+                            bpy.ops.object.select_all(action='DESELECT')
+                            for obj in imported_objects:
+                                obj.select_set(True)
+                            bpy.context.view_layer.objects.active = imported_objects[0]
+                            bpy.ops.object.transform_apply(location=False, rotation=False, scale=True)
+                            print(f"[TRELLIS2] Scaled mesh to {target_bu} BU (factor {scale_factor:.4f})")
+
+            # --- Optional studio lighting for native PBR textures ---
             tex_mode = getattr(self, '_texture_mode', 'native')
+            if tex_mode == 'native' and getattr(context.scene, 'trellis2_auto_lighting', False):
+                self._setup_studio_lighting(context, target_bu)
+
+            # --- Phase 3: If diffusion texturing, auto-place cameras + start generation ---
             if tex_mode in ('sdxl', 'flux1', 'qwen_image_edit'):
                 # Place cameras NOW (while operator context is still valid)
                 camera_count = getattr(context.scene, 'trellis2_camera_count', 8)
@@ -2018,15 +2443,29 @@ class Trellis2Generate(bpy.types.Operator):
                         break
 
                 try:
-                    bpy.ops.object.add_cameras(
-                        placement_mode='normal_weighted',
-                        num_cameras=camera_count,
-                        auto_prompts=True,
-                        review_placement=False,
-                        purge_others=True,
-                        exclude_bottom=True,
-                    )
-                    print(f"[TRELLIS2] Placed {camera_count} cameras (normal-weighted)")
+                    _pm = getattr(context.scene, 'trellis2_placement_mode', 'normal_weighted')
+                    _cam_kwargs = {
+                        'placement_mode': _pm,
+                        'num_cameras': camera_count,
+                        'auto_prompts': getattr(context.scene, 'trellis2_auto_prompts', True),
+                        'review_placement': False,
+                        'purge_others': True,
+                        'exclude_bottom': getattr(context.scene, 'trellis2_exclude_bottom', True),
+                        'exclude_bottom_angle': getattr(context.scene, 'trellis2_exclude_bottom_angle', 1.5533),
+                        'auto_aspect': getattr(context.scene, 'trellis2_auto_aspect', 'per_camera'),
+                        'occlusion_mode': getattr(context.scene, 'trellis2_occlusion_mode', 'none'),
+                        'consider_existing': getattr(context.scene, 'trellis2_consider_existing', True),
+                        'clamp_elevation': getattr(context.scene, 'trellis2_clamp_elevation', False),
+                        'max_elevation_angle': getattr(context.scene, 'trellis2_max_elevation', 1.2217),
+                        'min_elevation_angle': getattr(context.scene, 'trellis2_min_elevation', -0.1745),
+                    }
+                    if _pm == 'greedy_coverage':
+                        _cam_kwargs['coverage_target'] = getattr(context.scene, 'trellis2_coverage_target', 0.95)
+                        _cam_kwargs['max_auto_cameras'] = getattr(context.scene, 'trellis2_max_auto_cameras', 12)
+                    if _pm == 'fan_from_camera':
+                        _cam_kwargs['fan_angle'] = getattr(context.scene, 'trellis2_fan_angle', 90.0)
+                    bpy.ops.object.add_cameras(**_cam_kwargs)
+                    print(f"[TRELLIS2] Placed {camera_count} cameras ({_pm})")
                 except Exception as cam_err:
                     print(f"[TRELLIS2] Warning: Camera placement failed: {cam_err}")
                     traceback.print_exc()
@@ -2043,6 +2482,55 @@ class Trellis2Generate(bpy.types.Operator):
             self.report({'ERROR'}, f"Failed to import GLB: {e}")
             traceback.print_exc()
             return {'CANCELLED'}
+
+    # -----------------------------------------------------------------
+    # Studio lighting (three-point rig for PBR showcase)
+    # -----------------------------------------------------------------
+    def _setup_studio_lighting(self, context, import_scale):
+        """Create a three-point studio lighting setup around the imported mesh."""
+        S = max(import_scale, 0.5)   # Avoid degenerate positions
+        dist = S * 2.5               # Distance from origin
+
+        # (name, watts, size, color_rgb, azimuth_deg, elevation_deg)
+        light_defs = [
+            ("SG_Key",  200, 1.5 * S, (1.0, 0.96, 0.90),   45, 40),
+            ("SG_Fill",  80, 2.5 * S, (0.90, 0.94, 1.0),   -60, 15),
+            ("SG_Rim",  120, 0.8 * S, (1.0, 1.0, 1.0),     170, 55),
+        ]
+
+        collection = context.collection
+        created = []
+
+        for name, power, size, color, az_deg, el_deg in light_defs:
+            # Remove any stale light with the same name
+            old = bpy.data.objects.get(name)
+            if old:
+                bpy.data.objects.remove(old, do_unlink=True)
+
+            az = math.radians(az_deg)
+            el = math.radians(el_deg)
+            x = dist * math.cos(el) * math.sin(az)
+            y = -dist * math.cos(el) * math.cos(az)   # -Y = Blender front
+            z = dist * math.sin(el)
+
+            light_data = bpy.data.lights.new(name=name, type='AREA')
+            light_data.energy = power
+            light_data.size = size
+            light_data.color = color
+
+            light_obj = bpy.data.objects.new(name=name, object_data=light_data)
+            collection.objects.link(light_obj)
+
+            light_obj.location = (x, y, z)
+            # Aim at origin
+            direction = mathutils.Vector((0, 0, 0)) - mathutils.Vector((x, y, z))
+            rot = direction.to_track_quat('-Z', 'Y')
+            light_obj.rotation_euler = rot.to_euler()
+
+            created.append(light_obj)
+
+        print(f"[TRELLIS2] Studio lighting created: {[o.name for o in created]}")
+        return created
 
     def _schedule_texture_generation(self, context):
         """Defer texture generation via a timer so Blender can digest the new cameras.
@@ -2106,11 +2594,27 @@ class Trellis2Generate(bpy.types.Operator):
                 traceback.print_exc()
             return None  # Run once
 
+        # Remember which cameras exist before texturing so we can delete
+        # the ones we placed if the user opted in.
+        _pre_tex_cameras = {obj.name for obj in bpy.context.scene.objects if obj.type == 'CAMERA'}
+
         def _pipeline_watcher():
             """Clear the pipeline flag when texturing finishes."""
             if bpy.context.scene.generation_status == 'idle':
                 bpy.context.scene.trellis2_pipeline_active = False
                 print("[TRELLIS2] Pipeline complete — overall bar removed")
+
+                # Delete auto-placed cameras if the user requested it
+                if getattr(bpy.context.scene, 'trellis2_delete_cameras', False):
+                    to_remove = [obj for obj in bpy.context.scene.objects
+                                 if obj.type == 'CAMERA' and obj.name in _pre_tex_cameras]
+                    if to_remove:
+                        bpy.ops.object.select_all(action='DESELECT')
+                        for obj in to_remove:
+                            obj.select_set(True)
+                        bpy.ops.object.delete()
+                        print(f"[TRELLIS2] Deleted {len(to_remove)} auto-placed cameras")
+
                 return None  # Stop timer
             return 1.0  # Check again in 1s
 
@@ -2123,7 +2627,12 @@ class Trellis2Generate(bpy.types.Operator):
         If *gen_from* is ``'prompt'`` the method first generates an input
         image via a lightweight txt2img ComfyUI workflow, saves it to the
         revision directory and passes that to the TRELLIS.2 mesh workflow.
+
+        When the preview gallery is enabled (``trellis2_preview_gallery_enabled``),
+        the prompt path generates N images with different seeds and pauses to
+        let the user pick one via the viewport overlay before continuing.
         """
+        import random as _rng
         try:
             # --- Phase 1: Image acquisition ---
             if gen_from == 'prompt':
@@ -2145,10 +2654,84 @@ class Trellis2Generate(bpy.types.Operator):
 
                 self._detail_stage = "Starting txt2img"
 
-                img_result = self.workflow_manager.generate_txt2img(context)
-                if isinstance(img_result, dict) and "error" in img_result:
-                    self._error = f"txt2img failed: {img_result['error']}"
-                    return
+                gallery_enabled = getattr(context.scene, 'trellis2_preview_gallery_enabled', False)
+                gallery_count = max(1, int(getattr(context.scene, 'trellis2_preview_gallery_count', 4)))
+
+                if gallery_enabled and gallery_count >= 1:
+                    # ── Preview gallery loop ──────────────────────────
+                    img_result = None  # will hold the chosen image bytes
+
+                    # Seed a local RNG for deterministic gallery sequences.
+                    # Same scene seed ➜ same gallery images every run.
+                    base_seed = int(getattr(context.scene, 'seed', 0))
+                    if base_seed == 0:
+                        gallery_rng = _rng.Random()       # truly random
+                    else:
+                        gallery_rng = _rng.Random(base_seed)  # deterministic
+
+                    while True:
+                        pil_images = []
+                        seeds = []
+                        # Reset progress for each batch
+                        self._phase_progress = 0
+                        self._update_overall()
+                        for i in range(gallery_count):
+                            self._detail_stage = f"Generating preview {i + 1}/{gallery_count}"
+                            # Set up remapping so WebSocket progress (0-100 per image)
+                            # maps to the correct slice of the overall phase bar.
+                            base = (i / gallery_count) * 90
+                            span = (1 / gallery_count) * 90
+                            self._progress_remap = (base, span)
+                            self._phase_progress = base
+                            self._update_overall()
+
+                            rand_seed = gallery_rng.randint(1, 2**31 - 1)
+                            result = self.workflow_manager.generate_txt2img(
+                                context, seed_override=rand_seed)
+                            if isinstance(result, dict) and "error" in result:
+                                self._error = f"txt2img failed (seed {rand_seed}): {result['error']}"
+                                return
+
+                            pil_img = Image.open(io.BytesIO(result))
+                            pil_images.append(pil_img)
+                            seeds.append(rand_seed)
+
+                        # Clear remapping before waiting
+                        self._progress_remap = None
+
+                        # Hand off to the main thread for user selection
+                        self._gallery_data = (pil_images, seeds)
+                        self._gallery_ready = True
+                        self._detail_stage = "Waiting for selection"
+                        self._phase_progress = 95
+                        self._update_overall()
+
+                        # Block until the modal sets the event
+                        self._gallery_event.wait()
+                        self._gallery_event.clear()
+
+                        if self._gallery_action == 'select':
+                            img_result = self._gallery_selected_bytes
+                            chosen_seed = self._gallery_selected_seed
+                            if chosen_seed is not None:
+                                context.scene.seed = chosen_seed
+                            break
+                        elif self._gallery_action == 'more':
+                            # Loop around and generate another batch
+                            continue
+                        else:  # cancel
+                            self._error = "Preview gallery cancelled"
+                            return
+
+                    if img_result is None:
+                        self._error = "No image selected from gallery"
+                        return
+                else:
+                    # ── Single image (legacy path) ───────────────────
+                    img_result = self.workflow_manager.generate_txt2img(context)
+                    if isinstance(img_result, dict) and "error" in img_result:
+                        self._error = f"txt2img failed: {img_result['error']}"
+                        return
 
                 # Phase 1 complete
                 self._phase_progress = 100

@@ -75,11 +75,26 @@ def update_architecture_mode(self, context):
         if scene.model_architecture != mode:
             scene.model_architecture = mode          # triggers update_combined
     else:
-        # Entering TRELLIS.2 mode — sync backbone only if texture_mode is diffusion
-        tex_mode = getattr(scene, 'trellis2_texture_mode', 'native')
-        if tex_mode in ('sdxl', 'flux1', 'qwen_image_edit'):
-            if scene.model_architecture != tex_mode:
-                scene.model_architecture = tex_mode  # triggers update_combined
+        # Entering TRELLIS.2 mode — sync backbone for any diffusion need
+        _sync_trellis2_backbone(scene)
+
+
+def _sync_trellis2_backbone(scene):
+    """Pick the right diffusion backbone for the current TRELLIS.2 state.
+
+    If the texture-mode is a diffusion arch, use that.  Otherwise fall
+    back to the initial-image arch (relevant when generate_from == prompt
+    and texture_mode is native/none).
+    """
+    tex_mode = getattr(scene, 'trellis2_texture_mode', 'native')
+    if tex_mode in ('sdxl', 'flux1', 'qwen_image_edit'):
+        target = tex_mode
+    elif getattr(scene, 'trellis2_generate_from', 'image') == 'prompt':
+        target = getattr(scene, 'trellis2_initial_image_arch', 'sdxl')
+    else:
+        return  # no diffusion backbone needed
+    if scene.model_architecture != target:
+        scene.model_architecture = target  # triggers update_combined
 
 
 def update_trellis2_texture_mode(self, context):
@@ -89,9 +104,8 @@ def update_trellis2_texture_mode(self, context):
     * If the chosen mode is a diffusion architecture and differs from the
       current backbone, syncs ``model_architecture`` (which triggers a
       checkpoint refresh).
-    * If ``generate_from`` is *prompt* and the user picks ``none`` or
-      ``native`` (no diffusion), auto-switch to ``sdxl`` so there is always
-      a diffusion model available for the image-generation step.
+    * When ``generate_from`` is *prompt* and texture_mode is non-diffusion,
+      syncs the backbone from ``trellis2_initial_image_arch`` instead.
     """
     scene = context.scene
     if getattr(scene, 'architecture_mode', '') != 'trellis2':
@@ -99,34 +113,36 @@ def update_trellis2_texture_mode(self, context):
 
     tex_mode = scene.trellis2_texture_mode
 
-    # When prompt mode, a diffusion backbone is mandatory
-    if getattr(scene, 'trellis2_generate_from', 'image') == 'prompt' and tex_mode in ('none', 'native'):
-        scene.trellis2_texture_mode = 'sdxl'
-        return                                       # re-entrant; callback fires again
-
     # Sync skip_texture flag used by the workflow code
     scene.trellis2_skip_texture = (tex_mode != 'native')
 
-    if tex_mode in ('sdxl', 'flux1', 'qwen_image_edit'):
-        if scene.model_architecture != tex_mode:
-            scene.model_architecture = tex_mode      # triggers update_combined
+    _sync_trellis2_backbone(scene)
+
+
+def update_trellis2_initial_image_arch(self, context):
+    """Called when the user changes the initial-image architecture for TRELLIS.2.
+
+    Syncs the diffusion backbone when texture_mode is native/none so the
+    checkpoint list refreshes to match the chosen architecture.
+    """
+    scene = context.scene
+    if getattr(scene, 'architecture_mode', '') != 'trellis2':
+        return
+    _sync_trellis2_backbone(scene)
 
 
 def update_trellis2_generate_from(self, context):
     """Called when the user switches between Image and Prompt input mode.
 
-    If switching to *prompt* while the texture mode is ``none`` or
-    ``native`` (no diffusion model selected), force ``trellis2_texture_mode``
-    to ``sdxl`` so a checkpoint is available for image generation.
+    Syncs the diffusion backbone via ``_sync_trellis2_backbone`` so a
+    checkpoint is available for the initial-image generation step.
     """
     scene = context.scene
     if getattr(scene, 'architecture_mode', '') != 'trellis2':
         return
 
     if scene.trellis2_generate_from == 'prompt':
-        tex_mode = getattr(scene, 'trellis2_texture_mode', 'native')
-        if tex_mode in ('none', 'native'):
-            scene.trellis2_texture_mode = 'sdxl'     # triggers update_trellis2_texture_mode
+        _sync_trellis2_backbone(scene)
 
 
 def update_combined(self, context):
@@ -2068,12 +2084,170 @@ def register():
         update=update_trellis2_texture_mode
     )
 
+    bpy.types.Scene.trellis2_initial_image_arch = bpy.props.EnumProperty(
+        name="Initial Image Architecture",
+        description="Diffusion architecture used to generate the initial image when Generate From is set to Prompt and Texture Mode is Native or None",
+        items=[
+            ('sdxl', 'SDXL', 'Stable Diffusion XL'),
+            ('flux1', 'Flux 1', 'Flux 1 architecture'),
+            ('qwen_image_edit', 'Qwen Image Edit', 'Qwen Image Edit architecture'),
+        ],
+        default='sdxl',
+        update=update_trellis2_initial_image_arch
+    )
+
     bpy.types.Scene.trellis2_camera_count = bpy.props.IntProperty(
         name="Camera Count",
         description="Number of cameras to place around the generated mesh for texture projection",
         default=8,
         min=2,
         max=32
+    )
+
+    bpy.types.Scene.trellis2_placement_mode = bpy.props.EnumProperty(
+        name="Placement Mode",
+        description="Strategy for placing cameras around the generated mesh",
+        items=[
+            ('orbit_ring', "Orbit Ring", "Place cameras in a circle around the center"),
+            ('hemisphere', "Sphere Coverage", "Distribute cameras evenly across a sphere using a Fibonacci spiral"),
+            ('normal_weighted', "Normal-Weighted", "Automatically place cameras to cover the most surface area, using K-means on face normals weighted by area"),
+            ('pca_axes', "PCA Axes", "Place cameras along the mesh's principal axes of variation"),
+            ('greedy_coverage', "Greedy Coverage", "Iteratively add cameras that maximise new visible surface. Automatically determines the number of cameras needed"),
+            ('fan_from_camera', "Fan from Camera", "Spread cameras in an arc around the active camera's orbit position"),
+        ],
+        default='normal_weighted'
+    )
+
+    bpy.types.Scene.trellis2_auto_prompts = bpy.props.BoolProperty(
+        name="Auto View Prompts",
+        description="Automatically generate view-direction prompts for each camera (e.g. 'front view', 'rear view, from above')",
+        default=True
+    )
+
+    bpy.types.Scene.trellis2_exclude_bottom = bpy.props.BoolProperty(
+        name="Exclude Bottom Faces",
+        description="Ignore downward-facing geometry when placing cameras",
+        default=True
+    )
+
+    bpy.types.Scene.trellis2_exclude_bottom_angle = bpy.props.FloatProperty(
+        name="Bottom Angle Threshold",
+        description="Faces whose normal points more than this many degrees below the horizon are excluded",
+        default=1.5533,  # 89 degrees in radians
+        min=0.1745,
+        max=1.5708,
+        subtype='ANGLE',
+        unit='ROTATION'
+    )
+
+    bpy.types.Scene.trellis2_auto_aspect = bpy.props.EnumProperty(
+        name="Auto Aspect Ratio",
+        description="Automatically adjust render aspect ratio to match the mesh silhouette",
+        items=[
+            ('off', "Off", "Use current scene resolution for all cameras"),
+            ('shared', "Shared", "Average silhouette aspect across all cameras and set a single scene resolution"),
+            ('per_camera', "Per Camera", "Each camera gets its own optimal aspect ratio"),
+        ],
+        default='per_camera'
+    )
+
+    bpy.types.Scene.trellis2_occlusion_mode = bpy.props.EnumProperty(
+        name="Occlusion Handling",
+        description="How to account for self-occlusion when choosing camera directions",
+        items=[
+            ('none', "None (Fast)", "Back-face culling only — ignores self-occlusion"),
+            ('full_matrix', "Full Occlusion Matrix", "Build a complete BVH-validated visibility matrix. Most accurate but slower"),
+            ('two_pass', "Two-Pass Refinement", "Fast back-face pass, then targeted BVH refinement"),
+            ('vis_weighted', "Visibility-Weighted", "Weight faces by visibility fraction; mostly-occluded faces have reduced influence"),
+        ],
+        default='none'
+    )
+
+    bpy.types.Scene.trellis2_consider_existing = bpy.props.BoolProperty(
+        name="Consider Existing Cameras",
+        description="Treat existing cameras as already-placed directions so auto modes avoid duplicating their coverage",
+        default=True
+    )
+
+    bpy.types.Scene.trellis2_delete_cameras = bpy.props.BoolProperty(
+        name="Delete Cameras After",
+        description="Automatically delete cameras placed during the TRELLIS.2 pipeline once generation and texturing are complete",
+        default=False
+    )
+
+    bpy.types.Scene.trellis2_coverage_target = bpy.props.FloatProperty(
+        name="Coverage Target",
+        description="Stop adding cameras when this fraction of surface area is visible (Greedy mode)",
+        default=0.95,
+        min=0.5,
+        max=1.0,
+        subtype='FACTOR'
+    )
+
+    bpy.types.Scene.trellis2_max_auto_cameras = bpy.props.IntProperty(
+        name="Max Cameras (Greedy)",
+        description="Upper limit on cameras for Greedy Coverage mode",
+        default=12,
+        min=2,
+        max=50
+    )
+
+    bpy.types.Scene.trellis2_fan_angle = bpy.props.FloatProperty(
+        name="Fan Angle",
+        description="Total angular spread of the fan in degrees",
+        default=90.0,
+        min=10.0,
+        max=350.0
+    )
+
+    bpy.types.Scene.trellis2_import_scale = bpy.props.FloatProperty(
+        name="Import Scale (BU)",
+        description="Scale imported TRELLIS.2 meshes so the longest axis equals this many Blender units. Set to 0 to keep the original size",
+        default=2.0,
+        min=0.0,
+        max=100.0,
+        soft_min=0.0,
+        soft_max=10.0,
+    )
+
+    bpy.types.Scene.trellis2_clamp_elevation = bpy.props.BoolProperty(
+        name="Clamp Elevation",
+        description="Restrict camera elevation to avoid extreme top-down or bottom-up views that diffusion models often struggle with",
+        default=False,
+    )
+
+    bpy.types.Scene.trellis2_max_elevation = bpy.props.FloatProperty(
+        name="Max Elevation",
+        description="Maximum upward elevation angle. Cameras looking further up will be clamped",
+        default=1.2217,  # 70 degrees
+        min=0.0,
+        max=1.5708,      # 90 degrees
+        subtype='ANGLE',
+        unit='ROTATION',
+    )
+
+    bpy.types.Scene.trellis2_min_elevation = bpy.props.FloatProperty(
+        name="Min Elevation",
+        description="Minimum downward elevation angle. Cameras looking further down will be clamped",
+        default=-0.1745,  # -10 degrees
+        min=-1.5708,      # -90 degrees
+        max=0.0,
+        subtype='ANGLE',
+        unit='ROTATION',
+    )
+
+    bpy.types.Scene.trellis2_preview_gallery_enabled = bpy.props.BoolProperty(
+        name="Preview Gallery",
+        description="When in prompt mode, generate multiple images with different seeds and let you pick the best one before proceeding to 3D generation",
+        default=False,
+    )
+
+    bpy.types.Scene.trellis2_preview_gallery_count = bpy.props.IntProperty(
+        name="Gallery Count",
+        description="Number of images to generate per batch in the preview gallery",
+        default=4,
+        min=1,
+        max=16,
     )
 
     bpy.types.Scene.qwen_guidance_map_type = bpy.props.EnumProperty(
@@ -2411,6 +2585,11 @@ def register():
         description="Toggle TRELLIS.2 native texture settings",
         default=False
     )
+    bpy.types.Scene.show_trellis2_camera_settings = bpy.props.BoolProperty(
+        name="Show Camera Placement Settings",
+        description="Toggle TRELLIS.2 camera placement settings",
+        default=False
+    )
     bpy.types.Scene.trellis2_last_input_image = bpy.props.StringProperty(
         name="TRELLIS.2 Last Input Image",
         description="Path to the image most recently used as TRELLIS.2 input (set automatically after generation)",
@@ -2528,16 +2707,19 @@ def register():
     )
     bpy.types.Scene.trellis2_max_tokens = bpy.props.IntProperty(
         name="Max Tokens",
-        description="Maximum tokens for shape generation. Lower = less VRAM. 24576 (~6GB) recommended for 16GB GPUs",
-        default=24576,
+        description="Max sparse-voxel tokens during cascade upsampling (only affects cascade modes). "
+                    "Higher = more detail but more VRAM. "
+                    "Try 32768 or 24576 if running out of VRAM",
+        default=49152,
         min=16384,
         max=65536,
         step=4096
     )
     bpy.types.Scene.trellis2_texture_size = bpy.props.IntProperty(
         name="Texture Size",
-        description="Output texture resolution in pixels",
-        default=2048,
+        description="Resolution of the UV-baked texture in pixels. Higher values reduce aliasing at UV seams. "
+                    "The native voxel grid is 1024, so values above 1024 interpolate existing data",
+        default=4096,
         min=512,
         max=8192,
         step=512
@@ -2559,6 +2741,12 @@ def register():
         name="Post-Processing",
         description="Run ComfyUI-side mesh post-processing (decimation + remeshing). "
                     "Disable to import the raw mesh for manual retopology",
+        default=True
+    )
+    bpy.types.Scene.trellis2_auto_lighting = bpy.props.BoolProperty(
+        name="Auto Studio Lighting",
+        description="Create a three-point studio lighting rig (key, fill, rim) after import "
+                    "to showcase PBR materials",
         default=True
     )
     bpy.types.Scene.trellis2_skip_texture = bpy.props.BoolProperty(
@@ -2719,16 +2907,28 @@ def unregister():
     trellis2_props = [
         'trellis2_available', 'show_trellis2_params', 'show_trellis2_advanced',
         'show_trellis2_mesh_settings', 'show_trellis2_texture_settings',
+        'show_trellis2_camera_settings',
         'trellis2_last_input_image', 'qwen_use_trellis2_style',
         'trellis2_pipeline_active', 'trellis2_pipeline_phase_start_pct',
         'trellis2_pipeline_total_phases',
-        'trellis2_generate_from', 'trellis2_texture_mode', 'trellis2_camera_count',
+        'trellis2_generate_from', 'trellis2_texture_mode', 'trellis2_initial_image_arch',
+        'trellis2_camera_count',
+        'trellis2_placement_mode', 'trellis2_auto_prompts',
+        'trellis2_exclude_bottom', 'trellis2_exclude_bottom_angle',
+        'trellis2_auto_aspect', 'trellis2_occlusion_mode',
+        'trellis2_consider_existing', 'trellis2_delete_cameras',
+        'trellis2_coverage_target',
+        'trellis2_max_auto_cameras', 'trellis2_fan_angle',
+        'trellis2_import_scale',
+        'trellis2_clamp_elevation', 'trellis2_max_elevation', 'trellis2_min_elevation',
+        'trellis2_preview_gallery_enabled', 'trellis2_preview_gallery_count',
         'trellis2_input_image', 'trellis2_resolution', 'trellis2_vram_mode',
         'trellis2_attn_backend', 'trellis2_seed', 'trellis2_ss_guidance',
         'trellis2_ss_steps', 'trellis2_shape_guidance', 'trellis2_shape_steps',
         'trellis2_tex_guidance', 'trellis2_tex_steps', 'trellis2_max_tokens',
         'trellis2_texture_size', 'trellis2_decimation', 'trellis2_remesh',
         'trellis2_post_processing_enabled',
+        'trellis2_auto_lighting',
         'trellis2_skip_texture', 'trellis2_low_vram', 'trellis2_background_color',
         'trellis2_include_1024', 'trellis2_fill_holes',
     ]

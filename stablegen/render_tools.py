@@ -2688,6 +2688,35 @@ class AddCameras(bpy.types.Operator):
         default='none'
     ) # type: ignore
 
+    clamp_elevation: bpy.props.BoolProperty(
+        name="Clamp Elevation",
+        description="Restrict camera elevation to avoid extreme top-down or bottom-up views "
+                    "that diffusion models often struggle with",
+        default=False
+    ) # type: ignore
+
+    max_elevation_angle: bpy.props.FloatProperty(
+        name="Max Elevation",
+        description="Maximum upward elevation angle (degrees above horizon). "
+                    "Cameras looking further up will be clamped to this angle",
+        default=1.2217,  # 70 degrees in radians
+        min=0.0,
+        max=1.5708,      # 90 degrees
+        subtype='ANGLE',
+        unit='ROTATION'
+    ) # type: ignore
+
+    min_elevation_angle: bpy.props.FloatProperty(
+        name="Min Elevation",
+        description="Minimum downward elevation angle (degrees below horizon). "
+                    "Cameras looking further down will be clamped to this angle",
+        default=-0.1745,  # -10 degrees in radians
+        min=-1.5708,      # -90 degrees
+        max=0.0,
+        subtype='ANGLE',
+        unit='ROTATION'
+    ) # type: ignore
+
     _timer = None
     _camera_index = 0
     _cameras = []
@@ -2729,6 +2758,11 @@ class AddCameras(bpy.types.Operator):
             if self.exclude_bottom:
                 layout.prop(self, "exclude_bottom_angle")
             layout.prop(self, "auto_prompts")
+            layout.prop(self, "clamp_elevation")
+            if self.clamp_elevation:
+                row = layout.row(align=True)
+                row.prop(self, "min_elevation_angle", text="Min")
+                row.prop(self, "max_elevation_angle", text="Max")
         layout.prop(self, "review_placement")
         layout.prop(self, "purge_others")
         if not self.purge_others and is_auto:
@@ -3143,6 +3177,49 @@ class AddCameras(bpy.types.Operator):
                 view_dir = rv3d.view_rotation @ mathutils.Vector((0, 0, -1))
                 ref_dir = np.array([-view_dir.x, -view_dir.y, -view_dir.z])
             directions = _sort_directions_spatially(directions, ref_dir)
+
+        # --- Clamp elevation angles to avoid extreme top/bottom views ---
+        if self.clamp_elevation and directions:
+            min_rad = self.min_elevation_angle
+            max_rad = self.max_elevation_angle
+            clamped = []
+            for d in directions:
+                d_np = np.array(d, dtype=float)
+                norm = np.linalg.norm(d_np)
+                if norm < 1e-8:
+                    continue
+                d_np /= norm
+                elev = math.asin(float(np.clip(d_np[2], -1.0, 1.0)))
+                if min_rad <= elev <= max_rad:
+                    clamped.append(d_np)
+                    continue
+                elev = max(min_rad, min(max_rad, elev))
+                horiz = math.sqrt(float(d_np[0]**2 + d_np[1]**2))
+                if horiz < 1e-8:
+                    # Pure vertical direction – pick an arbitrary azimuth
+                    azimuth = 0.0
+                else:
+                    azimuth = math.atan2(float(d_np[1]), float(d_np[0]))
+                cos_e = math.cos(elev)
+                d_np = np.array([cos_e * math.cos(azimuth),
+                                 cos_e * math.sin(azimuth),
+                                 math.sin(elev)])
+                clamped.append(d_np)
+
+            # Deduplicate near-identical directions that may have been created
+            # by clamping several cameras to the same elevation limit.
+            _MERGE_COS = math.cos(math.radians(8.0))  # merge within 8°
+            deduped = []
+            for d in clamped:
+                if all(float(np.dot(d, existing)) < _MERGE_COS
+                       for existing in deduped):
+                    deduped.append(d)
+            n_before = len(directions)
+            directions = deduped
+            if len(directions) < n_before:
+                self.report({'INFO'},
+                    f"Elevation clamp: {n_before} → {len(directions)} cameras "
+                    f"(merged {n_before - len(directions)} near-duplicates)")
 
         render = context.scene.render
         total_px = render.resolution_x * render.resolution_y

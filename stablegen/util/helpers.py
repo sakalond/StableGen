@@ -1550,7 +1550,7 @@ prompt_text_trellis2 = """
       "ss_sampling_steps": 12,
       "shape_guidance_strength": 7.5,
       "shape_sampling_steps": 12,
-      "max_tokens": 24576
+      "max_tokens": 49152
     },
     "class_type": "Trellis2ImageToShape",
     "_meta": {
@@ -1575,7 +1575,7 @@ prompt_text_trellis2 = """
     "inputs": {
       "voxelgrid_path": ["6", 1],
       "decimation_target": 100000,
-      "texture_size": 2048,
+      "texture_size": 4096,
       "remesh": true,
       "filename_prefix": "trellis2"
     },
@@ -1642,7 +1642,7 @@ prompt_text_trellis2_shape_only = """
       "ss_sampling_steps": 12,
       "shape_guidance_strength": 7.5,
       "shape_sampling_steps": 12,
-      "max_tokens": 24576
+      "max_tokens": 49152
     },
     "class_type": "Trellis2ImageToShape",
     "_meta": {

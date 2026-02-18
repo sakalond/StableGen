@@ -839,12 +839,17 @@ class WorkflowManager:
     #  Txt2Img — lightweight single-image generation for prompt-to-image
     # ------------------------------------------------------------------
 
-    def generate_txt2img(self, context):
+    def generate_txt2img(self, context, seed_override=None):
         """Generate a single image from the scene prompt and checkpoint.
 
         Builds a minimal txt2img ComfyUI workflow (with LoRA support) and
         returns the generated image as raw PNG bytes delivered via the
         ``SaveImageWebsocket`` node.
+
+        Args:
+            seed_override: If not None, overrides ``scene.seed`` in the
+                built workflow.  Useful for preview-gallery generation from
+                a background thread where ``scene.seed`` may not propagate.
 
         Returns:
             bytes: Raw image data on success.
@@ -855,12 +860,29 @@ class WorkflowManager:
         scene = context.scene
         architecture = scene.model_architecture  # synced from texture_mode
 
+        # When using TRELLIS.2 with native/none texturing the backbone is
+        # synced from trellis2_initial_image_arch instead of texture_mode.
+        # Double-check here in case the property wasn't synced yet.
+        if getattr(scene, 'architecture_mode', '') == 'trellis2':
+            tex_mode = getattr(scene, 'trellis2_texture_mode', 'native')
+            if tex_mode not in ('sdxl', 'flux1', 'qwen_image_edit'):
+                architecture = getattr(scene, 'trellis2_initial_image_arch', 'sdxl')
+
         if architecture == 'qwen_image_edit':
             prompt, save_node = self._build_qwen_txt2img(context)
         elif architecture == 'flux1':
             prompt, save_node = self._build_flux_txt2img(context)
         else:
             prompt, save_node = self._build_sdxl_txt2img(context)
+
+        # Patch seed if caller supplies an override (thread-safe)
+        if seed_override is not None:
+            for _node in prompt.values():
+                _inp = _node.get('inputs', {})
+                if 'seed' in _inp:
+                    _inp['seed'] = seed_override
+                if 'noise_seed' in _inp:
+                    _inp['noise_seed'] = seed_override
 
         ws = self._connect_to_websocket(server_address, client_id)
         if ws is None:
@@ -1133,8 +1155,13 @@ class WorkflowManager:
     # ── GLB mesh validation ───────────────────────────────────────────
     _GLB_VERTEX_THRESHOLD = 10.0    # absolute coordinate cap
     _GLB_OUTLIER_SIGMA   = 8.0     # for absolute-value outlier check
-    _GLB_LAPLACIAN_SIGMA = 6.0     # Laplacian displacement outlier threshold
-    _GLB_SPIKE_FRACTION  = 0.001   # if > 0.1% of verts are Laplacian outliers → corrupt
+    _GLB_LAPLACIAN_SIGMA = 8.0    # Laplacian displacement outlier threshold — set high
+                                    # (10σ) so only truly extreme needle-like spikes are
+                                    # flagged; legitimate sharp edges/corners sit at ~5-8σ
+    _GLB_SPIKE_FRACTION  = 0.002  # 0.02% — very tight because at 10σ virtually all
+                                    # flagged vertices are genuine artifacts
+    _GLB_SPIKE_ABS_MAX   = 25      # absolute cap — with 10σ even a handful of
+                                    # flagged vertices indicates corruption
 
     @staticmethod
     def _validate_glb_mesh(glb_bytes, threshold=None, sigma=None):
@@ -1307,9 +1334,16 @@ class WorkflowManager:
                 )
                 total_spikes += spike_count
 
-            # Check overall spike fraction
+            # Check overall spike count (absolute cap + fraction)
             if total_verts > 0 and total_spikes > 0:
                 frac = total_spikes / total_verts
+                abs_max = WorkflowManager._GLB_SPIKE_ABS_MAX
+                if total_spikes > abs_max:
+                    return False, (
+                        f"Mesh has {total_spikes} Laplacian-outlier vertices "
+                        f"(exceeds absolute cap of {abs_max}). "
+                        f"Likely cumesh corruption."
+                    )
                 if frac > spike_frac:
                     return False, (
                         f"Mesh has {total_spikes} Laplacian-outlier vertices "
@@ -1689,6 +1723,33 @@ class WorkflowManager:
             export_node_id = NODES[export_node_key]
             glb_output_path = None
 
+            # Friendly node labels for the progress bars
+            NODE_LABELS = {
+                'input_image':              'Loading Image',
+                'load_models':              'Loading Models',
+                'remove_bg':                'Removing Background',
+                'get_conditioning':         'Conditioning',
+                'image_to_shape':           'Generating Shape',
+                'shape_to_textured_mesh':   'Generating Texture',
+                'simplify':                 'Simplifying Mesh',
+                'export_trimesh':           'Exporting Mesh',
+                'export_glb':               'Exporting GLB',
+            }
+
+            # Build a lookup of known step counts so we can identify
+            # which sampling sub-phase a within-node progress event
+            # belongs to (the TRELLIS nodes may emit separate runs of
+            # progress events for SS, shape, and texture sampling).
+            _ss_steps    = scene.trellis2_ss_steps
+            _shape_steps = scene.trellis2_shape_steps
+            _tex_steps   = getattr(scene, 'trellis2_tex_steps', 0)
+            _current_exec_node = None  # node-key of the currently executing node
+
+            # Track accumulated sub-phases within a node so we can
+            # compute a node-internal overall progress.
+            _sub_phase_idx = 0     # resets when the executing node changes
+            _sub_phase_count = 1   # how many sub-phases this node has
+
             while True:
                 try:
                     out = ws.recv()
@@ -1714,9 +1775,9 @@ class WorkflowManager:
                                 break  # Execution complete
                             else:
                                 node_id = data['node']
-                                # Map node IDs to readable names for progress
                                 node_names = {v: k for k, v in NODES.items()}
-                                node_label = node_names.get(node_id, node_id)
+                                node_key = node_names.get(node_id, node_id)
+                                node_label = NODE_LABELS.get(node_key, node_key)
                                 print(f"[TRELLIS2] Executing: {node_label}")
                                 self.operator._phase_stage = f"TRELLIS.2: {node_label}"
                                 # Update progress based on node weight
@@ -1726,6 +1787,17 @@ class WorkflowManager:
                                         self.operator._update_overall()
                                 self.operator._detail_stage = node_label
                                 self.operator._detail_progress = 0
+
+                                # Reset sub-phase tracking for the new node
+                                _current_exec_node = node_key
+                                _sub_phase_idx = 0
+                                if node_key == 'image_to_shape':
+                                    # SS sampling + shape sampling = 2 sub-phases
+                                    _sub_phase_count = 2
+                                elif node_key == 'shape_to_textured_mesh':
+                                    _sub_phase_count = 1
+                                else:
+                                    _sub_phase_count = 1
 
                     elif message['type'] == 'executed':
                         # Capture output from export node (newer ComfyUI versions)
@@ -1753,12 +1825,52 @@ class WorkflowManager:
                                             break
 
                     elif message['type'] == 'progress':
-                        # Within-node progress (sampler steps)
-                        progress = (message['data']['value'] / message['data']['max']) * 100
-                        if progress != 0:
-                            self.operator._detail_progress = progress
-                            self.operator._detail_stage = f"Step {message['data']['value']}/{message['data']['max']}"
-                            print(f"[TRELLIS2] Progress: {progress:.1f}%")
+                        # Within-node progress (sampler steps).
+                        # TRELLIS.2 nodes may emit separate runs of progress
+                        # events for each internal sampling phase.  We detect
+                        # the sub-phase by matching ``max`` against known step
+                        # counts (SS, shape, texture).
+                        p_data = message['data']
+                        p_value = p_data['value']
+                        p_max   = p_data['max']
+                        step_progress = (p_value / p_max) * 100 if p_max else 0
+
+                        # ── Sub-phase identification ──
+                        sub_label = ""
+                        if _current_exec_node == 'image_to_shape':
+                            if p_max == _ss_steps:
+                                sub_label = "Sampling SS"
+                                # First sub-phase: reset index if we see it again
+                                if _sub_phase_idx == 0 or p_value == 1:
+                                    _sub_phase_idx = 0
+                            elif p_max == _shape_steps:
+                                sub_label = "Sampling Shape SLat"
+                                if _sub_phase_idx < 1:
+                                    _sub_phase_idx = 1
+                            else:
+                                # Unknown max — show generic label
+                                sub_label = "Sampling"
+                        elif _current_exec_node == 'shape_to_textured_mesh':
+                            if p_max == _tex_steps:
+                                sub_label = "Sampling Texture"
+                            else:
+                                sub_label = "Sampling"
+                        else:
+                            sub_label = "Processing"
+
+                        # Compute node-internal overall progress accounting for sub-phases
+                        if _sub_phase_count > 1:
+                            node_overall = ((_sub_phase_idx + step_progress / 100.0)
+                                            / _sub_phase_count) * 100.0
+                        else:
+                            node_overall = step_progress
+
+                        if step_progress != 0:
+                            self.operator._detail_progress = node_overall
+                            self.operator._detail_stage = (
+                                f"{sub_label}: Step {p_value}/{p_max}"
+                            )
+                            print(f"[TRELLIS2] {sub_label}: Step {p_value}/{p_max} ({step_progress:.0f}%)")
 
                     elif message['type'] == 'execution_error':
                         error_data = message.get('data', {})
@@ -2364,7 +2476,13 @@ class WorkflowManager:
                         if hasattr(self.operator, '_detail_progress'):
                             self.operator._detail_progress = progress
                             self.operator._detail_stage = f"Step {message['data']['value']}/{message['data']['max']}"
-                            self.operator._phase_progress = progress
+                            # Remap progress into a sub-range when gallery mode is active
+                            remap = getattr(self.operator, '_progress_remap', None)
+                            if remap:
+                                base, span = remap
+                                self.operator._phase_progress = base + (progress / 100.0) * span
+                            else:
+                                self.operator._phase_progress = progress
                             if hasattr(self.operator, '_update_overall'):
                                 self.operator._update_overall()
                         print(f"Progress: {progress:.1f}%")

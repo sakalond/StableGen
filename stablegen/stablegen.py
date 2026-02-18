@@ -116,6 +116,65 @@ GEN_PARAMETERS = [
     "refine_edge_feather_projection",
     "refine_edge_feather_width",
     "refine_edge_feather_softness",
+    # --- TRELLIS.2 ---
+    "trellis2_generate_from",
+    "trellis2_texture_mode",
+    "trellis2_initial_image_arch",
+    "trellis2_camera_count",
+    "trellis2_placement_mode",
+    "trellis2_auto_prompts",
+    "trellis2_exclude_bottom",
+    "trellis2_exclude_bottom_angle",
+    "trellis2_auto_aspect",
+    "trellis2_occlusion_mode",
+    "trellis2_consider_existing",
+    "trellis2_delete_cameras",
+    "trellis2_coverage_target",
+    "trellis2_max_auto_cameras",
+    "trellis2_fan_angle",
+    "trellis2_resolution",
+    "trellis2_vram_mode",
+    "trellis2_attn_backend",
+    "trellis2_seed",
+    "trellis2_ss_guidance",
+    "trellis2_ss_steps",
+    "trellis2_shape_guidance",
+    "trellis2_shape_steps",
+    "trellis2_tex_guidance",
+    "trellis2_tex_steps",
+    "trellis2_max_tokens",
+    "trellis2_texture_size",
+    "trellis2_decimation",
+    "trellis2_remesh",
+    "trellis2_post_processing_enabled",
+    "trellis2_low_vram",
+    "trellis2_background_color",
+    "trellis2_include_1024",
+    "trellis2_fill_holes",
+    "trellis2_import_scale",
+    "trellis2_clamp_elevation",
+    "trellis2_max_elevation",
+    "trellis2_min_elevation",
+    "trellis2_preview_gallery_enabled",
+    "trellis2_preview_gallery_count",
+    "trellis2_auto_lighting",
+
+    # --- General workflow settings (not prompt/seed/model/paths) ---
+    "use_ipadapter",
+    "sequential_ipadapter_regenerate_wo_controlnet",
+    "allow_modify_existing_textures",
+    "ask_object_prompts",
+    "weight_exponent_mask",
+    "mask_blocky",
+    "architecture_mode",
+    "use_camera_prompts",
+    "sg_use_custom_camera_order",
+    "apply_bsdf",
+    "generation_mode",
+    "texture_objects",
+    "use_flux_lora",
+    "qwen_use_trellis2_style",
+    "trellis2_skip_texture",
 ]
 
 def get_preset_items(self, context):
@@ -529,10 +588,34 @@ class StableGenPanel(bpy.types.Panel):
                     split.label(text="Input Image:")
                     split.prop(scene, "trellis2_input_image", text="")
 
+                # Preview gallery (only when generate_from = prompt)
+                if scene.trellis2_generate_from == 'prompt':
+                    row = params_container.row(align=True)
+                    row.prop(scene, "trellis2_preview_gallery_enabled", text="Preview Gallery", toggle=True, icon="IMAGE_REFERENCE")
+                    sub = row.row(align=True)
+                    sub.enabled = scene.trellis2_preview_gallery_enabled
+                    sub.prop(scene, "trellis2_preview_gallery_count", text="Count")
+
                 # Texture Generation Mode
                 split = params_container.split(factor=0.5)
                 split.label(text="Texture Mode:")
                 split.prop(scene, "trellis2_texture_mode", text="")
+
+                # Prompt + native/none: show initial-image architecture & checkpoint
+                _prompt_native = (
+                    scene.trellis2_generate_from == 'prompt'
+                    and trellis2_tex_mode in ('native', 'none')
+                )
+                if _prompt_native:
+                    split = params_container.split(factor=0.5)
+                    split.label(text="Initial Image Arch:")
+                    split.prop(scene, "trellis2_initial_image_arch", text="")
+
+                    split = params_container.split(factor=0.25)
+                    split.label(text="Checkpoint:")
+                    row = split.row(align=True)
+                    row.prop(scene, "model_name", text="")
+                    row.operator("stablegen.refresh_checkpoint_list", text="", icon='FILE_REFRESH')
 
                 # When diffusion texturing: show checkpoint, generation mode, camera count
                 if trellis2_diffusion_texturing:
@@ -548,9 +631,6 @@ class StableGenPanel(bpy.types.Panel):
                         split.prop(scene, "qwen_generation_method", text="")
                     else:
                         split.prop(scene, "generation_method", text="")
-
-                    row = params_container.row()
-                    row.prop(scene, "trellis2_camera_count", text="Camera Count")
             else:
                 # --- Standard diffusion layout ---
                 # Split for model name
@@ -680,6 +760,75 @@ class StableGenPanel(bpy.types.Panel):
                     row.prop(scene, "trellis2_tex_steps", text="Tex Steps")
                     row = content_box.row()
                     row.prop(scene, "trellis2_texture_size", text="Texture Size")
+
+                    content_box.separator()
+                    row = content_box.row()
+                    row.prop(scene, "trellis2_auto_lighting", text="Studio Lighting", icon="LIGHT_AREA")
+
+            # --- TRELLIS.2: Camera Placement Settings (diffusion texturing) ---
+            if is_trellis2 and trellis2_diffusion_texturing:
+                content_box = draw_collapsible_section(advanced_params_box, "show_trellis2_camera_settings", "Camera Placement (TRELLIS.2)", icon="CAMERA_DATA")
+                if content_box:
+                    _t2_pm = getattr(scene, 'trellis2_placement_mode', 'normal_weighted')
+
+                    row = content_box.row()
+                    row.prop(scene, "trellis2_import_scale", text="Import Scale (BU)")
+
+                    content_box.separator()
+
+                    split = content_box.split(factor=0.4)
+                    split.label(text="Placement:")
+                    split.prop(scene, "trellis2_placement_mode", text="")
+
+                    # Camera count (not used by greedy)
+                    if _t2_pm != 'greedy_coverage':
+                        row = content_box.row()
+                        row.prop(scene, "trellis2_camera_count", text="Camera Count")
+
+                    # Greedy-specific
+                    if _t2_pm == 'greedy_coverage':
+                        row = content_box.row(align=True)
+                        row.prop(scene, "trellis2_coverage_target", text="Coverage Target")
+                        row.prop(scene, "trellis2_max_auto_cameras", text="Max Cameras")
+
+                    # Fan-specific
+                    if _t2_pm == 'fan_from_camera':
+                        row = content_box.row()
+                        row.prop(scene, "trellis2_fan_angle", text="Fan Angle")
+
+                    content_box.separator()
+
+                    row = content_box.row()
+                    row.prop(scene, "trellis2_auto_prompts", text="Auto View Prompts", toggle=True, icon="OUTLINER_OB_CAMERA")
+
+                    split = content_box.split(factor=0.4)
+                    split.label(text="Auto Aspect:")
+                    split.prop(scene, "trellis2_auto_aspect", text="")
+
+                    split = content_box.split(factor=0.4)
+                    split.label(text="Occlusion:")
+                    split.prop(scene, "trellis2_occlusion_mode", text="")
+
+                    row = content_box.row()
+                    row.prop(scene, "trellis2_exclude_bottom", text="Exclude Bottom Faces", toggle=True, icon="TRIA_DOWN_BAR")
+                    if scene.trellis2_exclude_bottom:
+                        row = content_box.row()
+                        row.prop(scene, "trellis2_exclude_bottom_angle", text="Bottom Angle")
+
+                    row = content_box.row()
+                    row.prop(scene, "trellis2_consider_existing", text="Consider Existing Cameras", toggle=True)
+
+                    row = content_box.row()
+                    row.prop(scene, "trellis2_delete_cameras", text="Delete Cameras After", toggle=True, icon="TRASH")
+
+                    content_box.separator()
+
+                    row = content_box.row()
+                    row.prop(scene, "trellis2_clamp_elevation", text="Clamp Elevation", toggle=True, icon="CON_ROTLIMIT")
+                    if scene.trellis2_clamp_elevation:
+                        row = content_box.row(align=True)
+                        row.prop(scene, "trellis2_min_elevation", text="Min")
+                        row.prop(scene, "trellis2_max_elevation", text="Max")
 
             # --- Diffusion-based advanced sections ---
             # Each is individually guarded: shown for standard arches or TRELLIS.2 with diffusion texturing
