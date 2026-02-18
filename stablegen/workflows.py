@@ -12,6 +12,7 @@ from datetime import datetime, timedelta
 
 from .util.helpers import prompt_text_qwen_image_edit, prompt_text_trellis2, prompt_text_trellis2_shape_only
 from .utils import get_generation_dirs
+from .timeout_config import get_timeout
 
 from io import BytesIO
 import numpy as np
@@ -532,16 +533,22 @@ class WorkflowManager:
                 prompt[NODES['pos_prompt']]['inputs']['prompt'] = pos_prompt_text
 
         # Case 1b: TRELLIS.2 input image as style (when no external style configured)
-        elif getattr(context.scene, 'qwen_use_trellis2_style', False) and is_initial_image:
-            t2_path = getattr(context.scene, 'trellis2_last_input_image', '')
-            if t2_path and os.path.exists(bpy.path.abspath(t2_path)):
-                style_image_info = self.operator._get_uploaded_image_info(context, "custom", filename=bpy.path.abspath(t2_path))
-            if style_image_info:
-                if context.scene.qwen_use_custom_prompts:
-                    pos_prompt_text = (context.scene.qwen_custom_prompt_initial).format(main_prompt=user_prompt)
-                else:
-                    pos_prompt_text = self._get_qwen_default_prompts(context, is_initial_image).format(main_prompt=user_prompt)
-                prompt[NODES['pos_prompt']]['inputs']['prompt'] = pos_prompt_text
+        elif getattr(context.scene, 'qwen_use_trellis2_style', False):
+            use_t2_this_frame = True
+            if not is_initial_image and getattr(context.scene, 'qwen_trellis2_style_initial_only', False):
+                # Initial-only mode: fall back to sequential style for subsequent frames
+                use_t2_this_frame = False
+                context.scene.sequential_ipadapter = True
+            if use_t2_this_frame:
+                t2_path = getattr(context.scene, 'trellis2_last_input_image', '')
+                if t2_path and os.path.exists(bpy.path.abspath(t2_path)):
+                    style_image_info = self.operator._get_uploaded_image_info(context, "custom", filename=bpy.path.abspath(t2_path))
+                if style_image_info:
+                    if context.scene.qwen_use_custom_prompts:
+                        pos_prompt_text = (context.scene.qwen_custom_prompt_initial).format(main_prompt=user_prompt)
+                    else:
+                        pos_prompt_text = self._get_qwen_default_prompts(context, is_initial_image).format(main_prompt=user_prompt)
+                    prompt[NODES['pos_prompt']]['inputs']['prompt'] = pos_prompt_text
 
         # Case 2: Sequential generation (after first image)
         elif not is_initial_image:
@@ -717,8 +724,10 @@ class WorkflowManager:
         # Return the generated image from the save_image node
         return images[NODES['save_image']][0]
 
-    def _check_server_alive(self, server_address, timeout=5):
+    def _check_server_alive(self, server_address, timeout=None):
         """Return True if the ComfyUI server responds to a lightweight request."""
+        if timeout is None:
+            timeout = get_timeout('ping')
         try:
             req = urllib.request.Request(
                 f"http://{server_address}/system_stats",
@@ -735,7 +744,7 @@ class WorkflowManager:
             req = urllib.request.Request(
                 f"http://{server_address}/system_stats", method='GET'
             )
-            resp = json.loads(urllib.request.urlopen(req, timeout=5).read())
+            resp = json.loads(urllib.request.urlopen(req, timeout=get_timeout('api')).read())
             dev = resp.get("devices", [{}])[0]
             vram_free = dev.get("vram_free", 0) / (1024 * 1024)
             vram_total = dev.get("vram_total", 0) / (1024 * 1024)
@@ -775,7 +784,7 @@ class WorkflowManager:
                 f"http://{server_address}/free", data=d,
                 headers={'Content-Type': 'application/json'}, method='POST'
             )
-            urllib.request.urlopen(r, timeout=10)
+            urllib.request.urlopen(r, timeout=get_timeout('api'))
 
         def _clear_history():
             d = json.dumps({"clear": True}).encode('utf-8')
@@ -783,7 +792,7 @@ class WorkflowManager:
                 f"http://{server_address}/history", data=d,
                 headers={'Content-Type': 'application/json'}, method='POST'
             )
-            urllib.request.urlopen(r, timeout=10)
+            urllib.request.urlopen(r, timeout=get_timeout('api'))
 
         def _clear_queue():
             d = json.dumps({"clear": True}).encode('utf-8')
@@ -791,7 +800,7 @@ class WorkflowManager:
                 f"http://{server_address}/queue", data=d,
                 headers={'Content-Type': 'application/json'}, method='POST'
             )
-            urllib.request.urlopen(r, timeout=10)
+            urllib.request.urlopen(r, timeout=get_timeout('api'))
 
         for attempt in range(1, retries + 1):
             try:
@@ -1395,7 +1404,7 @@ class WorkflowManager:
                     print(f"[TRELLIS2] Failed to clear Triton cache {cache_dir}: {e}")
         return cleared
 
-    def _reboot_comfyui(self, server_address, poll_timeout=120):
+    def _reboot_comfyui(self, server_address, poll_timeout=None):
         """
         Attempt to reboot ComfyUI via the ComfyUI Manager ``/manager/reboot``
         endpoint, then wait for the server to come back online.
@@ -1406,12 +1415,15 @@ class WorkflowManager:
         """
         import time
 
+        if poll_timeout is None:
+            poll_timeout = get_timeout('reboot')
+
         reboot_url = f"http://{server_address}/manager/reboot"
         print(f"[TRELLIS2] Requesting ComfyUI reboot via {reboot_url} ...")
 
         try:
             req = urllib.request.Request(reboot_url, method='GET')
-            resp = urllib.request.urlopen(req, timeout=10)
+            resp = urllib.request.urlopen(req, timeout=get_timeout('api'))
             status = resp.getcode()
             if status not in (200, 201, 204):
                 print(f"[TRELLIS2] Reboot endpoint returned unexpected status {status}")
@@ -1622,8 +1634,20 @@ class WorkflowManager:
         prompt[NODES['load_models']]["inputs"]["vram_mode"] = scene.trellis2_vram_mode
         prompt[NODES['load_models']]["inputs"]["attn_backend"] = scene.trellis2_attn_backend
 
-        # Configure remove background
-        prompt[NODES['remove_bg']]["inputs"]["low_vram"] = scene.trellis2_low_vram
+        # Configure background removal (or bypass it)
+        skip_bg = getattr(scene, 'trellis2_bg_removal', 'auto') == 'skip'
+        if skip_bg:
+            # Remove the RemoveBackground node from the workflow.
+            # Wire GetConditioning to use LoadImage outputs directly:
+            #   LoadImage[0] → image,  LoadImage[1] → mask (alpha channel).
+            # If the input has no alpha, ComfyUI's LoadImage provides an
+            # all-white mask (= entire image is foreground).
+            remove_bg_node_id = NODES.pop('remove_bg')
+            del prompt[remove_bg_node_id]
+            prompt[NODES['get_conditioning']]["inputs"]["image"] = [NODES['input_image'], 0]
+            prompt[NODES['get_conditioning']]["inputs"]["mask"] = [NODES['input_image'], 1]
+        else:
+            prompt[NODES['remove_bg']]["inputs"]["low_vram"] = scene.trellis2_low_vram
 
         # Configure conditioning
         prompt[NODES['get_conditioning']]["inputs"]["background_color"] = scene.trellis2_background_color
@@ -1700,23 +1724,25 @@ class WorkflowManager:
                 NODE_PROGRESS = {
                     NODES['input_image']:        2,
                     NODES['load_models']:        3,
-                    NODES['remove_bg']:         12,
                     NODES['get_conditioning']:   25,
                     NODES['image_to_shape']:     80,
                     NODES['simplify']:           90,
                     NODES['export_trimesh']:     98,
                 }
+                if not skip_bg:
+                    NODE_PROGRESS[NODES['remove_bg']] = 12
             else:
                 # Full textured pipeline (single submission)
                 NODE_PROGRESS = {
                     NODES['input_image']:              2,
                     NODES['load_models']:              3,
-                    NODES['remove_bg']:               10,
                     NODES['get_conditioning']:         18,
                     NODES['image_to_shape']:           55,
                     NODES['shape_to_textured_mesh']:   85,
                     NODES['export_glb']:               98,
                 }
+                if not skip_bg:
+                    NODE_PROGRESS[NODES['remove_bg']] = 10
 
             # Wait for execution to complete via WebSocket
             # Also capture 'executed' events which may contain the output path
@@ -2362,7 +2388,7 @@ class WorkflowManager:
         """
         try:
             history_url = f"http://{server_address}/history/{prompt_id}"
-            history = json.loads(urllib.request.urlopen(history_url, timeout=30).read())
+            history = json.loads(urllib.request.urlopen(history_url, timeout=get_timeout('transfer')).read())
             outputs = history.get(prompt_id, {}).get("outputs", {}).get(node_id, {})
             image_list = outputs.get("images", [])
             result = []
@@ -2374,7 +2400,7 @@ class WorkflowManager:
                              f"filename={urllib.parse.quote(filename)}"
                              f"&subfolder={urllib.parse.quote(subfolder)}"
                              f"&type={urllib.parse.quote(img_type)}")
-                data = urllib.request.urlopen(view_url, timeout=60).read()
+                data = urllib.request.urlopen(view_url, timeout=get_timeout('transfer')).read()
                 result.append(data)
             return result
         except Exception as e:

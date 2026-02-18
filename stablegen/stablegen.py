@@ -148,6 +148,7 @@ GEN_PARAMETERS = [
     "trellis2_remesh",
     "trellis2_post_processing_enabled",
     "trellis2_low_vram",
+    "trellis2_bg_removal",
     "trellis2_background_color",
     "trellis2_include_1024",
     "trellis2_fill_holes",
@@ -174,6 +175,7 @@ GEN_PARAMETERS = [
     "texture_objects",
     "use_flux_lora",
     "qwen_use_trellis2_style",
+    "qwen_trellis2_style_initial_only",
     "trellis2_skip_texture",
 ]
 
@@ -748,8 +750,12 @@ class StableGenPanel(bpy.types.Panel):
 
                     # Misc
                     content_box.label(text="Misc:", icon="PREFERENCES")
-                    row = content_box.row()
-                    row.prop(scene, "trellis2_low_vram", text="Low VRAM Background Removal", toggle=True, icon="GHOST_ENABLED")
+                    split = content_box.split(factor=0.5)
+                    split.label(text="BG Removal:")
+                    split.prop(scene, "trellis2_bg_removal", text="")
+                    if scene.trellis2_bg_removal == 'auto':
+                        row = content_box.row()
+                        row.prop(scene, "trellis2_low_vram", text="Low VRAM Background Removal", toggle=True, icon="GHOST_ENABLED")
 
             # --- TRELLIS.2: Native Texture Settings ---
             if is_trellis2 and trellis2_tex_mode == 'native':
@@ -1050,6 +1056,19 @@ class StableGenPanel(bpy.types.Panel):
                             if scene.sequential_ipadapter_mode == 'recent':
                                 subsequent_box.prop(scene, "sequential_desaturate_factor", text="Desaturate")
                                 subsequent_box.prop(scene, "sequential_contrast_factor", text="Reduce Contrast")
+
+                        if getattr(scene, 'architecture_mode', '') == 'trellis2' and scene.qwen_use_trellis2_style:
+                            t2_style_box = content_box.box()
+                            row = t2_style_box.row()
+                            row.prop(scene, "qwen_trellis2_style_initial_only", text="TRELLIS.2 Style for Initial Only", toggle=True)
+                            if scene.qwen_trellis2_style_initial_only:
+                                subsequent_box = t2_style_box.box()
+                                split = subsequent_box.split(factor=0.5)
+                                split.label(text="Subsequent mode:")
+                                split.prop(scene, "sequential_ipadapter_mode", text="")
+                                if scene.sequential_ipadapter_mode == 'recent':
+                                    subsequent_box.prop(scene, "sequential_desaturate_factor", text="Desaturate")
+                                    subsequent_box.prop(scene, "sequential_contrast_factor", text="Reduce Contrast")
 
                         if not scene.qwen_use_external_style_image and scene.generation_method in ['sequential', 'separate']:
                             row = content_box.row()

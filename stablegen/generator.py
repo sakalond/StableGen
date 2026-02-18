@@ -27,6 +27,7 @@ from .utils import get_last_material_index, get_generation_dirs, get_file_path, 
 from .project import project_image, reinstate_compare_nodes # pylint: disable=relative-beyond-top-level
 from .workflows import WorkflowManager
 from .util.mirror_color import MirrorReproject, _get_viewport_ref_np, _apply_color_match_to_file
+from .timeout_config import get_timeout
 
 # Import wheels
 import websocket
@@ -298,7 +299,7 @@ def upload_image_to_comfyui(server_address, image_path, image_type="input"):
             data = {'overwrite': 'true', 'type': image_type}
 
             # Increased timeout for potentially large images or slow networks
-            response = requests.post(upload_url, files=files, data=data, timeout=120)
+            response = requests.post(upload_url, files=files, data=data, timeout=get_timeout('transfer'))
             response.raise_for_status() # Raise HTTPError for bad responses (4xx or 5xx)
 
         response_data = response.json()
@@ -2567,14 +2568,14 @@ class Trellis2Generate(bpy.types.Operator):
                         f"http://{srv}/free", data=flush_data,
                         headers={"Content-Type": "application/json"}
                     )
-                    urllib.request.urlopen(flush_req, timeout=10)
+                    urllib.request.urlopen(flush_req, timeout=get_timeout('api'))
                     # 2. Clear history/cache
                     hist_data = json.dumps({"clear": True}).encode('utf-8')
                     hist_req = urllib.request.Request(
                         f"http://{srv}/history", data=hist_data,
                         headers={"Content-Type": "application/json"}
                     )
-                    urllib.request.urlopen(hist_req, timeout=10)
+                    urllib.request.urlopen(hist_req, timeout=get_timeout('api'))
                     # 3. Wait for VRAM release
                     import time
                     time.sleep(3)

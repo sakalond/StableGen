@@ -492,7 +492,7 @@ DEPENDENCIES: Dict[str, Dict[str, Any]] = {
         "commit": "6b0b2148f45bbafa0b86bfd25c63602b63a7aae0",
         "target_dir_relative": "custom_nodes",
         "repo_name": "ComfyUI-TRELLIS2",
-        "license": "MIT", "packages": ["trellis2"],
+        "license": "MIT (Note: textured pipeline uses NVIDIA non-commercial libs)", "packages": ["trellis2"],
         "pip_packages": ["comfy-env==0.2.0"],
         "run_install_script": True,
         "post_clone_patches": [
@@ -595,7 +595,9 @@ MENU_PACKAGES: Dict[str, Dict[str, Any]] = {
     '8': {"name": "[TRELLIS.2] Image-to-3D Node",
         "tags": ["trellis2"],
         "size_gb": 0.1,
-        "description_suffix": "*Installs ComfyUI-TRELLIS2 custom node. Models are downloaded automatically on first use by the node.*"},
+        "description_suffix": "*Installs ComfyUI-TRELLIS2 custom node. Models are downloaded automatically on first use by the node.*\n"
+                              "    *LICENSE NOTICE: Only the 'Native (TRELLIS.2)' texture mode uses nvdiffrast/nvdiffrec*\n"
+                              "    *(NVIDIA Source Code License — non-commercial use only). See README.md for full details.*",
 }
 
 # --- Helper Functions ---
@@ -971,7 +973,42 @@ def main():
             print("Installation of this package cancelled by user.")
             print_separator()
             continue
-            
+
+        # Display TRELLIS.2 license notice if installing that package
+        if "trellis2" in selected_option["tags"]:
+            print_separator(char='!')
+            print("TRELLIS.2 THIRD-PARTY LICENSE NOTICE")
+            print_separator(char='!')
+            print("NOTE: This notice applies ONLY to the TRELLIS.2 Image-to-3D feature.")
+            print("StableGen's standard texturing pipelines (SDXL, FLUX, Qwen) are unaffected.")
+            print()
+            print("ComfyUI-TRELLIS2 and the TRELLIS.2 model are MIT-licensed.")
+            print("However, the TRELLIS.2 TEXTURED mesh pipeline uses the following NVIDIA")
+            print("libraries that are restricted to NON-COMMERCIAL use only:")
+            print()
+            print("  - nvdiffrast  (NVIDIA Source Code License, 1-Way Commercial)")
+            print("  - nvdiffrec   (NVIDIA Source Code License)")
+            print()
+            print("These licenses restrict usage to 'research or evaluation purposes only")
+            print("and not for any direct or indirect monetary gain' (Section 3.3).")
+            print("Only NVIDIA and its affiliates may use them commercially.")
+            print()
+            print("These libraries are ONLY used when Texture Mode is set to")
+            print("'Native (TRELLIS.2)' for UV rasterization and PBR texture baking.")
+            print()
+            print("All other modes do not introduce additional NVIDIA restrictions:")
+            print("  - Texture Mode 'None' (shape-only) - permissively licensed")
+            print("  - Projection texture modes (SDXL, Flux, Qwen) - the selected")
+            print("    diffusion model's own license applies as usual")
+            print()
+            print("For full details, see the README.md License section.")
+            print_separator(char='!')
+            ack = input("Acknowledge and continue? (y/n, Enter for yes): ").strip().lower()
+            if not (ack == "" or ack == 'y'):
+                print("Installation cancelled.")
+                print_separator()
+                continue
+
         print_separator(char='*')
         for item_details in items_to_process_this_round:
             if item_details["id"] in processed_during_this_session: # Should not happen if items_to_process_this_round is built correctly

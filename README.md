@@ -387,6 +387,33 @@ We welcome contributions! Whether it's bug reports, feature suggestions, code co
 
 StableGen is released under the **GNU General Public License v3.0**. See the `LICENSE` file for details.
 
+### Third-Party Licenses: TRELLIS.2 Image-to-3D
+
+> **Note:** This section applies **only** to the TRELLIS.2 Image-to-3D feature. StableGen's standard texturing pipelines (SDXL, FLUX.1-dev, Qwen Image Edit) do not use any of the libraries listed below and are unaffected by these licensing restrictions.
+
+The TRELLIS.2 feature relies on several third-party components, each with its own license. **Users should be aware of these licenses, particularly the non-commercial restrictions on certain NVIDIA libraries used in the TRELLIS.2 textured output pipeline.**
+
+| Component | License | Commercial Use Permitted? |
+|---|---|---|
+| [TRELLIS.2](https://github.com/microsoft/TRELLIS.2) (Microsoft) | MIT | ✅ Yes |
+| [TRELLIS.2-4B model weights](https://huggingface.co/microsoft/TRELLIS.2-4B) | MIT | ✅ Yes |
+| [ComfyUI-TRELLIS2](https://github.com/PozzettiAndrea/ComfyUI-TRELLIS2) | MIT | ✅ Yes |
+| [DINOv3](https://github.com/facebookresearch/dinov3) (Meta, image conditioning) | [DINOv3 License](https://ai.meta.com/resources/models-and-libraries/dinov3-license/) | ✅ Yes |
+| [BiRefNet](https://github.com/ZhengPeng7/BiRefNet) (background removal) | MIT | ✅ Yes |
+| [FlexGEMM](https://github.com/JeffreyXiang/FlexGEMM) (sparse convolutions) | MIT | ✅ Yes |
+| [CuMesh](https://github.com/JeffreyXiang/CuMesh) (mesh operations) | MIT | ✅ Yes |
+| O-Voxel (voxel processing, part of TRELLIS.2) | MIT | ✅ Yes |
+| [nvdiffrast](https://github.com/NVlabs/nvdiffrast) (NVIDIA) | NVIDIA Source Code License (1-Way Commercial) | ❌ **Non-commercial only** |
+| [nvdiffrec](https://github.com/NVlabs/nvdiffrec) (NVIDIA) | NVIDIA Source Code License | ❌ **Non-commercial only** |
+
+**Important:** The NVIDIA libraries (`nvdiffrast` and `nvdiffrec`) are only used when the TRELLIS.2 **Texture Mode** is set to **"Native (TRELLIS.2)"** — specifically for UV rasterization and PBR texture baking. Their license restricts usage to *"research or evaluation purposes only and not for any direct or indirect monetary gain"* (Section 3.3). Only NVIDIA and its affiliates may use these libraries commercially.
+
+**All other TRELLIS.2 modes do not introduce NVIDIA licensing restrictions:**
+* **Shape-only mode ("None")** — does not use nvdiffrast/nvdiffrec. All other pipeline components are permissively licensed (MIT/Apache 2.0 + DINOv3 License).
+* **Projection-based texture modes ("SDXL", "Flux 1", "Qwen Image Edit")** — does not use nvdiffrast/nvdiffrec. The licensing terms of the selected diffusion model apply as usual (e.g., FLUX.1-dev has its own license terms separate from the TRELLIS.2 pipeline).
+
+If you require commercial use of the "Native (TRELLIS.2)" texture mode, consider contacting NVIDIA regarding commercial licensing for nvdiffrast/nvdiffrec.
+
 ---
 
 ## 🙏 Acknowledgements
