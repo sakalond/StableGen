@@ -385,6 +385,21 @@ class ComfyUIGenerate(bpy.types.Operator):
         self._progress = 0
         self._wait_event = threading.Event()
         self.workflow_manager = WorkflowManager(self)
+
+    def _run_on_main_thread(self, func):
+        """Execute *func* on Blender's main thread via a timer callback and
+        block until it completes.  Sets ``self._error`` on failure."""
+        def _callback():
+            try:
+                func()
+            except Exception as exc:
+                self._error = str(exc)
+                traceback.print_exc()
+            self._wait_event.set()
+            return None          # one-shot timer
+        bpy.app.timers.register(_callback)
+        self._wait_event.wait()
+        self._wait_event.clear()
                 
     def _get_qwen_context_colors(self, context):
         fallback = (1.0, 0.0, 1.0)
@@ -586,63 +601,7 @@ class ComfyUIGenerate(bpy.types.Operator):
         if not context.scene.overwrite_material or self._material_id == -1 or (context.scene.generation_method == 'local_edit' or (context.scene.model_architecture.startswith('qwen') and context.scene.qwen_generation_method == 'local_edit')):
             self._material_id += 1
 
-        if context.scene.generation_mode == 'standard' or context.scene.generation_mode == 'regenerate_selected':
-            # If there is depth controlnet unit
-            if any(unit["unit_type"] == "depth" for unit in controlnet_units) or (context.scene.use_flux_lora and context.scene.model_architecture == 'flux1') or (context.scene.model_architecture == 'qwen_image_edit' and context.scene.qwen_guidance_map_type == 'depth') or (context.scene.model_architecture.startswith('qwen') and context.scene.qwen_generation_method in ('refine', 'local_edit') and context.scene.qwen_refine_use_depth):
-                if context.scene.generation_method != 'uv_inpaint':
-                    # Export depth maps for each camera
-                    for i, camera in enumerate(self._cameras):
-                        bpy.context.scene.camera = camera
-                        with _SGCameraResolution(context, camera):
-                            self.export_depthmap(context, camera_id=i)
-                    if context.scene.generation_method == 'grid':
-                        self.combine_maps(context, self._cameras, type="depth")
-            # If there is canny controlnet unit
-            if any(unit["unit_type"] == "canny" for unit in controlnet_units):
-                if context.scene.generation_method != 'uv_inpaint':
-                    # Export canny maps for each camera
-                    for i, camera in enumerate(self._cameras):
-                        bpy.context.scene.camera = camera
-                        with _SGCameraResolution(context, camera):
-                            export_canny(context, camera_id=i, low_threshold=context.scene.canny_threshold_low, high_threshold=context.scene.canny_threshold_high)
-                    if context.scene.generation_method == 'grid':
-                        self.combine_maps(context, self._cameras, type="canny")
-            # If there is normal controlnet unit
-            if any(unit["unit_type"] == "normal" for unit in controlnet_units) or (context.scene.model_architecture == 'qwen_image_edit' and context.scene.qwen_guidance_map_type == 'normal'):
-                if context.scene.generation_method != 'uv_inpaint':
-                    # Export normal maps for each camera
-                    for i, camera in enumerate(self._cameras):
-                        bpy.context.scene.camera = camera
-                        with _SGCameraResolution(context, camera):
-                            self.export_normal(context, camera_id=i)
-                    if context.scene.generation_method == 'grid':
-                        self.combine_maps(context, self._cameras, type="normal")
-
-            # If Qwen guidance using Workbench
-            if context.scene.model_architecture == 'qwen_image_edit' and context.scene.qwen_guidance_map_type == 'workbench':
-                if context.scene.generation_method != 'uv_inpaint':
-                    # Export workbench render for each camera
-                    # We need to target the directory that get_file_path(..., subtype="workbench") expects
-                    workbench_dir = get_dir_path(context, "controlnet")["workbench"]
-                    for i, camera in enumerate(self._cameras):
-                        bpy.context.scene.camera = camera
-                        # Filename logic must match get_file_path: "render{camera_id}" -> "render{camera_id}0001.png"
-                        with _SGCameraResolution(context, camera):
-                            export_render(context, camera_id=i, output_dir=workbench_dir, filename=f"render{i}")
-                    if context.scene.generation_method == 'grid':
-                        self.combine_maps(context, self._cameras, type="workbench")
-            # If Qwen guidance using Viewport
-            elif context.scene.model_architecture == 'qwen_image_edit' and context.scene.qwen_guidance_map_type == 'viewport':
-                if context.scene.generation_method != 'uv_inpaint':
-                    # Export viewport render for each camera
-                    viewport_dir = get_dir_path(context, "controlnet")["viewport"]
-                    for i, camera in enumerate(self._cameras):
-                        bpy.context.scene.camera = camera
-                        # Filename logic must match get_file_path: "viewport{camera_id}.png"
-                        with _SGCameraResolution(context, camera):
-                            export_viewport(context, camera_id=i, output_dir=viewport_dir, filename=f"viewport{i}")
-                    if context.scene.generation_method == 'grid':
-                        self.combine_maps(context, self._cameras, type="viewport")
+        self._controlnet_units = list(controlnet_units)
 
         # Prepare for generating
         if context.scene.generation_method == 'grid':
@@ -661,21 +620,6 @@ class ComfyUIGenerate(bpy.types.Operator):
                     self._original_visibility[obj.name] = obj.hide_render
                     obj.hide_render = True
 
-        # Refine/Local Edit mode preparation
-        if context.scene.generation_method in ('refine', 'local_edit') or (context.scene.model_architecture.startswith('qwen') and context.scene.qwen_generation_method in ('refine', 'local_edit')):
-            for i, camera in enumerate(self._cameras):
-                bpy.context.scene.camera = camera
-                with _SGCameraResolution(context, camera):
-                    export_emit_image(context, self._to_texture, camera_id=i)
-                    # Render per-camera geometry silhouette mask for edge feathering
-                    if context.scene.refine_edge_feather_projection and (
-                        context.scene.generation_method == 'local_edit'
-                        or (context.scene.model_architecture.startswith('qwen')
-                            and context.scene.qwen_generation_method == 'local_edit')):
-                        render_edge_feather_mask(
-                            context, self._to_texture, camera, i,
-                            feather_width=context.scene.refine_edge_feather_width,
-                            softness=context.scene.refine_edge_feather_softness)
 
         # UV inpainting mode preparation
         if context.scene.generation_method == 'uv_inpaint':
@@ -693,6 +637,7 @@ class ComfyUIGenerate(bpy.types.Operator):
                 baked_texture_path = get_file_path(context, "baked", object_name=obj.name)
                 if not os.path.exists(baked_texture_path):
                     # Bake the texture if it doesn't exist
+                    self._stage = f"Baking UV Textures ({obj.name})"
                     prepare_baking(context)
                     unwrap(obj, method='pack', overlap_only=True)
                     bake_texture(context, obj, texture_resolution=2048, output_dir=get_dir_path(context, "baked"))
@@ -725,9 +670,11 @@ class ComfyUIGenerate(bpy.types.Operator):
                     return {'CANCELLED'}
                     
                 # Export visibility masks for each object
+                self._stage = f"Computing Visibility ({obj.name})"
                 export_visibility(context, None, obj)
 
         if context.scene.view_blend_use_color_match and self._to_texture:
+            self._stage = "Matching Colors"
             # Use the first target object as the reference for viewport color
             ref_np = _get_viewport_ref_np(self._to_texture[0])
             if ref_np is not None:
@@ -950,6 +897,159 @@ class ComfyUIGenerate(bpy.types.Operator):
             ComfyUIGenerate._active_ws = None
         remove_empty_dirs(context)
 
+    # ------------------------------------------------------------------
+    # Map preparation — runs from the async thread via timer callbacks
+    # so that _stage updates are visible in real time through the modal.
+    # ------------------------------------------------------------------
+    def _prepare_maps(self, context):
+        """Render ControlNet / refine maps.  Called at the start of the async
+        thread; every Blender render is dispatched to the main thread via
+        ``_run_on_main_thread`` so the progress bar can update between calls."""
+        controlnet_units = self._controlnet_units
+        cameras = self._cameras
+
+        if context.scene.generation_mode in ('standard', 'regenerate_selected'):
+            need_depth = (
+                any(u["unit_type"] == "depth" for u in controlnet_units)
+                or (context.scene.use_flux_lora and context.scene.model_architecture == 'flux1')
+                or (context.scene.model_architecture == 'qwen_image_edit'
+                    and context.scene.qwen_guidance_map_type == 'depth')
+                or (context.scene.model_architecture.startswith('qwen')
+                    and context.scene.qwen_generation_method in ('refine', 'local_edit')
+                    and context.scene.qwen_refine_use_depth)
+            )
+            if need_depth and context.scene.generation_method != 'uv_inpaint':
+                for i, camera in enumerate(cameras):
+                    self._stage = f"Rendering Depth Maps ({i+1}/{len(cameras)})"
+                    _i, _cam = i, camera
+                    def _render_depth(_i=_i, _cam=_cam):
+                        bpy.context.scene.camera = _cam
+                        with _SGCameraResolution(context, _cam):
+                            self.export_depthmap(context, camera_id=_i)
+                    self._run_on_main_thread(_render_depth)
+                    if self._error:
+                        return
+                if context.scene.generation_method == 'grid':
+                    self._run_on_main_thread(
+                        lambda: self.combine_maps(context, cameras, type="depth"))
+                    if self._error:
+                        return
+
+            need_canny = any(u["unit_type"] == "canny" for u in controlnet_units)
+            if need_canny and context.scene.generation_method != 'uv_inpaint':
+                for i, camera in enumerate(cameras):
+                    self._stage = f"Rendering Canny Maps ({i+1}/{len(cameras)})"
+                    _i, _cam = i, camera
+                    def _render_canny(_i=_i, _cam=_cam):
+                        bpy.context.scene.camera = _cam
+                        with _SGCameraResolution(context, _cam):
+                            export_canny(context, camera_id=_i,
+                                         low_threshold=context.scene.canny_threshold_low,
+                                         high_threshold=context.scene.canny_threshold_high)
+                    self._run_on_main_thread(_render_canny)
+                    if self._error:
+                        return
+                if context.scene.generation_method == 'grid':
+                    self._run_on_main_thread(
+                        lambda: self.combine_maps(context, cameras, type="canny"))
+                    if self._error:
+                        return
+
+            need_normal = (
+                any(u["unit_type"] == "normal" for u in controlnet_units)
+                or (context.scene.model_architecture == 'qwen_image_edit'
+                    and context.scene.qwen_guidance_map_type == 'normal')
+            )
+            if need_normal and context.scene.generation_method != 'uv_inpaint':
+                for i, camera in enumerate(cameras):
+                    self._stage = f"Rendering Normal Maps ({i+1}/{len(cameras)})"
+                    _i, _cam = i, camera
+                    def _render_normal(_i=_i, _cam=_cam):
+                        bpy.context.scene.camera = _cam
+                        with _SGCameraResolution(context, _cam):
+                            self.export_normal(context, camera_id=_i)
+                    self._run_on_main_thread(_render_normal)
+                    if self._error:
+                        return
+                if context.scene.generation_method == 'grid':
+                    self._run_on_main_thread(
+                        lambda: self.combine_maps(context, cameras, type="normal"))
+                    if self._error:
+                        return
+
+            # Qwen guidance using Workbench
+            if (context.scene.model_architecture == 'qwen_image_edit'
+                    and context.scene.qwen_guidance_map_type == 'workbench'
+                    and context.scene.generation_method != 'uv_inpaint'):
+                workbench_dir = get_dir_path(context, "controlnet")["workbench"]
+                for i, camera in enumerate(cameras):
+                    self._stage = f"Rendering Workbench ({i+1}/{len(cameras)})"
+                    _i, _cam = i, camera
+                    def _render_wb(_i=_i, _cam=_cam):
+                        bpy.context.scene.camera = _cam
+                        with _SGCameraResolution(context, _cam):
+                            export_render(context, camera_id=_i,
+                                          output_dir=workbench_dir, filename=f"render{_i}")
+                    self._run_on_main_thread(_render_wb)
+                    if self._error:
+                        return
+                if context.scene.generation_method == 'grid':
+                    self._run_on_main_thread(
+                        lambda: self.combine_maps(context, cameras, type="workbench"))
+                    if self._error:
+                        return
+
+            # Qwen guidance using Viewport
+            elif (context.scene.model_architecture == 'qwen_image_edit'
+                  and context.scene.qwen_guidance_map_type == 'viewport'
+                  and context.scene.generation_method != 'uv_inpaint'):
+                viewport_dir = get_dir_path(context, "controlnet")["viewport"]
+                for i, camera in enumerate(cameras):
+                    self._stage = f"Rendering Viewport ({i+1}/{len(cameras)})"
+                    _i, _cam = i, camera
+                    def _render_vp(_i=_i, _cam=_cam):
+                        bpy.context.scene.camera = _cam
+                        with _SGCameraResolution(context, _cam):
+                            export_viewport(context, camera_id=_i,
+                                            output_dir=viewport_dir, filename=f"viewport{_i}")
+                    self._run_on_main_thread(_render_vp)
+                    if self._error:
+                        return
+                if context.scene.generation_method == 'grid':
+                    self._run_on_main_thread(
+                        lambda: self.combine_maps(context, cameras, type="viewport"))
+                    if self._error:
+                        return
+
+        # Refine / Local Edit mode — emit images + edge feather masks
+        is_refine = (
+            context.scene.generation_method in ('refine', 'local_edit')
+            or (context.scene.model_architecture.startswith('qwen')
+                and context.scene.qwen_generation_method in ('refine', 'local_edit'))
+        )
+        if is_refine:
+            need_feather = (
+                context.scene.refine_edge_feather_projection
+                and (context.scene.generation_method == 'local_edit'
+                     or (context.scene.model_architecture.startswith('qwen')
+                         and context.scene.qwen_generation_method == 'local_edit'))
+            )
+            for i, camera in enumerate(cameras):
+                self._stage = f"Preparing Refinement Maps ({i+1}/{len(cameras)})"
+                _i, _cam = i, camera
+                def _render_refine(_i=_i, _cam=_cam):
+                    bpy.context.scene.camera = _cam
+                    with _SGCameraResolution(context, _cam):
+                        export_emit_image(context, self._to_texture, camera_id=_i)
+                        if need_feather:
+                            render_edge_feather_mask(
+                                context, self._to_texture, _cam, _i,
+                                feather_width=context.scene.refine_edge_feather_width,
+                                softness=context.scene.refine_edge_feather_softness)
+                self._run_on_main_thread(_render_refine)
+                if self._error:
+                    return
+
     def async_generate(self, context, camera_id = None):
         """     
         Asynchronously generates the image using ComfyUI.         
@@ -958,6 +1058,11 @@ class ComfyUIGenerate(bpy.types.Operator):
         """
         self._error = None
         try:
+            # --- Render ControlNet / refine maps with live progress ---
+            self._prepare_maps(context)
+            if self._error:
+                return
+
             while self._threads_left > 0 and ComfyUIGenerate._is_running and not context.scene.generation_mode == 'project_only':
                 # Swap scene resolution to per-camera values if stored.
                 # Must use a timer callback so the write happens on the
@@ -1064,7 +1169,7 @@ class ComfyUIGenerate(bpy.types.Operator):
                             for unit in context.scene.controlnet_units:
                                 unit.strength = 0.0
                     else:
-                        self._stage = "Generating Image"
+                        self._stage = "Uploading to Server"
                     self._progress = 0
                     
                     # Generate the image
@@ -1089,6 +1194,8 @@ class ComfyUIGenerate(bpy.types.Operator):
                             else:
                                 image = self.workflow_manager.generate(context, controlnet_info=controlnet_info, ipadapter_ref_info=ipadapter_ref_info)
                         else:
+                            self._stage = "Preparing Next Camera"
+                            self._progress = 0
                             def context_callback():
                                 try:
                                     # Export visibility mask and render for the current camera, we need to use a callback to be in the main thread
@@ -1118,6 +1225,7 @@ class ComfyUIGenerate(bpy.types.Operator):
                             self._wait_event.clear()
                             if self._error:
                                 return
+                            self._stage = "Uploading to Server"
                             # Get info for the previous render and mask
                             render_info = self._get_uploaded_image_info(context, "inpaint", subtype="render", camera_id=self._current_image)
                             mask_info = self._get_uploaded_image_info(context, "inpaint", subtype="visibility", camera_id=self._current_image)
@@ -1186,6 +1294,7 @@ class ComfyUIGenerate(bpy.types.Operator):
                     
                      # Sequential mode callback
                     if context.scene.generation_method == 'sequential':
+                        self._stage = "Projecting Image"
                         def image_project_callback():
                             try:
                                 redraw_ui(context)
@@ -1276,6 +1385,7 @@ class ComfyUIGenerate(bpy.types.Operator):
             return None
         
         if context.scene.view_blend_use_color_match and self._to_texture:
+            self._stage = "Matching Colors"
             # Use the first object in the target list as the color reference
             ref_np = _get_viewport_ref_np(self._to_texture[0])
             if ref_np is not None:

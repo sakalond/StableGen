@@ -2,7 +2,7 @@
 
 import bpy  # pylint: disable=import-error
 
-_DEFAULTS = {'ping': 1.0, 'api': 10.0, 'transfer': 120.0, 'reboot': 120.0}
+_DEFAULTS = {'ping': 1.0, 'api': 10.0, 'transfer': 120.0, 'reboot': 120.0, 'mesh_gen': 600.0}
 
 
 def get_timeout(category, default=None):

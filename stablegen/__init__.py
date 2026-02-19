@@ -423,6 +423,18 @@ class StableGenAddonPreferences(bpy.types.AddonPreferences):
         precision=0,
     ) # type: ignore
 
+    timeout_mesh_gen: bpy.props.FloatProperty(
+        name="Mesh Generation Timeout (s)",
+        description="Timeout for TRELLIS.2 mesh generation WebSocket. "
+                    "Mesh simplification / post-processing can take several "
+                    "minutes without sending progress messages",
+        default=600.0,
+        min=60.0,
+        max=3600.0,
+        step=100,
+        precision=0,
+    ) # type: ignore
+
     def draw(self, context):
         """     
         Draws the preferences panel.         
@@ -481,6 +493,7 @@ class StableGenAddonPreferences(bpy.types.AddonPreferences):
             col.prop(self, "timeout_api")
             col.prop(self, "timeout_transfer")
             col.prop(self, "timeout_reboot")
+            col.prop(self, "timeout_mesh_gen")
 
 class CheckServerStatus(bpy.types.Operator):
     """Checks if the ComfyUI server is reachable."""
@@ -2835,6 +2848,11 @@ def register():
         description="Toggle TRELLIS.2 camera placement settings",
         default=False
     )
+    bpy.types.Scene.show_trellis2_artifact_filter = bpy.props.BoolProperty(
+        name="Show Artifact Filtering",
+        description="Toggle TRELLIS.2 artifact filtering settings",
+        default=False
+    )
     bpy.types.Scene.trellis2_last_input_image = bpy.props.StringProperty(
         name="TRELLIS.2 Last Input Image",
         description="Path to the image most recently used as TRELLIS.2 input (set automatically after generation)",
@@ -3058,6 +3076,38 @@ def register():
         update=update_parameters
     )
 
+    # Artifact Filtering
+    bpy.types.Scene.trellis2_artifact_laplacian_sigma = bpy.props.FloatProperty(
+        name="Laplacian Sigma",
+        description="Laplacian displacement outlier threshold in standard deviations. "
+                    "Vertices displaced more than this many σ from the mesh-wide mean "
+                    "are flagged as spikes. Lower = stricter filtering",
+        default=8.0,
+        min=1.0,
+        max=30.0,
+        step=10,
+        precision=1,
+        update=update_parameters
+    )
+    bpy.types.Scene.trellis2_artifact_spike_abs_max = bpy.props.IntProperty(
+        name="Max Spike Count",
+        description="Maximum number of Laplacian-outlier vertices allowed before "
+                    "the mesh is considered corrupt and triggers a retry",
+        default=25,
+        min=1,
+        max=500,
+        update=update_parameters
+    )
+    bpy.types.Scene.trellis2_artifact_max_retries = bpy.props.IntProperty(
+        name="Max Retries",
+        description="Maximum number of retry attempts when artifact filtering "
+                    "detects a corrupt mesh (each retry clears Triton cache and reboots ComfyUI)",
+        default=1,
+        min=0,
+        max=10,
+        update=update_parameters
+    )
+
 def unregister():   
     """     
     Unregisters the addon.         
@@ -3209,6 +3259,8 @@ def unregister():
         'trellis2_auto_lighting',
         'trellis2_skip_texture', 'trellis2_low_vram', 'trellis2_bg_removal', 'trellis2_background_color',
         'trellis2_fill_holes',
+        'trellis2_artifact_laplacian_sigma', 'trellis2_artifact_spike_abs_max',
+        'trellis2_artifact_max_retries', 'show_trellis2_artifact_filter',
     ]
     for prop in trellis2_props:
         if hasattr(bpy.types.Scene, prop):

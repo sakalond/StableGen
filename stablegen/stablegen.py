@@ -771,6 +771,18 @@ class StableGenPanel(bpy.types.Panel):
                         row = content_box.row()
                         row.prop(scene, "trellis2_low_vram", text="Low VRAM Background Removal", toggle=True, icon="GHOST_ENABLED")
 
+                    content_box.separator()
+
+                    # Artifact Filtering (nested collapsible)
+                    af_box = draw_collapsible_section(content_box, "show_trellis2_artifact_filter", "Artifact Filtering", icon="FILTER")
+                    if af_box:
+                        row = af_box.row()
+                        row.prop(scene, "trellis2_artifact_laplacian_sigma", text="Laplacian Sigma")
+                        row = af_box.row()
+                        row.prop(scene, "trellis2_artifact_spike_abs_max", text="Max Spike Count")
+                        row = af_box.row()
+                        row.prop(scene, "trellis2_artifact_max_retries", text="Max Retries")
+
             # --- TRELLIS.2: Native Texture Settings ---
             if is_trellis2 and trellis2_tex_mode == 'native':
                 content_box = draw_collapsible_section(advanced_params_box, "show_trellis2_texture_settings", "Texture Settings (TRELLIS.2 Native)", icon="TEXTURE")

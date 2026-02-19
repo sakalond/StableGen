@@ -1173,13 +1173,10 @@ class WorkflowManager:
     # ── GLB mesh validation ───────────────────────────────────────────
     _GLB_VERTEX_THRESHOLD = 10.0    # absolute coordinate cap
     _GLB_OUTLIER_SIGMA   = 8.0     # for absolute-value outlier check
-    _GLB_LAPLACIAN_SIGMA = 8.0    # Laplacian displacement outlier threshold — set high
-                                    # (10σ) so only truly extreme needle-like spikes are
-                                    # flagged; legitimate sharp edges/corners sit at ~5-8σ
+    _GLB_LAPLACIAN_SIGMA = 8.0    # fallback — overridden by scene property
     _GLB_SPIKE_FRACTION  = 0.002  # 0.02% — very tight because at 10σ virtually all
                                     # flagged vertices are genuine artifacts
-    _GLB_SPIKE_ABS_MAX   = 25      # absolute cap — with 10σ even a handful of
-                                    # flagged vertices indicates corruption
+    _GLB_SPIKE_ABS_MAX   = 25      # fallback — overridden by scene property
 
     @staticmethod
     def _validate_glb_mesh(glb_bytes, threshold=None, sigma=None):
@@ -1202,7 +1199,10 @@ class WorkflowManager:
             threshold = WorkflowManager._GLB_VERTEX_THRESHOLD
         if sigma is None:
             sigma = WorkflowManager._GLB_OUTLIER_SIGMA
-        lap_sigma = WorkflowManager._GLB_LAPLACIAN_SIGMA
+        # Read user-facing settings if available, else use class defaults
+        _scene = getattr(bpy.context, 'scene', None)
+        lap_sigma = getattr(_scene, 'trellis2_artifact_laplacian_sigma',
+                            WorkflowManager._GLB_LAPLACIAN_SIGMA)
         spike_frac = WorkflowManager._GLB_SPIKE_FRACTION
 
         if not glb_bytes or len(glb_bytes) < 20:
@@ -1355,7 +1355,8 @@ class WorkflowManager:
             # Check overall spike count (absolute cap + fraction)
             if total_verts > 0 and total_spikes > 0:
                 frac = total_spikes / total_verts
-                abs_max = WorkflowManager._GLB_SPIKE_ABS_MAX
+                abs_max = getattr(_scene, 'trellis2_artifact_spike_abs_max',
+                                  WorkflowManager._GLB_SPIKE_ABS_MAX)
                 if total_spikes > abs_max:
                     return False, (
                         f"Mesh has {total_spikes} Laplacian-outlier vertices "
@@ -1528,6 +1529,7 @@ class WorkflowManager:
 
         is_local = self._is_local_server(server_address)
         original_seed = context.scene.trellis2_seed
+        max_retries = getattr(context.scene, 'trellis2_artifact_max_retries', 1)
 
         try:
             # ── First attempt ──────────────────────────────────────────
@@ -1544,18 +1546,26 @@ class WorkflowManager:
 
             # Mesh is corrupt — Triton JIT cache is the most common cause.
             print(f"[TRELLIS2] Mesh validation FAILED: {reason}")
-            print("[TRELLIS2] Attempting automatic recovery "
-                  "(Triton cache clear + ComfyUI reboot)...")
 
-            # ── Recovery: clear cache + reboot ─────────────────────────
-            if is_local:
-                self._clear_triton_cache()
+            if max_retries <= 0:
+                print("[TRELLIS2] Artifact retries disabled (max_retries=0).")
+            else:
+                print(f"[TRELLIS2] Attempting automatic recovery "
+                      f"(up to {max_retries} retries, Triton cache clear + ComfyUI reboot)...")
 
-            rebooted = self._reboot_comfyui(server_address)
+            rebooted = False
+            for retry_i in range(max_retries):
+                # ── Recovery: clear cache + reboot ─────────────────────
+                if is_local:
+                    self._clear_triton_cache()
 
-            if rebooted:
-                # One final attempt after a clean reboot
-                print("[TRELLIS2] Running final attempt after reboot...")
+                rebooted = self._reboot_comfyui(server_address)
+
+                if not rebooted:
+                    print(f"[TRELLIS2] Could not reboot ComfyUI — aborting retries.")
+                    break
+
+                print(f"[TRELLIS2] Retry {retry_i + 1}/{max_retries} after reboot...")
                 new_seed = random.randint(0, 2**31 - 1)
                 context.scene.trellis2_seed = new_seed
                 client_id = str(uuid.uuid4())
@@ -1569,8 +1579,7 @@ class WorkflowManager:
                 if ok:
                     return result
 
-                print(f"[TRELLIS2] Post-reboot attempt also failed: {reason}")
-                # Fall through to the warning below
+                print(f"[TRELLIS2] Retry {retry_i + 1}/{max_retries} also failed: {reason}")
 
             # ── Truly exhausted ────────────────────────────────────────
             if is_local:
@@ -1723,6 +1732,11 @@ class WorkflowManager:
         if ws is None:
             return {"error": "conn_failed"}
 
+        # TRELLIS.2 simplification / post-processing can take several
+        # minutes without sending any WS messages.  Use the user-
+        # configurable mesh generation timeout.
+        ws.settimeout(get_timeout('mesh_gen'))
+
         # Let the operator close this WS on cancel
         if hasattr(self.operator, '_active_ws'):
             self.operator._active_ws = ws
@@ -1793,6 +1807,13 @@ class WorkflowManager:
             while True:
                 try:
                     out = ws.recv()
+                except websocket.WebSocketTimeoutException:
+                    # Timeout on recv — server is still alive but a heavy
+                    # step (e.g. simplification) took longer than expected.
+                    # Keep waiting instead of treating it as a crash.
+                    print("[TRELLIS2] WebSocket recv timed out — "
+                          "server may still be processing. Retrying...")
+                    continue
                 except (ConnectionError, OSError, Exception) as ws_err:
                     err_name = type(ws_err).__name__
                     print(f"[TRELLIS2] WebSocket died ({err_name}): {ws_err}")
@@ -2553,6 +2574,10 @@ class WorkflowManager:
                     progress = (message['data']['value'] / message['data']['max']) * 100
                     if progress != 0:
                         self.operator._progress = progress  # Update progress for UI
+                        # Transition stage from "Uploading" to "Generating" on
+                        # first actual sampler progress from the server.
+                        if self.operator._stage == "Uploading to Server":
+                            self.operator._stage = "Generating Image"
                         # Also update 3-tier detail when called from Trellis2Generate
                         if hasattr(self.operator, '_detail_progress'):
                             self.operator._detail_progress = progress
