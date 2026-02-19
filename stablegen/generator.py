@@ -2108,6 +2108,8 @@ class Trellis2Generate(bpy.types.Operator):
     _error = None
     _glb_data = None
     _is_running = False
+    _cancelled = False
+    _active_ws = None  # WebSocket reference for cancel-time close
     _progress = 0.0
     _stage = "Initializing"
     workflow_manager: object = None
@@ -2178,8 +2180,34 @@ class Trellis2Generate(bpy.types.Operator):
 
     def execute(self, context):
         if Trellis2Generate._is_running:
-            # Cancel
+            # Cancel — tell the server to stop and close the WebSocket
+            # so the background thread unblocks from ws.recv().
+            Trellis2Generate._cancelled = True
             Trellis2Generate._is_running = False
+
+            # Send /interrupt to ComfyUI (same as standard texturing cancel)
+            try:
+                server_address = context.preferences.addons[__package__].preferences.server_address
+                data = json.dumps({"client_id": str(uuid.uuid4())}).encode('utf-8')
+                req = urllib.request.Request("http://{}/interrupt".format(server_address), data=data)
+                urllib.request.urlopen(req)
+            except Exception:
+                pass  # Best effort — server may already be gone
+
+            # Close the active WebSocket so the thread's ws.recv() raises
+            ws = Trellis2Generate._active_ws
+            if ws:
+                try:
+                    ws.close()
+                except Exception:
+                    pass
+                Trellis2Generate._active_ws = None
+
+            # Wake up the gallery event in case the thread is blocked there
+            if self._gallery_event:
+                self._gallery_action = 'cancel'
+                self._gallery_event.set()
+
             self.report({'WARNING'}, "TRELLIS.2 generation cancelled")
             return {'FINISHED'}
 
@@ -2331,8 +2359,16 @@ class Trellis2Generate(bpy.types.Operator):
         # Thread finished - clean up timer
         context.window_manager.event_timer_remove(self._timer)
         self._timer = None
+        was_cancelled = Trellis2Generate._cancelled
         Trellis2Generate._is_running = False
+        Trellis2Generate._cancelled = False
+        Trellis2Generate._active_ws = None
         self._cleanup_gallery()
+
+        # User cancelled — exit silently (no error toast)
+        if was_cancelled:
+            context.scene.generation_status = 'idle'
+            return {'FINISHED'}
 
         if self._error:
             self.report({'ERROR'}, f"TRELLIS.2 error: {self._error}")
@@ -2738,6 +2774,10 @@ class Trellis2Generate(bpy.types.Operator):
                 self._phase_progress = 100
                 self._update_overall()
 
+                # Early exit if cancelled during txt2img
+                if self._cancelled:
+                    return
+
                 # Save the generated image bytes to the revision directory
                 save_dir = revision_dir if revision_dir else (
                     context.preferences.addons[__package__].preferences.output_dir
@@ -2760,6 +2800,10 @@ class Trellis2Generate(bpy.types.Operator):
                 except Exception:
                     pass
 
+                # Early exit if cancelled during txt2img
+                if self._cancelled:
+                    return
+
             # --- Phase 2 (or 1 if no txt2img): TRELLIS.2 mesh generation ---
             trellis_phase = 2 if gen_from == 'prompt' else 1
             self._current_phase = trellis_phase
@@ -2775,11 +2819,17 @@ class Trellis2Generate(bpy.types.Operator):
 
             result = self.workflow_manager.generate_trellis2(context, image_path)
 
+            # Suppress error reporting when the user cancelled
+            if self._cancelled:
+                return
+
             if isinstance(result, dict) and "error" in result:
                 self._error = result["error"]
             else:
                 self._glb_data = result
 
         except Exception as e:
+            if self._cancelled:
+                return  # Swallow exceptions caused by cancel-time WS close
             self._error = str(e)
             traceback.print_exc()

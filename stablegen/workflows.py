@@ -897,11 +897,17 @@ class WorkflowManager:
         if ws is None:
             return {"error": "WebSocket connection failed"}
 
+        # Let the operator close this WS on cancel
+        if hasattr(self.operator, '_active_ws'):
+            self.operator._active_ws = ws
+
         try:
             images = self._execute_prompt_and_get_images(
                 ws, prompt, client_id, server_address, {"save_image": save_node}
             )
         finally:
+            if hasattr(self.operator, '_active_ws'):
+                self.operator._active_ws = None
             try:
                 ws.close()
             except Exception:
@@ -1651,7 +1657,8 @@ class WorkflowManager:
 
         # Configure conditioning
         prompt[NODES['get_conditioning']]["inputs"]["background_color"] = scene.trellis2_background_color
-        prompt[NODES['get_conditioning']]["inputs"]["include_1024"] = scene.trellis2_include_1024
+        # Auto-determine whether 1024 conditioning is needed from resolution mode
+        prompt[NODES['get_conditioning']]["inputs"]["include_1024"] = scene.trellis2_resolution != '512'
 
         # Configure shape generation
         seed = scene.trellis2_seed
@@ -1712,6 +1719,10 @@ class WorkflowManager:
         ws = self._connect_to_websocket(server_address, client_id)
         if ws is None:
             return {"error": "conn_failed"}
+
+        # Let the operator close this WS on cancel
+        if hasattr(self.operator, '_active_ws'):
+            self.operator._active_ws = ws
 
         prompt_id = None
         try:
@@ -1782,6 +1793,9 @@ class WorkflowManager:
                 except (ConnectionError, OSError, Exception) as ws_err:
                     err_name = type(ws_err).__name__
                     print(f"[TRELLIS2] WebSocket died ({err_name}): {ws_err}")
+                    # Distinguish user-initiated cancel from a real crash
+                    if getattr(self.operator, '_cancelled', False):
+                        return {"error": "cancelled"}
                     return {"error": (
                         "ComfyUI server crashed during TRELLIS.2 generation "
                         "(likely VRAM exhaustion). Please restart ComfyUI, "
@@ -1905,6 +1919,8 @@ class WorkflowManager:
                         print(f"[TRELLIS2] Error: {self.operator._error}")
                         return {"error": self.operator._error}
         finally:
+            if hasattr(self.operator, '_active_ws'):
+                self.operator._active_ws = None
             if ws:
                 try:
                     ws.close()

@@ -2716,6 +2716,7 @@ def register():
         description="Model resolution for generation. Higher values use more VRAM",
         items=[
             ('512', '512', 'Low resolution, fast, less VRAM'),
+            ('1024', '1024', 'Direct 1024 generation with higher sparse structure resolution'),
             ('1024_cascade', '1024 Cascade', 'Medium resolution with cascade (recommended)'),
             ('1536_cascade', '1536 Cascade', 'High resolution with cascade, most VRAM'),
         ],
@@ -2886,12 +2887,6 @@ def register():
         default='black',
         update=update_parameters
     )
-    bpy.types.Scene.trellis2_include_1024 = bpy.props.BoolProperty(
-        name="Include 1024 Conditioning",
-        description="Include 1024-resolution conditioning. Disable for lower VRAM usage with 512 resolution",
-        default=True,
-        update=update_parameters
-    )
     bpy.types.Scene.trellis2_fill_holes = bpy.props.BoolProperty(
         name="Fill Holes",
         description="Fill holes in the mesh during simplification (shape-only mode)",
@@ -3049,7 +3044,7 @@ def unregister():
         'trellis2_post_processing_enabled',
         'trellis2_auto_lighting',
         'trellis2_skip_texture', 'trellis2_low_vram', 'trellis2_bg_removal', 'trellis2_background_color',
-        'trellis2_include_1024', 'trellis2_fill_holes',
+        'trellis2_fill_holes',
     ]
     for prop in trellis2_props:
         if hasattr(bpy.types.Scene, prop):

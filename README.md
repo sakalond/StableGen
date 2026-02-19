@@ -1,14 +1,12 @@
-# StableGen: AI-Powered 3D Texturing in Blender ✨
+# StableGen: AI-Powered 3D Generation & Texturing in Blender ✨
 
 [![License: GPL v3](https://img.shields.io/badge/License-GPLv3-blue.svg)](https://www.gnu.org/licenses/gpl-3.0)
 [![Blender Version](https://img.shields.io/badge/Blender-4.2+%20%7C%205.1%2B-orange.svg)](#system-requirements)
 [![GitHub All Releases](https://img.shields.io/github/downloads/sakalond/stablegen/total?color=brightgreen&label=Downloads)](https://github.com/sakalond/stablegen/releases)
 
-**Transform your 3D texturing workflow with the power of generative AI, directly within Blender!**
+**Create 3D assets from images and prompts, then texture and refine them — all inside Blender.**
 
-StableGen is an open-source Blender plugin designed to seamlessly integrate advanced diffusion models (SDXL, FLUX.1-dev, Qwen Image Edit 2509) into your creative process. Generate complex, coherent, and controllable textures for your 3D models and entire scenes using a flexible ComfyUI backend.
-
-New: **TRELLIS.2 Image-to-3D** — generate textured 3D meshes from a single reference image, powered by [ComfyUI-TRELLIS2](https://github.com/PozzettiAndrea/ComfyUI-TRELLIS2).
+StableGen is an open-source Blender addon that brings generative AI into your 3D workflow. **Generate** fully textured 3D meshes from a single image or text prompt via [TRELLIS.2](https://github.com/microsoft/TRELLIS.2), then **texture and refine** them — or any existing model — using SDXL, FLUX.1-dev, or Qwen Image Edit through a flexible [ComfyUI](https://github.com/comfyanonymous/ComfyUI) backend.
 
 ---
 
@@ -36,8 +34,16 @@ New: **TRELLIS.2 Image-to-3D** — generate textured 3D meshes from a single ref
 
 ## 🌟 Key Features
 
-StableGen empowers 3D artists by bringing cutting-edge AI texturing capabilities into Blender:
+StableGen brings AI-powered 3D generation and texturing directly into Blender:
 
+* 🧊 **TRELLIS.2: Image & Prompt to 3D:**
+    * Generate fully textured 3D meshes from a single reference image or text prompt using Microsoft's [TRELLIS.2](https://github.com/microsoft/TRELLIS.2) (4B-parameter model).
+    * **Multiple resolution modes:** 512, 1024, 1024 Cascade (recommended), and 1536 Cascade for maximum geometric detail.
+    * **Flexible texture pipeline:** Use TRELLIS.2's native PBR textures, or automatically texture the generated mesh with SDXL, FLUX.1-dev, or Qwen Image Edit for higher-quality diffusion textures.
+    * **Preview Gallery:** Generate multiple candidate images with different seeds and pick the best before committing to 3D generation.
+    * **Smart mesh handling:** Auto-recovery from mesh corruption, configurable decimation/remeshing, import scaling, and studio lighting setup.
+    * VRAM-conscious: disk offloading, configurable attention backend, and low-VRAM modes.
+    * Powered by [ComfyUI-TRELLIS2](https://github.com/PozzettiAndrea/ComfyUI-TRELLIS2) (installable via `installer.py`).
 * 🌍 **Scene-Wide Multi-Mesh Texturing:**
     * Don't just texture one mesh at a time! StableGen is designed to apply textures to **all mesh objects in your scene simultaneously** from your defined camera viewpoints. Alternatively, you can choose to texture only selected objects.
     * Achieve a cohesive look across entire environments or collections of assets in a single generation pass.
@@ -60,11 +66,6 @@ StableGen empowers 3D artists by bringing cutting-edge AI texturing capabilities
     * Leverage multiple ControlNet units (Depth, Canny, Normal) simultaneously to ensure generated textures respect your model's geometry.
     * Fine-tune strength, start/end steps for each ControlNet unit.
     * Supports custom ControlNet model mapping.
-* 🧊 **TRELLIS.2 Image-to-3D (Experimental):**
-    * Generate a fully textured 3D mesh from a single reference image using TRELLIS.2.
-    * Configurable resolution, VRAM mode (CPU/disk offloading for 16GB cards), guidance strengths, and mesh export settings.
-    * GLB output is automatically imported into the Blender scene.
-    * Requires `ComfyUI-TRELLIS2` custom node (installable via `installer.py`).
 * 🖌️ **Powerful Style Guidance with IPAdapter:**
     * Use external reference images to guide the style, mood, and content of your textures with IPAdapter.
     * Employ IPAdapter without an reference image for enhanced consistency in multi-view generation modes.
@@ -403,7 +404,7 @@ The TRELLIS.2 feature relies on several third-party components, each with its ow
 | [FlexGEMM](https://github.com/JeffreyXiang/FlexGEMM) (sparse convolutions) | MIT | ✅ Yes |
 | [CuMesh](https://github.com/JeffreyXiang/CuMesh) (mesh operations) | MIT | ✅ Yes |
 | O-Voxel (voxel processing, part of TRELLIS.2) | MIT | ✅ Yes |
-| [nvdiffrast](https://github.com/NVlabs/nvdiffrast) (NVIDIA) | NVIDIA Source Code License (1-Way Commercial) | ❌ **Non-commercial only** |
+| [nvdiffrast](https://github.com/NVlabs/nvdiffrast) (NVIDIA) | NVIDIA Source Code License | ❌ **Non-commercial only** |
 | [nvdiffrec](https://github.com/NVlabs/nvdiffrec) (NVIDIA) | NVIDIA Source Code License | ❌ **Non-commercial only** |
 
 **Important:** The NVIDIA libraries (`nvdiffrast` and `nvdiffrec`) are only used when the TRELLIS.2 **Texture Mode** is set to **"Native (TRELLIS.2)"** — specifically for UV rasterization and PBR texture baking. Their license restricts usage to *"research or evaluation purposes only and not for any direct or indirect monetary gain"* (Section 3.3). Only NVIDIA and its affiliates may use these libraries commercially.
