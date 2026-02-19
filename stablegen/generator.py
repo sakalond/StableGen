@@ -344,6 +344,7 @@ class ComfyUIGenerate(bpy.types.Operator):
     _progress = 0
     _error = None
     _is_running = False
+    _active_ws = None  # WebSocket reference for cancel-time close
     _threads_left = 0
     _cameras = None
     _selected_camera_ids = None
@@ -939,6 +940,14 @@ class ComfyUIGenerate(bpy.types.Operator):
         context.scene.generation_status = 'waiting'
         ComfyUIGenerate._is_running = False
         urllib.request.urlopen(req)
+        # Close active WebSocket to unblock recv() immediately
+        ws = getattr(ComfyUIGenerate, '_active_ws', None)
+        if ws:
+            try:
+                ws.close()
+            except Exception:
+                pass
+            ComfyUIGenerate._active_ws = None
         remove_empty_dirs(context)
 
     def async_generate(self, context, camera_id = None):
@@ -949,7 +958,7 @@ class ComfyUIGenerate(bpy.types.Operator):
         """
         self._error = None
         try:
-            while self._threads_left > 0 and not context.scene.generation_mode == 'project_only':
+            while self._threads_left > 0 and ComfyUIGenerate._is_running and not context.scene.generation_mode == 'project_only':
                 # Swap scene resolution to per-camera values if stored.
                 # Must use a timer callback so the write happens on the
                 # main thread; writing RNA from a background thread would
@@ -2636,8 +2645,8 @@ class Trellis2Generate(bpy.types.Operator):
         _pre_tex_cameras = {obj.name for obj in bpy.context.scene.objects if obj.type == 'CAMERA'}
 
         def _pipeline_watcher():
-            """Clear the pipeline flag when texturing finishes."""
-            if bpy.context.scene.generation_status == 'idle':
+            """Clear the pipeline flag when texturing finishes or is cancelled."""
+            if bpy.context.scene.generation_status in ('idle', 'waiting'):
                 bpy.context.scene.trellis2_pipeline_active = False
                 print("[TRELLIS2] Pipeline complete — overall bar removed")
 

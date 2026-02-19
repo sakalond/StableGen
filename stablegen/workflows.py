@@ -900,6 +900,8 @@ class WorkflowManager:
         # Let the operator close this WS on cancel
         if hasattr(self.operator, '_active_ws'):
             self.operator._active_ws = ws
+            # Also set on class level so cancel from a new instance can find it
+            type(self.operator)._active_ws = ws
 
         try:
             images = self._execute_prompt_and_get_images(
@@ -908,6 +910,7 @@ class WorkflowManager:
         finally:
             if hasattr(self.operator, '_active_ws'):
                 self.operator._active_ws = None
+                type(self.operator)._active_ws = None
             try:
                 ws.close()
             except Exception:
@@ -1936,11 +1939,16 @@ class WorkflowManager:
 
         glb_source_path = glb_output_path  # May already be set from WS event
 
+        # Helper: bail early when the user hits Cancel
+        def _cancelled():
+            return getattr(self.operator, '_cancelled', False)
+
         # Strategy 2: Query history for the output path
-        if not glb_source_path:
+        if not glb_source_path and not _cancelled():
             try:
                 history_url = f"http://{server_address}/history/{prompt_id}"
-                history_response = json.loads(urllib.request.urlopen(history_url).read())
+                history_response = json.loads(urllib.request.urlopen(
+                    history_url, timeout=get_timeout('api')).read())
 
                 if prompt_id in history_response:
                     outputs = history_response[prompt_id].get("outputs", {})
@@ -1970,7 +1978,7 @@ class WorkflowManager:
                 print(f"[TRELLIS2] History query failed: {e}")
 
         # Strategy 3: Read directly from disk (works when ComfyUI is local)
-        if glb_source_path and os.path.isfile(glb_source_path):
+        if glb_source_path and not _cancelled() and os.path.isfile(glb_source_path):
             try:
                 print(f"[TRELLIS2] Reading GLB directly from disk: {glb_source_path}")
                 with open(glb_source_path, 'rb') as f:
@@ -1982,12 +1990,12 @@ class WorkflowManager:
                 print(f"[TRELLIS2] Direct file read failed: {e}")
 
         # Strategy 4: HTTP download via /view endpoint
-        if glb_source_path:
+        if glb_source_path and not _cancelled():
             glb_filename = os.path.basename(glb_source_path)
             try:
                 view_url = f"http://{server_address}/view?filename={urllib.parse.quote(glb_filename)}&type=output"
                 print(f"[TRELLIS2] Downloading GLB via HTTP: {view_url}")
-                glb_response = urllib.request.urlopen(view_url)
+                glb_response = urllib.request.urlopen(view_url, timeout=get_timeout('transfer'))
                 glb_data = glb_response.read()
                 print(f"[TRELLIS2] Downloaded GLB: {len(glb_data)} bytes")
                 if glb_data and len(glb_data) > 0:
@@ -1995,19 +2003,24 @@ class WorkflowManager:
             except Exception as e:
                 print(f"[TRELLIS2] HTTP download failed: {e}")
 
+        if _cancelled():
+            return {"error": "cancelled"}
+
         # Strategy 5: Scan ComfyUI output directory for files matching our prefix
         # This handles the case where the export node path wasn't captured via API
         print(f"[TRELLIS2] Scanning for files with prefix '{unique_prefix}'...")
 
         # 5a: Try to discover ComfyUI's output directory from the server
         comfyui_output_dir = None
-        try:
-            system_url = f"http://{server_address}/system_stats"
-            system_response = json.loads(urllib.request.urlopen(system_url).read())
-            # Some ComfyUI versions include directory info
-            comfyui_output_dir = system_response.get("output_dir")
-        except Exception:
-            pass
+        if not _cancelled():
+            try:
+                system_url = f"http://{server_address}/system_stats"
+                system_response = json.loads(urllib.request.urlopen(
+                    system_url, timeout=get_timeout('api')).read())
+                # Some ComfyUI versions include directory info
+                comfyui_output_dir = system_response.get("output_dir")
+            except Exception:
+                pass
 
         # 5b: Try common local paths relative to server
         if not comfyui_output_dir:
@@ -2049,20 +2062,30 @@ class WorkflowManager:
 
         # 5c: Try HTTP download with timestamp-based filename guesses
         # The export nodes use format: {prefix}_{YYYYMMDD_HHMMSS}.glb
+        # Use a short timeout per request so slow remote connections don't
+        # block for minutes, and check for cancellation each iteration.
+        is_remote = not self._is_local_server(server_address)
+        scan_range = 30 if is_remote else 120  # fewer guesses for remote
+        scan_timeout = 5 if is_remote else 10   # per-request timeout (seconds)
         now = datetime.now()
-        for delta_seconds in range(0, 120):  # Try last 2 minutes of timestamps
+        for delta_seconds in range(0, scan_range):
+            if _cancelled():
+                return {"error": "cancelled"}
             for delta in [timedelta(seconds=-delta_seconds), timedelta(seconds=delta_seconds)]:
                 candidate_time = now + delta
                 candidate_name = f"{unique_prefix}_{candidate_time.strftime('%Y%m%d_%H%M%S')}.glb"
                 try:
                     view_url = f"http://{server_address}/view?filename={urllib.parse.quote(candidate_name)}&type=output"
-                    glb_response = urllib.request.urlopen(view_url)
+                    glb_response = urllib.request.urlopen(view_url, timeout=scan_timeout)
                     glb_data = glb_response.read()
                     if glb_data and len(glb_data) > 0:
                         print(f"[TRELLIS2] Found GLB via timestamp scan: {candidate_name} ({len(glb_data)} bytes)")
                         return glb_data
                 except Exception:
                     continue
+
+        if _cancelled():
+            return {"error": "cancelled"}
 
         self.operator._error = (
             f"Failed to retrieve GLB from ComfyUI. "
@@ -2427,7 +2450,13 @@ class WorkflowManager:
         """Establishes WebSocket connection to ComfyUI server."""
         try:
             ws = websocket.WebSocket()
+            # Use a short timeout for the initial TCP+WS handshake.
+            ws.settimeout(get_timeout('api'))
             ws.connect(f"ws://{server_address}/ws?clientId={client_id}")
+            # Switch to a longer timeout for recv() during generation —
+            # ComfyUI may take a while between progress messages (model
+            # loading, TRELLIS.2 processing, etc.).
+            ws.settimeout(get_timeout('transfer'))
             return ws
         except ConnectionRefusedError:
             self._error = f"Connection to ComfyUI WebSocket was refused at {server_address}. Is ComfyUI running and accessible?"
@@ -2497,7 +2526,17 @@ class WorkflowManager:
         current_node = ""
         
         while True:
-            out = ws.recv()
+            try:
+                out = ws.recv()
+            except websocket.WebSocketTimeoutException:
+                print(f"[StableGen] WebSocket recv timed out after "
+                      f"{get_timeout('transfer')}s. The server may be "
+                      f"slow or the connection was lost.")
+                break
+            except (ConnectionError, OSError, Exception) as ws_err:
+                print(f"[StableGen] WebSocket error during generation: {ws_err}")
+                break
+
             if isinstance(out, str):
                 message = json.loads(out)
                 
@@ -2573,7 +2612,7 @@ class WorkflowManager:
             }).encode('utf-8')
             
             req = urllib.request.Request(f"http://{server_address}/prompt", data=data)
-            response = json.loads(urllib.request.urlopen(req).read())
+            response = json.loads(urllib.request.urlopen(req, timeout=get_timeout('api')).read())
             
             return response['prompt_id']
         except Exception as e:

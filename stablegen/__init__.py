@@ -55,6 +55,65 @@ _cached_lora_list = [("NONE_AVAILABLE", "None available", "Fetch models from ser
 _cached_checkpoint_architecture = None
 _pending_checkpoint_refresh_architecture = None
 
+# Counter for in-flight async refresh operations (checkpoint, LoRA, controlnet).
+# The UI checks this to display a "Refreshing…" indicator.
+_pending_refreshes = 0
+
+# ---------------------------------------------------------------------------
+#  Async network helper — run blocking I/O off the main thread
+# ---------------------------------------------------------------------------
+import threading as _threading
+import traceback as _traceback
+
+# Monotonically incrementing token so we can discard stale results when the
+# server address changes while a request is still in-flight.
+_async_generation = 0
+
+def _run_async(work_fn, done_fn, poll_interval=0.25, track_generation=False):
+    """Run *work_fn* in a background thread; call *done_fn(result)* on the
+    main thread via ``bpy.app.timers`` when finished.
+
+    *work_fn* receives no arguments and should return a result dict/object.
+    *done_fn* receives that result.  Both run without any lock — *done_fn*
+    is guaranteed to execute on the main Blender thread.
+
+    If *track_generation* is True the call increments the global
+    ``_async_generation`` counter and the result is silently discarded if
+    a newer tracked call was started before this one finishes.  Use this
+    only for server-address-change callbacks where stale results must be
+    dropped; refresh operators should leave it False so their results are
+    never accidentally discarded.
+    """
+    global _async_generation
+    if track_generation:
+        _async_generation += 1
+    gen = _async_generation
+
+    container = {}  # mutable box for the thread to deposit its result
+
+    def _worker():
+        try:
+            container['result'] = work_fn()
+        except Exception:
+            _traceback.print_exc()
+            container['result'] = None
+
+    t = _threading.Thread(target=_worker, daemon=True)
+    t.start()
+
+    def _poll():
+        # Discard result if the server address changed after we started.
+        if gen != _async_generation:
+            return None  # stop polling — stale
+        if t.is_alive():
+            return poll_interval  # keep polling
+        try:
+            done_fn(container.get('result'))
+        except Exception:
+            _traceback.print_exc()
+        return None  # done
+    bpy.app.timers.register(_poll, first_interval=poll_interval)
+
 
 def update_architecture_mode(self, context):
     """Called when the user changes the architecture_mode dropdown.
@@ -178,78 +237,64 @@ def update_combined(self, context):
             prefs.server_address = clean_address
             return None
 
-    # Check if server is reachable
-    if not check_server_availability(context.preferences.addons[__package__].preferences.server_address, timeout=get_timeout('ping')):
-        context.preferences.addons[__package__].preferences.server_online = False
-        print("ComfyUI server is not reachable.")
+    server_address = prefs.server_address
+
+    if not server_address:
+        prefs.server_online = False
+        global _cached_checkpoint_list, _cached_lora_list
+        _cached_checkpoint_list = [("NO_SERVER", "Set Server Address", "...")]
+        _cached_lora_list = [("NO_SERVER", "Set Server Address", "...")]
         return None
-    else:
-        context.preferences.addons[__package__].preferences.server_online = True
 
-    # Auto-detect TRELLIS.2 availability
-    trellis2_found = check_trellis2_available(
-        context.preferences.addons[__package__].preferences.server_address, timeout=get_timeout('ping')
-    )
-    context.scene.trellis2_available = trellis2_found
+    # ── Async: run ping + TRELLIS check + model list refresh in background ──
+    # Results are applied on the main thread via _run_async's done callback.
+    print("Server address changed, checking asynchronously...")
 
+    def _bg_work():
+        """Background thread – only network I/O, no bpy access."""
+        result = {}
+        result['online'] = check_server_availability(server_address, timeout=get_timeout('ping'))
+        if result['online']:
+            result['trellis2'] = check_trellis2_available(server_address, timeout=get_timeout('api'))
+        else:
+            result['trellis2'] = False
+        return result
+
+    def _on_done(result):
+        """Main-thread callback – apply results to bpy properties."""
+        if result is None:
+            return
+        prefs = bpy.context.preferences.addons[__package__].preferences
+        prefs.server_online = result.get('online', False)
+
+        if hasattr(bpy.context, 'scene') and bpy.context.scene:
+            bpy.context.scene.trellis2_available = result.get('trellis2', False)
+
+        if not result.get('online', False):
+            print("ComfyUI server is not reachable.")
+            return
+
+        # Server is online — trigger model list refresh + load_handler
+        # on the main thread.  The refresh operators themselves will
+        # be made async individually.
+        update_parameters(None, bpy.context)
+        load_handler(None)
+
+        def _deferred_refresh():
+            try:
+                bpy.ops.stablegen.refresh_checkpoint_list('INVOKE_DEFAULT')
+                bpy.ops.stablegen.refresh_lora_list('INVOKE_DEFAULT')
+                bpy.ops.stablegen.refresh_controlnet_mappings('INVOKE_DEFAULT')
+            except Exception as e:
+                print(f"Error during deferred refresh: {e}")
+            return None
+        bpy.app.timers.register(_deferred_refresh, first_interval=0.1)
+
+    _run_async(_bg_work, _on_done, track_generation=True)
+
+    # Synchronous parts that don't block (no network) can stay here:
     update_parameters(self, context)
     load_handler(None)
-
-    # Automatically Refresh Lists on Server Change
-    # Check if server address is valid before trying to refresh
-    if context.preferences.addons[__package__].preferences.server_address:
-         print("Server address changed, attempting to refresh model lists...")
-         def deferred_refresh():
-             try:
-                  bpy.ops.stablegen.refresh_checkpoint_list('INVOKE_DEFAULT')
-                  bpy.ops.stablegen.refresh_lora_list('INVOKE_DEFAULT')
-                  bpy.ops.stablegen.refresh_controlnet_mappings('INVOKE_DEFAULT') # Refresh CN too
-             except Exception as e:
-                  print(f"Error during deferred refresh: {e}")
-             return None # Timer runs only once
-         bpy.app.timers.register(deferred_refresh, first_interval=0.1)
-    else:
-         print("Server address cleared, cannot refresh lists.")
-         global _cached_checkpoint_list, _cached_lora_list
-         _cached_checkpoint_list = [("NO_SERVER", "Set Server Address", "...")]
-         _cached_lora_list = [("NO_SERVER", "Set Server Address", "...")]
-
-    # Checkpoint model reset
-    current_checkpoint = context.scene.model_name
-    # update_model_list is now the API version
-    checkpoint_items = update_model_list(self, context)
-    valid_checkpoint_ids = {item[0] for item in checkpoint_items}
-    placeholder_id = next((item[0] for item in checkpoint_items if item[0].startswith("NO_") or item[0] == "NONE_FOUND"), None)
-
-    if current_checkpoint not in valid_checkpoint_ids:
-        if placeholder_id:
-            context.scene.model_name = placeholder_id
-        elif checkpoint_items: # If no placeholder but other items, pick first valid one
-            context.scene.model_name = checkpoint_items[0][0]
-        # else: # No models found at all, leave it potentially invalid or set to a default if possible
-
-    # LoRA unit reset (uses API now)
-    if hasattr(context.scene, 'lora_units'):
-        lora_items = get_lora_models(self, context) # API version
-        valid_lora_ids = {item[0] for item in lora_items}
-        placeholder_lora_id = next((item[0] for item in lora_items if item[0].startswith("NO_") or item[0] == "NONE_FOUND"), None)
-
-        # Iterate safely while removing
-        indices_to_remove = []
-        for i, lora_unit in enumerate(context.scene.lora_units):
-            if lora_unit.model_name not in valid_lora_ids or lora_unit.model_name == placeholder_lora_id:
-                indices_to_remove.append(i)
-
-        # Remove invalid units in reverse order to maintain indices
-        for i in sorted(indices_to_remove, reverse=True):
-             context.scene.lora_units.remove(i)
-
-    # Check/reset current LoRA unit index
-    num_loras = len(context.scene.lora_units)
-    if context.scene.lora_units_index >= num_loras:
-         context.scene.lora_units_index = max(0, num_loras - 1)
-    elif num_loras == 0:
-         context.scene.lora_units_index = 0 # Or -1 if appropriate, ensure index is valid
 
     return None
 
@@ -457,25 +502,42 @@ class CheckServerStatus(bpy.types.Operator):
         server_addr = prefs.server_address
 
         print(f"Checking server status at {server_addr}...")
-        # Use the existing check function with a short timeout
-        is_online = check_server_availability(server_addr, timeout=get_timeout('ping')) # Use slightly longer than 0.5?
 
-        prefs.server_online = is_online # Update the preference property
+        def _bg_work():
+            result = {}
+            result['online'] = check_server_availability(server_addr, timeout=get_timeout('ping'))
+            if result['online']:
+                result['trellis2'] = check_trellis2_available(server_addr, timeout=get_timeout('api'))
+            else:
+                result['trellis2'] = False
+            return result
 
-        if is_online:
-            self.report({'INFO'}, f"ComfyUI server is online at {server_addr}.")
-            # Trigger full refresh here if desired on manual check success
-            bpy.ops.stablegen.refresh_checkpoint_list('INVOKE_DEFAULT')
-            bpy.ops.stablegen.refresh_lora_list('INVOKE_DEFAULT')
-            bpy.ops.stablegen.refresh_controlnet_mappings('INVOKE_DEFAULT')
-            load_handler(None)
-            # Auto-detect TRELLIS.2 availability
-            trellis2_found = check_trellis2_available(server_addr)
-            context.scene.trellis2_available = trellis2_found
-        else:
-            self.report({'ERROR'}, f"ComfyUI server unreachable or timed out at {server_addr}.")
+        def _on_done(result):
+            if result is None:
+                return
+            _prefs = bpy.context.preferences.addons[__package__].preferences
+            _prefs.server_online = result.get('online', False)
 
-        # The update function on the property handles UI redraw
+            if hasattr(bpy.context, 'scene') and bpy.context.scene:
+                bpy.context.scene.trellis2_available = result.get('trellis2', False)
+
+            if result.get('online', False):
+                print(f"ComfyUI server is online at {server_addr}.")
+                load_handler(None)
+                def _deferred_refresh():
+                    try:
+                        bpy.ops.stablegen.refresh_checkpoint_list('INVOKE_DEFAULT')
+                        bpy.ops.stablegen.refresh_lora_list('INVOKE_DEFAULT')
+                        bpy.ops.stablegen.refresh_controlnet_mappings('INVOKE_DEFAULT')
+                    except Exception as e:
+                        print(f"Error during deferred refresh: {e}")
+                    return None
+                bpy.app.timers.register(_deferred_refresh, first_interval=0.1)
+            else:
+                print(f"ComfyUI server unreachable or timed out at {server_addr}.")
+
+        _run_async(_bg_work, _on_done, track_generation=True)
+        self.report({'INFO'}, f"Checking server at {server_addr}...")
 
         return {'FINISHED'}
 
@@ -518,71 +580,95 @@ class RefreshControlNetMappings(bpy.types.Operator):
         return prefs and prefs.preferences.server_address
 
     def execute(self, context):
-        prefs = context.preferences.addons[__package__].preferences
-        server_models = fetch_from_comfyui_api(context, "/models/controlnet")
+        prefs = context.preferences.addons.get(__package__)
+        if not prefs:
+            self.report({'ERROR'}, "Cannot access addon preferences.")
+            return {'CANCELLED'}
 
-        if server_models is None: # Indicates connection/config error
-             self.report({'ERROR'}, "Could not fetch models. Check server address and ensure ComfyUI is running.")
-             return {'CANCELLED'}
+        server_address = prefs.preferences.server_address
 
-        if not server_models:
-             self.report({'WARNING'}, "No ControlNet models found on the server.")
-             # Clear existing list if server returns empty
-             prefs.controlnet_model_mappings.clear()
-             return {'FINISHED'}
+        # Snapshot existing mapping names so the bg thread can compute
+        # which models to add/remove without touching bpy.
+        existing_model_names = set()
+        for item in prefs.preferences.controlnet_model_mappings:
+            existing_model_names.add(item.name)
 
-        # Synchronization Logic
-        current_mappings = {item.name: item for item in prefs.controlnet_model_mappings}
-        server_model_set = set(server_models)
-        current_model_set = set(current_mappings.keys())
+        def _bg_work():
+            server_models = _fetch_api_list(server_address, "/models/controlnet")
+            return {'server_models': server_models,
+                    'existing_names': existing_model_names}
 
-        # 1. Remove models from prefs that are no longer on the server
-        models_to_remove = current_model_set - server_model_set
-        indices_to_remove = []
-        for i, item in enumerate(prefs.controlnet_model_mappings):
-            if item.name in models_to_remove:
-                indices_to_remove.append(i)
+        def _on_done(result):
+            global _pending_refreshes
+            _pending_refreshes = max(0, _pending_refreshes - 1)
+            if result is None:
+                return
+            server_models = result.get('server_models')
+            existing_names = result.get('existing_names', set())
 
-        # Remove in reverse order to avoid index issues
-        for i in sorted(indices_to_remove, reverse=True):
-             prefs.controlnet_model_mappings.remove(i)
-             # Adjust index if necessary
-             if prefs.controlnet_mapping_index >= len(prefs.controlnet_model_mappings):
-                  prefs.controlnet_mapping_index = max(0, len(prefs.controlnet_model_mappings) - 1)
+            _prefs = bpy.context.preferences.addons.get(__package__)
+            if not _prefs:
+                return
+            mappings = _prefs.preferences.controlnet_model_mappings
 
+            if server_models is None:
+                print("ControlNet refresh: cannot reach server.")
+                return
 
-        # 2. Add new models found on the server
-        models_to_add = server_model_set - current_model_set
-        for model_name in sorted(list(models_to_add)):
-            new_item = prefs.controlnet_model_mappings.add()
-            new_item.name = model_name
-
-            # Guessing Logic
-            name_lower = model_name.lower()
-            is_union_guess = 'union' in name_lower or 'promax' in name_lower
-
-            # Guess based on keywords, prioritizing union
-            if is_union_guess:
-                new_item.supports_depth = True
-                new_item.supports_canny = True
-                new_item.supports_normal = True # Assume union supports all current types
-                print(f"  Guessed '{model_name}' as Union (Depth, Canny, Normal).")
+            if not server_models:
+                print("ControlNet refresh: no models found, clearing list.")
+                mappings.clear()
             else:
-                if 'depth' in name_lower:
-                    new_item.supports_depth = True
-                    print(f"  Guessed '{model_name}' as Depth.")
-                if 'canny' in name_lower or 'lineart' in name_lower or 'scribble' in name_lower:
-                    new_item.supports_canny = True
-                    print(f"  Guessed '{model_name}' as Canny.")
-                if 'normal' in name_lower:
-                    new_item.supports_normal = True
-                    print(f"  Guessed '{model_name}' as Normal.")
+                server_set = set(server_models)
+                current_set = set(item.name for item in mappings)
 
-            # If no specific type keyword found (and not union), leave all as False
-            if not is_union_guess and not new_item.supports_depth and not new_item.supports_canny and not new_item.supports_normal:
-                 print(f"  Could not guess type for '{model_name}'. Please assign manually.")
+                # Remove stale entries
+                models_to_remove = current_set - server_set
+                indices_to_remove = []
+                for i, item in enumerate(mappings):
+                    if item.name in models_to_remove:
+                        indices_to_remove.append(i)
+                for i in sorted(indices_to_remove, reverse=True):
+                    mappings.remove(i)
+                    if _prefs.preferences.controlnet_mapping_index >= len(mappings):
+                        _prefs.preferences.controlnet_mapping_index = max(0, len(mappings) - 1)
 
-        self.report({'INFO'}, f"Refreshed ControlNet list: {len(models_to_add)} added, {len(models_to_remove)} removed.")
+                # Add new entries with type guessing
+                models_to_add = server_set - current_set
+                for model_name in sorted(models_to_add):
+                    new_item = mappings.add()
+                    new_item.name = model_name
+                    name_lower = model_name.lower()
+                    is_union = 'union' in name_lower or 'promax' in name_lower
+                    if is_union:
+                        new_item.supports_depth = True
+                        new_item.supports_canny = True
+                        new_item.supports_normal = True
+                        print(f"  Guessed '{model_name}' as Union (Depth, Canny, Normal).")
+                    else:
+                        if 'depth' in name_lower:
+                            new_item.supports_depth = True
+                            print(f"  Guessed '{model_name}' as Depth.")
+                        if 'canny' in name_lower or 'lineart' in name_lower or 'scribble' in name_lower:
+                            new_item.supports_canny = True
+                            print(f"  Guessed '{model_name}' as Canny.")
+                        if 'normal' in name_lower:
+                            new_item.supports_normal = True
+                            print(f"  Guessed '{model_name}' as Normal.")
+                        if not (new_item.supports_depth or new_item.supports_canny or new_item.supports_normal):
+                            print(f"  Could not guess type for '{model_name}'. Please assign manually.")
+
+                print(f"ControlNet refresh: {len(models_to_add)} added, {len(models_to_remove)} removed.")
+
+            # Redraw UI
+            for window in bpy.context.window_manager.windows:
+                for area in window.screen.areas:
+                    area.tag_redraw()
+
+        _run_async(_bg_work, _on_done)
+        global _pending_refreshes
+        _pending_refreshes += 1
+        self.report({'INFO'}, "Fetching ControlNet models...")
         return {'FINISHED'}
     
 from .timeout_config import get_timeout  # noqa: E402 – placed here to avoid circular imports
@@ -731,6 +817,49 @@ def fetch_from_comfyui_api(context, endpoint):
         print(f"  An unexpected error occurred fetching from {url}: {e}")
 
     return [] # Return empty list on any failure
+
+
+def _fetch_api_list(server_address, endpoint):
+    """Thread-safe variant of *fetch_from_comfyui_api* — takes an explicit
+    *server_address* instead of reading from bpy context, so it can run in a
+    background thread.
+
+    Returns a list of strings on success, ``None`` on connection/config error,
+    or ``[]`` when the server returns an empty or invalid list.
+    """
+    if not server_address:
+        return None
+
+    if not check_server_availability(server_address, timeout=get_timeout('ping')):
+        return None
+
+    if not endpoint.startswith('/'):
+        endpoint = '/' + endpoint
+
+    url = f"http://{server_address}{endpoint}"
+    try:
+        response = requests.get(url, timeout=get_timeout('api'))
+        response.raise_for_status()
+        data = response.json()
+
+        if isinstance(data, list):
+            string_items = [item for item in data if isinstance(item, str)]
+            return string_items
+        else:
+            print(f"  Error: API endpoint {endpoint} did not return a JSON list.")
+            return []
+    except requests.exceptions.Timeout:
+        print(f"  Error: Timeout connecting to {url}.")
+    except requests.exceptions.ConnectionError:
+        print(f"  Error: Connection failed to {url}.")
+    except requests.exceptions.RequestException as e:
+        print(f"  Error fetching from {url}: {e}")
+    except json.JSONDecodeError:
+        print(f"  Error: Could not decode JSON from {url}.")
+    except Exception as e:
+        print(f"  Unexpected error fetching from {url}: {e}")
+
+    return []
 
 
 def get_models_from_directory(scan_root_path: str, valid_extensions: tuple, type_for_description: str, path_prefix_for_id: str = ""):
@@ -948,67 +1077,81 @@ class RefreshCheckpointList(bpy.types.Operator):
         return prefs and prefs.preferences.server_address
 
     def execute(self, context):
-        global _cached_checkpoint_list, _cached_checkpoint_architecture
-        items = []
-        model_list = None # Initialize to None
+        prefs = context.preferences.addons.get(__package__)
+        if not prefs:
+            self.report({'ERROR'}, "Cannot access addon preferences.")
+            return {'CANCELLED'}
 
+        server_address = prefs.preferences.server_address
         architecture = getattr(context.scene, "model_architecture", "sdxl")
 
-        # Determine endpoint based on current architecture setting
-        if architecture == 'sdxl':
-            model_list = fetch_from_comfyui_api(context, "/models/checkpoints")
-            model_type_desc = "Checkpoint"
-        elif architecture == 'flux1':
-            model_list = fetch_from_comfyui_api(context, "/models/unet_gguf")
-            if model_list is not None:
-                to_extend = fetch_from_comfyui_api(context, "/models/diffusion_models")
-                if to_extend:
-                    model_list.extend(to_extend)
-            model_type_desc = "UNET"
-        elif architecture == 'qwen_image_edit':
-            model_list = fetch_from_comfyui_api(context, "/models/unet_gguf")
-            if model_list is not None:
-                to_extend = fetch_from_comfyui_api(context, "/models/diffusion_models")
-                if to_extend:
-                    model_list.extend(to_extend)
-            model_type_desc = "UNET (GGUF/Safetensors)"
+        def _bg_work():
+            """Background thread — network I/O only, no bpy access."""
+            model_list = None
+            if architecture == 'sdxl':
+                model_list = _fetch_api_list(server_address, "/models/checkpoints")
+                model_type_desc = "Checkpoint"
+            elif architecture in ('flux1', 'qwen_image_edit'):
+                model_list = _fetch_api_list(server_address, "/models/unet_gguf")
+                if model_list is not None:
+                    extra = _fetch_api_list(server_address, "/models/diffusion_models")
+                    if extra:
+                        model_list.extend(extra)
+                model_type_desc = "UNET" if architecture == 'flux1' else "UNET (GGUF/Safetensors)"
+            else:
+                model_type_desc = "Model"
+            return {'model_list': model_list, 'architecture': architecture,
+                    'model_type_desc': model_type_desc}
 
-        if model_list is None: # Config error
-            _cached_checkpoint_list = [("NO_SERVER", "Set Server Address", "Cannot fetch")]
-            _cached_checkpoint_architecture = None
-            self.report({'ERROR'}, "Cannot fetch models. Check server address.")
-            # Force UI update if possible
-            if context.area:
-                context.area.tag_redraw()
-            return {'CANCELLED'}
-        elif not model_list: # API ok, but empty list
-             _cached_checkpoint_list = [("NONE_FOUND", f"No {model_type_desc}s Found", "Server list is empty")]
-             _cached_checkpoint_architecture = architecture
-             self.report({'WARNING'}, f"No {model_type_desc} models found on server.")
-        else: # Models found
-            for model_name in sorted(model_list):
-                items.append((model_name, model_name, f"{model_type_desc}: {model_name}"))
-            _cached_checkpoint_list = items
-            _cached_checkpoint_architecture = architecture
-            self.report({'INFO'}, f"Refreshed {model_type_desc} list ({len(items)} found).")
+        def _on_done(result):
+            """Main-thread callback — update caches and UI."""
+            global _cached_checkpoint_list, _cached_checkpoint_architecture, _pending_refreshes
+            _pending_refreshes = max(0, _pending_refreshes - 1)
+            if result is None:
+                return
 
-        # Reset Logic after refresh
-        current_checkpoint = context.scene.model_name
-        valid_checkpoint_ids = {item[0] for item in _cached_checkpoint_list}
-        placeholder_id = next((item[0] for item in _cached_checkpoint_list if item[0].startswith("NO_") or item[0] == "NONE_FOUND"), None)
+            model_list = result.get('model_list')
+            arch = result.get('architecture')
+            desc = result.get('model_type_desc', 'Model')
 
-        if current_checkpoint not in valid_checkpoint_ids:
-            if placeholder_id:
-                context.scene.model_name = placeholder_id
-            elif _cached_checkpoint_list:
-                context.scene.model_name = _cached_checkpoint_list[0][0]
+            if model_list is None:
+                _cached_checkpoint_list = [("NO_SERVER", "Set Server Address", "Cannot fetch")]
+                _cached_checkpoint_architecture = None
+                print(f"Checkpoint refresh: cannot reach server.")
+            elif not model_list:
+                _cached_checkpoint_list = [("NONE_FOUND", f"No {desc}s Found", "Server list is empty")]
+                _cached_checkpoint_architecture = arch
+                print(f"Checkpoint refresh: no {desc} models found.")
+            else:
+                items = []
+                for name in sorted(model_list):
+                    items.append((name, name, f"{desc}: {name}"))
+                _cached_checkpoint_list = items
+                _cached_checkpoint_architecture = arch
+                print(f"Checkpoint refresh: {len(items)} {desc}(s) found.")
 
-        # Force UI update if possible (e.g., redraw panels)
-        if context.area:
-            context.area.tag_redraw()
-        # A more robust redraw might be needed depending on context
-        # bpy.ops.wm.redraw_timer(type='DRAW_WIN_SWAP', iterations=1)
+            # Reset model_name if current selection is no longer valid
+            scene = bpy.context.scene if hasattr(bpy.context, 'scene') else None
+            if scene:
+                current = scene.model_name
+                valid_ids = {it[0] for it in _cached_checkpoint_list}
+                if current not in valid_ids:
+                    placeholder = next((it[0] for it in _cached_checkpoint_list
+                                        if it[0].startswith("NO_") or it[0] == "NONE_FOUND"), None)
+                    if placeholder:
+                        scene.model_name = placeholder
+                    elif _cached_checkpoint_list:
+                        scene.model_name = _cached_checkpoint_list[0][0]
 
+            # Redraw UI
+            for window in bpy.context.window_manager.windows:
+                for area in window.screen.areas:
+                    area.tag_redraw()
+
+        _run_async(_bg_work, _on_done)
+        global _pending_refreshes
+        _pending_refreshes += 1
+        self.report({'INFO'}, "Fetching checkpoint list...")
         return {'FINISHED'}
     
 class RefreshLoRAList(bpy.types.Operator):
@@ -1023,44 +1166,65 @@ class RefreshLoRAList(bpy.types.Operator):
         return prefs and prefs.preferences.server_address
 
     def execute(self, context):
-        global _cached_lora_list
-        items = []
-        lora_list = fetch_from_comfyui_api(context, "/models/loras")
-
-        if lora_list is None: # Config error
-            _cached_lora_list = [("NO_SERVER", "Set Server Address", "Cannot fetch")]
-            self.report({'ERROR'}, "Cannot fetch LoRAs. Check server address.")
-            context.area.tag_redraw()
+        prefs = context.preferences.addons.get(__package__)
+        if not prefs:
+            self.report({'ERROR'}, "Cannot access addon preferences.")
             return {'CANCELLED'}
-        elif not lora_list: # API ok, but empty
-             _cached_lora_list = [("NONE_FOUND", "No LoRAs Found", "Server list is empty")]
-             self.report({'WARNING'}, "No LoRA models found on server.")
-        else: # LoRAs found
-            for lora_name in sorted(lora_list):
-                items.append((lora_name, lora_name, f"LoRA: {lora_name}"))
-            _cached_lora_list = items
-            self.report({'INFO'}, f"Refreshed LoRA list ({len(items)} found).")
 
-        # Reset Logic after refresh
-        if hasattr(context.scene, 'lora_units'):
-            valid_lora_ids = {item[0] for item in _cached_lora_list}
-            placeholder_lora_id = next((item[0] for item in _cached_lora_list if item[0].startswith("NO_") or item[0] == "NONE_FOUND"), None)
-            indices_to_remove = []
-            for i, lora_unit in enumerate(context.scene.lora_units):
-                if lora_unit.model_name not in valid_lora_ids or lora_unit.model_name == placeholder_lora_id:
-                    indices_to_remove.append(i)
-            for i in sorted(indices_to_remove, reverse=True):
-                context.scene.lora_units.remove(i)
+        server_address = prefs.preferences.server_address
 
-            num_loras = len(context.scene.lora_units)
-            if context.scene.lora_units_index >= num_loras:
-                context.scene.lora_units_index = max(0, num_loras - 1)
-            elif num_loras == 0:
-                context.scene.lora_units_index = 0
+        def _bg_work():
+            return {'lora_list': _fetch_api_list(server_address, "/models/loras")}
 
-        if context.area:
-            context.area.tag_redraw()
-        # bpy.ops.wm.redraw_timer(type='DRAW_WIN_SWAP', iterations=1)
+        def _on_done(result):
+            global _cached_lora_list, _pending_refreshes
+            _pending_refreshes = max(0, _pending_refreshes - 1)
+            if result is None:
+                return
+
+            lora_list = result.get('lora_list')
+
+            if lora_list is None:
+                _cached_lora_list = [("NO_SERVER", "Set Server Address", "Cannot fetch")]
+                print("LoRA refresh: cannot reach server.")
+            elif not lora_list:
+                _cached_lora_list = [("NONE_FOUND", "No LoRAs Found", "Server list is empty")]
+                print("LoRA refresh: no models found.")
+            else:
+                items = []
+                for name in sorted(lora_list):
+                    items.append((name, name, f"LoRA: {name}"))
+                _cached_lora_list = items
+                print(f"LoRA refresh: {len(items)} model(s) found.")
+
+            # Clean up invalid lora_units selections
+            scene = bpy.context.scene if hasattr(bpy.context, 'scene') else None
+            if scene and hasattr(scene, 'lora_units'):
+                valid_ids = {it[0] for it in _cached_lora_list}
+                placeholder = next((it[0] for it in _cached_lora_list
+                                    if it[0].startswith("NO_") or it[0] == "NONE_FOUND"), None)
+                indices_to_remove = []
+                for i, unit in enumerate(scene.lora_units):
+                    if unit.model_name not in valid_ids or unit.model_name == placeholder:
+                        indices_to_remove.append(i)
+                for i in sorted(indices_to_remove, reverse=True):
+                    scene.lora_units.remove(i)
+
+                num_loras = len(scene.lora_units)
+                if scene.lora_units_index >= num_loras:
+                    scene.lora_units_index = max(0, num_loras - 1)
+                elif num_loras == 0:
+                    scene.lora_units_index = 0
+
+            # Redraw UI
+            for window in bpy.context.window_manager.windows:
+                for area in window.screen.areas:
+                    area.tag_redraw()
+
+        _run_async(_bg_work, _on_done)
+        global _pending_refreshes
+        _pending_refreshes += 1
+        self.report({'INFO'}, "Fetching LoRA list...")
         return {'FINISHED'}
 
 class AddControlNetUnit(bpy.types.Operator):

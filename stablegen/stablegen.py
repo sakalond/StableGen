@@ -1,9 +1,16 @@
 """ This file contains the operators and panels for the StableGen addon """
 # disable import-error because pylint doesn't recognize the blenders internal modules
 import os
+import sys
 import bpy  # pylint: disable=import-error
 import mathutils  # pylint: disable=import-error
 import math  # pylint: disable=import-error
+
+
+def _is_refreshing():
+    """Return True while async model-list refreshes are in-flight."""
+    pkg = sys.modules.get(__package__)
+    return getattr(pkg, '_pending_refreshes', 0) > 0
 
 # Stock presets
 PRESETS = {
@@ -337,6 +344,12 @@ class StableGenPanel(bpy.types.Panel):
         action_row = layout.row()
         action_row.scale_y = 2.0 # Scale the row vertically
 
+        # Show a "Refreshing…" indicator while async model fetches are in-flight
+        if _is_refreshing():
+            refresh_row = layout.row()
+            refresh_row.alignment = 'CENTER'
+            refresh_row.label(text="Refreshing model lists...", icon="SORTTIME")
+
         if _is_trellis2_mode:
             # --- TRELLIS.2 Generate Button ---
             trellis2_op = next(
@@ -439,8 +452,11 @@ class StableGenPanel(bpy.types.Panel):
                 action_row.operator("object.trellis2_generate", text="Select an image first", icon="ERROR")
                 action_row.enabled = False
             elif not getattr(scene, 'trellis2_available', False):
-                action_row.operator("object.trellis2_generate", text="TRELLIS.2 nodes not found on server", icon="ERROR")
-                action_row.enabled = False
+                split = action_row.split(factor=0.8)
+                err_sub = split.row()
+                err_sub.operator("object.trellis2_generate", text="TRELLIS.2 nodes not found", icon="ERROR")
+                err_sub.enabled = False
+                split.operator("stablegen.check_server_status", text="", icon="FILE_REFRESH")
             else:
                 action_row.operator("object.trellis2_generate", text="Generate 3D Mesh", icon="MESH_ICOSPHERE")
         else:
@@ -576,7 +592,9 @@ class StableGenPanel(bpy.types.Panel):
                 if not getattr(scene, 'trellis2_available', False):
                     warn_row = params_container.row()
                     warn_row.alert = True
-                    warn_row.label(text="TRELLIS.2 nodes not detected on server", icon="ERROR")
+                    warn_split = warn_row.split(factor=0.9)
+                    warn_split.label(text="TRELLIS.2 nodes not detected on server", icon="ERROR")
+                    warn_split.operator("stablegen.check_server_status", text="", icon="FILE_REFRESH")
 
                 # Generate From toggle (Image / Prompt)
                 split = params_container.split(factor=0.5)
