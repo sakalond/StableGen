@@ -15,6 +15,14 @@ class AddHDRI(bpy.types.Operator):
 		subtype='FILE_PATH'
 	) # type: ignore
 
+	strength: bpy.props.FloatProperty(
+		name="Strength",
+		description="Brightness of the HDRI environment lighting",
+		default=1.0,
+		min=0.01,
+		max=10.0
+	) # type: ignore
+
 	def execute(self, context):
 		world = context.scene.world
 		if not world:
@@ -50,6 +58,7 @@ class AddHDRI(bpy.types.Operator):
 		bg_hdri = nodes.new("ShaderNodeBackground")
 		bg_hdri.name = "HDRI Background"
 		bg_hdri.location = (0, 100)
+		bg_hdri.inputs['Strength'].default_value = self.strength
 		
 		bg_solid = nodes.new("ShaderNodeBackground")
 		bg_solid.name = "Solid Background"
@@ -67,7 +76,7 @@ class AddHDRI(bpy.types.Operator):
 		links.new(bg_solid.outputs['Background'], mix_shader.inputs[2])
 		links.new(mix_shader.outputs['Shader'], output_node.inputs['Surface'])
 
-		self.report({'INFO'}, "HDRI lighting added (background hidden).")
+		self.report({'INFO'}, f"HDRI lighting added (strength={self.strength:.2f}, background hidden).")
 		return {'FINISHED'}
 
 	def invoke(self, context, event):
@@ -253,6 +262,7 @@ def get_generation_dirs(context):
 		},
   		"uv_inpaint_root": os.path.join(revision_dir, "uv_inpaint"),
 		"misc" : os.path.join(revision_dir, "misc"),
+		"pbr": os.path.join(revision_dir, "pbr"),
 	}
 
 def ensure_dirs_exist(dirs_dict):
@@ -281,6 +291,8 @@ def ensure_dirs_exist(dirs_dict):
 		os.makedirs(path, exist_ok=True)
 	# Create misc directory
 	os.makedirs(dirs_dict["misc"], exist_ok=True)
+	# Create pbr directory
+	os.makedirs(dirs_dict["pbr"], exist_ok=True)
 
 def get_file_path(context, file_type, subtype=None, filename=None, camera_id=None, object_name=None, material_id=None, legacy=False):
 	"""
@@ -350,7 +362,16 @@ def get_file_path(context, file_type, subtype=None, filename=None, camera_id=Non
 		if subtype == "visibility":
 			filename = f"{object_name}_baked_visibility" if not filename else filename
 		return os.path.join(base_dir, f"{filename}.png")
-	
+
+	elif file_type == "pbr" and subtype:
+		# PBR decomposition maps: subtype is the map name (albedo, roughness, metallic, etc.)
+		base_dir = dirs["pbr"]
+		material_suffix = f"-{material_id}" if material_id is not None else ""
+		if camera_id is not None:
+			return os.path.join(base_dir, f"pbr_{subtype}_cam{camera_id}{material_suffix}.png")
+		else:
+			return os.path.join(base_dir, f"pbr_{subtype}{material_suffix}.png")
+
 	# Fallback to revision directory
 	return os.path.join(dirs["revision"], f"{filename or 'file'}.png")
 

@@ -5007,6 +5007,51 @@ class ExportOrbitGIF(bpy.types.Operator):
         default='LINEAR'
     ) # type: ignore
 
+    # ── PBR showcase settings ─────────────────────────────────────────
+    use_hdri: bpy.props.BoolProperty(
+        name="HDRI Environment",
+        description="Use the scene's existing HDRI world (set up via the "
+                    "Add HDRI operator) for realistic environment lighting",
+        default=False
+    ) # type: ignore
+
+    hdri_rotation: bpy.props.FloatProperty(
+        name="Environment Rotation",
+        description="Initial Z-rotation offset for the HDRI (degrees)",
+        default=0.0,
+        min=0.0,
+        max=360.0,
+        subtype='ANGLE'
+    ) # type: ignore
+
+    env_mode: bpy.props.EnumProperty(
+        name="Environment Mode",
+        description="How the environment lighting interacts with the orbit",
+        items=[
+            ('FIXED', "Fixed",
+             "Camera orbits, HDRI stays fixed — reflections shift naturally"),
+            ('COUNTER', "Counter-Rotate",
+             "HDRI rotates opposite to camera — 2× apparent light change"),
+            ('ENV_ONLY', "Environment Only",
+             "Camera stays fixed, only the HDRI rotates around the model"),
+        ],
+        default='FIXED'
+    ) # type: ignore
+
+    use_shadow_plane: bpy.props.BoolProperty(
+        name="Ground Shadow",
+        description="Add a temporary shadow-catcher plane beneath the "
+                    "model for a grounded appearance (Cycles only)",
+        default=False
+    ) # type: ignore
+
+    use_denoiser: bpy.props.BoolProperty(
+        name="Denoise",
+        description="Enable Cycles denoising for cleaner specular "
+                    "highlights with fewer samples",
+        default=True
+    ) # type: ignore
+
     _timer = None
     _rendering = False
     _cancelled = False # Added flag to track cancellation
@@ -5014,6 +5059,9 @@ class ExportOrbitGIF(bpy.types.Operator):
     _handle_cancel = None
     _initial_settings = {}
     _temp_empty = None # Added for the pivot empty
+    _temp_shadow_plane = None  # Added for shadow catcher
+    _env_mapping_node = None   # For HDRI rotation animation
+    _original_world_data = None  # Store entire world setup for restore
     _output_path = "" # Internal variable to store the final GIF path
     _output_path_mp4 = "" # Internal variable to store the final MP4 path
     _temp_dir = "" # Temporary directory for frames
@@ -5114,6 +5162,198 @@ class ExportOrbitGIF(bpy.types.Operator):
             for kf in fc.keyframe_points:
                 kf.interpolation = interpolation_type
 
+    # ── PBR Showcase helpers ──────────────────────────────────────────
+
+    def _setup_hdri_environment(self, context):
+        """Prepare the scene's existing HDRI world for orbit rendering.
+
+        Assumes the world was already set up by the AddHDRI operator
+        (or any setup with an Environment Texture node).  This method:
+
+        1. Stores the original world state for ``cleanup()``.
+        2. Injects a Mapping node before the Environment Texture to
+           allow rotation animation (counter-rotate / env-only modes).
+        3. Applies the user's initial rotation offset.
+
+        If no Environment Texture node is found, falls back to creating
+        a procedural Nishita sky with a Mapping node.
+        """
+        world = context.scene.world
+        if not world:
+            world = bpy.data.worlds.new("SG_OrbitWorld")
+            context.scene.world = world
+
+        # Store original state for restore
+        self._original_world_data = {
+            'world_ref': world,
+            'use_nodes': world.use_nodes,
+            'color': world.color.copy(),
+        }
+
+        world.use_nodes = True
+        tree = world.node_tree
+
+        # Find the existing Environment Texture node
+        env_tex = None
+        for node in tree.nodes:
+            if node.type == 'TEX_ENVIRONMENT':
+                env_tex = node
+                break
+
+        if env_tex is None:
+            # No HDRI world set up — create a procedural sky fallback
+            print("[StableGen] Orbit GIF: No HDRI found, creating sky fallback")
+            tree.nodes.clear()
+
+            tex_coord = tree.nodes.new("ShaderNodeTexCoord")
+            tex_coord.location = (-800, 300)
+
+            mapping = tree.nodes.new("ShaderNodeMapping")
+            mapping.location = (-600, 300)
+            mapping.inputs["Rotation"].default_value[2] = self.hdri_rotation
+            self._env_mapping_node = mapping
+
+            sky_tex = tree.nodes.new("ShaderNodeTexSky")
+            sky_tex.location = (-300, 300)
+            sky_tex.sky_type = 'NISHITA'
+            sky_tex.sun_elevation = math.radians(30)
+            sky_tex.sun_rotation = math.radians(45)
+
+            bg_node = tree.nodes.new("ShaderNodeBackground")
+            bg_node.location = (0, 300)
+
+            output_node = tree.nodes.new("ShaderNodeOutputWorld")
+            output_node.location = (200, 300)
+
+            tree.links.new(tex_coord.outputs["Generated"],
+                           mapping.inputs["Vector"])
+            tree.links.new(mapping.outputs["Vector"],
+                           sky_tex.inputs["Vector"])
+            tree.links.new(sky_tex.outputs["Color"],
+                           bg_node.inputs["Color"])
+            tree.links.new(bg_node.outputs["Background"],
+                           output_node.inputs["Surface"])
+
+            # Track that we created the fallback so cleanup can remove it
+            self._original_world_data['created_fallback'] = True
+            return
+
+        # ── Inject Mapping node before the Environment Texture ────────
+        # Store original Vector input link/socket for restore
+        existing_vec_link = None
+        if env_tex.inputs["Vector"].links:
+            existing_vec_link = env_tex.inputs["Vector"].links[0]
+            self._original_world_data['env_vec_from_socket'] = (
+                existing_vec_link.from_socket)
+
+        # Create TexCoord + Mapping chain
+        tex_coord = tree.nodes.new("ShaderNodeTexCoord")
+        tex_coord.name = "SG_OrbitTexCoord"
+        tex_coord.location = (env_tex.location[0] - 500,
+                              env_tex.location[1])
+
+        mapping = tree.nodes.new("ShaderNodeMapping")
+        mapping.name = "SG_OrbitMapping"
+        mapping.location = (env_tex.location[0] - 250,
+                            env_tex.location[1])
+        mapping.inputs["Rotation"].default_value[2] = self.hdri_rotation
+        self._env_mapping_node = mapping
+
+        tree.links.new(tex_coord.outputs["Generated"],
+                       mapping.inputs["Vector"])
+
+        # Remove existing vector link and insert mapping before env tex
+        if existing_vec_link:
+            # Rewire: old_source → Mapping.Vector, Mapping.out → EnvTex.Vector
+            old_source = existing_vec_link.from_socket
+            tree.links.remove(existing_vec_link)
+            tree.links.new(old_source, mapping.inputs["Vector"])
+        # else: TexCoord → Mapping is already connected above
+
+        tree.links.new(mapping.outputs["Vector"],
+                       env_tex.inputs["Vector"])
+
+        print("[StableGen] Orbit GIF: using existing HDRI world"
+              f" (rotation offset={math.degrees(self.hdri_rotation):.0f}°)")
+
+    def _setup_shadow_plane(self, context):
+        """Create a temporary shadow-catcher plane beneath the model."""
+        obj = context.active_object
+        if not obj:
+            return
+
+        # Determine the bottom of the object's bounding box in world space
+        bbox_corners = [obj.matrix_world @ mathutils.Vector(c)
+                        for c in obj.bound_box]
+        min_z = min(c.z for c in bbox_corners)
+        center_x = sum(c.x for c in bbox_corners) / 8
+        center_y = sum(c.y for c in bbox_corners) / 8
+
+        # Determine a reasonable plane size (2× the bounding box extent)
+        extent_x = max(c.x for c in bbox_corners) - min(c.x for c in bbox_corners)
+        extent_y = max(c.y for c in bbox_corners) - min(c.y for c in bbox_corners)
+        plane_size = max(extent_x, extent_y) * 3
+
+        bpy.ops.mesh.primitive_plane_add(
+            size=plane_size,
+            location=(center_x, center_y, min_z))
+        plane = context.active_object
+        plane.name = "SG_ShadowPlane"
+
+        # Set as shadow catcher (Cycles)
+        plane.is_shadow_catcher = True
+
+        # Create a holdout material so the plane is invisible except
+        # for the shadow it catches.
+        mat = bpy.data.materials.new("SG_ShadowCatcher")
+        mat.use_nodes = True
+        mat.node_tree.nodes.clear()
+        output = mat.node_tree.nodes.new("ShaderNodeOutputMaterial")
+        holdout = mat.node_tree.nodes.new("ShaderNodeHoldout")
+        holdout.location = (-200, 0)
+        mat.node_tree.links.new(holdout.outputs[0],
+                                output.inputs["Surface"])
+        plane.data.materials.append(mat)
+
+        self._temp_shadow_plane = plane
+        print("[StableGen] Orbit GIF: shadow catcher plane added")
+
+    def _animate_hdri_rotation(self, context, total_frames):
+        """Animate the HDRI Mapping node rotation for counter-rotate
+        or environment-only modes."""
+        if not self._env_mapping_node:
+            return
+
+        mapping = self._env_mapping_node
+        prefs = bpy.context.preferences.edit
+        prev_interp = prefs.keyframe_new_interpolation_type
+        prefs.keyframe_new_interpolation_type = self.interpolation
+        try:
+            # Start rotation = current value (may include user offset)
+            start_z = mapping.inputs["Rotation"].default_value[2]
+            mapping.inputs["Rotation"].default_value[2] = start_z
+            mapping.inputs["Rotation"].keyframe_insert(
+                data_path="default_value", index=2, frame=1)
+
+            # For counter-rotate: rotate in opposite direction to camera
+            # For env-only: rotate in positive direction
+            if self.env_mode == 'COUNTER':
+                end_z = start_z - math.radians(360)
+            else:
+                end_z = start_z + math.radians(360)
+
+            mapping.inputs["Rotation"].default_value[2] = end_z
+            mapping.inputs["Rotation"].keyframe_insert(
+                data_path="default_value", index=2, frame=total_frames + 1)
+        finally:
+            prefs.keyframe_new_interpolation_type = prev_interp
+
+        # Force interpolation on the world node tree's fcurves
+        world = context.scene.world
+        if world and world.node_tree:
+            self._force_fcurve_interpolation(
+                world.node_tree, self.interpolation)
+
     def setup_animation(self, context):
         obj = context.active_object
         scene = context.scene
@@ -5161,24 +5401,29 @@ class ExportOrbitGIF(bpy.types.Operator):
         scene.frame_end = total_frames
         scene.render.fps = self.frame_rate
 
-        # Animate Empty's Rotation
-        # Set keyframe interpolation type before inserting so keyframes
-        # are created with the correct curve.
-        prefs = bpy.context.preferences.edit
-        prev_interp = prefs.keyframe_new_interpolation_type
-        prefs.keyframe_new_interpolation_type = self.interpolation
-        try:
-            self._temp_empty.rotation_euler = (0, 0, 0)
-            self._temp_empty.keyframe_insert(data_path="rotation_euler", index=2, frame=1)
+        # Animate Empty's Rotation (skip if ENV_ONLY — camera stays fixed)
+        if self.env_mode != 'ENV_ONLY':
+            # Set keyframe interpolation type before inserting so keyframes
+            # are created with the correct curve.
+            prefs = bpy.context.preferences.edit
+            prev_interp = prefs.keyframe_new_interpolation_type
+            prefs.keyframe_new_interpolation_type = self.interpolation
+            try:
+                self._temp_empty.rotation_euler = (0, 0, 0)
+                self._temp_empty.keyframe_insert(data_path="rotation_euler", index=2, frame=1)
 
-            self._temp_empty.rotation_euler = (0, 0, math.radians(360))
-            self._temp_empty.keyframe_insert(data_path="rotation_euler", index=2, frame=total_frames + 1)
-        finally:
-            prefs.keyframe_new_interpolation_type = prev_interp
+                self._temp_empty.rotation_euler = (0, 0, math.radians(360))
+                self._temp_empty.keyframe_insert(data_path="rotation_euler", index=2, frame=total_frames + 1)
+            finally:
+                prefs.keyframe_new_interpolation_type = prev_interp
 
-        # Post-insert: force the chosen interpolation on all keyframe points.
-        # The preference alone doesn't always take effect on Blender 5.x.
-        self._force_fcurve_interpolation(self._temp_empty, self.interpolation)
+            # Post-insert: force the chosen interpolation on all keyframe points.
+            # The preference alone doesn't always take effect on Blender 5.x.
+            self._force_fcurve_interpolation(self._temp_empty, self.interpolation)
+
+        # Animate HDRI environment rotation (counter-rotate or env-only)
+        if self.use_hdri and self.env_mode in ('COUNTER', 'ENV_ONLY'):
+            self._animate_hdri_rotation(context, total_frames)
 
 
     def execute(self, context):
@@ -5228,6 +5473,25 @@ class ExportOrbitGIF(bpy.types.Operator):
         render.use_placeholder = False
         render.film_transparent = True 
         cycles.samples = self.samples # Set samples for rendering
+
+        # ── PBR Showcase: HDRI Environment ────────────────────────────
+        if self.use_hdri:
+            self._setup_hdri_environment(context)
+
+        # ── PBR Showcase: Cycles Denoiser ─────────────────────────────
+        if self.use_denoiser and scene.render.engine == 'CYCLES':
+            self._initial_settings['use_denoising'] = cycles.use_denoising
+            self._initial_settings['denoiser'] = cycles.denoiser
+            cycles.use_denoising = True
+            # Prefer OpenImageDenoise (CPU-based, always available)
+            try:
+                cycles.denoiser = 'OPENIMAGEDENOISE'
+            except TypeError:
+                pass  # Fallback to whatever is default
+
+        # ── PBR Showcase: Ground Shadow Plane ─────────────────────────
+        if self.use_shadow_plane and scene.render.engine == 'CYCLES':
+            self._setup_shadow_plane(context)
 
         # Setup Animation
         try:
@@ -5335,7 +5599,7 @@ class ExportOrbitGIF(bpy.types.Operator):
                     setattr(render.image_settings, 'file_format', value)
                 elif key == 'color_mode':
                     setattr(render.image_settings, 'color_mode', value)
-                elif key == 'samples': # Restore samples
+                elif key in ('samples', 'use_denoising', 'denoiser'):
                     setattr(cycles, key, value)
                 elif key == 'engine': # Restore engine
                     setattr(render, key, value)
@@ -5368,6 +5632,76 @@ class ExportOrbitGIF(bpy.types.Operator):
             if self._temp_empty.name in bpy.data.objects:
                 bpy.data.objects.remove(self._temp_empty, do_unlink=True)
             self._temp_empty = None
+
+        # Remove temporary shadow-catcher plane
+        if self._temp_shadow_plane:
+            try:
+                # Remove the material
+                for mat_slot in self._temp_shadow_plane.data.materials:
+                    if mat_slot and mat_slot.name in bpy.data.materials:
+                        bpy.data.materials.remove(mat_slot)
+                # Remove the mesh data
+                mesh_data = self._temp_shadow_plane.data
+                if self._temp_shadow_plane.name in context.scene.collection.objects:
+                    context.scene.collection.objects.unlink(self._temp_shadow_plane)
+                if self._temp_shadow_plane.name in bpy.data.objects:
+                    bpy.data.objects.remove(self._temp_shadow_plane, do_unlink=True)
+                if mesh_data and mesh_data.name in bpy.data.meshes:
+                    bpy.data.meshes.remove(mesh_data)
+            except Exception as e:
+                print(f"Warning: Could not remove shadow plane: {e}")
+            self._temp_shadow_plane = None
+
+        # Restore the world environment (remove injected mapping nodes)
+        if self._original_world_data:
+            try:
+                world = self._original_world_data['world_ref']
+                if world and world.name in bpy.data.worlds:
+                    # Remove HDRI animation keyframes
+                    if world.node_tree and world.node_tree.animation_data:
+                        action = world.node_tree.animation_data.action
+                        if action and action.name in bpy.data.actions:
+                            bpy.data.actions.remove(action)
+                        world.node_tree.animation_data_clear()
+
+                    if self._original_world_data.get('created_fallback'):
+                        # We created a whole sky fallback — restore original
+                        world.use_nodes = self._original_world_data['use_nodes']
+                        world.color = self._original_world_data['color']
+                        if not self._original_world_data['use_nodes']:
+                            if world.node_tree:
+                                world.node_tree.nodes.clear()
+                    else:
+                        # We injected SG_OrbitMapping + SG_OrbitTexCoord
+                        # into the existing tree.  Remove them and restore
+                        # the original vector link.
+                        tree = world.node_tree
+                        if tree:
+                            # Find the env tex and restore its vector input
+                            env_tex = None
+                            for node in tree.nodes:
+                                if node.type == 'TEX_ENVIRONMENT':
+                                    env_tex = node
+                                    break
+
+                            orig_socket = self._original_world_data.get(
+                                'env_vec_from_socket')
+                            if env_tex and orig_socket:
+                                tree.links.new(orig_socket,
+                                               env_tex.inputs["Vector"])
+                            elif env_tex:
+                                # Had no vector link originally — just remove
+                                for link in list(env_tex.inputs["Vector"].links):
+                                    tree.links.remove(link)
+
+                            # Remove injected nodes
+                            for name in ("SG_OrbitMapping", "SG_OrbitTexCoord"):
+                                if name in tree.nodes:
+                                    tree.nodes.remove(tree.nodes[name])
+            except Exception as e:
+                print(f"Warning: Could not restore world environment: {e}")
+            self._original_world_data = None
+        self._env_mapping_node = None
 
 
         self._rendering = False # Ensure rendering flag is reset

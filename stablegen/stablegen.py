@@ -1044,6 +1044,55 @@ class StableGenPanel(bpy.types.Panel):
                 row = content_box.row()
                 row.prop(scene, "overwrite_material", text="Overwrite Material", toggle=True, icon="FILE_REFRESH")
 
+                # ── PBR Decomposition ──
+                content_box.separator()
+                row = content_box.row()
+                row.prop(scene, "pbr_decomposition", text="PBR Decomposition", toggle=True, icon="NODE_MATERIAL")
+                if scene.pbr_decomposition:
+                    sub = content_box.box()
+                    # ── Map toggles ──
+                    sub.label(text="Maps to Extract:", icon="IMAGE_DATA")
+                    grid = sub.grid_flow(row_major=True, columns=3, even_columns=True, align=True)
+                    grid.prop(scene, "pbr_map_albedo", toggle=True, icon="SHADING_SOLID")
+                    grid.prop(scene, "pbr_map_roughness", toggle=True, icon="MATFLUID")
+                    grid.prop(scene, "pbr_map_metallic", toggle=True, icon="META_BALL")
+                    grid.prop(scene, "pbr_map_normal", toggle=True, icon="NORMALS_FACE")
+                    grid.prop(scene, "pbr_map_depth", toggle=True, icon="MOD_DISPLACE")
+                    # ── Per-map adjustment controls ──
+                    if scene.pbr_map_normal:
+                        adj_row = sub.row()
+                        adj_row.prop(scene, "pbr_normal_mode", text="Normal Mode")
+                        adj_row = sub.row()
+                        adj_row.prop(scene, "pbr_normal_strength", text="Normal Strength", slider=True)
+                    # ── Albedo source selector (only when albedo enabled) ──
+                    if scene.pbr_map_albedo:
+                        sub.separator()
+                        row = sub.row()
+                        row.prop(scene, "pbr_albedo_source", text="Albedo Source")
+                        if scene.pbr_albedo_source == 'delight':
+                            adj_row = sub.row()
+                            adj_row.prop(scene, "pbr_delight_strength", text="Delight Strength", slider=True)
+                    sub.separator()
+                    # ── Quality settings ──
+                    row = sub.row(align=True)
+                    row.prop(scene, "pbr_use_native_resolution", text="Native Resolution", toggle=True, icon="FULLSCREEN_ENTER")
+                    row.prop(scene, "pbr_tiling", text="")
+                    if scene.pbr_tiling != 'off':
+                        row = sub.row(align=True)
+                        row.prop(scene, "pbr_tile_grid", text="Tile Grid (N×N)")
+                        row.prop(scene, "pbr_tile_superres", text="Super Res", toggle=True, icon="IMAGE_PLANE")
+                    if not scene.pbr_use_native_resolution:
+                        row = sub.row()
+                        row.prop(scene, "pbr_processing_resolution", text="Processing Resolution")
+                    row = sub.row(align=True)
+                    row.prop(scene, "pbr_denoise_steps", text="Denoise Steps")
+                    row.prop(scene, "pbr_ensemble_size", text="Ensemble Size")
+                    sub.separator()
+                    row = sub.row()
+                    row.prop(scene, "pbr_replace_color_with_albedo", text="Use Albedo as Base Color", toggle=True, icon="SHADING_SOLID")
+                    row = sub.row()
+                    row.prop(scene, "pbr_auto_lighting", text="Studio Lighting", toggle=True, icon="LIGHT_AREA")
+
             # --- Image Guidance (IPAdapter & ControlNet) ---
             if _show_diffusion_sections:
                 if scene.model_architecture in ['sdxl', 'flux1']:

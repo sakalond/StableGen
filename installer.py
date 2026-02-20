@@ -485,6 +485,41 @@ DEPENDENCIES: Dict[str, Dict[str, Any]] = {
         "target_path_relative": "models/diffusion_models", "filename": "svdq-int4_r128-qwen-image-edit-2509-lightning-4steps-251115.safetensors",
         "license": "Apache 2.0", "size_mb": 12700, "packages": ["qwen_nunchaku"]
     },
+    # --- PBR Decomposition (Marigold IID) ---
+    "cn_comfyui_marigold": {
+        "id": "cn_comfyui_marigold", "type": "node", "name": "ComfyUI-Marigold (IID/Depth/Normal)",
+        "git_url": "https://github.com/kijai/ComfyUI-Marigold.git",
+        "target_dir_relative": "custom_nodes",
+        "repo_name": "ComfyUI-Marigold",
+        "license": "GPL-3.0", "packages": ["pbr_marigold"],
+        "pip_packages": ["diffusers>=0.28"],
+        "run_install_script": True,
+    },
+    # --- StableDelight (specular-free albedo) ---
+    "cn_comfyui_stabledelight": {
+        "id": "cn_comfyui_stabledelight", "type": "node", "name": "ComfyUI StableDelight (Delighting)",
+        "git_url": "https://github.com/lldacing/ComfyUI_StableDelight_ll.git",
+        "target_dir_relative": "custom_nodes",
+        "repo_name": "ComfyUI_StableDelight_ll",
+        "license": "Apache-2.0", "packages": ["pbr_stabledelight"],
+        "post_clone_patches": [
+            {
+                "file": "nodes/BaseNode.py",
+                "marker": "local_files_only=False",
+                "anchor": "local_files_only=True",
+                "patch": "local_files_only=False",
+                "mode": "replace",
+            },
+        ],
+    },
+    "model_stabledelight": {
+        "id": "model_stabledelight", "type": "hf_model",
+        "name": "StableDelight Model (yoso-delight-v0-4-base)",
+        "hf_repo": "Stable-X/yoso-delight-v0-4-base",
+        "local_dir": "Stable-X--yoso-delight-v0-4-base",
+        "license": "Apache-2.0", "size_mb": 3300,
+        "packages": ["pbr_stabledelight"],
+    },
     # --- TRELLIS.2 ---
     "cn_trellis2": {
         "id": "cn_trellis2", "type": "node", "name": "ComfyUI TRELLIS.2",
@@ -598,6 +633,19 @@ MENU_PACKAGES: Dict[str, Dict[str, Any]] = {
         "description_suffix": "*Installs ComfyUI-TRELLIS2 custom node. Models are downloaded automatically on first use by the node.*\n"
                               "    *LICENSE NOTICE: Only the 'Native (TRELLIS.2)' texture mode uses nvdiffrast/nvdiffrec*\n"
                               "    *(NVIDIA Source Code License — non-commercial use only). See README.md for full details.*",
+    },
+    '9': {"name": "[PBR DECOMPOSITION] Marigold IID Node",
+        "tags": ["pbr_marigold"],
+        "size_gb": 0.01,
+        "description_suffix": "*Installs ComfyUI-Marigold custom node for PBR decomposition (albedo, roughness, metallic).*\n"
+                              "    *IID models (~2GB each) are downloaded automatically from HuggingFace on first use.*",
+    },
+    '10': {"name": "[PBR DECOMPOSITION] StableDelight Node + Model",
+        "tags": ["pbr_marigold", "pbr_stabledelight"],
+        "size_gb": 3.3,
+        "description_suffix": "*Installs ComfyUI_StableDelight_ll custom node + downloads the*\n"
+                              "    *Stable-X/yoso-delight-v0-4-base model (~3.3GB fp16) for specular-free albedo.*",
+    },
 }
 
 # --- Helper Functions ---
@@ -832,6 +880,70 @@ def download_file(item_details: Dict[str, Any], comfyui_path: Path):
         print(f"  An unexpected error occurred during download of {item_details['name']}: {e}")
 
 
+def download_hf_model(item_details: Dict[str, Any], comfyui_path: Path):
+    """Download a HuggingFace diffusers model repo into ComfyUI/models/diffusers/.
+
+    Uses ``huggingface_hub.snapshot_download`` if available, otherwise falls
+    back to ``huggingface-cli download``.
+
+    Required keys in *item_details*:
+        hf_repo   – e.g. ``'Stable-X/yoso-delight-v0-4-base'``
+        local_dir – directory name under ``models/diffusers/``,
+                    e.g. ``'Stable-X--yoso-delight-v0-4-base'``
+    """
+    hf_repo = item_details["hf_repo"]
+    local_dir_name = item_details["local_dir"]
+    target_dir = comfyui_path / "models" / "diffusers" / local_dir_name
+
+    if target_dir.is_dir() and (target_dir / "model_index.json").exists():
+        print(f"INFO: HuggingFace model '{hf_repo}' already exists at '{target_dir}'. Skipping.")
+        return
+
+    create_dir_if_not_exists(target_dir.parent)
+    print(f"  Downloading HuggingFace model: {hf_repo} (~{item_details.get('size_mb', '?')} MB)")
+    print(f"  License: {item_details.get('license', 'unknown')}")
+    print(f"  Destination: {target_dir}")
+
+    # Try Python API first
+    try:
+        from huggingface_hub import snapshot_download
+        snapshot_download(
+            repo_id=hf_repo,
+            local_dir=str(target_dir),
+            local_dir_use_symlinks=False,
+            # Download config files + fp16 weight variant only (skip fp32)
+            allow_patterns=[
+                "*.json", "*.txt", "*.yaml", "*.md", "*.py", "*.model",
+                "*.fp16.safetensors", "*.fp16.bin",
+                "tokenizer/**",
+            ],
+        )
+        print(f"  HuggingFace model download complete: {local_dir_name}")
+        return
+    except ImportError:
+        print("  huggingface_hub not available, trying CLI fallback...")
+    except Exception as e:
+        print(f"  snapshot_download failed: {e}. Trying CLI fallback...")
+
+    # Fallback: huggingface-cli
+    try:
+        python_exe = find_comfyui_python(comfyui_path)
+        cmd = [
+            str(python_exe), "-m", "huggingface_hub.commands.huggingface_cli",
+            "download", hf_repo,
+            "--local-dir", str(target_dir),
+        ]
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
+        if result.returncode == 0:
+            print(f"  HuggingFace model download complete: {local_dir_name}")
+        else:
+            print(f"  ERROR downloading HuggingFace model: {result.stderr}")
+    except Exception as e:
+        print(f"  ERROR downloading HuggingFace model '{hf_repo}': {e}")
+        print(f"  You can manually download it with:")
+        print(f"    huggingface-cli download {hf_repo} --local-dir {target_dir}")
+
+
 def clone_git_repo(item_details: Dict[str, Any], comfyui_path: Path):
     git_url = item_details["git_url"]
     target_parent_dir = comfyui_path / item_details["target_dir_relative"]
@@ -938,7 +1050,7 @@ def main():
 
     while True:
         display_menu(comfyui_base_path)
-        choice = input("Enter your choice (1-8, or q to quit): ").strip().lower()
+        choice = input("Enter your choice (1-9, or q to quit): ").strip().lower()
 
         if choice == 'q':
             print("Exiting installer.")
@@ -1033,6 +1145,9 @@ def main():
             elif item_details["type"] == "model":
                 target_full_path = comfyui_base_path / item_details["target_path_relative"] / item_details["filename"]
                 download_file(item_details, comfyui_base_path)
+            elif item_details["type"] == "hf_model":
+                target_full_path = comfyui_base_path / "models" / "diffusers" / item_details["local_dir"]
+                download_hf_model(item_details, comfyui_base_path)
             
             processed_during_this_session.add(item_details["id"])
         

@@ -3076,6 +3076,192 @@ def register():
         update=update_parameters
     )
 
+    # ── PBR Decomposition (Marigold IID) ──────────────────────────────
+    bpy.types.Scene.pbr_decomposition = bpy.props.BoolProperty(
+        name="PBR Decomposition",
+        description="Run Marigold decomposition on each generated image to "
+                    "produce PBR material maps (albedo, roughness, metallic, normal, depth)",
+        default=False,
+        update=update_parameters
+    )
+
+    # ── Albedo source ─────────────────────────────────────────────────
+    bpy.types.Scene.pbr_albedo_source = bpy.props.EnumProperty(
+        name="Albedo Source",
+        description="Model to use for extracting the Base Color / albedo map",
+        items=[
+            ('marigold', "Marigold IID (Flat Albedo)",
+             "True albedo from Marigold IID-Appearance — removes all lighting "
+             "but may lose texture detail"),
+            ('delight', "StableDelight (Delighted)",
+             "Specular-removed image via StableDelight — preserves diffuse "
+             "shading and texture detail, only strips highlights"),
+        ],
+        default='marigold',
+        update=update_parameters,
+    )
+
+    # ── Per-map enable toggles ────────────────────────────────────────
+    bpy.types.Scene.pbr_map_albedo = bpy.props.BoolProperty(
+        name="Albedo",
+        description="Extract albedo (diffuse colour without lighting) and use it as Base Color",
+        default=True,
+        update=update_parameters
+    )
+    bpy.types.Scene.pbr_map_roughness = bpy.props.BoolProperty(
+        name="Roughness",
+        description="Extract roughness map (0 = mirror, 1 = rough)",
+        default=True,
+        update=update_parameters
+    )
+    bpy.types.Scene.pbr_map_metallic = bpy.props.BoolProperty(
+        name="Metallic",
+        description="Extract metallic map (0 = dielectric, 1 = metal)",
+        default=True,
+        update=update_parameters
+    )
+    bpy.types.Scene.pbr_map_normal = bpy.props.BoolProperty(
+        name="Normal",
+        description="Extract surface normal map for detail and bump. "
+                    "Warning: may cause triangle artifacts on voxel-remeshed geometry",
+        default=True,
+        update=update_parameters
+    )
+    bpy.types.Scene.pbr_normal_mode = bpy.props.EnumProperty(
+        name="Normal Mode",
+        description="How to apply the predicted normal map to the mesh",
+        items=[
+            ('world', "World Space",
+             "Camera-space normals are converted to world space. "
+             "Works on any geometry (no tangent frame needed). "
+             "Best general-purpose mode"),
+            ('bump', "Bump from Normal",
+             "Convert the normal map to a bump/height map. "
+             "Works on any geometry including voxel remesh, "
+             "but loses directional detail"),
+            ('tangent', "Tangent Space",
+             "Standard tangent-space normal map. "
+             "Best quality on properly UV-unwrapped meshes, "
+             "may show triangle artifacts on voxel-remeshed geometry"),
+        ],
+        default='world',
+        update=update_parameters,
+    )
+    bpy.types.Scene.pbr_normal_strength = bpy.props.FloatProperty(
+        name="Normal Strength",
+        description="How strongly the normal map perturbs the surface shading. "
+                    "Lower values reduce triangle artifacts on poor topology",
+        default=1.0,
+        min=0.0,
+        max=2.0,
+        step=0.05,
+        update=update_parameters
+    )
+    bpy.types.Scene.pbr_delight_strength = bpy.props.FloatProperty(
+        name="Delight Strength",
+        description="How strongly StableDelight removes specular reflections. "
+                    "Lower values preserve more original texture detail. "
+                    "1.0 = full delighting, 0.5 = subtle",
+        default=1.0,
+        min=0.01,
+        max=5.0,
+        step=0.1,
+        update=update_parameters
+    )
+    bpy.types.Scene.pbr_map_depth = bpy.props.BoolProperty(
+        name="Depth / Height",
+        description="Extract depth map for displacement/height",
+        default=False,
+        update=update_parameters
+    )
+    bpy.types.Scene.pbr_use_native_resolution = bpy.props.BoolProperty(
+        name="Use Native Resolution",
+        description="Process PBR maps at the image's native resolution (longest "
+                    "edge, rounded to 64px). Produces sharper results but uses "
+                    "more VRAM. When disabled, the fixed Processing Resolution is used",
+        default=True,
+        update=update_parameters
+    )
+    bpy.types.Scene.pbr_tiling = bpy.props.EnumProperty(
+        name="Tiling",
+        description="Tile-based super-resolution for PBR maps.  Each tile "
+                    "is upscaled to the full image resolution before "
+                    "processing, producing N\u00b2\u00d7 the effective detail",
+        items=[
+            ('off',       "Off",       "No tiling — process the full image in one pass"),
+            ('selective', "Selective", "Tile albedo only (StableDelight and/or "
+                                       "IID albedo).  Normals, roughness, metallic "
+                                       "and depth are processed normally"),
+            ('all',       "All",       "Tile every PBR model including normals and depth"),
+        ],
+        default='selective',
+        update=update_parameters
+    )
+    bpy.types.Scene.pbr_tile_grid = bpy.props.IntProperty(
+        name="Tile Grid",
+        description="N\u00d7N grid size for tiling.  2 = 4 tiles (4\u00d7 detail), "
+                    "3 = 9 tiles (9\u00d7 detail), 4 = 16 tiles (16\u00d7 detail).  "
+                    "Processing time scales with N\u00b2",
+        default=2,
+        min=2,
+        max=4,
+        update=update_parameters
+    )
+    bpy.types.Scene.pbr_tile_superres = bpy.props.BoolProperty(
+        name="Super Resolution",
+        description="When enabled, the stitched PBR maps are kept at the "
+                    "upscaled tile resolution (~N\u00d7 the original image size).  "
+                    "When disabled (default), tiles are scaled back to the "
+                    "original image resolution — still higher detail from "
+                    "tiled processing, but matching the source texture size",
+        default=True,
+        update=update_parameters
+    )
+    bpy.types.Scene.pbr_processing_resolution = bpy.props.IntProperty(
+        name="Processing Resolution",
+        description="Internal processing resolution for the Marigold model. "
+                    "Output is upscaled back to the original resolution. "
+                    "768 is the default for the model's training resolution",
+        default=768,
+        min=256,
+        max=2048,
+        step=64,
+        update=update_parameters
+    )
+    bpy.types.Scene.pbr_denoise_steps = bpy.props.IntProperty(
+        name="Denoise Steps",
+        description="Number of denoising steps. "
+                    "More steps = better quality but slower. 4 is a good balance",
+        default=4,
+        min=1,
+        max=50,
+        update=update_parameters
+    )
+    bpy.types.Scene.pbr_ensemble_size = bpy.props.IntProperty(
+        name="Ensemble Size",
+        description="Number of ensemble predictions to average. "
+                    "Higher = more stable results but linearly slower. "
+                    "1 is usually sufficient",
+        default=1,
+        min=1,
+        max=10,
+        update=update_parameters
+    )
+    bpy.types.Scene.pbr_replace_color_with_albedo = bpy.props.BoolProperty(
+        name="Use Albedo as Base Color",
+        description="Replace the projected colour texture with the albedo map. "
+                    "This effectively delights the texture",
+        default=True,
+        update=update_parameters
+    )
+    bpy.types.Scene.pbr_auto_lighting = bpy.props.BoolProperty(
+        name="Studio Lighting",
+        description="Create a three-point studio lighting rig (key, fill, rim) "
+                    "after PBR projection to showcase PBR materials",
+        default=False,
+        update=update_parameters
+    )
+
     # Artifact Filtering
     bpy.types.Scene.trellis2_artifact_laplacian_sigma = bpy.props.FloatProperty(
         name="Laplacian Sigma",
@@ -3230,6 +3416,22 @@ def unregister():
     del bpy.types.Scene.qwen_context_cleanup_value_adjust
     del bpy.types.Scene.qwen_context_fallback_dilation
     del bpy.types.Scene.qwen_timestep_zero_ref
+
+    # --- PBR Decomposition Properties ---
+    pbr_props = [
+        'pbr_decomposition', 'pbr_albedo_source',
+        'pbr_map_albedo', 'pbr_map_roughness', 'pbr_map_metallic',
+        'pbr_map_normal', 'pbr_map_depth',
+        'pbr_normal_mode', 'pbr_normal_strength',
+        'pbr_delight_strength',
+        'pbr_use_native_resolution', 'pbr_tiling', 'pbr_tile_grid', 'pbr_tile_superres',
+        'pbr_processing_resolution', 'pbr_denoise_steps', 'pbr_ensemble_size',
+        'pbr_replace_color_with_albedo', 'pbr_auto_lighting',
+        'pbr_model_variant',  # legacy, kept for compat
+    ]
+    for prop in pbr_props:
+        if hasattr(bpy.types.Scene, prop):
+            delattr(bpy.types.Scene, prop)
 
     # --- TRELLIS.2 Properties ---
     trellis2_props = [

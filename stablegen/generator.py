@@ -37,6 +37,67 @@ def redraw_ui(context):
     for area in context.screen.areas:
         area.tag_redraw()
 
+
+def setup_studio_lighting(context, scale=1.0):
+    """Create a three-point studio lighting rig (key, fill, rim).
+
+    Re-usable from any generation mode (TRELLIS.2, PBR decomposition, etc.).
+
+    Args:
+        context: Blender context.
+        scale: Scene scale factor — lights are placed at ``scale * 2.5`` distance.
+    """
+    S = max(scale, 0.5)
+    dist = S * 2.5
+
+    light_defs = [
+        ("SG_Key",  200, 1.5 * S, (1.0, 0.96, 0.90),   45, 40),
+        ("SG_Fill",  80, 2.5 * S, (0.90, 0.94, 1.0),   -60, 15),
+        ("SG_Rim",  120, 0.8 * S, (1.0, 1.0, 1.0),     170, 55),
+    ]
+
+    collection = context.collection
+    created = []
+
+    for name, power, size, color, az_deg, el_deg in light_defs:
+        old = bpy.data.objects.get(name)
+        if old:
+            bpy.data.objects.remove(old, do_unlink=True)
+
+        az = math.radians(az_deg)
+        el = math.radians(el_deg)
+        x = dist * math.cos(el) * math.sin(az)
+        y = -dist * math.cos(el) * math.cos(az)
+        z = dist * math.sin(el)
+
+        light_data = bpy.data.lights.new(name=name, type='AREA')
+        light_data.energy = power
+        light_data.size = size
+        light_data.color = color
+
+        light_obj = bpy.data.objects.new(name=name, object_data=light_data)
+        collection.objects.link(light_obj)
+
+        light_obj.location = (x, y, z)
+        direction = mathutils.Vector((0, 0, 0)) - mathutils.Vector((x, y, z))
+        rot = direction.to_track_quat('-Z', 'Y')
+        light_obj.rotation_euler = rot.to_euler()
+
+        created.append(light_obj)
+
+    print(f"[StableGen] Studio lighting created: {[o.name for o in created]}")
+    return created
+
+
+def _pbr_setup_studio_lights(context, to_texture):
+    """Calculate scene scale from target objects and set up studio lights."""
+    max_dim = 1.0
+    for obj in to_texture:
+        if hasattr(obj, 'dimensions'):
+            max_dim = max(max_dim, *obj.dimensions)
+    setup_studio_lighting(context, scale=max_dim)
+
+
 class Regenerate(bpy.types.Operator):
     """Regenerate textures for selected cameras / viewpoints
     - Works for sequential and separate generation modes
@@ -1057,6 +1118,7 @@ class ComfyUIGenerate(bpy.types.Operator):
         :return: None     
         """
         self._error = None
+        self._pbr_maps = {}  # camera_key → {map_name: file_path}
         try:
             # --- Render ControlNet / refine maps with live progress ---
             self._prepare_maps(context)
@@ -1291,7 +1353,9 @@ class ComfyUIGenerate(bpy.types.Operator):
                         image_path = image_path.replace(".png", "_ipadapter.png")
                         with open(image_path, 'wb') as f:
                             f.write(image)
-                    
+
+                    # ── PBR decomposition is deferred until after ALL cameras ──
+
                      # Sequential mode callback
                     if context.scene.generation_method == 'sequential':
                         self._stage = "Projecting Image"
@@ -1367,8 +1431,47 @@ class ComfyUIGenerate(bpy.types.Operator):
             traceback.print_exc()
             return
 
+        # ── PBR Decomposition (runs after ALL cameras are generated) ──
+        if getattr(context.scene, 'pbr_decomposition', False):
+            self._pbr_maps = {}
+            # Collect camera images that need PBR decomposition
+            camera_images = {}  # cam_idx → image_path
+            num_cameras = len(self._cameras)
+            for cam_idx in range(num_cameras):
+                cam_image_path = get_file_path(
+                    context, "generated", camera_id=cam_idx,
+                    material_id=self._material_id,
+                )
+                if os.path.exists(cam_image_path):
+                    # In project_only (reproject) mode, reuse existing PBR
+                    # maps when all enabled maps are already on disk.  This
+                    # avoids re-running the slow ComfyUI decomposition.
+                    if context.scene.generation_mode == 'project_only':
+                        existing = self._find_existing_pbr_maps(
+                            context, cam_idx)
+                        if existing:
+                            self._pbr_maps[cam_idx] = existing
+                            print(f"[StableGen] Reusing existing PBR maps "
+                                  f"for camera {cam_idx}")
+                            continue
+                        print(f"[StableGen] PBR maps missing for camera "
+                              f"{cam_idx}, running decomposition…")
+                    camera_images[cam_idx] = cam_image_path
+            if camera_images:
+                self._run_pbr_decomposition_batched(context, camera_images)
+
         def image_project_callback():
             if context.scene.generation_method == 'sequential':
+                # In sequential mode, projection happened per-camera inside the loop.
+                # PBR is projected onto the existing material after all cameras.
+                if getattr(context.scene, 'pbr_decomposition', False) and hasattr(self, '_pbr_maps') and self._pbr_maps:
+                    from .project import project_pbr_to_bsdf
+                    project_pbr_to_bsdf(
+                        context, self._to_texture, self._pbr_maps,
+                        material_id=self._material_id
+                    )
+                    if getattr(context.scene, 'pbr_auto_lighting', False):
+                        _pbr_setup_studio_lights(context, self._to_texture)
                 return None
             self._stage = "Projecting Image"
             redraw_ui(context)
@@ -1382,6 +1485,17 @@ class ComfyUIGenerate(bpy.types.Operator):
                         context, "generated_baked", object_name=obj.name, material_id=self._material_id
                     )
                     apply_uv_inpaint_texture(context, obj, texture_path)
+
+            # Project PBR maps onto material after color projection
+            if getattr(context.scene, 'pbr_decomposition', False) and hasattr(self, '_pbr_maps') and self._pbr_maps:
+                from .project import project_pbr_to_bsdf
+                project_pbr_to_bsdf(
+                    context, self._to_texture, self._pbr_maps,
+                    material_id=self._material_id
+                )
+                if getattr(context.scene, 'pbr_auto_lighting', False):
+                    _pbr_setup_studio_lights(context, self._to_texture)
+
             return None
         
         if context.scene.view_blend_use_color_match and self._to_texture:
@@ -1477,6 +1591,625 @@ class ComfyUIGenerate(bpy.types.Operator):
 
         if hasattr(self, '_uploaded_images_cache') and self._uploaded_images_cache is not None:
             self._uploaded_images_cache.pop(os.path.abspath(image_path), None)
+
+    # ── PBR Decomposition ──────────────────────────────────────────────
+    def _find_existing_pbr_maps(self, context, camera_id):
+        """Check if all enabled PBR maps already exist on disk for a camera.
+
+        Returns a dict ``{map_name: file_path}`` when every required map
+        is present, or ``None`` if any enabled map is missing (the caller
+        should run decomposition in that case).
+        """
+        scene = context.scene
+        existing = {}
+
+        map_checks = []
+        if getattr(scene, 'pbr_map_albedo', True):
+            map_checks.append('albedo')
+        if getattr(scene, 'pbr_map_roughness', True):
+            map_checks.append('roughness')
+        if getattr(scene, 'pbr_map_metallic', True):
+            map_checks.append('metallic')
+        if getattr(scene, 'pbr_map_normal', True):
+            map_checks.append('normal')
+        if getattr(scene, 'pbr_map_depth', False):
+            map_checks.append('depth')
+
+        if not map_checks:
+            return None
+
+        for map_name in map_checks:
+            path = get_file_path(
+                context, "pbr", subtype=map_name,
+                camera_id=camera_id, material_id=self._material_id
+            )
+            if os.path.exists(path):
+                existing[map_name] = path
+            else:
+                return None  # At least one required map is missing
+
+        return existing
+
+    # ── Tiled PBR processing ──────────────────────────────────────────
+
+    @staticmethod
+    def _create_tile_blend_mask(h, w, overlap_x, overlap_y,
+                                fade_left, fade_right,
+                                fade_top, fade_bottom):
+        """Return a float32 [H, W, 1] weight mask with cosine fade on inner edges.
+
+        Only the edges that border a neighbouring tile (indicated by the
+        ``fade_*`` booleans) get a cosine-weighted ramp.
+        ``overlap_x`` controls left/right ramp length,
+        ``overlap_y`` controls top/bottom ramp length.
+        Image-boundary edges stay at full weight (1.0).
+        """
+        mask = np.ones((h, w, 1), dtype=np.float32)
+
+        if overlap_x > 0:
+            ramp_x = np.linspace(0.0, np.pi, overlap_x, dtype=np.float32)
+            ramp_x = (1.0 - np.cos(ramp_x)) * 0.5      # 0 → 1 cosine ease
+            if fade_left and overlap_x <= w:
+                mask[:, :overlap_x, 0] *= ramp_x[np.newaxis, :]
+            if fade_right and overlap_x <= w:
+                mask[:, -overlap_x:, 0] *= ramp_x[np.newaxis, ::-1]
+
+        if overlap_y > 0:
+            ramp_y = np.linspace(0.0, np.pi, overlap_y, dtype=np.float32)
+            ramp_y = (1.0 - np.cos(ramp_y)) * 0.5
+            if fade_top and overlap_y <= h:
+                mask[:overlap_y, :, 0] *= ramp_y[:, np.newaxis]
+            if fade_bottom and overlap_y <= h:
+                mask[-overlap_y:, :, 0] *= ramp_y[::-1, np.newaxis]
+
+        return mask
+
+    def _process_model_tiled(self, context, image_path, model_name=None,
+                              process_fn=None):
+        """Run a model on an N×N grid of overlapping tiles.
+
+        Each tile is **upscaled to the full image's longest edge** before
+        processing, so the model spends its full resolution budget on
+        only 1/N² of the spatial area — effectively N²× the detail.
+        The stitched output is at the **upscaled** resolution (~N× the
+        original), producing super-resolution PBR maps.
+
+        Args:
+            model_name: Passed to ``generate_pbr_maps()``.
+            process_fn: Optional callable ``(context, tile_path) → result``.
+                        If given, called instead of ``generate_pbr_maps``.
+                        May return ``bytes`` (single image) or ``list[bytes]``.
+
+        Returns the same ``list[bytes]`` as ``generate_pbr_maps()``.
+        """
+        import tempfile
+
+        OVERLAP = 64  # pixels each tile extends beyond its boundary
+        MIN_DIM = 256 # skip tiling if either dimension is too small
+
+        scene = context.scene
+        N = getattr(scene, 'pbr_tile_grid', 2)
+
+        src = Image.open(image_path)
+        W, H = src.size
+        longest = max(W, H)
+
+        if W < MIN_DIM or H < MIN_DIM:
+            src.close()
+            print(f"[StableGen]     Image {W}×{H} too small for tiling, "
+                  f"processing normally")
+            if process_fn is not None:
+                fb = process_fn(context, image_path)
+                return [fb] if isinstance(fb, bytes) else fb
+            return self.workflow_manager.generate_pbr_maps(
+                context, image_path, model_name=model_name)
+
+        # Compute tile boundaries in original-image coordinates
+        x_bounds = [W * c // N for c in range(N + 1)]   # [0, W/N, 2W/N, …, W]
+        y_bounds = [H * r // N for r in range(N + 1)]
+
+        tile_info = []  # list of (l, t, r, b, fade_left, fade_right, fade_top, fade_bottom)
+        for row in range(N):
+            for col in range(N):
+                l = x_bounds[col]   - (OVERLAP if col > 0     else 0)
+                r = x_bounds[col+1] + (OVERLAP if col < N - 1 else 0)
+                t = y_bounds[row]   - (OVERLAP if row > 0     else 0)
+                b = y_bounds[row+1] + (OVERLAP if row < N - 1 else 0)
+                # Clamp to image bounds
+                l = max(l, 0);  r = min(r, W)
+                t = max(t, 0);  b = min(b, H)
+                tile_info.append((
+                    l, t, r, b,
+                    col > 0,        # fade_left
+                    col < N - 1,    # fade_right
+                    row > 0,        # fade_top
+                    row < N - 1,    # fade_bottom
+                ))
+
+        total_tiles = len(tile_info)
+
+        # Uniform scale factor — upscale tiles so longest edge ≈ full image
+        sample_tw = tile_info[0][2] - tile_info[0][0]
+        sample_th = tile_info[0][3] - tile_info[0][1]
+        sample_longest = max(sample_tw, sample_th)
+        scale = longest / sample_longest if sample_longest < longest else 1.0
+
+        # ── Process each tile ─────────────────────────────────
+        all_tile_results = []   # list of list[bytes]
+        tile_up_sizes = []      # (up_w, up_h) per tile
+        tmp_dir = tempfile.gettempdir()
+
+        for i, (l, t, r, b, fl, fr, ft, fb) in enumerate(tile_info):
+            tw, th = r - l, b - t
+            tile_img = src.crop((l, t, r, b))
+
+            tile_longest = max(tw, th)
+            if tile_longest < longest:
+                up_w = int(round(tw * scale))
+                up_h = int(round(th * scale))
+                tile_img = tile_img.resize(
+                    (up_w, up_h), Image.LANCZOS)
+                print(f"[StableGen]     Tile {i+1}/{total_tiles}:  "
+                      f"{tw}×{th} → {up_w}×{up_h}  "
+                      f"region ({l},{t})→({r},{b})")
+            else:
+                up_w, up_h = tw, th
+                print(f"[StableGen]     Tile {i+1}/{total_tiles}:  "
+                      f"{tw}×{th}  region ({l},{t})→({r},{b})")
+            tile_up_sizes.append((up_w, up_h))
+
+            tile_path = os.path.join(tmp_dir, f"sg_tile_{i}.png")
+            tile_img.save(tile_path)
+
+            if process_fn is not None:
+                result = process_fn(context, tile_path)
+                # Normalise to list[bytes] (StableDelight returns bytes)
+                if isinstance(result, bytes):
+                    result = [result]
+            else:
+                result = self.workflow_manager.generate_pbr_maps(
+                    context, tile_path, model_name=model_name,
+                    force_native_resolution=True)
+
+            try:
+                os.remove(tile_path)
+            except OSError:
+                pass
+
+            if isinstance(result, dict):
+                print(f"[StableGen]     Tile {i+1} failed, falling back "
+                      f"to full-image processing")
+                src.close()
+                if process_fn is not None:
+                    fb = process_fn(context, image_path)
+                    return [fb] if isinstance(fb, bytes) else fb
+                return self.workflow_manager.generate_pbr_maps(
+                    context, image_path, model_name=model_name)
+
+            # Resize model output to expected upscaled tile dims
+            resized = []
+            for map_bytes in result:
+                map_img = Image.open(io.BytesIO(map_bytes))
+                if map_img.size != (up_w, up_h):
+                    map_img = map_img.resize((up_w, up_h), Image.LANCZOS)
+                buf = io.BytesIO()
+                map_img.save(buf, format='PNG')
+                resized.append(buf.getvalue())
+            all_tile_results.append(resized)
+
+        src.close()
+
+        # ── Stitch tiles ──────────────────────────────────────
+        superres = getattr(scene, 'pbr_tile_superres', False)
+
+        if superres:
+            # Super-resolution: stitch at the upscaled tile size (~N× original)
+            out_W = int(round(W * scale))
+            out_H = int(round(H * scale))
+            scaled_overlap = int(round(OVERLAP * scale))
+        else:
+            # Original resolution: downscale tiles back before stitching
+            out_W, out_H = W, H
+            scaled_overlap = OVERLAP  # overlap in original coords
+
+        num_maps = len(all_tile_results[0])
+        stitched = []
+
+        for map_idx in range(num_maps):
+            canvas = np.zeros((out_H, out_W, 3), dtype=np.float32)
+            weight = np.zeros((out_H, out_W, 1), dtype=np.float32)
+
+            for i, (l, t, r, b, fl, fr, ft, fb) in enumerate(tile_info):
+                tile_bytes = all_tile_results[i][map_idx]
+                tile_img = Image.open(io.BytesIO(tile_bytes)).convert('RGB')
+
+                if superres:
+                    up_w, up_h = tile_up_sizes[i]
+                    sl = int(round(l * scale))
+                    st = int(round(t * scale))
+                    sr = min(sl + up_w, out_W)
+                    sb = min(st + up_h, out_H)
+                else:
+                    # Downscale tile back to original crop dimensions
+                    orig_w, orig_h = r - l, b - t
+                    if tile_img.size != (orig_w, orig_h):
+                        tile_img = tile_img.resize(
+                            (orig_w, orig_h), Image.LANCZOS)
+                    sl, st, sr, sb = l, t, r, b
+
+                tile_arr = np.asarray(tile_img, dtype=np.float32)
+                tile_arr = tile_arr[:sb - st, :sr - sl]
+
+                overlap_px = 2 * scaled_overlap
+                mask = self._create_tile_blend_mask(
+                    sb - st, sr - sl,
+                    overlap_x=overlap_px,
+                    overlap_y=overlap_px,
+                    fade_left=fl, fade_right=fr,
+                    fade_top=ft, fade_bottom=fb)
+
+                canvas[st:sb, sl:sr] += tile_arr * mask
+                weight[st:sb, sl:sr] += mask
+
+            canvas /= np.maximum(weight, 1e-6)
+            canvas = np.clip(canvas, 0, 255).astype(np.uint8)
+
+            out_img = Image.fromarray(canvas, mode='RGB')
+            buf = io.BytesIO()
+            out_img.save(buf, format='PNG')
+            stitched.append(buf.getvalue())
+
+        sr_label = " (super-res)" if superres else ""
+        print(f"[StableGen]     Stitched {N}×{N} output: {out_W}×{out_H}"
+              f"{sr_label}")
+
+        return stitched
+
+    def _convert_normals_cam_to_world(self, map_bytes, camera_id):
+        """Convert a Marigold camera-space normal map to world space.
+
+        Marigold normals are in camera space (X = right, Y = up,
+        Z = toward the camera).  The PNG encodes them as
+        ``(N + 1) / 2``, mapping [-1, 1] to [0, 1].
+
+        This method:
+          1. Decodes the PNG into an RGB float array.
+          2. Converts [0, 1] → [-1, 1].
+          3. Rotates each normal by the camera's world rotation
+             (Marigold OpenGL convention and Blender camera-local
+             convention agree: X-right, Y-up, Z-toward-viewer).
+          4. Re-normalises and re-encodes to [0, 1] PNG bytes.
+
+        Returns PNG bytes, or ``None`` on failure.
+        """
+        try:
+            img = Image.open(io.BytesIO(map_bytes)).convert('RGB')
+            arr = np.asarray(img, dtype=np.float32) / 255.0  # [H, W, 3] in [0,1]
+
+            # Decode to [-1, 1]
+            normals = arr * 2.0 - 1.0  # [H, W, 3]  (X, Y, Z) camera-space
+
+            # Marigold (OpenGL) convention:
+            #   X = right, Y = up, Z = toward camera (out of screen)
+            # Blender camera-local convention:
+            #   X = right, Y = up, Z = behind camera (camera looks -Z)
+            #
+            # These AGREE: a surface facing the camera has Z = +1 in
+            # both systems (+Z_local points toward the viewer).
+            # No axis flip is needed.
+
+            # Get camera rotation (camera-local → world)
+            cam = self._cameras[camera_id]
+            cam_rot = np.array(cam.matrix_world.to_3x3(), dtype=np.float32)  # 3×3
+
+            # Rotate all normals: N_world = cam_rot @ N_local
+            # Reshape to [H*W, 3] for batch matrix multiply
+            H, W, _ = normals.shape
+            flat = normals.reshape(-1, 3)           # [H*W, 3]
+            flat_world = (cam_rot @ flat.T).T       # [H*W, 3]
+
+            # Re-normalise (avoid div-by-zero)
+            norms = np.linalg.norm(flat_world, axis=1, keepdims=True)
+            norms = np.maximum(norms, 1e-6)
+            flat_world /= norms
+
+            # Encode back to [0, 1] PNG
+            world_normals = flat_world.reshape(H, W, 3)
+            encoded = np.clip((world_normals + 1.0) / 2.0, 0.0, 1.0)
+            encoded_u8 = (encoded * 255.0).astype(np.uint8)
+
+            out_img = Image.fromarray(encoded_u8, mode='RGB')
+            buf = io.BytesIO()
+            out_img.save(buf, format='PNG')
+            print(f"  Converted normal map to world space for camera {camera_id}")
+            return buf.getvalue()
+        except Exception as err:
+            print(f"  Warning: camera→world normal conversion failed: {err}")
+            return None
+
+    def _run_pbr_decomposition_batched(self, context, camera_images):
+        """Run PBR decomposition **model-first** across all cameras.
+
+        Instead of iterating cameras → models (which forces repeated model
+        loading/unloading), this iterates models → cameras so each model's
+        weights are loaded once and reused for every camera image.
+
+        Args:
+            context: Blender context.
+            camera_images: ``{cam_idx: image_path}`` for cameras that need
+                processing.
+        """
+        scene = context.scene
+        self._stage = "PBR Decomposition"
+        self._progress = 0
+        num_cams = len(camera_images)
+        cam_ids = sorted(camera_images.keys())
+        print(f"[StableGen] Running batched PBR decomposition on "
+              f"{num_cams} camera(s)…")
+
+        # Free VRAM before loading PBR models — the previous generation
+        # model may still be cached, and Marigold/StableDelight need
+        # GPU memory.
+        try:
+            server_address = context.preferences.addons[
+                __package__].preferences.server_address
+            self.workflow_manager._flush_comfyui_vram(
+                server_address, retries=1, label="PBR pre-load")
+        except Exception as e:
+            print(f"[StableGen] VRAM flush before PBR failed (non-fatal): {e}")
+
+        want_albedo = getattr(scene, 'pbr_map_albedo', True)
+        want_roughness = getattr(scene, 'pbr_map_roughness', True)
+        want_metallic = getattr(scene, 'pbr_map_metallic', True)
+        want_normal = getattr(scene, 'pbr_map_normal', True)
+        want_depth = getattr(scene, 'pbr_map_depth', False)
+        albedo_source = getattr(scene, 'pbr_albedo_source', 'delight')
+
+        use_delight = (want_albedo and albedo_source == 'delight')
+
+        # ── Determine which Marigold models to run ────────────────────
+        need_appearance = (
+            (want_albedo and albedo_source == 'marigold')
+            or want_roughness
+            or want_metallic
+        )
+        need_normals = want_normal
+        need_depth = want_depth
+
+        models_to_run = []
+        if need_appearance:
+            models_to_run.append((
+                'prs-eth/marigold-iid-appearance-v1-1',
+                ['albedo', 'material'],
+            ))
+        if need_normals:
+            models_to_run.append((
+                'prs-eth/marigold-normals-lcm-v0-1',
+                ['normal'],
+            ))
+        if need_depth:
+            models_to_run.append((
+                'prs-eth/marigold-depth-lcm-v1-0',
+                ['depth'],
+            ))
+
+        total_model_steps = len(models_to_run) + (1 if use_delight else 0)
+        if total_model_steps == 0:
+            print("[StableGen] No PBR maps enabled, skipping decomposition")
+            return
+
+        # Ensure every camera has an entry in _pbr_maps
+        for cam_idx in cam_ids:
+            if cam_idx not in self._pbr_maps:
+                self._pbr_maps[cam_idx] = {}
+
+        # ── Tiling settings ───────────────────────────────────────────
+        tiling_mode = getattr(scene, 'pbr_tiling', 'off')
+        tile_grid = getattr(scene, 'pbr_tile_grid', 2)
+
+        tile_model_keys = set()
+        if tiling_mode == 'selective':
+            tile_model_keys = {'appearance'}
+        elif tiling_mode == 'all':
+            tile_model_keys = {'appearance', 'normals', 'depth'}
+
+        model_step = 0
+
+        # ── StableDelight pass (all cameras) ──────────────────────────
+        if use_delight:
+            model_step += 1
+            tile_delight = tiling_mode in ('selective', 'all')
+            tile_label = f" (tiled {tile_grid}×{tile_grid})" if tile_delight else ""
+            print(f"[StableGen]   Model {model_step}/{total_model_steps}: "
+                  f"StableDelight{tile_label}")
+
+            for ci, cam_idx in enumerate(cam_ids):
+                image_path = camera_images[cam_idx]
+                self._stage = (f"PBR: StableDelight "
+                               f"(cam {ci+1}/{num_cams})")
+                self._progress = 0
+                print(f"    Camera {cam_idx} ({ci+1}/{num_cams})…")
+
+                if tile_delight:
+                    result = self._process_model_tiled(
+                        context, image_path,
+                        process_fn=self.workflow_manager.generate_delight_map)
+                    if isinstance(result, list) and result:
+                        result = result[0]
+                else:
+                    result = self.workflow_manager.generate_delight_map(
+                        context, image_path
+                    )
+
+                if isinstance(result, dict) and "error" in result:
+                    print(f"    StableDelight error: {result['error']}")
+                    self._warning = f"StableDelight failed: {result['error']}"
+                elif isinstance(result, bytes):
+                    pbr_path = get_file_path(
+                        context, "pbr", subtype="albedo",
+                        camera_id=cam_idx,
+                        material_id=self._material_id)
+                    try:
+                        with open(pbr_path, 'wb') as f:
+                            f.write(result)
+                        self._pbr_maps[cam_idx]['albedo'] = pbr_path
+                        print(f"    Saved albedo (delight) → "
+                              f"{os.path.basename(pbr_path)}")
+                    except Exception as err:
+                        print(f"    Failed to save delight albedo: {err}")
+
+        # ── Marigold model passes (all cameras per model) ─────────────
+        for model_name, map_names in models_to_run:
+            model_step += 1
+            model_short = model_name.split('/')[-1]
+            should_tile = any(k in model_short for k in tile_model_keys)
+            is_iid = 'appearance' in model_short
+
+            tile_label = f" (tiled {tile_grid}×{tile_grid})" if should_tile else ""
+            print(f"[StableGen]   Model {model_step}/{total_model_steps}: "
+                  f"{model_name}{tile_label}")
+
+            for ci, cam_idx in enumerate(cam_ids):
+                image_path = camera_images[cam_idx]
+                self._stage = (f"PBR: {model_short} "
+                               f"(cam {ci+1}/{num_cams})")
+                self._progress = 0
+
+                # ── Selective IID dual-run ─────────────────────────
+                dual_run_iid = (
+                    should_tile and is_iid
+                    and tiling_mode == 'selective'
+                    and not use_delight
+                )
+
+                extra = " + untiled material" if dual_run_iid else ""
+                print(f"    Camera {cam_idx} ({ci+1}/{num_cams}){extra}…")
+
+                if dual_run_iid:
+                    result_tiled = self._process_model_tiled(
+                        context, image_path, model_name)
+                    result_untiled = self.workflow_manager.generate_pbr_maps(
+                        context, image_path, model_name=model_name)
+                    if (isinstance(result_tiled, list)
+                            and len(result_tiled) >= 2
+                            and isinstance(result_untiled, list)
+                            and len(result_untiled) >= 2):
+                        result = [result_tiled[0], result_untiled[1]]
+                    elif isinstance(result_tiled, dict):
+                        result = result_tiled
+                    elif isinstance(result_untiled, dict):
+                        result = result_untiled
+                    else:
+                        result = (result_tiled
+                                  if isinstance(result_tiled, list)
+                                  else result_untiled)
+                elif should_tile and not (is_iid and use_delight):
+                    result = self._process_model_tiled(
+                        context, image_path, model_name)
+                else:
+                    result = self.workflow_manager.generate_pbr_maps(
+                        context, image_path, model_name=model_name)
+
+                if isinstance(result, dict) and "error" in result:
+                    print(f"    PBR model error: {result['error']}")
+                    self._warning = (f"PBR decomposition failed: "
+                                     f"{result['error']}")
+                    continue
+
+                # ── Save each output component ────────────────────
+                self._save_pbr_map_outputs(
+                    context, result, map_names, cam_idx,
+                    want_roughness=want_roughness,
+                    want_metallic=want_metallic,
+                    use_delight=use_delight)
+
+        print(f"[StableGen] PBR decomposition complete for "
+              f"{num_cams} camera(s)")
+
+    def _save_pbr_map_outputs(self, context, result, map_names, camera_id,
+                               want_roughness=True, want_metallic=True,
+                               use_delight=False):
+        """Save the output images from a single model run to disk.
+
+        Handles the IID material channel split (R=roughness, G=metallic)
+        and the camera→world normal conversion.
+
+        Args:
+            result: list of bytes (one per output map).
+            map_names: list of names corresponding to each output.
+            camera_id: Camera index.
+            want_roughness / want_metallic: Whether to save those channels.
+            use_delight: Whether StableDelight handles albedo (skip IID albedo).
+        """
+        scene = context.scene
+        for i, map_bytes in enumerate(result):
+            map_name = map_names[i] if i < len(map_names) else f"component_{i}"
+
+            # ── IID-Appearance "material" channel split ───────────
+            if map_name == 'material':
+                try:
+                    mat_img = Image.open(io.BytesIO(map_bytes)).convert('RGB')
+                except Exception as err:
+                    print(f"    Failed to decode material image: {err}")
+                    continue
+
+                if want_roughness:
+                    rough_img = mat_img.getchannel('R').convert('L')
+                    rough_path = get_file_path(
+                        context, "pbr", subtype="roughness",
+                        camera_id=camera_id,
+                        material_id=self._material_id)
+                    try:
+                        rough_img.save(rough_path)
+                        self._pbr_maps[camera_id]['roughness'] = rough_path
+                        print(f"    Saved roughness (material R) → "
+                              f"{os.path.basename(rough_path)}")
+                    except Exception as err:
+                        print(f"    Failed to save roughness: {err}")
+
+                if want_metallic:
+                    metal_img = mat_img.getchannel('G').convert('L')
+                    metal_path = get_file_path(
+                        context, "pbr", subtype="metallic",
+                        camera_id=camera_id,
+                        material_id=self._material_id)
+                    try:
+                        metal_img.save(metal_path)
+                        self._pbr_maps[camera_id]['metallic'] = metal_path
+                        print(f"    Saved metallic (material G) → "
+                              f"{os.path.basename(metal_path)}")
+                    except Exception as err:
+                        print(f"    Failed to save metallic: {err}")
+                continue
+
+            # Skip maps the user didn't enable
+            toggle_attr = f"pbr_map_{map_name}"
+            if hasattr(scene, toggle_attr) and not getattr(scene, toggle_attr):
+                continue
+
+            # Skip Marigold albedo when StableDelight is handling it
+            if map_name == 'albedo' and use_delight:
+                continue
+
+            pbr_path = get_file_path(
+                context, "pbr", subtype=map_name,
+                camera_id=camera_id,
+                material_id=self._material_id)
+            try:
+                # ── Camera→world-space conversion for normals ─────
+                if map_name == 'normal':
+                    converted = self._convert_normals_cam_to_world(
+                        map_bytes, camera_id)
+                    if converted is not None:
+                        map_bytes = converted
+
+                with open(pbr_path, 'wb') as f:
+                    f.write(map_bytes)
+                self._pbr_maps[camera_id][map_name] = pbr_path
+                print(f"    Saved {map_name} → "
+                      f"{os.path.basename(pbr_path)}")
+            except Exception as err:
+                print(f"    Failed to save PBR map {map_name}: {err}")
 
     def _apply_qwen_context_cleanup(self, context, image_bytes):
         hue_tolerance = max(context.scene.qwen_context_cleanup_hue_tolerance, 0.0)
@@ -2644,49 +3377,7 @@ class Trellis2Generate(bpy.types.Operator):
     # -----------------------------------------------------------------
     def _setup_studio_lighting(self, context, import_scale):
         """Create a three-point studio lighting setup around the imported mesh."""
-        S = max(import_scale, 0.5)   # Avoid degenerate positions
-        dist = S * 2.5               # Distance from origin
-
-        # (name, watts, size, color_rgb, azimuth_deg, elevation_deg)
-        light_defs = [
-            ("SG_Key",  200, 1.5 * S, (1.0, 0.96, 0.90),   45, 40),
-            ("SG_Fill",  80, 2.5 * S, (0.90, 0.94, 1.0),   -60, 15),
-            ("SG_Rim",  120, 0.8 * S, (1.0, 1.0, 1.0),     170, 55),
-        ]
-
-        collection = context.collection
-        created = []
-
-        for name, power, size, color, az_deg, el_deg in light_defs:
-            # Remove any stale light with the same name
-            old = bpy.data.objects.get(name)
-            if old:
-                bpy.data.objects.remove(old, do_unlink=True)
-
-            az = math.radians(az_deg)
-            el = math.radians(el_deg)
-            x = dist * math.cos(el) * math.sin(az)
-            y = -dist * math.cos(el) * math.cos(az)   # -Y = Blender front
-            z = dist * math.sin(el)
-
-            light_data = bpy.data.lights.new(name=name, type='AREA')
-            light_data.energy = power
-            light_data.size = size
-            light_data.color = color
-
-            light_obj = bpy.data.objects.new(name=name, object_data=light_data)
-            collection.objects.link(light_obj)
-
-            light_obj.location = (x, y, z)
-            # Aim at origin
-            direction = mathutils.Vector((0, 0, 0)) - mathutils.Vector((x, y, z))
-            rot = direction.to_track_quat('-Z', 'Y')
-            light_obj.rotation_euler = rot.to_euler()
-
-            created.append(light_obj)
-
-        print(f"[TRELLIS2] Studio lighting created: {[o.name for o in created]}")
-        return created
+        return setup_studio_lighting(context, scale=import_scale)
 
     def _schedule_texture_generation(self, context):
         """Defer texture generation via a timer so Blender can digest the new cameras.

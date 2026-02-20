@@ -983,6 +983,325 @@ class WorkflowManager:
 
         return prompt, "7"
 
+    # ── PBR Decomposition (Marigold IID) ───────────────────────────────
+    def generate_pbr_maps(self, context, input_image_path, model_name=None,
+                          force_native_resolution=False):
+        """Run a Marigold model on a generated texture and collect the output.
+
+        Uploads *input_image_path* to the ComfyUI server, runs it through the
+        ``MarigoldModelLoader`` + ``MarigoldDepthEstimation_v2`` pipeline,
+        and collects the resulting map(s) via ``SaveImageWebsocket``.
+
+        Different models produce different outputs:
+
+        * **IID-Appearance** → 3 images: [Albedo, Roughness, Metallicity]
+        * **IID-Lighting**   → 3 images: [Albedo, Shading, Residual]
+        * **Normals**        → 1 image:  [Normal map]
+        * **Depth**          → 1 image:  [Depth map]
+
+        Args:
+            input_image_path: Absolute path to the generated texture PNG.
+            model_name: HuggingFace model repo name to use, e.g.
+                ``'prs-eth/marigold-iid-appearance-v1-1'``.  If *None*,
+                defaults to the IID-Appearance model.
+            force_native_resolution: If *True*, always process at the
+                image's native longest edge (rounded to 64) regardless
+                of the user-configured resolution settings.  Used by
+                the tiling path so each tile gets full-detail processing.
+
+        Returns:
+            list[bytes] | dict: A list of raw-PNG byte buffers on success,
+                or ``{"error": "..."}`` on failure.
+        """
+        server_address = context.preferences.addons[__package__].preferences.server_address
+        client_id = str(uuid.uuid4())
+        scene = context.scene
+
+        if model_name is None:
+            model_name = 'prs-eth/marigold-iid-appearance-v1-1'
+
+        # Pre-flight: verify that ComfyUI-Marigold nodes are installed
+        required_nodes = ['MarigoldModelLoader', 'MarigoldDepthEstimation_v2']
+        for node_class in required_nodes:
+            try:
+                resp = urllib.request.urlopen(
+                    f"http://{server_address}/object_info/{node_class}",
+                    timeout=get_timeout('api')
+                )
+                data = json.loads(resp.read())
+                if node_class not in data:
+                    return {"error": f"ComfyUI-Marigold node '{node_class}' not found. "
+                                     f"Install ComfyUI-Marigold (run installer option 9 "
+                                     f"or git clone https://github.com/kijai/ComfyUI-Marigold "
+                                     f"into ComfyUI/custom_nodes/) and ensure 'diffusers>=0.28' "
+                                     f"is installed in ComfyUI's Python, then restart ComfyUI."}
+            except Exception:
+                return {"error": f"ComfyUI-Marigold node '{node_class}' not found. "
+                                 f"Install ComfyUI-Marigold (run installer option 9 "
+                                 f"or git clone https://github.com/kijai/ComfyUI-Marigold "
+                                 f"into ComfyUI/custom_nodes/) and ensure 'diffusers>=0.28' "
+                                 f"is installed in ComfyUI's Python, then restart ComfyUI."}
+
+        # Upload the source image to ComfyUI's input folder
+        from .generator import upload_image_to_comfyui
+        image_info = upload_image_to_comfyui(server_address, input_image_path)
+        if image_info is None:
+            return {"error": f"Failed to upload image for PBR decomposition: {input_image_path}"}
+
+        uploaded_name = image_info.get("name", os.path.basename(input_image_path))
+
+        # Determine the processing resolution.
+        # When 'Native Resolution' is enabled (or forced by tiling), use
+        # the image's own longest edge (rounded to 64) so Marigold
+        # processes at full detail.
+        # Otherwise fall back to the user-specified fixed resolution.
+        use_native = force_native_resolution or getattr(
+            scene, 'pbr_use_native_resolution', False)
+        if use_native:
+            try:
+                from PIL import Image as _PILImage
+                with _PILImage.open(input_image_path) as _img:
+                    _w, _h = _img.size
+                proc_res = max(_w, _h)
+                proc_res = ((proc_res + 63) // 64) * 64
+                print(f"[StableGen] Marigold: native resolution {proc_res}px "
+                      f"(input {_w}\u00d7{_h})")
+            except Exception:
+                proc_res = scene.pbr_processing_resolution
+        else:
+            proc_res = scene.pbr_processing_resolution
+
+        # Build the minimal ComfyUI workflow
+        prompt = {
+            "1": {
+                "class_type": "LoadImage",
+                "inputs": {"image": uploaded_name}
+            },
+            "2": {
+                "class_type": "MarigoldModelLoader",
+                "inputs": {
+                    "model": model_name,
+                }
+            },
+            "3": {
+                "class_type": "MarigoldDepthEstimation_v2",
+                "inputs": {
+                    "marigold_model": ["2", 0],
+                    "image": ["1", 0],
+                    "seed": scene.seed if scene.seed != 0 else random.randint(0, 2**31),
+                    "denoise_steps": scene.pbr_denoise_steps,
+                    "ensemble_size": scene.pbr_ensemble_size,
+                    "processing_resolution": proc_res,
+                    "scheduler": "LCMScheduler",
+                    "use_taesd_vae": False,
+                    # Keep loaded to avoid offloading to CPU — newer diffusers
+                    # raises ValueError when moving a float16 pipeline to CPU.
+                    "keep_model_loaded": True,
+                }
+            },
+            "4": {
+                "class_type": "SaveImageWebsocket",
+                "inputs": {"images": ["3", 0]}
+            }
+        }
+
+        NODES = {"save_image": "4"}
+
+        ws = self._connect_to_websocket(server_address, client_id)
+        if ws is None:
+            return {"error": "WebSocket connection failed for PBR decomposition"}
+
+        if hasattr(self.operator, '_active_ws'):
+            self.operator._active_ws = ws
+            type(self.operator)._active_ws = ws
+
+        try:
+            images = self._execute_prompt_and_get_images(
+                ws, prompt, client_id, server_address, NODES
+            )
+        finally:
+            if hasattr(self.operator, '_active_ws'):
+                self.operator._active_ws = None
+                type(self.operator)._active_ws = None
+            try:
+                ws.close()
+            except Exception:
+                pass
+
+        if images is None or not isinstance(images, dict) or not images:
+            return {"error": "PBR decomposition failed — no output received"}
+
+        save_node = NODES['save_image']
+        if save_node not in images or not images[save_node]:
+            return {"error": "PBR decomposition failed — no images from save node"}
+
+        pbr_maps = images[save_node]  # list of raw PNG bytes
+        print(f"[StableGen] Marigold '{model_name}' returned {len(pbr_maps)} image(s)")
+
+        return pbr_maps
+
+    def generate_delight_map(self, context, input_image_path):
+        """Run StableDelight on an image to produce a specular-free (delighted) version.
+
+        Uses the ``LoadStableDelightModel`` + ``ApplyStableDelight`` nodes
+        from the *ComfyUI_StableDelight_ll* custom-node package.
+
+        The delighted image preserves diffuse shading and texture detail
+        while removing specular highlights — making it a high-quality
+        alternative to Marigold IID's flat albedo for the Base Color slot.
+
+        Args:
+            input_image_path: Absolute path to the generated texture PNG.
+
+        Returns:
+            bytes | dict: Raw PNG bytes of the delighted image on success,
+                or ``{"error": "..."}`` on failure.
+        """
+        server_address = context.preferences.addons[__package__].preferences.server_address
+        client_id = str(uuid.uuid4())
+        scene = context.scene
+
+        # Pre-flight: verify that StableDelight nodes are installed
+        required_nodes = ['LoadStableDelightModel', 'ApplyStableDelight']
+        for node_class in required_nodes:
+            try:
+                resp = urllib.request.urlopen(
+                    f"http://{server_address}/object_info/{node_class}",
+                    timeout=get_timeout('api')
+                )
+                data = json.loads(resp.read())
+                if node_class not in data:
+                    return {"error": f"StableDelight node '{node_class}' not found. "
+                                     f"Install ComfyUI_StableDelight_ll (run installer "
+                                     f"option 10 or git clone "
+                                     f"https://github.com/lldacing/ComfyUI_StableDelight_ll "
+                                     f"into ComfyUI/custom_nodes/) and download the model "
+                                     f"'Stable-X/yoso-delight-v0-4-base' into "
+                                     f"ComfyUI/models/diffusers/, then restart ComfyUI."}
+            except Exception:
+                return {"error": f"StableDelight node '{node_class}' not found. "
+                                 f"Install ComfyUI_StableDelight_ll (run installer "
+                                 f"option 10 or git clone "
+                                 f"https://github.com/lldacing/ComfyUI_StableDelight_ll "
+                                 f"into ComfyUI/custom_nodes/) and download the model "
+                                 f"'Stable-X/yoso-delight-v0-4-base' into "
+                                 f"ComfyUI/models/diffusers/, then restart ComfyUI."}
+
+        # Resolve model path — the node expects a relative path under
+        # ComfyUI/models/diffusers/ containing model_index.json.
+        delight_model_path = "Stable-X--yoso-delight-v0-4-base"
+
+        # Upload the source image to ComfyUI's input folder
+        from .generator import upload_image_to_comfyui
+        image_info = upload_image_to_comfyui(server_address, input_image_path)
+        if image_info is None:
+            return {"error": f"Failed to upload image for StableDelight: {input_image_path}"}
+
+        uploaded_name = image_info.get("name", os.path.basename(input_image_path))
+
+        # Determine the processing resolution.
+        #
+        # The official Stable-X Predictor uses processing_resolution=2048,
+        # while the ComfyUI node defaults to 1024.  Both use
+        # MarigoldImageProcessor.preprocess() → resize_to_max_edge() which
+        # scales the image so its *longest edge* equals processing_resolution,
+        # then pads to a multiple of vae_scale_factor (8).
+        #
+        # Problems with a fixed resolution:
+        # - Too small (e.g. 1024): images larger than 1024px get downscaled
+        #   then bilinearly upscaled back → blurry output.
+        # - Too large: small images get massively upscaled → wastes VRAM
+        #   and can exceed available memory.
+        # - resolution=0: triggers skip_preprocess=True in the node, which
+        #   has a 3D/4D tensor bug in the pipeline's VAE encoder.
+        #
+        # Solution: use max(native_longest_edge, 1024).  This ensures:
+        # - Large images (>1024) are processed at native res (no downscale).
+        # - Small images (<1024) are upscaled to 1024 — giving the SD1.5-
+        #   based model enough spatial tokens to produce clean output.
+        # The value is rounded up to the nearest multiple of 64 (not just 8)
+        # to match the official Stable-X resize_image() convention, which
+        # aligns to 64 for clean integer dimensions through every UNet level
+        # (VAE /8, then 3 downsampling stages at /2 each = 64× total).
+        try:
+            from PIL import Image as _PILImage
+            with _PILImage.open(input_image_path) as _img:
+                _w, _h = _img.size
+            # Floor: at least 1024 (the model's ComfyUI default)
+            # Ceiling: native resolution (avoid downscaling)
+            proc_res = max(max(_w, _h), 1024)
+            # Round up to next multiple of 64 (official alignment)
+            proc_res = ((proc_res + 63) // 64) * 64
+            print(f"[StableGen] StableDelight: processing at {proc_res}px "
+                  f"(input {_w}×{_h})")
+        except Exception:
+            proc_res = 1024  # safe fallback
+
+        # Build the ComfyUI workflow
+        prompt = {
+            "1": {
+                "class_type": "LoadImage",
+                "inputs": {"image": uploaded_name}
+            },
+            "2": {
+                "class_type": "LoadStableDelightModel",
+                "inputs": {
+                    "model": delight_model_path,
+                    "device": "AUTO",
+                }
+            },
+            "3": {
+                "class_type": "ApplyStableDelight",
+                "inputs": {
+                    "model": ["2", 0],
+                    "images": ["1", 0],
+                    "strength": getattr(scene, 'pbr_delight_strength', 1.0),
+                    "resolution": proc_res,
+                    "upscale_method": "bilinear",
+                }
+            },
+            "4": {
+                "class_type": "SaveImageWebsocket",
+                "inputs": {"images": ["3", 0]}
+            }
+        }
+
+        NODES = {"save_image": "4"}
+
+        ws = self._connect_to_websocket(server_address, client_id)
+        if ws is None:
+            return {"error": "WebSocket connection failed for StableDelight"}
+
+        if hasattr(self.operator, '_active_ws'):
+            self.operator._active_ws = ws
+            type(self.operator)._active_ws = ws
+
+        try:
+            images = self._execute_prompt_and_get_images(
+                ws, prompt, client_id, server_address, NODES
+            )
+        finally:
+            if hasattr(self.operator, '_active_ws'):
+                self.operator._active_ws = None
+                type(self.operator)._active_ws = None
+            try:
+                ws.close()
+            except Exception:
+                pass
+
+        if images is None or not isinstance(images, dict) or not images:
+            return {"error": "StableDelight failed — no output received"}
+
+        save_node = NODES['save_image']
+        if save_node not in images or not images[save_node]:
+            return {"error": "StableDelight failed — no images from save node"}
+
+        delight_images = images[save_node]
+        print(f"[StableGen] StableDelight returned {len(delight_images)} image(s)")
+
+        # StableDelight returns a single image
+        return delight_images[0] if delight_images else {"error": "StableDelight returned empty"}
+
     def _build_flux_txt2img(self, context):
         """Return (prompt_dict, save_node_id) for a minimal Flux txt2img with LoRA support."""
         scene = context.scene
