@@ -35,6 +35,245 @@ def _copy_uv_to_attribute(obj, uv_layer_name, attr_name):
     obj.data.update()
 
 
+def _bake_visibility_weights(context, objects, cameras, mat_id, stop_index=1000000):
+    """Pre-compute per-vertex, per-camera visibility weights and store them
+    as ``FLOAT`` ``POINT``-domain mesh attributes.
+
+    Attribute naming: ``_SG_VisWeight_{cam_idx}_{mat_id}``
+
+    The computation replicates the same logic as the runtime
+    ``create_native_raycast_visibility`` + ``create_native_feather`` shader
+    nodes but runs once in Python so the resulting material has no world-space
+    dependencies — projected textures survive object transforms.
+
+    Uses NumPy for bulk frustum/angle/feather computation and only falls back
+    to per-vertex BVH raycasting for the subset that passes initial checks.
+    """
+    import bmesh
+    import numpy as np
+    from mathutils.bvhtree import BVHTree
+    from math import pow as fpow
+
+    scene = context.scene
+    angle_threshold = scene.discard_factor        # degrees
+    power_exponent  = scene.weight_exponent
+    feather_active  = scene.visibility_vignette
+    feather_width   = scene.visibility_vignette_width if feather_active else 0.0
+    feather_gamma   = scene.visibility_vignette_softness if feather_active else 1.0
+    feather_width   = max(0.0, min(feather_width, 0.49))
+
+    # Pre-compute camera data once -----------------------------------------------
+    cam_data = []
+    for camera in cameras:
+        cam_loc = camera.location.copy()
+        quat    = camera.matrix_world.to_quaternion()
+        cam_dir = quat @ Vector((0, 0, -1))
+        cam_up  = quat @ Vector((0, 1, 0))
+        cam_right   = cam_dir.cross(cam_up).normalized()
+        cam_up_vec  = cam_right.cross(cam_dir).normalized()
+
+        cam_res_x, cam_res_y = _get_camera_resolution(camera, scene)
+        fov = camera.data.angle_x
+        if cam_res_y > cam_res_x:
+            fov = 2 * atan(tan(fov / 2) * cam_res_x / cam_res_y)
+        filmw  = tan(fov / 2)
+        aspect = cam_res_x / cam_res_y
+        filmh  = filmw / aspect
+
+        cam_data.append((
+            np.array(cam_loc, dtype=np.float64),
+            np.array(cam_dir, dtype=np.float64),
+            np.array(cam_right, dtype=np.float64),
+            np.array(cam_up_vec, dtype=np.float64),
+            filmw, filmh,
+            cam_loc,  # keep mathutils Vector for BVH calls
+        ))
+
+    # Build scene-wide BVH for occlusion (matches ShaderNodeRaycast behaviour,
+    # which checks ALL visible scene geometry, not just the current object).
+    scene_bm = bmesh.new()
+    vert_offset = 0
+    for scene_obj in context.view_layer.objects:
+        if scene_obj.type != 'MESH' or scene_obj.hide_get():
+            continue
+        tmp = bmesh.new()
+        tmp.from_mesh(scene_obj.data)
+        tmp.transform(scene_obj.matrix_world)
+        for v in tmp.verts:
+            scene_bm.verts.new(v.co)
+        scene_bm.verts.ensure_lookup_table()
+        for f in tmp.faces:
+            try:
+                scene_bm.faces.new(
+                    [scene_bm.verts[v.index + vert_offset] for v in f.verts])
+            except ValueError:
+                pass  # skip degenerate / duplicate faces
+        vert_offset += len(tmp.verts)
+        tmp.free()
+    scene_bm.normal_update()
+    scene_tree = BVHTree.FromBMesh(scene_bm)
+    scene_bm.free()
+    print(f"[StableGen] Scene BVH built ({vert_offset} verts across visible meshes)")
+
+    # Per-object bake -------------------------------------------------------------
+    n_cameras = len(cameras)
+    for obj_idx, obj in enumerate(objects):
+        bm = bmesh.new()
+        bm.from_mesh(obj.data)
+        bm.transform(obj.matrix_world)
+        bm.normal_update()
+
+        n_verts = len(bm.verts)
+        # Build numpy arrays (Nx3) for positions and normals
+        positions_np = np.array([v.co[:] for v in bm.verts], dtype=np.float64)
+        normals_np   = np.array([v.normal[:] for v in bm.verts], dtype=np.float64)
+        bm.free()
+
+        for cam_idx, camera in enumerate(cameras):
+            print(f"[StableGen] Baking visibility: object {obj_idx+1}/{len(objects)}, "
+                  f"camera {cam_idx+1}/{n_cameras} ({n_verts} verts)")
+
+            weights = np.zeros(n_verts, dtype=np.float64)
+
+            if cam_idx > stop_index:
+                # Store zeros (camera disabled) and continue
+                attr_name = f"_SG_VisWeight_{cam_idx}_{mat_id}"
+                existing  = obj.data.attributes.get(attr_name)
+                if existing:
+                    obj.data.attributes.remove(existing)
+                attr = obj.data.attributes.new(
+                    name=attr_name, type='FLOAT', domain='POINT')
+                attr.data.foreach_set("value", weights.tolist())
+                continue
+
+            cam_loc_np, cam_dir_np, cam_right_np, cam_up_np, filmw, filmh, cam_loc_mu = cam_data[cam_idx]
+
+            # ── Vectorised frustum + angle pre-filter ──────────────────
+            to_vert = positions_np - cam_loc_np                     # (N, 3)
+            dists   = np.linalg.norm(to_vert, axis=1)              # (N,)
+            valid   = dists > 1e-8
+            direction = np.zeros_like(to_vert)
+            direction[valid] = to_vert[valid] / dists[valid, None]
+
+            # Frustum: d_neg_fwd < 0  (vertex is in front of camera)
+            d_neg_fwd = np.einsum('ij,j->i', direction, -cam_dir_np)
+            valid &= d_neg_fwd < 0
+
+            neg_cam_z = np.where(valid, -d_neg_fwd, 1.0)  # avoid /0
+            d_right   = np.einsum('ij,j->i', direction, cam_right_np)
+            d_up      = np.einsum('ij,j->i', direction, cam_up_np)
+            x_proj    = d_right / neg_cam_z
+            y_proj    = d_up    / neg_cam_z
+
+            valid &= (np.abs(x_proj) < filmw) & (np.abs(y_proj) < filmh)
+
+            # Angle threshold
+            dot_dn    = np.abs(np.einsum('ij,ij->i', direction, normals_np))
+            dot_dn    = np.clip(dot_dn, 0.0, 1.0)
+            angle_deg = np.degrees(np.arccos(dot_dn))
+            valid &= angle_deg < angle_threshold
+
+            # ── BVH raycast only for candidates that passed filters ───
+            candidate_indices = np.nonzero(valid)[0]
+            occluded = np.zeros(n_verts, dtype=bool)
+            for vi in candidate_indices:
+                d_mu = Vector(direction[vi])
+                hit_loc, _, _, hit_dist = scene_tree.ray_cast(
+                    cam_loc_mu, d_mu, float(dists[vi]) + 0.01)
+                if hit_loc is not None and dists[vi] > hit_dist + 0.001:
+                    occluded[vi] = True
+
+            valid &= ~occluded
+
+            # ── Silhouette erosion ─────────────────────────────────────
+            # Cast offset rays around each visible vertex.  If any offset
+            # ray hits an occluder significantly closer, this vertex is
+            # near a depth discontinuity (e.g. hand edge on body) and its
+            # weight should be zeroed so another camera fills that area.
+            silhouette_margin_px = getattr(scene, 'sg_silhouette_margin', 3)
+            if silhouette_margin_px > 0:
+                # Angular offset per pixel (radians)
+                cam_res_x_n, cam_res_y_n = _get_camera_resolution(camera, scene)
+                rad_per_px = fov / max(cam_res_x_n, 1)
+                offset_angle = rad_per_px * silhouette_margin_px
+
+                visible_indices = np.nonzero(valid)[0]
+                near_silhouette = np.zeros(n_verts, dtype=bool)
+
+                # Offset directions in camera space
+                offsets_right = cam_right_np * offset_angle
+                offsets_up    = cam_up_np * offset_angle
+
+                use_8_rays = getattr(scene, 'sg_silhouette_rays', '4') == '8'
+                if use_8_rays:
+                    diag = offset_angle * 0.7071067811865476  # 1/sqrt(2)
+                    offsets_diag_ru = cam_right_np * diag + cam_up_np * diag
+                    offsets_diag_rd = cam_right_np * diag - cam_up_np * diag
+                    all_offsets = (offsets_right, -offsets_right,
+                                   offsets_up, -offsets_up,
+                                   offsets_diag_ru, -offsets_diag_ru,
+                                   offsets_diag_rd, -offsets_diag_rd)
+                else:
+                    all_offsets = (offsets_right, -offsets_right,
+                                   offsets_up, -offsets_up)
+
+                for vi in visible_indices:
+                    d_base = direction[vi]
+                    dist_v = float(dists[vi])
+                    is_edge = False
+                    for off in all_offsets:
+                        d_off = d_base + off
+                        # Normalise (offset is small, so direction barely changes)
+                        norm = float(np.linalg.norm(d_off))
+                        if norm < 1e-8:
+                            continue
+                        d_off_mu = Vector(d_off / norm)
+                        h_loc, _, _, h_dist = scene_tree.ray_cast(
+                            cam_loc_mu, d_off_mu, dist_v + 0.01)
+                        depth_thr = getattr(scene, 'sg_silhouette_depth', 0.05)
+                        if h_loc is not None and dist_v > h_dist + depth_thr:
+                            is_edge = True
+                            break
+                    if is_edge:
+                        near_silhouette[vi] = True
+
+                valid &= ~near_silhouette
+
+            # ── Vectorised weight + feather ────────────────────────────
+            w = np.power(np.maximum(dot_dn, 1e-12), power_exponent)
+
+            if feather_width > 0:
+                nx   = np.abs(x_proj) / filmw
+                ny   = np.abs(y_proj) / filmh
+                edge = np.maximum(nx, ny)
+                low  = 1.0 - feather_width
+                need_feather = edge > low
+                t  = np.clip((edge - low) / feather_width, 0.0, 1.0)
+                ss = t * t * (3.0 - 2.0 * t)      # smoothstep
+                ff = np.power(np.maximum(1.0 - ss, 0.0),
+                              max(feather_gamma, 0.01))
+                w  = np.where(need_feather, w * ff, w)
+
+            weights[valid] = w[valid]
+
+            # Store as FLOAT POINT-domain attribute on the *base* mesh
+            attr_name = f"_SG_VisWeight_{cam_idx}_{mat_id}"
+            existing  = obj.data.attributes.get(attr_name)
+            if existing:
+                obj.data.attributes.remove(existing)
+            attr = obj.data.attributes.new(
+                name=attr_name, type='FLOAT', domain='POINT')
+            attr.data.foreach_set("value", weights.tolist())
+
+            # Force UI update between cameras to keep Blender responsive
+            if context.window:
+                context.window.cursor_set('WAIT')
+            for area in context.screen.areas:
+                area.tag_redraw()
+
+        obj.data.update()
+
+
 def create_native_raycast_visibility(nodes, links, camera, geometry, context, i, mat_id, stop_index):
     """
     Creates a visibility weight node group using the native Raycast shader node (Blender 5.1+).
@@ -1049,6 +1288,19 @@ def project_image(context, to_project, mat_id, stop_index=1000000):
         if buffer_uv:
             obj.data.uv_layers.remove(buffer_uv)
 
+    # ── Optional: bake per-vertex visibility weights ──────────────────
+    use_baked_weights = getattr(context.scene, 'bake_visibility_weights', False)
+    if use_baked_weights:
+        # Always compute weights for ALL cameras (ignore stop_index).
+        #
+        # Needs further testing, maybe will need to revert this.
+
+        # In sequential mode, only bake on the first call (stop_index=0)
+        # to avoid recomputing the same weights N times.
+        is_sequential = context.scene.generation_method == 'sequential'
+        if not is_sequential or stop_index == 0:
+            _bake_visibility_weights(context, to_project, cameras, mat_id)
+
     # Switch to Cycles (needed for Raycast shader node on all versions)
     context.scene.render.engine = 'CYCLES'
     # Force CPU + OSL only for Blender < 5.1 (native Raycast nodes don't need it)
@@ -1271,7 +1523,49 @@ def project_image(context, to_project, mat_id, stop_index=1000000):
             
             # Compute the dot product of the direction vector and geometry normal
 
-            if use_native_raycast:
+            if use_baked_weights:
+                # ── Baked-weights path (transform-stable) ──
+                # Read pre-computed per-vertex weight from mesh attribute.
+                # A pass-through Math node is used so outputs[0] provides the
+                # scalar float (ShaderNodeAttribute outputs[0] is Color).
+                vis_attr = nodes.new("ShaderNodeAttribute")
+                vis_attr.attribute_name = f"_SG_VisWeight_{i}_{mat_id}"
+                vis_attr.attribute_type = 'GEOMETRY'
+                vis_attr.location = (-400, (-800) * i)
+                vis_attr.label = f"BakedVis-{i}-{mat_id}"
+
+                passthrough = nodes.new("ShaderNodeMath")
+                passthrough.operation = 'MULTIPLY'
+                passthrough.inputs[1].default_value = 1.0
+                passthrough.location = (-200, (-800) * i)
+                passthrough.label = f"Angle-{i}-{mat_id}"
+                links.new(vis_attr.outputs["Fac"], passthrough.inputs[0])
+
+                scripts_to_connect = []
+                final_weight_node = passthrough
+
+                script_nodes.append(scripts_to_connect)
+
+                if i > stop_index and not voronoi_active:
+                    less_than = nodes.new("ShaderNodeMath")
+                    less_than.operation = 'LESS_THAN'
+                    less_than.location = (-100, (-800) * i)
+                    less_than.inputs[1].default_value = -1
+                    links.new(passthrough.outputs[0], less_than.inputs[0])
+                    script_nodes_outputs.append(less_than)
+                else:
+                    script_nodes_outputs.append(final_weight_node)
+
+                subtract_nodes.append(None)
+                normalize_nodes.append(None)
+                add_camera_loc_nodes.append(None)
+                length_nodes.append(None)
+                camera_fov_nodes.append(None)
+                camera_aspect_ratio_nodes.append(None)
+                camera_direction_nodes.append(None)
+                camera_up_nodes.append(None)
+
+            elif use_native_raycast:
                 # ── Native Raycast path (Blender 5.1+) ──
                 result = create_native_raycast_visibility(
                     nodes, links, camera, geometry, context, i, mat_id, stop_index
@@ -1479,7 +1773,12 @@ def project_image(context, to_project, mat_id, stop_index=1000000):
             uv_output = "Vector" if uv_map_node.type == 'ATTRIBUTE' else "UV"
             links.new(uv_map_node.outputs[uv_output], tex_image.inputs["Vector"])
 
-            if not use_native_raycast:
+            if use_baked_weights or use_native_raycast:
+                # Baked-weights path: all links already made during creation.
+                # Native raycast path: all links already made inside
+                # create_native_raycast_visibility / create_native_feather.
+                pass
+            else:
                 # OSL path: connect subtract, normalize, script inputs, length
                 subtract = subtract_nodes[i] 
                 normalize = normalize_nodes[i] 
@@ -1827,9 +2126,10 @@ def project_pbr_to_bsdf(context, to_texture, pbr_maps, material_id=None):
         channel_wiring['metallic'] = 'Metallic'
     if getattr(scene, 'pbr_map_normal', True):
         special_wiring['normal'] = 'normal'
-    if getattr(scene, 'pbr_map_depth', False):
-        special_wiring['depth'] = 'displacement'
-
+    if getattr(scene, 'pbr_map_height', False):
+        special_wiring['height'] = 'displacement'
+    if getattr(scene, 'pbr_map_emission', False):
+        special_wiring['emission'] = 'emission'
     processed_materials = set()
 
     for obj in to_texture:
@@ -1927,8 +2227,13 @@ def project_pbr_to_bsdf(context, to_texture, pbr_maps, material_id=None):
                 if not pbr_img:
                     continue
 
-                # Non-Color for data maps
+                # Colorspace: roughness/metallic are always linear data.
+                # Albedo from IID-Lighting is also linear; IID-Appearance
+                # albedo is sRGB (Blender's default for PNG), so leave it.
                 if channel in ('roughness', 'metallic'):
+                    pbr_img.colorspace_settings.name = 'Non-Color'
+                elif (channel == 'albedo'
+                      and getattr(scene, 'pbr_albedo_source', 'marigold') == 'lighting'):
                     pbr_img.colorspace_settings.name = 'Non-Color'
 
                 pbr_tex = nodes.new("ShaderNodeTexImage")
@@ -2098,7 +2403,8 @@ def project_pbr_to_bsdf(context, to_texture, pbr_maps, material_id=None):
                                   principled.inputs["Normal"])
 
             elif sp_type == 'displacement':
-                # Create Displacement node → Material Output Displacement
+                # ── Displacement / Height Map ─────────────────────
+                height_scale = getattr(scene, 'pbr_height_scale', 0.1)
                 output_node = None
                 for node in nodes:
                     if node.type == 'OUTPUT_MATERIAL':
@@ -2110,11 +2416,28 @@ def project_pbr_to_bsdf(context, to_texture, pbr_maps, material_id=None):
                         output_node.location[0] - 300,
                         output_node.location[1] - 200)
                     disp_node.label = "PBR Displacement"
-                    disp_node.inputs["Scale"].default_value = 0.1
+                    disp_node.inputs["Scale"].default_value = height_scale
                     disp_node.inputs["Midlevel"].default_value = 0.5
                     links.new(sp_output, disp_node.inputs["Height"])
                     links.new(disp_node.outputs["Displacement"],
                               output_node.inputs["Displacement"])
+
+            elif sp_type == 'emission':
+                # ── Emission Map ──────────────────────────────────
+                emission_strength = getattr(
+                    scene, 'pbr_emission_strength', 5.0)
+                if "Emission Color" in principled.inputs:
+                    links.new(sp_output,
+                              principled.inputs["Emission Color"])
+                    principled.inputs[
+                        "Emission Strength"].default_value = emission_strength
+                elif "Emission" in principled.inputs:
+                    # Older Blender versions use "Emission" not "Emission Color"
+                    links.new(sp_output,
+                              principled.inputs["Emission"])
+                    if "Emission Strength" in principled.inputs:
+                        principled.inputs[
+                            "Emission Strength"].default_value = emission_strength
 
             channel_idx += 1
 
@@ -2126,4 +2449,84 @@ def project_pbr_to_bsdf(context, to_texture, pbr_maps, material_id=None):
 
         processed_materials.add(mat.name)
 
+    # ── AO Bake (geometry-based, per-object) ──────────────────────────
+    if getattr(scene, 'pbr_map_ao', False):
+        _bake_ao_for_objects(context, to_texture, scene)
+
+
+def _bake_ao_for_objects(context, to_texture, scene):
+    """Add shader-based Ambient Occlusion to materials.
+
+    Inserts a Blender ``Ambient Occlusion`` shader node into each
+    material and multiplies it with the Base Color input of the
+    Principled BSDF.  This is evaluated at render time — zero bake
+    time and works with any poly count.
+    """
+    ao_samples = getattr(scene, 'pbr_ao_samples', 16)
+    ao_distance = getattr(scene, 'pbr_ao_distance', 0.0)
+
+    print(f"[StableGen] Adding shader-based AO "
+          f"({ao_samples} samples, distance={ao_distance})…")
+
+    processed = set()
+    for oi, obj in enumerate(to_texture):
+        if not hasattr(obj, 'active_material') or not obj.active_material:
+            continue
+        mat = obj.active_material
+        if mat.name in processed:
+            continue
+        if not mat.use_nodes:
+            continue
+
+        nodes = mat.node_tree.nodes
+        links = mat.node_tree.links
+
+        # Find Principled BSDF
+        principled = None
+        for node in nodes:
+            if node.type == 'BSDF_PRINCIPLED':
+                principled = node
+                break
+        if principled is None:
+            continue
+
+        print(f"    Adding AO node to {mat.name} "
+              f"({oi+1}/{len(to_texture)})…")
+
+        # Create Ambient Occlusion shader node
+        ao_node = nodes.new("ShaderNodeAmbientOcclusion")
+        ao_node.samples = ao_samples
+        ao_node.label = "PBR AO"
+        ao_node.location = (
+            principled.location[0] - 500,
+            principled.location[1] + 350)
+        if ao_distance > 0:
+            ao_node.inputs["Distance"].default_value = ao_distance
+
+        # Wire AO into the material:
+        # Intercept Base Color → Principled BSDF with a Multiply mix.
+        base_input = principled.inputs.get("Base Color")
+        if base_input and base_input.links:
+            old_source = base_input.links[0].from_socket
+
+            mix_node = nodes.new("ShaderNodeMix")
+            mix_node.data_type = 'RGBA'
+            mix_node.blend_type = 'MULTIPLY'
+            mix_node.inputs["Factor"].default_value = 1.0
+            mix_node.location = (
+                principled.location[0] - 200,
+                principled.location[1] + 200)
+            mix_node.label = "AO Multiply"
+
+            links.new(old_source, mix_node.inputs[6])        # A (base colour)
+            links.new(ao_node.outputs["AO"], mix_node.inputs[7])  # B (AO)
+            links.new(mix_node.outputs[2], base_input)        # Result → Base Color
+        else:
+            # No existing link — just plug AO colour directly
+            links.new(ao_node.outputs["Color"], base_input)
+
+        processed.add(mat.name)
+
+    print(f"[StableGen] AO shader nodes added "
+          f"({len(processed)} material(s))")
 

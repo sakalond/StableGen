@@ -7,6 +7,7 @@ import cv2
 import uuid
 import json
 import urllib.request
+import urllib.parse
 import socket
 import threading
 import requests
@@ -273,9 +274,18 @@ class Reproject(bpy.types.Operator):
             # Check if the camera has a corresponding generated image
             image_path = get_file_path(context, "generated", camera_id=i, material_id=max_id)
             if not os.path.exists(image_path):
-                self.report({'ERROR'}, f"Camera {i} does not have a corresponding generated image.")
-                print(f"{image_path} does not exist")
-                return {'CANCELLED'}
+                # Try to recover from a packed/embedded Blender image
+                # (e.g. after saving and reopening the .blend file when the
+                # original output directory no longer exists).
+                recovered = self._recover_image_from_blend(
+                    image_path, to_texture, max_id)
+                if not recovered:
+                    self.report(
+                        {'ERROR'},
+                        f"Camera {i} does not have a corresponding "
+                        f"generated image.")
+                    print(f"{image_path} does not exist")
+                    return {'CANCELLED'}
         
         self._original_method = context.scene.generation_method
         self._original_overwrite_material = context.scene.overwrite_material
@@ -293,14 +303,88 @@ class Reproject(bpy.types.Operator):
         # Switch to modal and wait for completion
         print("Going modal")
         return {'RUNNING_MODAL'}
-    
-    def modal(self, context, event):
-        """     
-        Handles modal events.         
-        :param context: Blender context.         
-        :param event: Blender event.         
-        :return: {'PASS_THROUGH'}     
+
+    @staticmethod
+    def _recover_image_from_blend(image_path, to_texture, material_id):
+        """Try to recover a generated image from bpy.data.images.
+
+        When a .blend file is saved after generation, the generated
+        textures are packed/embedded as Blender image data-blocks.  If
+        the original output directory no longer exists (e.g. moved PC,
+        temp folder cleared), we can find the image in the material's
+        node tree and re-save it to the expected path.
+
+        Returns True if the file was successfully recovered.
         """
+        target_name = os.path.basename(image_path)
+
+        def _try_save_image(img):
+            """Attempt to write an image data-block to *image_path*."""
+            os.makedirs(os.path.dirname(image_path), exist_ok=True)
+
+            # Case 1: packed file — write raw bytes
+            if img.packed_file:
+                try:
+                    with open(image_path, 'wb') as f:
+                        f.write(img.packed_file.data)
+                    print(f"[StableGen] Recovered packed image: "
+                          f"{target_name}")
+                    return True
+                except Exception as err:
+                    print(f"[StableGen] Packed write failed: {err}")
+
+            # Case 2: image has a valid filepath elsewhere — copy it
+            existing_path = bpy.path.abspath(img.filepath_raw)
+            if existing_path and os.path.isfile(existing_path):
+                try:
+                    import shutil
+                    shutil.copy2(existing_path, image_path)
+                    print(f"[StableGen] Copied image from "
+                          f"{existing_path} → {image_path}")
+                    return True
+                except Exception as err:
+                    print(f"[StableGen] File copy failed: {err}")
+
+            # Case 3: pixel data in memory — save via render
+            try:
+                if img.has_data or len(img.pixels) > 0:
+                    img.save_render(image_path)
+                    print(f"[StableGen] Recovered image via save_render: "
+                          f"{target_name}")
+                    return True
+            except Exception:
+                pass
+
+            return False
+
+        # Strategy 1: scan Image Texture nodes in the target materials
+        # (most reliable — images are directly referenced by the object
+        #  being reprojected, so we won't accidentally pick up images
+        #  from a different model/object that share the same filename).
+        for obj in to_texture:
+            if not hasattr(obj, 'data') or not obj.data.materials:
+                continue
+            for mat in obj.data.materials:
+                if not mat or not mat.use_nodes:
+                    continue
+                for node in mat.node_tree.nodes:
+                    if node.type == 'TEX_IMAGE' and node.image:
+                        node_filename = os.path.basename(
+                            node.image.filepath_raw)
+                        if node_filename == target_name:
+                            if _try_save_image(node.image):
+                                return True
+
+        # Strategy 2: direct name lookup in bpy.data.images (fallback)
+        for img in bpy.data.images:
+            if img.name == target_name or os.path.basename(
+                    img.filepath_raw) == target_name:
+                if _try_save_image(img):
+                    return True
+
+        return False
+
+    def modal(self, context, event):
         if event.type == 'TIMER':
             running = False
             if ComfyUIGenerate._is_running:
@@ -424,6 +508,12 @@ class ComfyUIGenerate(bpy.types.Operator):
     _current_image = 0
     _total_images = 0
     _wait_event = None
+    # PBR progress (model-level steps across all cameras)
+    _pbr_active = False
+    _pbr_step = 0
+    _pbr_total_steps = 0
+    _pbr_cam = 0           # current camera index within current step
+    _pbr_cam_total = 1     # total cameras in current step
 
     # Add new properties at the top of the class
     _object_prompts: dict = {}
@@ -444,6 +534,11 @@ class ComfyUIGenerate(bpy.types.Operator):
         self._current_image = 0
         self._stage = ""
         self._progress = 0
+        self._pbr_active = False
+        self._pbr_step = 0
+        self._pbr_total_steps = 0
+        self._pbr_cam = 0
+        self._pbr_cam_total = 1
         self._wait_event = threading.Event()
         self.workflow_manager = WorkflowManager(self)
 
@@ -1612,8 +1707,10 @@ class ComfyUIGenerate(bpy.types.Operator):
             map_checks.append('metallic')
         if getattr(scene, 'pbr_map_normal', True):
             map_checks.append('normal')
-        if getattr(scene, 'pbr_map_depth', False):
-            map_checks.append('depth')
+        if getattr(scene, 'pbr_map_height', False):
+            map_checks.append('height')
+        if getattr(scene, 'pbr_map_emission', False):
+            map_checks.append('emission')
 
         if not map_checks:
             return None
@@ -1962,10 +2059,13 @@ class ComfyUIGenerate(bpy.types.Operator):
         want_roughness = getattr(scene, 'pbr_map_roughness', True)
         want_metallic = getattr(scene, 'pbr_map_metallic', True)
         want_normal = getattr(scene, 'pbr_map_normal', True)
-        want_depth = getattr(scene, 'pbr_map_depth', False)
+        want_height = getattr(scene, 'pbr_map_height', False)
+        want_emission = getattr(scene, 'pbr_map_emission', False)
+        emission_method = getattr(scene, 'pbr_emission_method', 'residual')
         albedo_source = getattr(scene, 'pbr_albedo_source', 'delight')
 
         use_delight = (want_albedo and albedo_source == 'delight')
+        use_lighting_albedo = (want_albedo and albedo_source == 'lighting')
 
         # ── Determine which Marigold models to run ────────────────────
         need_appearance = (
@@ -1974,7 +2074,12 @@ class ComfyUIGenerate(bpy.types.Operator):
             or want_metallic
         )
         need_normals = want_normal
-        need_depth = want_depth
+        need_height = want_height
+        # IID-Lighting is needed for 'residual' emission OR 'lighting' albedo
+        need_iid_lighting = (
+            (want_emission and emission_method == 'residual')
+            or use_lighting_albedo
+        )
 
         models_to_run = []
         if need_appearance:
@@ -1987,16 +2092,34 @@ class ComfyUIGenerate(bpy.types.Operator):
                 'prs-eth/marigold-normals-lcm-v0-1',
                 ['normal'],
             ))
-        if need_depth:
+        if need_height:
             models_to_run.append((
                 'prs-eth/marigold-depth-lcm-v1-0',
-                ['depth'],
+                ['height'],
+            ))
+        if need_iid_lighting:
+            models_to_run.append((
+                'prs-eth/marigold-iid-lighting-v1-1',
+                ['_lighting_albedo', '_lighting_shading', '_lighting_residual'],
             ))
 
-        total_model_steps = len(models_to_run) + (1 if use_delight else 0)
+        # Count extra post-processing steps (HSV / VLM emission)
+        extra_emission_steps = 0
+        if want_emission and emission_method in ('hsv', 'vlm_seg'):
+            extra_emission_steps = 1
+
+        total_model_steps = (len(models_to_run)
+                             + (1 if use_delight else 0)
+                             + extra_emission_steps)
         if total_model_steps == 0:
             print("[StableGen] No PBR maps enabled, skipping decomposition")
             return
+
+        # Activate PBR progress tracking for the UI
+        self._pbr_active = True
+        self._pbr_step = 0
+        self._pbr_total_steps = total_model_steps
+        self._pbr_cam_total = num_cams
 
         # Ensure every camera has an entry in _pbr_maps
         for cam_idx in cam_ids:
@@ -2008,23 +2131,75 @@ class ComfyUIGenerate(bpy.types.Operator):
         tile_grid = getattr(scene, 'pbr_tile_grid', 2)
 
         tile_model_keys = set()
+
+        # Custom mode per-map toggles (read once, used later)
+        custom_tile_albedo = False
+        custom_tile_material = False
+        custom_tile_normal = False
+        custom_tile_height = False
+        custom_tile_emission = False
+        # Whether IID-Appearance is the albedo provider
+        appearance_provides_albedo = (not use_delight
+                                      and not use_lighting_albedo)
+
         if tiling_mode == 'selective':
-            tile_model_keys = {'appearance'}
+            # When using lighting albedo, don't tile appearance
+            # (its albedo will be discarded — only material channels needed).
+            if not use_lighting_albedo:
+                tile_model_keys.add('appearance')
+            if use_lighting_albedo:
+                tile_model_keys.add('lighting')
         elif tiling_mode == 'all':
-            tile_model_keys = {'appearance', 'normals', 'depth'}
+            tile_model_keys = {'appearance', 'normals', 'depth', 'lighting'}
+        elif tiling_mode == 'custom':
+            custom_tile_albedo = getattr(scene, 'pbr_tile_albedo', True)
+            custom_tile_material = getattr(scene, 'pbr_tile_material', False)
+            custom_tile_normal = getattr(scene, 'pbr_tile_normal', False)
+            custom_tile_height = getattr(scene, 'pbr_tile_height', False)
+            custom_tile_emission = (
+                getattr(scene, 'pbr_tile_emission', False)
+                and want_emission
+                and emission_method == 'residual'
+            )
+
+            # IID-Appearance: tile if ANY of its outputs are tiled
+            need_tile_appearance = (
+                custom_tile_material
+                or (custom_tile_albedo and appearance_provides_albedo)
+            )
+            if need_tile_appearance:
+                tile_model_keys.add('appearance')
+
+            # IID-Lighting: tile if albedo or residual/emission output
+            # needs tiling
+            need_tile_lighting = (
+                (use_lighting_albedo and custom_tile_albedo)
+                or custom_tile_emission
+            )
+            if need_tile_lighting:
+                tile_model_keys.add('lighting')
+
+            # Single-output models
+            if custom_tile_normal:
+                tile_model_keys.add('normals')
+            if custom_tile_height:
+                tile_model_keys.add('depth')
 
         model_step = 0
 
         # ── StableDelight pass (all cameras) ──────────────────────────
         if use_delight:
             model_step += 1
-            tile_delight = tiling_mode in ('selective', 'all')
+            self._pbr_step = model_step
+            tile_delight = (tiling_mode in ('selective', 'all')
+                            or (tiling_mode == 'custom' and custom_tile_albedo))
             tile_label = f" (tiled {tile_grid}×{tile_grid})" if tile_delight else ""
             print(f"[StableGen]   Model {model_step}/{total_model_steps}: "
                   f"StableDelight{tile_label}")
 
             for ci, cam_idx in enumerate(cam_ids):
                 image_path = camera_images[cam_idx]
+                self._pbr_cam = ci
                 self._stage = (f"PBR: StableDelight "
                                f"(cam {ci+1}/{num_cams})")
                 self._progress = 0
@@ -2061,9 +2236,11 @@ class ComfyUIGenerate(bpy.types.Operator):
         # ── Marigold model passes (all cameras per model) ─────────────
         for model_name, map_names in models_to_run:
             model_step += 1
+            self._pbr_step = model_step
             model_short = model_name.split('/')[-1]
             should_tile = any(k in model_short for k in tile_model_keys)
             is_iid = 'appearance' in model_short
+            is_iid_lighting = 'lighting' in model_short
 
             tile_label = f" (tiled {tile_grid}×{tile_grid})" if should_tile else ""
             print(f"[StableGen]   Model {model_step}/{total_model_steps}: "
@@ -2071,18 +2248,62 @@ class ComfyUIGenerate(bpy.types.Operator):
 
             for ci, cam_idx in enumerate(cam_ids):
                 image_path = camera_images[cam_idx]
+                self._pbr_cam = ci
                 self._stage = (f"PBR: {model_short} "
                                f"(cam {ci+1}/{num_cams})")
                 self._progress = 0
 
-                # ── Selective IID dual-run ─────────────────────────
-                dual_run_iid = (
-                    should_tile and is_iid
-                    and tiling_mode == 'selective'
-                    and not use_delight
-                )
+                # ── Dual-run logic ─────────────────────────────────
+                # Dual-run = run tiled + untiled, then stitch outputs.
+                # Needed when some outputs of a multi-output model
+                # should be tiled and others should not.
+                dual_run_iid = False
+                dual_run_iid_reverse = False   # tile material, untile albedo
+                dual_run_lighting = False
 
-                extra = " + untiled material" if dual_run_iid else ""
+                if tiling_mode == 'selective':
+                    dual_run_iid = (
+                        should_tile and is_iid and not use_delight
+                    )
+                    dual_run_lighting = (
+                        should_tile and is_iid_lighting
+                        and use_lighting_albedo
+                    )
+                elif tiling_mode == 'custom' and should_tile:
+                    if is_iid:
+                        # IID-Appearance: [albedo, material]
+                        want_tiled_albedo = (custom_tile_albedo
+                                             and appearance_provides_albedo)
+                        want_tiled_material = custom_tile_material
+                        # Dual-run only when there's a mismatch
+                        if want_tiled_albedo and not want_tiled_material:
+                            dual_run_iid = True
+                        elif want_tiled_material and not want_tiled_albedo:
+                            dual_run_iid = True
+                            dual_run_iid_reverse = True
+                        # If both tiled → full tile (no dual-run)
+                        # If neither → shouldn't reach here (should_tile=False)
+                    elif is_iid_lighting:
+                        # IID-Lighting: [albedo, shading, residual]
+                        # Determine per-output tiling needs
+                        want_tiled_l_albedo = (use_lighting_albedo
+                                               and custom_tile_albedo)
+                        want_tiled_l_residual = custom_tile_emission
+                        # Shading is always untiled (no benefit).
+                        # Dual-run when at least one output is tiled
+                        # but not all (shading is never tiled, so dual-run
+                        # is needed whenever ANY lighting output is tiled).
+                        any_tiled = want_tiled_l_albedo or want_tiled_l_residual
+                        if any_tiled:
+                            dual_run_lighting = True
+
+                extra = ""
+                if dual_run_iid and not dual_run_iid_reverse:
+                    extra = " + untiled material"
+                elif dual_run_iid and dual_run_iid_reverse:
+                    extra = " + untiled albedo"
+                elif dual_run_lighting:
+                    extra = " + untiled shading"
                 print(f"    Camera {cam_idx} ({ci+1}/{num_cams}){extra}…")
 
                 if dual_run_iid:
@@ -2094,7 +2315,12 @@ class ComfyUIGenerate(bpy.types.Operator):
                             and len(result_tiled) >= 2
                             and isinstance(result_untiled, list)
                             and len(result_untiled) >= 2):
-                        result = [result_tiled[0], result_untiled[1]]
+                        if dual_run_iid_reverse:
+                            # Tile material, keep albedo untiled
+                            result = [result_untiled[0], result_tiled[1]]
+                        else:
+                            # Tile albedo, keep material untiled
+                            result = [result_tiled[0], result_untiled[1]]
                     elif isinstance(result_tiled, dict):
                         result = result_tiled
                     elif isinstance(result_untiled, dict):
@@ -2103,7 +2329,44 @@ class ComfyUIGenerate(bpy.types.Operator):
                         result = (result_tiled
                                   if isinstance(result_tiled, list)
                                   else result_untiled)
-                elif should_tile and not (is_iid and use_delight):
+                elif dual_run_lighting:
+                    # IID-Lighting: stitch per-output from tiled/untiled
+                    result_tiled = self._process_model_tiled(
+                        context, image_path, model_name)
+                    result_untiled = self.workflow_manager.generate_pbr_maps(
+                        context, image_path, model_name=model_name)
+                    if (isinstance(result_tiled, list)
+                            and len(result_tiled) >= 3
+                            and isinstance(result_untiled, list)
+                            and len(result_untiled) >= 3):
+                        # Per-output: pick tiled or untiled based on toggles
+                        if tiling_mode == 'custom':
+                            tile_l_albedo = (use_lighting_albedo
+                                             and custom_tile_albedo)
+                            tile_l_residual = custom_tile_emission
+                        else:
+                            # selective: tile albedo only
+                            tile_l_albedo = True
+                            tile_l_residual = False
+                        r_albedo = (result_tiled[0] if tile_l_albedo
+                                    else result_untiled[0])
+                        r_shading = result_untiled[1]   # always untiled
+                        r_residual = (result_tiled[2] if tile_l_residual
+                                      else result_untiled[2])
+                        result = [r_albedo, r_shading, r_residual]
+                    elif isinstance(result_tiled, dict):
+                        result = result_tiled
+                    elif isinstance(result_untiled, dict):
+                        result = result_untiled
+                    else:
+                        result = (result_tiled
+                                  if isinstance(result_tiled, list)
+                                  else result_untiled)
+                elif should_tile:
+                    # Tile the model even when StableDelight handles albedo —
+                    # the IID-Appearance albedo output is discarded by
+                    # _save_pbr_map_outputs, but roughness/metallic still
+                    # benefit from tiling.
                     result = self._process_model_tiled(
                         context, image_path, model_name)
                 else:
@@ -2121,14 +2384,66 @@ class ComfyUIGenerate(bpy.types.Operator):
                     context, result, map_names, cam_idx,
                     want_roughness=want_roughness,
                     want_metallic=want_metallic,
-                    use_delight=use_delight)
+                    use_delight=use_delight,
+                    use_lighting_albedo=use_lighting_albedo)
+
+        # ── Post-Marigold emission passes ─────────────────────────────
+        if want_emission:
+            if emission_method == 'residual':
+                # IID-Lighting residual was already saved by the model
+                # loop above – now gate it with roughness/metallic.
+                model_step += 1
+                self._pbr_step = model_step
+                self._progress = 0
+                print(f"[StableGen]   Post-processing emission (residual "
+                      f"gating) – step {model_step}/{total_model_steps}")
+                for ci, cam_idx in enumerate(cam_ids):
+                    self._pbr_cam = ci
+                    self._stage = (f"PBR: Emission gating "
+                                   f"(cam {ci+1}/{num_cams})")
+                    self._progress = (ci / num_cams) * 100
+                    self._gate_emission_residual(context, cam_idx)
+                self._progress = 100
+
+            elif emission_method == 'hsv':
+                model_step += 1
+                self._pbr_step = model_step
+                self._progress = 0
+                print(f"[StableGen]   Emission via HSV threshold "
+                      f"– step {model_step}/{total_model_steps}")
+                for ci, cam_idx in enumerate(cam_ids):
+                    self._pbr_cam = ci
+                    self._stage = (f"PBR: HSV emission "
+                                   f"(cam {ci+1}/{num_cams})")
+                    self._progress = (ci / num_cams) * 100
+                    image_path = camera_images[cam_idx]
+                    self._generate_emission_hsv(context, cam_idx, image_path)
+                self._progress = 100
+
+            elif emission_method == 'vlm_seg':
+                model_step += 1
+                self._pbr_step = model_step
+                self._progress = 0
+                print(f"[StableGen]   Emission via VLM segmentation "
+                      f"– step {model_step}/{total_model_steps}")
+                for ci, cam_idx in enumerate(cam_ids):
+                    self._pbr_cam = ci
+                    self._stage = (f"PBR: VLM emission "
+                                   f"(cam {ci+1}/{num_cams})")
+                    image_path = camera_images[cam_idx]
+                    self._generate_emission_vlm(context, cam_idx, image_path)
+
+        # Deactivate PBR progress tracking
+        self._pbr_active = False
+        self._pbr_step = 0
+        self._pbr_total_steps = 0
 
         print(f"[StableGen] PBR decomposition complete for "
               f"{num_cams} camera(s)")
 
     def _save_pbr_map_outputs(self, context, result, map_names, camera_id,
                                want_roughness=True, want_metallic=True,
-                               use_delight=False):
+                               use_delight=False, use_lighting_albedo=False):
         """Save the output images from a single model run to disk.
 
         Handles the IID material channel split (R=roughness, G=metallic)
@@ -2182,13 +2497,46 @@ class ComfyUIGenerate(bpy.types.Operator):
                         print(f"    Failed to save metallic: {err}")
                 continue
 
+            # ── IID-Lighting intermediate outputs ─────────────────
+            # These are prefixed with '_lighting_' to avoid toggle
+            # checks.  The residual is saved for later gating; albedo
+            # and shading are discarded unless using lighting albedo.
+            if map_name.startswith('_lighting_'):
+                lighting_key = map_name  # e.g. '_lighting_residual'
+                lighting_path = get_file_path(
+                    context, "pbr", subtype=lighting_key.lstrip('_'),
+                    camera_id=camera_id,
+                    material_id=self._material_id)
+                try:
+                    with open(lighting_path, 'wb') as f:
+                        f.write(map_bytes)
+                    self._pbr_maps[camera_id][lighting_key] = lighting_path
+                    print(f"    Saved {lighting_key} → "
+                          f"{os.path.basename(lighting_path)}")
+
+                    # When using IID-Lighting as albedo source, copy the
+                    # lighting albedo to the main albedo slot as well.
+                    if map_name == '_lighting_albedo' and use_lighting_albedo:
+                        albedo_path = get_file_path(
+                            context, "pbr", subtype="albedo",
+                            camera_id=camera_id,
+                            material_id=self._material_id)
+                        with open(albedo_path, 'wb') as f:
+                            f.write(map_bytes)
+                        self._pbr_maps[camera_id]['albedo'] = albedo_path
+                        print(f"    Saved albedo (IID-Lighting) → "
+                              f"{os.path.basename(albedo_path)}")
+                except Exception as err:
+                    print(f"    Failed to save {lighting_key}: {err}")
+                continue
+
             # Skip maps the user didn't enable
             toggle_attr = f"pbr_map_{map_name}"
             if hasattr(scene, toggle_attr) and not getattr(scene, toggle_attr):
                 continue
 
-            # Skip Marigold albedo when StableDelight is handling it
-            if map_name == 'albedo' and use_delight:
+            # Skip Marigold IID-Appearance albedo when another source handles it
+            if map_name == 'albedo' and (use_delight or use_lighting_albedo):
                 continue
 
             pbr_path = get_file_path(
@@ -2210,6 +2558,278 @@ class ComfyUIGenerate(bpy.types.Operator):
                       f"{os.path.basename(pbr_path)}")
             except Exception as err:
                 print(f"    Failed to save PBR map {map_name}: {err}")
+
+    # ── Emission extraction methods ───────────────────────────────────
+
+    def _gate_emission_residual(self, context, camera_id):
+        """Gate the IID-Lighting residual with roughness/metallic to
+        produce a cleaner emission map.
+
+        emission = residual × (1 − metallic) × roughness_mask, then
+        threshold.  High-metallic + low-roughness regions are likely
+        specular reflections, not true emission.
+        """
+        scene = context.scene
+        cam_maps = self._pbr_maps.get(camera_id, {})
+        residual_path = cam_maps.get('_lighting_residual')
+        if not residual_path or not os.path.exists(residual_path):
+            print(f"    Emission residual not found for camera {camera_id}")
+            return
+
+        threshold = getattr(scene, 'pbr_emission_threshold', 0.2)
+
+        try:
+            residual = np.array(Image.open(residual_path).convert('RGB')).astype(np.float32) / 255.0
+
+            # Optionally gate with metallic if available — high metallic
+            # surfaces produce strong specular that isn't true emission.
+            metal_path = cam_maps.get('metallic')
+            if metal_path and os.path.exists(metal_path):
+                metal_img = Image.open(metal_path).convert('L')
+                # Resize metallic to match residual dims (they may differ
+                # when tiling/super-res settings aren't identical).
+                res_h, res_w = residual.shape[:2]
+                if metal_img.size != (res_w, res_h):
+                    metal_img = metal_img.resize(
+                        (res_w, res_h), Image.Resampling.BILINEAR)
+                metallic = np.array(metal_img).astype(np.float32) / 255.0
+                gate = (1.0 - metallic)[:, :, np.newaxis]
+                residual = residual * gate
+
+            # Apply soft threshold — pixels below the threshold are
+            # smoothly faded out rather than hard-clipped.
+            luminance = np.mean(residual, axis=2)
+            # Smooth fade: rescale [0, threshold] → 0, [threshold, 1] → preserved
+            fade = np.clip((luminance - threshold * 0.5) / max(threshold * 0.5, 1e-6),
+                           0.0, 1.0)[:, :, np.newaxis]
+            emission = residual * fade
+
+            emission_img = Image.fromarray(
+                np.clip(emission * 255, 0, 255).astype(np.uint8), mode='RGB')
+            emission_path = get_file_path(
+                context, "pbr", subtype="emission",
+                camera_id=camera_id,
+                material_id=self._material_id)
+            emission_img.save(emission_path)
+            self._pbr_maps[camera_id]['emission'] = emission_path
+            print(f"    Saved emission (residual gated) → "
+                  f"{os.path.basename(emission_path)}")
+        except Exception as err:
+            print(f"    Failed to generate emission (residual): {err}")
+            import traceback; traceback.print_exc()
+
+    def _generate_emission_hsv(self, context, camera_id, image_path):
+        """Extract emission via high-saturation + high-value thresholding
+        in HSV space.  Glowing objects retain colour intensity while
+        normally-lit surfaces desaturate under bright light.
+        """
+        scene = context.scene
+        sat_min = getattr(scene, 'pbr_emission_saturation_min', 0.5)
+        val_min = getattr(scene, 'pbr_emission_value_min', 0.85)
+        bloom_radius = getattr(scene, 'pbr_emission_bloom', 5.0)
+        threshold = getattr(scene, 'pbr_emission_threshold', 0.3)
+
+        try:
+            original = np.array(Image.open(image_path).convert('RGB'))
+            rgb_f = original.astype(np.float32) / 255.0
+
+            # RGB → HSV
+            maxc = rgb_f.max(axis=2)
+            minc = rgb_f.min(axis=2)
+            delta = maxc - minc
+            saturation = np.where(maxc > 1e-6, delta / maxc, 0.0)
+            value = maxc
+
+            # Build binary mask: high saturation AND high value
+            mask = ((saturation >= sat_min) & (value >= val_min)).astype(np.float32)
+
+            # Apply bloom (Gaussian blur) to soften edges
+            if bloom_radius > 0:
+                try:
+                    import cv2
+                    ksize = int(bloom_radius * 4) | 1  # must be odd
+                    mask = cv2.GaussianBlur(mask, (ksize, ksize), bloom_radius)
+                except ImportError:
+                    # Fallback: simple box blur via PIL
+                    from PIL import ImageFilter
+                    mask_pil = Image.fromarray(
+                        (mask * 255).astype(np.uint8), mode='L')
+                    mask_pil = mask_pil.filter(
+                        ImageFilter.GaussianBlur(radius=bloom_radius))
+                    mask = np.array(mask_pil).astype(np.float32) / 255.0
+
+            # Apply threshold on the blurred mask
+            mask = np.where(mask > threshold, mask, 0.0)
+
+            # Multiply mask by original RGB to get coloured emission
+            emission = rgb_f * mask[:, :, np.newaxis]
+
+            emission_img = Image.fromarray(
+                np.clip(emission * 255, 0, 255).astype(np.uint8), mode='RGB')
+            emission_path = get_file_path(
+                context, "pbr", subtype="emission",
+                camera_id=camera_id,
+                material_id=self._material_id)
+            emission_img.save(emission_path)
+            self._pbr_maps[camera_id]['emission'] = emission_path
+            print(f"    Saved emission (HSV threshold) → "
+                  f"{os.path.basename(emission_path)}")
+        except Exception as err:
+            print(f"    Failed to generate emission (HSV): {err}")
+            import traceback; traceback.print_exc()
+
+    def _generate_emission_vlm(self, context, camera_id, image_path):
+        """Extract emission via Grounding DINO + SAM 2 segmentation.
+
+        Uses ComfyUI nodes to run Grounding DINO with emissive keywords,
+        then SAM 2 to get pixel-perfect masks, and multiplies with the
+        original image for a coloured emission map.
+        """
+        scene = context.scene
+        keywords = getattr(scene, 'pbr_emission_keywords',
+                           'neon sign, LED, fire, candle flame, '
+                           'screen display, laser, hologram, glowing crystal')
+        threshold = getattr(scene, 'pbr_emission_threshold', 0.3)
+
+        server_address = context.preferences.addons[
+            __package__].preferences.server_address
+
+        # Check that required nodes exist
+        required_nodes = [
+            'GroundingDinoModelLoader (segment anything)',
+            'GroundingDinoSAMSegment (segment anything)',
+            'SAMModelLoader (segment anything)',
+        ]
+        for node_class in required_nodes:
+            try:
+                resp = urllib.request.urlopen(
+                    f"http://{server_address}/object_info/{urllib.parse.quote(node_class)}",
+                    timeout=get_timeout('api')
+                )
+                data = json.loads(resp.read())
+            except Exception:
+                print(f"    VLM emission: ComfyUI node '{node_class}' not found. "
+                      f"Skipping VLM emission. Install comfyui_segment_anything.")
+                self._warning = (f"VLM Emission requires comfyui_segment_anything. "
+                                 f"Node '{node_class}' not found.")
+                return
+
+        # Upload image
+        from .generator import upload_image_to_comfyui
+        image_info = upload_image_to_comfyui(server_address, image_path)
+        if image_info is None:
+            print(f"    Failed to upload image for VLM emission")
+            return
+
+        uploaded_name = image_info.get("name", os.path.basename(image_path))
+
+        # Build the ComfyUI workflow:
+        # LoadImage → GroundingDINO detect → SAM segment → mask output
+        prompt = {
+            "1": {
+                "class_type": "LoadImage",
+                "inputs": {"image": uploaded_name}
+            },
+            "2": {
+                "class_type": "GroundingDinoModelLoader (segment anything)",
+                "inputs": {
+                    "model_name": "GroundingDINO_SwinB (938MB)"
+                }
+            },
+            "3": {
+                "class_type": "SAMModelLoader (segment anything)",
+                "inputs": {
+                    "model_name": "sam_vit_h (2.56GB)"
+                }
+            },
+            "4": {
+                "class_type": "GroundingDinoSAMSegment (segment anything)",
+                "inputs": {
+                    "grounding_dino_model": ["2", 0],
+                    "sam_model": ["3", 0],
+                    "image": ["1", 0],
+                    "prompt": keywords,
+                    "threshold": threshold,
+                }
+            },
+            # SAM output 1 is MASK; convert to IMAGE for SaveImageWebsocket
+            "4b": {
+                "class_type": "MaskToImage",
+                "inputs": {"mask": ["4", 1]}
+            },
+            "5": {
+                "class_type": "SaveImageWebsocket",
+                "inputs": {"images": ["4b", 0]}
+            }
+        }
+
+        NODES = {"save_image": "5"}
+
+        client_id = str(uuid.uuid4())
+        ws = self.workflow_manager._connect_to_websocket(
+            server_address, client_id)
+        if ws is None:
+            print(f"    VLM emission: WebSocket connection failed")
+            return
+
+        try:
+            images = self.workflow_manager._execute_prompt_and_get_images(
+                ws, prompt, client_id, server_address, NODES
+            )
+        finally:
+            try:
+                ws.close()
+            except Exception:
+                pass
+
+        if (images is None or not isinstance(images, dict)
+                or "5" not in images or not images["5"]):
+            print(f"    VLM emission: No mask output received. "
+                  f"The scene may not contain recognisable emissive objects.")
+            # Fall back to a black emission map
+            try:
+                orig = Image.open(image_path).convert('RGB')
+                black = Image.new('RGB', orig.size, (0, 0, 0))
+                emission_path = get_file_path(
+                    context, "pbr", subtype="emission",
+                    camera_id=camera_id,
+                    material_id=self._material_id)
+                black.save(emission_path)
+                self._pbr_maps[camera_id]['emission'] = emission_path
+                print(f"    Saved emission (VLM – no emissive objects) → "
+                      f"{os.path.basename(emission_path)}")
+            except Exception:
+                pass
+            return
+
+        mask_bytes = images["5"][0]
+        try:
+            mask = np.array(Image.open(io.BytesIO(mask_bytes)).convert('L')).astype(np.float32) / 255.0
+            original = np.array(Image.open(image_path).convert('RGB')).astype(np.float32) / 255.0
+
+            # Resize mask if dimensions differ
+            if mask.shape[:2] != original.shape[:2]:
+                mask_pil = Image.fromarray((mask * 255).astype(np.uint8), mode='L')
+                mask_pil = mask_pil.resize(
+                    (original.shape[1], original.shape[0]),
+                    Image.Resampling.BILINEAR)
+                mask = np.array(mask_pil).astype(np.float32) / 255.0
+
+            emission = original * mask[:, :, np.newaxis]
+
+            emission_img = Image.fromarray(
+                np.clip(emission * 255, 0, 255).astype(np.uint8), mode='RGB')
+            emission_path = get_file_path(
+                context, "pbr", subtype="emission",
+                camera_id=camera_id,
+                material_id=self._material_id)
+            emission_img.save(emission_path)
+            self._pbr_maps[camera_id]['emission'] = emission_path
+            print(f"    Saved emission (VLM segmentation) → "
+                  f"{os.path.basename(emission_path)}")
+        except Exception as err:
+            print(f"    Failed to generate emission (VLM): {err}")
+            import traceback; traceback.print_exc()
 
     def _apply_qwen_context_cleanup(self, context, image_bytes):
         hue_tolerance = max(context.scene.qwen_context_cleanup_hue_tolerance, 0.0)

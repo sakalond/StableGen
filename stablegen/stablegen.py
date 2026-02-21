@@ -121,6 +121,9 @@ GEN_PARAMETERS = [
     "visibility_vignette_width",
     "visibility_vignette_softness",
     "visibility_vignette_blur",
+    "sg_silhouette_margin",
+    "sg_silhouette_depth",
+    "sg_silhouette_rays",
     "refine_feather_ramp_pos_0",
     "refine_feather_ramp_pos_1",
     "refine_edge_feather_projection",
@@ -493,25 +496,51 @@ class StableGenPanel(bpy.types.Panel):
                     operator_instance = next((op for win in context.window_manager.windows for op in win.modal_operators if op.bl_idname == 'OBJECT_OT_test_stable'), None)
                     if operator_instance:
                         progress_col = layout.column()
-                        progress_text = f"{getattr(operator_instance, '_stage', 'Generating')} ({getattr(operator_instance, '_progress', 0):.0f}%)"
-                        progress_factor = getattr(operator_instance, '_progress', 0) / 100.0
-                        progress_col.progress(text=progress_text, factor=max(0.0, min(progress_factor, 1.0))) # Ensure factor is <= 1.0 (logic maintained)
+                        raw_progress = getattr(operator_instance, '_progress', 0) / 100.0
+                        pbr_active = getattr(operator_instance, '_pbr_active', False)
 
-                        total_images = getattr(operator_instance, '_total_images', 0)
-                        if total_images > 1:
-                            current_image_idx = getattr(operator_instance, '_current_image', 0)
-                            current_image_decimal_progress = max(0.0, min(progress_factor, 1.0))
-                            
-                            # Ensure total_images is not zero to prevent division by zero
-                            overall_progress_factor = (current_image_idx + current_image_decimal_progress) / total_images if total_images > 0 else 0
-                            overall_progress_factor_clamped = max(0.0, min(overall_progress_factor, 1.0))
+                        if pbr_active:
+                            # During PBR: top bar shows camera progress within
+                            # the current model step (no raw ComfyUI jitter).
+                            pbr_step = getattr(operator_instance, '_pbr_step', 0)
+                            pbr_total = max(getattr(operator_instance, '_pbr_total_steps', 1), 1)
+                            pbr_cam = getattr(operator_instance, '_pbr_cam', 0)
+                            pbr_cam_total = max(getattr(operator_instance, '_pbr_cam_total', 1), 1)
 
-                            current_img = min(current_image_idx + 1, total_images)  # Clamp to total_images
-
+                            # Top bar: camera X out of N within this step
+                            cam_frac = pbr_cam / pbr_cam_total
+                            stage_text = getattr(operator_instance, '_stage', 'PBR Decomposition')
                             progress_col.progress(
-                                text=f"Overall: Image {current_img}/{total_images}",
-                                factor=overall_progress_factor_clamped # Ensure factor is <= 1.0 (logic maintained)
+                                text=stage_text,
+                                factor=max(0.0, min(cam_frac, 1.0))
                             )
+                            # Bottom bar: overall PBR progress
+                            pbr_factor = max(0.0, min(
+                                ((pbr_step - 1) + cam_frac) / pbr_total, 1.0))
+                            progress_col.progress(
+                                text=f"PBR: Step {pbr_step}/{pbr_total}",
+                                factor=pbr_factor
+                            )
+                        else:
+                            # Normal generation progress
+                            progress_text = f"{getattr(operator_instance, '_stage', 'Generating')} ({getattr(operator_instance, '_progress', 0):.0f}%)"
+                            progress_col.progress(text=progress_text, factor=max(0.0, min(raw_progress, 1.0)))
+
+                            total_images = getattr(operator_instance, '_total_images', 0)
+                            if total_images > 1:
+                                current_image_idx = getattr(operator_instance, '_current_image', 0)
+                                current_image_decimal_progress = max(0.0, min(raw_progress, 1.0))
+                                
+                                # Ensure total_images is not zero to prevent division by zero
+                                overall_progress_factor = (current_image_idx + current_image_decimal_progress) / total_images if total_images > 0 else 0
+                                overall_progress_factor_clamped = max(0.0, min(overall_progress_factor, 1.0))
+
+                                current_img = min(current_image_idx + 1, total_images)  # Clamp to total_images
+
+                                progress_col.progress(
+                                    text=f"Overall: Image {current_img}/{total_images}",
+                                    factor=overall_progress_factor_clamped # Ensure factor is <= 1.0 (logic maintained)
+                                )
                             
                 elif context.scene.generation_status == 'waiting':
                     action_row.operator("object.test_stable", text="Waiting for Cancellation", icon="TIME")
@@ -542,6 +571,11 @@ class StableGenPanel(bpy.types.Panel):
                     text=f"{bake_stage}: Object {current_object + 1}/{total_objects}",
                     factor=overall_bake_progress if overall_bake_progress <=1.0 else 1.0 # Ensure factor is <= 1.0
                 )
+
+        export_row = layout.row()
+        export_row.operator("object.export_game_engine",
+                            text="Export for Game Engine",
+                            icon="EXPORT")
 
         # --- Preset Management ---
         preset_box = layout.box()
@@ -1016,7 +1050,18 @@ class StableGenPanel(bpy.types.Panel):
                 if scene.early_priority:
                     row = content_box.row()
                     row.prop(scene, "early_priority_strength", text="Priority Strength")
-                
+
+                row = content_box.row()
+                row.prop(scene, "bake_visibility_weights", text="Bake Visibility (Transform-Stable)", toggle=True, icon="MESH_DATA")
+
+                row = content_box.row()
+                row.prop(scene, "sg_silhouette_margin", text="Silhouette Margin (px)")
+
+                row = content_box.row()
+                row.prop(scene, "sg_silhouette_depth", text="Silhouette Depth Threshold")
+
+                row = content_box.row()
+                row.prop(scene, "sg_silhouette_rays", text="Silhouette Rays")
 
             # --- Output & Material Settings ---
             if _show_diffusion_sections:
@@ -1057,13 +1102,38 @@ class StableGenPanel(bpy.types.Panel):
                     grid.prop(scene, "pbr_map_roughness", toggle=True, icon="MATFLUID")
                     grid.prop(scene, "pbr_map_metallic", toggle=True, icon="META_BALL")
                     grid.prop(scene, "pbr_map_normal", toggle=True, icon="NORMALS_FACE")
-                    grid.prop(scene, "pbr_map_depth", toggle=True, icon="MOD_DISPLACE")
+                    grid.prop(scene, "pbr_map_height", toggle=True, icon="MOD_DISPLACE")
+                    grid.prop(scene, "pbr_map_ao", toggle=True, icon="SHADING_RENDERED")
+                    grid.prop(scene, "pbr_map_emission", toggle=True, icon="LIGHT_POINT")
                     # ── Per-map adjustment controls ──
                     if scene.pbr_map_normal:
                         adj_row = sub.row()
                         adj_row.prop(scene, "pbr_normal_mode", text="Normal Mode")
                         adj_row = sub.row()
                         adj_row.prop(scene, "pbr_normal_strength", text="Normal Strength", slider=True)
+                    if scene.pbr_map_height:
+                        adj_row = sub.row()
+                        adj_row.prop(scene, "pbr_height_scale", text="Height Scale", slider=True)
+                    if scene.pbr_map_ao:
+                        ao_row = sub.row(align=True)
+                        ao_row.prop(scene, "pbr_ao_samples", text="AO Samples")
+                        ao_row.prop(scene, "pbr_ao_distance", text="AO Distance")
+                    if scene.pbr_map_emission:
+                        adj_row = sub.row()
+                        adj_row.prop(scene, "pbr_emission_method", text="Method")
+                        adj_row = sub.row()
+                        adj_row.prop(scene, "pbr_emission_threshold", text="Threshold", slider=True)
+                        adj_row = sub.row()
+                        adj_row.prop(scene, "pbr_emission_strength", text="Emission Strength", slider=True)
+                        if scene.pbr_emission_method == 'hsv':
+                            hsv_row = sub.row(align=True)
+                            hsv_row.prop(scene, "pbr_emission_saturation_min", text="Sat Min", slider=True)
+                            hsv_row.prop(scene, "pbr_emission_value_min", text="Val Min", slider=True)
+                            hsv_row = sub.row()
+                            hsv_row.prop(scene, "pbr_emission_bloom", text="Bloom Radius", slider=True)
+                        elif scene.pbr_emission_method == 'vlm_seg':
+                            kw_row = sub.row()
+                            kw_row.prop(scene, "pbr_emission_keywords", text="Keywords")
                     # ── Albedo source selector (only when albedo enabled) ──
                     if scene.pbr_map_albedo:
                         sub.separator()
@@ -1081,6 +1151,13 @@ class StableGenPanel(bpy.types.Panel):
                         row = sub.row(align=True)
                         row.prop(scene, "pbr_tile_grid", text="Tile Grid (N×N)")
                         row.prop(scene, "pbr_tile_superres", text="Super Res", toggle=True, icon="IMAGE_PLANE")
+                    if scene.pbr_tiling == 'custom':
+                        row = sub.row(align=True)
+                        row.prop(scene, "pbr_tile_albedo", text="Albedo", toggle=True)
+                        row.prop(scene, "pbr_tile_material", text="Material", toggle=True)
+                        row.prop(scene, "pbr_tile_normal", text="Normal", toggle=True)
+                        row.prop(scene, "pbr_tile_height", text="Height", toggle=True)
+                        row.prop(scene, "pbr_tile_emission", text="Emission", toggle=True)
                     if not scene.pbr_use_native_resolution:
                         row = sub.row()
                         row.prop(scene, "pbr_processing_resolution", text="Processing Resolution")
@@ -1841,6 +1918,13 @@ class ApplyPreset(bpy.types.Operator):
                             context.scene.lora_units.remove(len(context.scene.lora_units) - 1)
                             return {'CANCELLED'}
                         
+            # Reverse-sync: if the preset set model_architecture but didn't
+            # include architecture_mode, update the visible dropdown to match.
+            if "architecture_mode" not in values:
+                arch = context.scene.model_architecture
+                if arch in ('sdxl', 'flux1', 'qwen_image_edit'):
+                    context.scene.architecture_mode = arch
+
             if skipped:
                 self.report({'WARNING'}, f"Preset '{preset}' applied (skipped {len(skipped)} incompatible setting(s)).")
             else:

@@ -594,6 +594,16 @@ DEPENDENCIES: Dict[str, Dict[str, Any]] = {
             },
         ]
     },
+    # --- VLM Emission (Grounding DINO + SAM 2) ---
+    "cn_comfyui_segment_anything": {
+        "id": "cn_comfyui_segment_anything", "type": "node",
+        "name": "ComfyUI Segment Anything (GroundingDINO + SAM)",
+        "git_url": "https://github.com/storyicon/comfyui_segment_anything.git",
+        "target_dir_relative": "custom_nodes",
+        "repo_name": "comfyui_segment_anything",
+        "license": "Apache 2.0", "packages": ["vlm_emission"],
+        "pip_packages": ["segment_anything"],
+    },
 }
 
 # Define what items each menu option entails by listing package tags
@@ -645,6 +655,13 @@ MENU_PACKAGES: Dict[str, Dict[str, Any]] = {
         "size_gb": 3.3,
         "description_suffix": "*Installs ComfyUI_StableDelight_ll custom node + downloads the*\n"
                               "    *Stable-X/yoso-delight-v0-4-base model (~3.3GB fp16) for specular-free albedo.*",
+    },
+    '11': {"name": "[VLM EMISSION] Grounding DINO + SAM Segmentation Node",
+        "tags": ["vlm_emission"],
+        "size_gb": 0.01,
+        "description_suffix": "*Installs comfyui_segment_anything custom node for VLM-driven emission extraction.*\n"
+                              "    *GroundingDINO_SwinB (~938MB) and sam_vit_h (~2.56GB) models are downloaded*\n"
+                              "    *automatically on first use.*",
     },
 }
 
@@ -1050,7 +1067,7 @@ def main():
 
     while True:
         display_menu(comfyui_base_path)
-        choice = input("Enter your choice (1-9, or q to quit): ").strip().lower()
+        choice = input("Enter your choice (1-11, or q to quit): ").strip().lower()
 
         if choice == 'q':
             print("Exiting installer.")

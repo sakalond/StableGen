@@ -1257,7 +1257,12 @@ class WorkflowManager:
                     "images": ["1", 0],
                     "strength": getattr(scene, 'pbr_delight_strength', 1.0),
                     "resolution": proc_res,
-                    "upscale_method": "bilinear",
+                    # Official Stable-X Predictor uses LANCZOS for resize.
+                    # F.interpolate (used by MarigoldImageProcessor) doesn't
+                    # support lanczos, but "bicubic" is the closest PyTorch
+                    # equivalent and much sharper than "bilinear" for both
+                    # input downscale and output upscale.
+                    "upscale_method": "bicubic",
                 }
             },
             "4": {

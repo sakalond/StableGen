@@ -210,7 +210,7 @@ def get_last_material_index(obj):
 	if obj.data.materials:
 		for mat in obj.data.materials:
 			if mat and mat.use_nodes:
-				for node in obj.active_material.node_tree.nodes:
+				for node in mat.node_tree.nodes:
 					if node.type == 'MATH' and node.operation == 'SUBTRACT':
 						if node.inputs[0].default_value > highest_index:
 							highest_index = node.inputs[0].default_value

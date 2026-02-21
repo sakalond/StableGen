@@ -1,7 +1,7 @@
 """ This script registers the addon. """
 import bpy # pylint: disable=import-error
 from .stablegen import StableGenPanel, ApplyPreset, SavePreset, DeletePreset, get_preset_items, update_parameters, ResetQwenPrompt
-from .render_tools import BakeTextures, AddCameras, CloneCamera, MirrorCamera, ToggleCameraLabels, SwitchMaterial, ExportOrbitGIF, CollectCameraPrompts, CameraPromptItem, CameraOrderItem, SG_UL_CameraOrderList, SyncCameraOrder, MoveCameraOrder, ApplyCameraOrderPreset
+from .render_tools import BakeTextures, AddCameras, CloneCamera, MirrorCamera, ToggleCameraLabels, SwitchMaterial, ExportOrbitGIF, ExportForGameEngine, CollectCameraPrompts, CameraPromptItem, CameraOrderItem, SG_UL_CameraOrderList, SyncCameraOrder, MoveCameraOrder, ApplyCameraOrderPreset
 from .debug_tools import debug_classes as _debug_classes
 from .utils import AddHDRI, ApplyModifiers, CurvesToMesh
 from .generator import ComfyUIGenerate, Reproject, Regenerate, MirrorReproject, Trellis2Generate
@@ -32,6 +32,7 @@ classes = [
     ToggleCameraLabels,
     SwitchMaterial,
     ExportOrbitGIF,
+    ExportForGameEngine,
     CollectCameraPrompts,
     CameraPromptItem,
     CameraOrderItem,
@@ -1947,6 +1948,16 @@ def register():
         default=True,
         update=update_parameters
     )
+    bpy.types.Scene.bake_visibility_weights = bpy.props.BoolProperty(
+        name="Bake Visibility Weights",
+        description="Pre-compute per-vertex visibility weights in Python instead of "
+                    "using shader Raycast nodes. Makes projected textures survive "
+                    "object transforms (move/rotate/scale) at the cost of vertex-level "
+                    "weight resolution instead of per-pixel. Recommended for meshes "
+                    "with >500 faces",
+        default=False,
+        update=update_parameters
+    )
     bpy.types.Scene.discard_factor = bpy.props.FloatProperty(
         name="Discard Factor",
         description="If the texture is facing the camera at an angle greater than this value, it will be discarded. This is useful for preventing artifacts from the very edge of the generated texture appearing when keeping high discard factor (use ~65 for best results when generating textures around an object)",
@@ -2145,6 +2156,42 @@ def register():
         name="Blur Vignette Mask",
         description="Apply a Gaussian blur to the vignette mask to soften edges",
         default=False,
+        update=update_parameters,
+    )
+
+    bpy.types.Scene.sg_silhouette_margin = bpy.props.IntProperty(
+        name="Silhouette Margin",
+        description="Pixel margin around occluder silhouettes where projection is suppressed. "
+                    "Prevents thin outlines of foreground geometry (e.g. hands) bleeding onto "
+                    "surfaces behind them.  0 = disabled",
+        default=3,
+        min=0,
+        max=20,
+        update=update_parameters,
+    )
+
+    bpy.types.Scene.sg_silhouette_depth = bpy.props.FloatProperty(
+        name="Silhouette Depth",
+        description="Minimum depth difference (Blender units) between the vertex and an offset "
+                    "ray hit to consider it a silhouette edge.  Raise if too much is eroded, "
+                    "lower if outlines remain",
+        default=0.05,
+        min=0.001,
+        max=1.0,
+        step=1,
+        precision=3,
+        update=update_parameters,
+    )
+
+    bpy.types.Scene.sg_silhouette_rays = bpy.props.EnumProperty(
+        name="Silhouette Rays",
+        description="Number of offset directions for silhouette detection.  "
+                    "4 = cardinal only (faster), 8 = cardinal + diagonal (better coverage)",
+        items=[
+            ('4', "4 (Cardinal)", "Right, Left, Up, Down"),
+            ('8', "8 (Cardinal + Diagonal)", "Cardinal + 4 diagonal directions"),
+        ],
+        default='4',
         update=update_parameters,
     )
 
@@ -3096,6 +3143,9 @@ def register():
             ('delight', "StableDelight (Delighted)",
              "Specular-removed image via StableDelight — preserves diffuse "
              "shading and texture detail, only strips highlights"),
+            ('lighting', "Marigold IID-Lighting (Vibrant)",
+             "Albedo from Marigold IID-Lighting — tends to produce more "
+             "vibrant, saturated colours than IID-Appearance"),
         ],
         default='marigold',
         update=update_parameters,
@@ -3168,10 +3218,137 @@ def register():
         step=0.1,
         update=update_parameters
     )
-    bpy.types.Scene.pbr_map_depth = bpy.props.BoolProperty(
-        name="Depth / Height",
-        description="Extract depth map for displacement/height",
+    bpy.types.Scene.pbr_map_height = bpy.props.BoolProperty(
+        name="Height",
+        description="Extract height/displacement map via Marigold depth estimation",
         default=False,
+        update=update_parameters
+    )
+    bpy.types.Scene.pbr_height_scale = bpy.props.FloatProperty(
+        name="Height Scale",
+        description="Displacement scale for the height map. "
+                    "Higher values produce more pronounced surface displacement",
+        default=0.1,
+        min=0.001,
+        max=2.0,
+        step=0.01,
+        precision=3,
+        update=update_parameters
+    )
+    bpy.types.Scene.pbr_map_ao = bpy.props.BoolProperty(
+        name="AO",
+        description="Bake an Ambient Occlusion map from mesh geometry "
+                    "(uses Blender's built-in bake, no ML required)",
+        default=False,
+        update=update_parameters
+    )
+    bpy.types.Scene.pbr_ao_samples = bpy.props.IntProperty(
+        name="AO Samples",
+        description="Number of samples for AO baking. "
+                    "Higher = cleaner but slower",
+        default=16,
+        min=1,
+        max=128,
+        update=update_parameters
+    )
+    bpy.types.Scene.pbr_ao_distance = bpy.props.FloatProperty(
+        name="AO Distance",
+        description="Maximum ray distance for AO baking.  "
+                    "0 = scene size (automatic)",
+        default=0.0,
+        min=0.0,
+        max=100.0,
+        step=0.1,
+        update=update_parameters
+    )
+    bpy.types.Scene.pbr_map_emission = bpy.props.BoolProperty(
+        name="Emission",
+        description="Extract an emission map (experimental). "
+                    "Identifies self-illuminating regions in the generated texture",
+        default=False,
+        update=update_parameters
+    )
+    bpy.types.Scene.pbr_emission_method = bpy.props.EnumProperty(
+        name="Emission Method",
+        description="Algorithm used to detect emissive regions",
+        items=[
+            ('residual',  "IID-Lighting Residual",
+             "Run Marigold IID-Lighting and extract the residual "
+             "(image − albedo × shading). Most accurate but requires "
+             "an additional model pass"),
+            ('hsv',       "HSV Threshold",
+             "Isolate pixels with high saturation + high value in HSV "
+             "space.  Fast, zero model cost, best for neon/sci-fi styles"),
+            ('vlm_seg',   "VLM Segmentation",
+             "Use Grounding DINO + SAM 2 to segment objects matching "
+             "emissive keywords (neon, screen, fire, LED …). Context-aware "
+             "but requires GroundingDINO + SAM2 ComfyUI nodes"),
+        ],
+        default='residual',
+        update=update_parameters
+    )
+    bpy.types.Scene.pbr_emission_threshold = bpy.props.FloatProperty(
+        name="Emission Threshold",
+        description="Minimum brightness/residual value to consider as emission. "
+                    "Higher = fewer false positives, lower = catches subtle glow",
+        default=0.2,
+        min=0.0,
+        max=1.0,
+        step=0.05,
+        precision=2,
+        update=update_parameters
+    )
+    bpy.types.Scene.pbr_emission_saturation_min = bpy.props.FloatProperty(
+        name="Saturation Min",
+        description="(HSV method) Minimum saturation for a pixel to be "
+                    "considered emissive. Glowing objects retain colour "
+                    "intensity while lit surfaces wash out",
+        default=0.5,
+        min=0.0,
+        max=1.0,
+        step=0.05,
+        precision=2,
+        update=update_parameters
+    )
+    bpy.types.Scene.pbr_emission_value_min = bpy.props.FloatProperty(
+        name="Value Min",
+        description="(HSV method) Minimum value/brightness for a pixel "
+                    "to be considered emissive",
+        default=0.85,
+        min=0.0,
+        max=1.0,
+        step=0.05,
+        precision=2,
+        update=update_parameters
+    )
+    bpy.types.Scene.pbr_emission_bloom = bpy.props.FloatProperty(
+        name="Bloom Radius",
+        description="(HSV method) Gaussian blur radius applied to the "
+                    "emission mask to simulate bloom / glow bleed. "
+                    "0 = sharp mask, higher = more bloom",
+        default=5.0,
+        min=0.0,
+        max=50.0,
+        step=1.0,
+        precision=1,
+        update=update_parameters
+    )
+    bpy.types.Scene.pbr_emission_keywords = bpy.props.StringProperty(
+        name="Emission Keywords",
+        description="(VLM Segmentation method) Comma-separated keywords "
+                    "for Grounding DINO to search for emissive objects",
+        default="neon sign, LED, fire, candle flame, screen display, "
+                "laser, hologram, glowing crystal",
+        update=update_parameters
+    )
+    bpy.types.Scene.pbr_emission_strength = bpy.props.FloatProperty(
+        name="Emission Strength",
+        description="Strength of the emission channel in the Principled BSDF",
+        default=5.0,
+        min=0.0,
+        max=100.0,
+        step=0.5,
+        precision=1,
         update=update_parameters
     )
     bpy.types.Scene.pbr_use_native_resolution = bpy.props.BoolProperty(
@@ -3191,10 +3368,44 @@ def register():
             ('off',       "Off",       "No tiling — process the full image in one pass"),
             ('selective', "Selective", "Tile albedo only (StableDelight and/or "
                                        "IID albedo).  Normals, roughness, metallic "
-                                       "and depth are processed normally"),
-            ('all',       "All",       "Tile every PBR model including normals and depth"),
+                                       "and height are processed normally"),
+            ('all',       "All",       "Tile every PBR model including normals and height"),
+            ('custom',    "Custom",    "Choose which maps to tile individually. "
+                                       "Models are run as efficiently as possible"),
         ],
         default='selective',
+        update=update_parameters
+    )
+    bpy.types.Scene.pbr_tile_albedo = bpy.props.BoolProperty(
+        name="Tile Albedo",
+        description="Tile the albedo map for higher detail",
+        default=True,
+        update=update_parameters
+    )
+    bpy.types.Scene.pbr_tile_material = bpy.props.BoolProperty(
+        name="Tile Material",
+        description="Tile the roughness and metallic maps (both come from "
+                    "the same IID-Appearance material output)",
+        default=False,
+        update=update_parameters
+    )
+    bpy.types.Scene.pbr_tile_normal = bpy.props.BoolProperty(
+        name="Tile Normal",
+        description="Tile the normal map for higher detail",
+        default=False,
+        update=update_parameters
+    )
+    bpy.types.Scene.pbr_tile_height = bpy.props.BoolProperty(
+        name="Tile Height",
+        description="Tile the height/displacement map for higher detail",
+        default=False,
+        update=update_parameters
+    )
+    bpy.types.Scene.pbr_tile_emission = bpy.props.BoolProperty(
+        name="Tile Emission",
+        description="Tile the IID-Lighting residual used for emission "
+                    "(only applies to the Residual emission method)",
+        default=False,
         update=update_parameters
     )
     bpy.types.Scene.pbr_tile_grid = bpy.props.IntProperty(
@@ -3333,6 +3544,7 @@ def unregister():
     del bpy.types.Scene.generation_status
     del bpy.types.Scene.generation_progress
     del bpy.types.Scene.overwrite_material
+    del bpy.types.Scene.bake_visibility_weights
     del bpy.types.Scene.discard_factor
     del bpy.types.Scene.discard_factor_generation_only
     del bpy.types.Scene.discard_factor_after_generation
@@ -3358,6 +3570,9 @@ def unregister():
     del bpy.types.Scene.visibility_vignette
     del bpy.types.Scene.visibility_vignette_width
     del bpy.types.Scene.visibility_vignette_softness
+    del bpy.types.Scene.sg_silhouette_margin
+    del bpy.types.Scene.sg_silhouette_depth
+    del bpy.types.Scene.sg_silhouette_rays
     del bpy.types.Scene.refine_edge_feather_projection
     del bpy.types.Scene.refine_edge_feather_width
     del bpy.types.Scene.refine_edge_feather_softness
@@ -3421,10 +3636,17 @@ def unregister():
     pbr_props = [
         'pbr_decomposition', 'pbr_albedo_source',
         'pbr_map_albedo', 'pbr_map_roughness', 'pbr_map_metallic',
-        'pbr_map_normal', 'pbr_map_depth',
+        'pbr_map_normal', 'pbr_map_height', 'pbr_height_scale',
+        'pbr_map_ao', 'pbr_ao_samples', 'pbr_ao_distance',
+        'pbr_map_emission', 'pbr_emission_method',
+        'pbr_emission_threshold', 'pbr_emission_saturation_min',
+        'pbr_emission_value_min', 'pbr_emission_bloom',
+        'pbr_emission_keywords', 'pbr_emission_strength',
         'pbr_normal_mode', 'pbr_normal_strength',
         'pbr_delight_strength',
-        'pbr_use_native_resolution', 'pbr_tiling', 'pbr_tile_grid', 'pbr_tile_superres',
+        'pbr_use_native_resolution', 'pbr_tiling',
+        'pbr_tile_albedo', 'pbr_tile_material', 'pbr_tile_normal', 'pbr_tile_height',
+        'pbr_tile_emission', 'pbr_tile_grid', 'pbr_tile_superres',
         'pbr_processing_resolution', 'pbr_denoise_steps', 'pbr_ensemble_size',
         'pbr_replace_color_with_albedo', 'pbr_auto_lighting',
         'pbr_model_variant',  # legacy, kept for compat

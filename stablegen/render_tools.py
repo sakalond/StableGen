@@ -4432,6 +4432,34 @@ def prepare_baking(context):
         else:
             bpy.context.scene.cycles.use_osl = True
         bpy.context.scene.cycles.device = 'CPU'
+    else:
+        # Blender 5.1+: prefer GPU baking for massive speedup on high-poly.
+        # Setting cycles.device = 'GPU' alone is not enough — we must also
+        # set compute_device_type on Cycles preferences and ensure the GPU
+        # device is enabled, otherwise Blender silently falls back to CPU.
+        try:
+            cycles_prefs = bpy.context.preferences.addons['cycles'].preferences
+            # Probe all available backends in order of preference
+            for backend in ('CUDA', 'OPTIX', 'HIP', 'ONEAPI', 'METAL'):
+                try:
+                    cycles_prefs.compute_device_type = backend
+                    cycles_prefs.get_devices()
+                    gpu_devs = [d for d in cycles_prefs.devices
+                                if d.type == backend]
+                    if gpu_devs:
+                        for d in gpu_devs:
+                            d.use = True
+                        bpy.context.scene.cycles.device = 'GPU'
+                        print(f"[StableGen] Baking with {backend} GPU: "
+                              f"{', '.join(d.name for d in gpu_devs)}")
+                        break
+                except TypeError:
+                    # This backend is not available on this platform
+                    continue
+            else:
+                print("[StableGen] No GPU backend found, baking on CPU")
+        except Exception:
+            pass  # Fall back to whatever the user had
 
     # Set bake type to diffuse and contributions to color only
     bpy.context.scene.cycles.bake_type = 'DIFFUSE'
@@ -4442,6 +4470,13 @@ def prepare_baking(context):
 
     # Set steps to 1 for faster baking
     bpy.context.scene.cycles.samples = 1
+
+    # Minimize light bounces — not needed for EMIT or color-only DIFFUSE bakes
+    bpy.context.scene.cycles.max_bounces = 0
+
+    # Keep the BVH in memory between consecutive bakes (huge win for PBR
+    # where we bake 5-7 channels of the same mesh back-to-back)
+    bpy.context.scene.render.use_persistent_data = True
 
 def unwrap(obj, method, overlap_only):
         """     
@@ -4522,6 +4557,8 @@ def unwrap(obj, method, overlap_only):
             bpy.ops.uv.unwrap(method='ANGLE_BASED', margin=0.001)
         elif method == 'smart':
             bpy.ops.uv.smart_project()
+        elif method == 'cube':
+            bpy.ops.uv.cube_project(cube_size=1.0)
         elif method == 'lightmap':
             bpy.ops.uv.lightmap_pack()
         elif method == 'pack':
@@ -4602,9 +4639,24 @@ def bake_texture(context, obj, texture_resolution, suffix = "", view_transform =
             links.new(before_output.outputs[0], bsdf_node.inputs[0])
             # Connect the BSDF node to the output node
             links.new(bsdf_node.outputs[0], output.inputs[0])
+
+        # Disconnect Metallic so the DIFFUSE color-only pass returns the
+        # true Base Color.  Principled BSDF multiplies diffuse by
+        # (1 - Metallic), which would dim metallic areas incorrectly.
+        for node in nodes:
+            if node.type == 'BSDF_PRINCIPLED':
+                met = node.inputs.get("Metallic")
+                if met:
+                    for link in list(met.links):
+                        links.remove(link)
+                    met.default_value = 0.0
+                break
             
         # Bake the texture
-        bpy.ops.object.bake(type='DIFFUSE', save_mode='EXTERNAL', filepath=image.filepath, width=texture_resolution, height=texture_resolution)
+        # Ensure OBJECT mode — bake fails silently in EDIT mode
+        if bpy.context.mode != 'OBJECT':
+            bpy.ops.object.mode_set(mode='OBJECT')
+        bpy.ops.object.bake(type='DIFFUSE', width=texture_resolution, height=texture_resolution)
        
         # Save the image if required
         if not os.path.exists(output_dir):
@@ -4629,19 +4681,25 @@ def bake_texture(context, obj, texture_resolution, suffix = "", view_transform =
         # First append the original active material
         if original_active_material:
             obj.data.materials.append(original_active_material)
-        for mat in original_materials:
-            if mat != original_active_material:
-                obj.data.materials.append(mat)
+        for mat_item in original_materials:
+            if mat_item != original_active_material:
+                obj.data.materials.append(mat_item)
+
+        # Remove the temporary material copy (prevent leak)
+        bpy.data.materials.remove(mat)
                 
         return True
 
 def _has_non_projection_uv(obj):
+    """Return True if the object has at least one UV map that can be used
+    for baking (not a StableGen projection UV or buffer)."""
     if not obj or obj.type != 'MESH':
         return False
     if not obj.data.uv_layers:
         return False
     for uv in obj.data.uv_layers:
-        if not uv.name.startswith("ProjectionUV"):
+        if (not uv.name.startswith("ProjectionUV")
+                and uv.name != "_SG_ProjectionBuffer"):
             return True
     return False
 
@@ -4662,6 +4720,317 @@ def _uvs_likely_overlap(obj, uv_name=None):
                 return True
             seen.add(key)
     return False
+
+
+# ── PBR Channel Baking Helpers ─────────────────────────────────────────
+
+# Standard export suffixes per PBR channel
+_PBR_CHANNEL_SUFFIXES = {
+    'base_color': 'BaseColor',
+    'roughness':  'Roughness',
+    'metallic':   'Metallic',
+    'normal':     'Normal',
+    'emission':   'Emission',
+    'height':     'Height',
+    'ao':         'AO',
+}
+
+
+def _find_pbr_bake_sources(mat):
+    """Inspect a Principled BSDF material and return bakeable PBR channel sources.
+
+    Returns:
+        dict: ``{channel_name: output_socket}`` for each connected PBR
+        channel on the material's Principled BSDF.
+    """
+    if not mat or not mat.use_nodes:
+        return {}
+
+    nodes = mat.node_tree.nodes
+    sources = {}
+
+    # Find Principled BSDF
+    principled = None
+    for node in nodes:
+        if node.type == 'BSDF_PRINCIPLED':
+            principled = node
+            break
+    if not principled:
+        return {}
+
+    # ── Base Color + AO ──────────────────────────────────────────────
+    base_input = principled.inputs.get("Base Color")
+    if base_input and base_input.links:
+        src_node = base_input.links[0].from_node
+        is_ao_mult = (
+            getattr(src_node, 'label', '') == 'AO Multiply'
+            or (src_node.type == 'MIX'
+                and getattr(src_node, 'data_type', '') == 'RGBA'
+                and getattr(src_node, 'blend_type', '') == 'MULTIPLY'))
+        if is_ao_mult:
+            # A input (index 6) = base colour, B input (index 7) = AO
+            a_in = src_node.inputs[6]
+            if a_in.links:
+                sources['base_color'] = a_in.links[0].from_socket
+            b_in = src_node.inputs[7]
+            if b_in.links:
+                sources['ao'] = b_in.links[0].from_socket
+        else:
+            sources['base_color'] = base_input.links[0].from_socket
+
+    # ── Roughness ────────────────────────────────────────────────────
+    ri = principled.inputs.get("Roughness")
+    if ri and ri.links:
+        sources['roughness'] = ri.links[0].from_socket
+
+    # ── Metallic ─────────────────────────────────────────────────────
+    mi = principled.inputs.get("Metallic")
+    if mi and mi.links:
+        sources['metallic'] = mi.links[0].from_socket
+
+    # ── Normal (raw colours before Normal Map node) ──────────────────
+    ni = principled.inputs.get("Normal")
+    if ni and ni.links:
+        n_node = ni.links[0].from_node
+        if n_node.type == 'NORMAL_MAP':
+            ci = n_node.inputs.get("Color")
+            if ci and ci.links:
+                sources['normal'] = ci.links[0].from_socket
+
+    # ── Emission ─────────────────────────────────────────────────────
+    ei = principled.inputs.get("Emission Color") or principled.inputs.get("Emission")
+    if ei and ei.links:
+        sources['emission'] = ei.links[0].from_socket
+
+    # ── Height (from Displacement node → Material Output) ────────────
+    for node in nodes:
+        if node.type == 'OUTPUT_MATERIAL':
+            di = node.inputs.get("Displacement")
+            if di and di.links:
+                d_node = di.links[0].from_node
+                if d_node.type == 'DISPLACEMENT':
+                    hi = d_node.inputs.get("Height")
+                    if hi and hi.links:
+                        sources['height'] = hi.links[0].from_socket
+            break
+
+    return sources
+
+
+def _restore_materials(obj, original_materials, original_active):
+    """Restore an object's material slots back to their original state."""
+    obj.data.materials.clear()
+    if original_active:
+        obj.data.materials.append(original_active)
+    for m in original_materials:
+        if m != original_active:
+            obj.data.materials.append(m)
+
+
+def bake_pbr_channel(context, obj, channel_name, texture_resolution, output_dir):
+    """Bake one PBR channel via the Emit technique.
+
+    Copies the material, finds the source socket for *channel_name*,
+    rewires it through an Emission shader to the Material Output, bakes
+    ``EMIT``, and saves the result to ``output_dir/{obj.name}_{Suffix}.png``.
+
+    Returns:
+        File path of the baked image, or ``None`` on failure.
+    """
+    if not obj.data.materials or not obj.active_material:
+        return None
+
+    # ── Save state ─────────────────────────────────────────────────
+    orig_vt = context.scene.view_settings.view_transform
+    orig_render = obj.hide_render
+    context.scene.view_settings.view_transform = 'Standard'
+    obj.hide_render = False
+
+    # ── Copy material onto the object ──────────────────────────────
+    original_materials = list(obj.data.materials)
+    original_active = obj.active_material
+    mat_copy = original_active.copy()
+    obj.data.materials.clear()
+    obj.data.materials.append(mat_copy)
+    mat_copy.use_nodes = True
+    nodes = mat_copy.node_tree.nodes
+    links = mat_copy.node_tree.links
+
+    # ── Find source socket in the copy ─────────────────────────────
+    sources = _find_pbr_bake_sources(mat_copy)
+    source_socket = sources.get(channel_name)
+    if source_socket is None:
+        _restore_materials(obj, original_materials, original_active)
+        bpy.data.materials.remove(mat_copy)
+        context.scene.view_settings.view_transform = orig_vt
+        obj.hide_render = orig_render
+        return None
+
+    # ── Find Output node ───────────────────────────────────────────
+    output_node = None
+    for n in nodes:
+        if n.type == 'OUTPUT_MATERIAL':
+            output_node = n
+            break
+    if not output_node:
+        _restore_materials(obj, original_materials, original_active)
+        bpy.data.materials.remove(mat_copy)
+        context.scene.view_settings.view_transform = orig_vt
+        obj.hide_render = orig_render
+        return None
+
+    # ── Rewire material for baking ───────────────────────────────
+    # Normal channel: use Cycles' built-in NORMAL bake which automatically
+    # converts to tangent space — game-engine / glTF compatible regardless
+    # of the original normal mode (world, bump, tangent).
+    # All other channels: rewire source → Emission → Output for EMIT bake.
+    bake_type = 'EMIT'
+    if channel_name == 'normal':
+        # Keep the Principled BSDF wired to the Output with the Normal
+        # input connected.  Cycles NORMAL bake evaluates the shader's
+        # final shading normal and converts it to tangent space for us.
+        bake_type = 'NORMAL'
+        # Ensure the normal influence is at full strength for baking
+        principled = None
+        for n in nodes:
+            if n.type == 'BSDF_PRINCIPLED':
+                principled = n
+                break
+        if principled and principled.inputs.get("Normal") and principled.inputs["Normal"].links:
+            nmap_node = principled.inputs["Normal"].links[0].from_node
+            if nmap_node.type == 'NORMAL_MAP':
+                nmap_node.inputs["Strength"].default_value = 1.0
+    else:
+        for link in list(output_node.inputs["Surface"].links):
+            links.remove(link)
+
+        emit_node = nodes.new("ShaderNodeEmission")
+        emit_node.location = (output_node.location[0] - 200,
+                              output_node.location[1])
+        links.new(source_socket, emit_node.inputs["Color"])
+        links.new(emit_node.outputs["Emission"],
+                  output_node.inputs["Surface"])
+
+    # ── Bake target image ──────────────────────────────────────────
+    suffix = _PBR_CHANNEL_SUFFIXES.get(channel_name, channel_name)
+    img_name = f"{obj.name}_{suffix}"
+    bake_img = bpy.data.images.new(name=img_name,
+                                   width=texture_resolution,
+                                   height=texture_resolution)
+
+    # Non-color channels (roughness, metallic, normal, height, AO) must be
+    # stored in linear / Non-Color so the round-trip is lossless:
+    #   Cycles linear → raw 8-bit → PNG → load as Non-Color → linear.
+    # Without this, the default sRGB image applies gamma encoding on write,
+    # but add_baked_material() loads them as Non-Color (no decode) →
+    # values are gamma-shifted (e.g. roughness 0.22 → 0.50).
+    if channel_name not in ('base_color', 'emission'):
+        bake_img.colorspace_settings.name = 'Non-Color'
+
+    tex_node = nodes.new("ShaderNodeTexImage")
+    tex_node.image = bake_img
+    nodes.active = tex_node
+
+    # ── Select object + non-projection UV ──────────────────────────
+    bpy.ops.object.select_all(action='DESELECT')
+    context.view_layer.objects.active = obj
+    obj.select_set(True)
+    for uv in obj.data.uv_layers:
+        if "ProjectionUV" not in uv.name and uv.name != "_SG_ProjectionBuffer":
+            obj.data.uv_layers.active = uv
+            break
+
+    # ── Bake ─────────────────────────────────────────────────────
+    # Ensure OBJECT mode — bake fails silently in EDIT mode
+    if bpy.context.mode != 'OBJECT':
+        bpy.ops.object.mode_set(mode='OBJECT')
+    if bake_type == 'NORMAL':
+        bpy.ops.object.bake(type='NORMAL',
+                            normal_space='TANGENT',
+                            width=texture_resolution,
+                            height=texture_resolution)
+    else:
+        bpy.ops.object.bake(type='EMIT',
+                            width=texture_resolution,
+                            height=texture_resolution)
+
+    # ── Save ───────────────────────────────────────────────────────
+    os.makedirs(output_dir, exist_ok=True)
+    out_path = os.path.join(output_dir, f"{obj.name}_{suffix}.png")
+    bake_img.filepath_raw = out_path
+    bake_img.file_format = 'PNG'
+    bake_img.save()
+    print(f"    Saved PBR channel: {out_path}")
+
+    # ── Cleanup ────────────────────────────────────────────────────
+    _restore_materials(obj, original_materials, original_active)
+    bpy.data.materials.remove(mat_copy)
+    context.scene.view_settings.view_transform = orig_vt
+    obj.hide_render = orig_render
+    return out_path
+
+
+def _flip_normal_green(filepath):
+    """Flip the green channel of a normal map (OpenGL ↔ DirectX)."""
+    if not os.path.exists(filepath):
+        return
+    try:
+        import numpy as np
+        img = bpy.data.images.load(filepath, check_existing=False)
+        w, h = img.size
+        px = np.array(img.pixels[:]).reshape(h, w, 4)
+        px[:, :, 1] = 1.0 - px[:, :, 1]
+        img.pixels = px.flatten().tolist()
+        img.save()
+        bpy.data.images.remove(img)
+        print(f"    Flipped normal green channel (DirectX): {filepath}")
+    except Exception as e:
+        print(f"[StableGen] Failed to flip normal green channel: {e}")
+
+
+def _pack_orm_texture(output_dir, obj_name):
+    """Pack AO, Roughness, Metallic into an ORM texture.
+
+    Channel layout: R = AO, G = Roughness, B = Metallic  (Unreal / glTF).
+    Requires at least Roughness and Metallic to exist.
+    """
+    import numpy as np
+
+    rough_path = os.path.join(output_dir, f"{obj_name}_Roughness.png")
+    metal_path = os.path.join(output_dir, f"{obj_name}_Metallic.png")
+    if not os.path.exists(rough_path) or not os.path.exists(metal_path):
+        return None
+
+    rough_img = bpy.data.images.load(rough_path, check_existing=True)
+    metal_img = bpy.data.images.load(metal_path, check_existing=True)
+    w, h = rough_img.size
+
+    rough_px = np.array(rough_img.pixels[:]).reshape(h, w, 4)
+    metal_px = np.array(metal_img.pixels[:]).reshape(h, w, 4)
+
+    ao_path = os.path.join(output_dir, f"{obj_name}_AO.png")
+    if os.path.exists(ao_path):
+        ao_img = bpy.data.images.load(ao_path, check_existing=True)
+        ao_px = np.array(ao_img.pixels[:]).reshape(h, w, 4)
+        ao_chan = ao_px[:, :, 0]
+    else:
+        ao_chan = np.ones((h, w), dtype=np.float32)
+
+    orm = np.ones((h, w, 4), dtype=np.float32)
+    orm[:, :, 0] = ao_chan
+    orm[:, :, 1] = rough_px[:, :, 0]
+    orm[:, :, 2] = metal_px[:, :, 0]
+
+    orm_img = bpy.data.images.new(name=f"{obj_name}_ORM", width=w, height=h)
+    orm_img.pixels = orm.flatten().tolist()
+
+    orm_path = os.path.join(output_dir, f"{obj_name}_ORM.png")
+    orm_img.filepath_raw = orm_path
+    orm_img.file_format = 'PNG'
+    orm_img.save()
+    print(f"    Packed ORM texture: {orm_path}")
+    return orm_path
+
 
 class BakeTextures(bpy.types.Operator):
     """Bakes textures using the cycles render engine.
@@ -4686,8 +5055,9 @@ class BakeTextures(bpy.types.Operator):
         description="Method to unwrap UVs before baking",
         items=[
             ('none', 'None', 'Skip UV unwrapping'),
-            ('basic', 'Basic Unwrap', 'Use basic angle-based unwrapping'),
-            ('smart', 'Smart UV Project', 'Use Smart UV Project with default parameters'),
+            ('cube', 'Cube Project', 'Fast cube projection — great for high-poly / TRELLIS meshes (handles 1M+ faces instantly)'),
+            ('smart', 'Smart UV Project', 'Smart UV Project — good balance of quality and speed'),
+            ('basic', 'Basic Unwrap', 'Angle-based unwrap — best quality but very slow on high-poly meshes'),
             ('lightmap', 'Lightmap Pack', 'Use Lightmap Pack with default parameters'),
             ('pack', 'Pack Islands', 'Use Pack Islands with default parameters')
         ],
@@ -4710,6 +5080,29 @@ class BakeTextures(bpy.types.Operator):
         name="Overlap Only",
         description="Only unwrap objects with overlapping UVs",
         default=False
+    ) # type: ignore
+
+    bake_pbr: bpy.props.BoolProperty(
+        name="Bake PBR Maps",
+        description="Bake individual PBR channel maps (BaseColor, Roughness, Metallic, Normal, Emission, Height, AO) "
+                    "with standard naming for game-engine import",
+        default=True
+    ) # type: ignore
+
+    export_orm: bpy.props.BoolProperty(
+        name="Pack ORM Texture",
+        description="Create a packed ORM texture (R=AO, G=Roughness, B=Metallic) for Unreal Engine / glTF workflows",
+        default=False
+    ) # type: ignore
+
+    normal_convention: bpy.props.EnumProperty(
+        name="Normal Convention",
+        description="Normal map Y-axis convention",
+        items=[
+            ('opengl', 'OpenGL (Y+)', 'Standard OpenGL / glTF / Unity / Blender convention'),
+            ('directx', 'DirectX (Y-)', 'DirectX / Unreal Engine convention (flips green channel)'),
+        ],
+        default='opengl'
     ) # type: ignore
 
     _timer = None
@@ -4763,6 +5156,13 @@ class BakeTextures(bpy.types.Operator):
         layout.prop(self, "overlap_only")
         layout.prop(self, "add_material")
         layout.prop(self, "flatten_for_refine")
+        layout.separator()
+        layout.label(text="PBR Export:")
+        layout.prop(self, "bake_pbr")
+        pbr_col = layout.column()
+        pbr_col.enabled = self.bake_pbr
+        pbr_col.prop(self, "export_orm")
+        pbr_col.prop(self, "normal_convention")
 
     def invoke(self, context, event):
         """     
@@ -4790,14 +5190,27 @@ class BakeTextures(bpy.types.Operator):
 
         self.original_engine = bpy.context.scene.render.engine
         self.original_shading = bpy.context.space_data.shading.type
-        # Set render engine to CYCLES
+        self.original_device = bpy.context.scene.cycles.device
+        self.original_samples = bpy.context.scene.cycles.samples
+        self.original_max_bounces = bpy.context.scene.cycles.max_bounces
+        self.original_persistent = bpy.context.scene.render.use_persistent_data
+        # Save Cycles compute_device_type so we can restore after GPU bake
+        try:
+            self._original_compute_device_type = (
+                bpy.context.preferences.addons['cycles'].preferences.compute_device_type
+            )
+        except Exception:
+            self._original_compute_device_type = None
+        # Set render engine to CYCLES (required for baking)
         bpy.context.scene.render.engine = 'CYCLES'
-        # Set viewport shading to "MATERIAL_PREVIEW"
+        # Switch to Solid shading to avoid conflicts with Rendered mode
+        # (Rendered viewport + bake = crash).  Solid is engine-independent
+        # and won't cause pink textures like Material Preview (EEVEE) does.
         for area in context.screen.areas:
             if area.type == 'VIEW_3D':
                 for space in area.spaces:
                     if space.type == 'VIEW_3D':
-                        space.shading.type = 'MATERIAL'
+                        space.shading.type = 'SOLID'
                         break
         prepare_baking(context)
 
@@ -4819,6 +5232,38 @@ class BakeTextures(bpy.types.Operator):
                     area.tag_redraw()
             redraw()
 
+            # ── PBR channel bake (flat queue, one item per tick) ──────
+            if self._phase == 'bake_pbr':
+                if self._pbr_queue_idx < len(self._pbr_queue):
+                    obj, channel = self._pbr_queue[self._pbr_queue_idx]
+                    nice = _PBR_CHANNEL_SUFFIXES.get(channel, channel)
+                    self._stage = f"PBR {nice} — {obj.name}"
+                    self._progress = (self._pbr_queue_idx / len(self._pbr_queue)) * 100
+                    redraw()
+                    bake_pbr_channel(
+                        context, obj, channel,
+                        self.texture_resolution,
+                        get_dir_path(context, "baked"))
+                    self._pbr_queue_idx += 1
+                else:
+                    # DirectX normal flip
+                    if self.normal_convention == 'directx':
+                        out_dir = get_dir_path(context, "baked")
+                        for obj in self._objects:
+                            _flip_normal_green(
+                                os.path.join(out_dir,
+                                             f"{obj.name}_Normal.png"))
+                    # Pack ORM
+                    if self.export_orm:
+                        self.report({'INFO'}, "Packing ORM textures...")
+                        self._phase = 'pack_orm'
+                        self._current_index = 0
+                    else:
+                        self.report({'INFO'}, "Applying materials...")
+                        self._phase = 'apply_material'
+                        self._current_index = 0
+                return {'PASS_THROUGH'}
+
             if self._current_index < len(self._objects):
                 obj = self._objects[self._current_index]
                 if self._phase == 'unwrap':
@@ -4828,33 +5273,46 @@ class BakeTextures(bpy.types.Operator):
 
                     if self.try_unwrap != 'none':
                         if not _has_non_projection_uv(obj):
+                            # No usable UV exists — must unwrap
                             unwrap(obj, self.try_unwrap, self.overlap_only)
+                        elif self.overlap_only:
+                            # Only re-unwrap if existing UVs overlap
+                            if _uvs_likely_overlap(obj):
+                                unwrap(obj, self.try_unwrap, self.overlap_only)
                         else:
-                            if self.overlap_only:
-                                if _uvs_likely_overlap(obj):
-                                    unwrap(obj, self.try_unwrap, self.overlap_only)
-                            else:
-                                pass
+                            # Always re-unwrap when overlap_only is disabled
+                            unwrap(obj, self.try_unwrap, self.overlap_only)
 
                     self._progress = 100
                 elif self._phase == 'bake':
-                    self._stage = f"Baking {obj.name}"
+                    if self.bake_pbr:
+                        # PBR mode bakes BaseColor via EMIT — skip the
+                        # redundant DIFFUSE bake entirely.
+                        self._progress = 100
+                    else:
+                        self._stage = f"Baking {obj.name}"
+                        self._progress = 0
+                        redraw()
+                        if not bake_texture(context, obj, self.texture_resolution, output_dir=get_dir_path(context, "baked")):
+                            self.report({'ERROR'}, f"Failed to bake texture for {obj.name}. No materials found.")
+                            context.window_manager.event_timer_remove(self._timer)
+                            return {'CANCELLED'}
+
+                        # NEW: optionally flatten into the projection material so you can keep refining
+                        if self.flatten_for_refine:
+                            try:
+                                baked_path = get_file_path(context, "baked", object_name=obj.name)
+                                flatten_projection_material_for_refine(context, obj, baked_path)
+                                purge_orphans()
+                            except Exception as e:
+                                print(f"[StableGen] Failed to flatten projection material for {obj.name}: {e}")
+
+                        self._progress = 100
+                elif self._phase == 'pack_orm':
+                    self._stage = f"Packing ORM — {obj.name}"
                     self._progress = 0
                     redraw()
-                    if not bake_texture(context, obj, self.texture_resolution, output_dir=get_dir_path(context, "baked")):
-                        self.report({'ERROR'}, f"Failed to bake texture for {obj.name}. No materials found.")
-                        context.window_manager.event_timer_remove(self._timer)
-                        return {'CANCELLED'}
-
-                    # NEW: optionally flatten into the projection material so you can keep refining
-                    if self.flatten_for_refine:
-                        try:
-                            baked_path = get_file_path(context, "baked", object_name=obj.name)
-                            flatten_projection_material_for_refine(context, obj, baked_path)
-                            purge_orphans()
-                        except Exception as e:
-                            print(f"[StableGen] Failed to flatten projection material for {obj.name}: {e}")
-
+                    _pack_orm_texture(get_dir_path(context, "baked"), obj.name)
                     self._progress = 100
                 elif self._phase == 'apply_material' and self.add_material:
                     self._stage = f"Applying Material to {obj.name}"
@@ -4871,13 +5329,44 @@ class BakeTextures(bpy.types.Operator):
                     self._phase = 'bake'
                     self._current_index = 0
                 elif self._phase == 'bake':
+                    if self.bake_pbr:
+                        self.report({'INFO'}, "Baking PBR channels...")
+                        self._phase = 'bake_pbr'
+                        self._pbr_queue = []
+                        for obj in self._objects:
+                            if obj.active_material:
+                                for ch in _find_pbr_bake_sources(obj.active_material):
+                                    self._pbr_queue.append((obj, ch))
+                        self._pbr_queue_idx = 0
+                        if not self._pbr_queue:
+                            # No PBR sources — skip straight to apply
+                            self.report({'INFO'}, "No PBR channels found, skipping PBR bake...")
+                            self._phase = 'apply_material'
+                            self._current_index = 0
+                    else:
+                        self.report({'INFO'}, "Applying materials...")
+                        self._phase = 'apply_material'
+                        self._current_index = 0
+                elif self._phase == 'pack_orm':
                     self.report({'INFO'}, "Applying materials...")
                     self._phase = 'apply_material'
                     self._current_index = 0
                 else:
                     context.window_manager.event_timer_remove(self._timer)
                     bpy.context.scene.render.engine = self.original_engine
-                    # Restore original shading type
+                    bpy.context.scene.cycles.device = self.original_device
+                    bpy.context.scene.cycles.samples = self.original_samples
+                    bpy.context.scene.cycles.max_bounces = self.original_max_bounces
+                    bpy.context.scene.render.use_persistent_data = self.original_persistent
+                    # Restore Cycles compute_device_type
+                    if self._original_compute_device_type is not None:
+                        try:
+                            bpy.context.preferences.addons['cycles'].preferences.compute_device_type = (
+                                self._original_compute_device_type
+                            )
+                        except Exception:
+                            pass
+                    # Restore original viewport shading
                     for area in context.screen.areas:
                         if area.type == 'VIEW_3D':
                             for space in area.spaces:
@@ -4890,63 +5379,196 @@ class BakeTextures(bpy.types.Operator):
         return {'PASS_THROUGH'}
 
     def add_baked_material(self, context, obj):
+        """Create a baked material with standard PBR textures (game-engine ready).
+
+        When ``bake_pbr`` is enabled, looks for ``{obj.name}_{Channel}.png``
+        files in the baked output directory and wires them to a Principled
+        BSDF.  Falls back to the single-texture path when PBR maps are absent.
+        """
+        output_dir = get_dir_path(context, "baked")
+
         mat = bpy.data.materials.new(name=f"{obj.name}_baked")
         obj.data.materials.append(mat)
-
         mat.use_nodes = True
         nodes = mat.node_tree.nodes
         links = mat.node_tree.links
-        # Remove all existing nodes
         for node in nodes:
             nodes.remove(node)
 
-        # Switch the active material to the new material (Switch to edit mode, select all, assign the material)
+        # Assign the new material to all faces
         obj.active_material_index = len(obj.material_slots) - 1
         bpy.context.view_layer.objects.active = obj
         bpy.ops.object.mode_set(mode='EDIT')
         bpy.ops.mesh.select_all(action='SELECT')
         bpy.ops.object.material_slot_assign()
         bpy.ops.object.mode_set(mode='OBJECT')
-        
-        # Add output node
+
+        # Output node
         output_node = nodes.new("ShaderNodeOutputMaterial")
-        output_node.location = (600, 0)
+        output_node.location = (800, 0)
 
-        # Add principled shader node
-        principled_node = nodes.new("ShaderNodeBsdfPrincipled")
-        principled_node.location = (400, 0)
-        principled_node.inputs["Roughness"].default_value = 1.0
+        # Principled BSDF
+        principled = nodes.new("ShaderNodeBsdfPrincipled")
+        principled.location = (400, 0)
+        # Fallback values when PBR textures are absent:
+        # max roughness + zero metallic → matte, non-reflective surface.
+        principled.inputs["Roughness"].default_value = 1.0
+        principled.inputs["Metallic"].default_value = 0.0
 
-
-        # Add uv map node
-        uv_map_node = nodes.new("ShaderNodeUVMap")
-        # If there is "BakeUV" uv map, use it
+        # UV Map
+        uv_node = nodes.new("ShaderNodeUVMap")
         if "BakeUV" in [uv.name for uv in obj.data.uv_layers]:
-            uv_map_node.uv_map = "BakeUV"
+            uv_node.uv_map = "BakeUV"
         else:
-            uv_map_node.uv_map = obj.data.uv_layers[0].name
-        uv_map_node.location = (-200, 0)
+            uv_node.uv_map = obj.data.uv_layers[0].name
+        uv_node.location = (-600, 0)
 
-        mat.use_nodes = True
-        nodes = mat.node_tree.nodes
-        links = mat.node_tree.links
+        # ── Base Color ────────────────────────────────────────────────
+        base_path = os.path.join(output_dir, f"{obj.name}_BaseColor.png")
+        if not os.path.exists(base_path):
+            # Fallback to standard diffuse bake
+            base_path = get_file_path(context, "baked", object_name=obj.name)
 
-        # Add image texture node
-        tex_image = nodes.new("ShaderNodeTexImage")
-        # Load the saved image
-        tex_image.image = bpy.data.images.load(get_file_path(context, "baked", object_name=obj.name))
-        tex_image.location = (0, 0)
+        has_base = os.path.exists(base_path)
+        if has_base:
+            tex_base = nodes.new("ShaderNodeTexImage")
+            tex_base.image = bpy.data.images.load(base_path)
+            tex_base.location = (-200, 200)
+            tex_base.label = "BaseColor"
+            links.new(uv_node.outputs["UV"], tex_base.inputs["Vector"])
 
-        # Connect nodes
-        links.new(uv_map_node.outputs["UV"], tex_image.inputs["Vector"])
-   
-        if context.scene.apply_bsdf:
-            links.new(tex_image.outputs["Color"], principled_node.inputs["Base Color"])
-            links.new(principled_node.outputs["BSDF"], output_node.inputs["Surface"])
+            if context.scene.apply_bsdf or self.bake_pbr:
+                links.new(tex_base.outputs["Color"],
+                          principled.inputs["Base Color"])
+                links.new(principled.outputs[0],
+                          output_node.inputs["Surface"])
+            else:
+                links.new(tex_base.outputs["Color"],
+                          output_node.inputs["Surface"])
+                return
         else:
-            links.new(tex_image.outputs["Color"], output_node.inputs["Surface"])
-            
-    
+            links.new(principled.outputs[0],
+                      output_node.inputs["Surface"])
+
+        if not self.bake_pbr:
+            return
+
+        # ── PBR channel textures ──────────────────────────────────────
+        y_pos = -100
+
+        # Roughness
+        rough_path = os.path.join(output_dir, f"{obj.name}_Roughness.png")
+        if os.path.exists(rough_path):
+            y_pos -= 250
+            tex = nodes.new("ShaderNodeTexImage")
+            tex.image = bpy.data.images.load(rough_path)
+            tex.image.colorspace_settings.name = 'Non-Color'
+            tex.location = (-200, y_pos)
+            tex.label = "Roughness"
+            links.new(uv_node.outputs["UV"], tex.inputs["Vector"])
+            links.new(tex.outputs["Color"],
+                      principled.inputs["Roughness"])
+
+        # Metallic
+        metal_path = os.path.join(output_dir, f"{obj.name}_Metallic.png")
+        if os.path.exists(metal_path):
+            y_pos -= 250
+            tex = nodes.new("ShaderNodeTexImage")
+            tex.image = bpy.data.images.load(metal_path)
+            tex.image.colorspace_settings.name = 'Non-Color'
+            tex.location = (-200, y_pos)
+            tex.label = "Metallic"
+            links.new(uv_node.outputs["UV"], tex.inputs["Vector"])
+            links.new(tex.outputs["Color"],
+                      principled.inputs["Metallic"])
+
+        # Normal
+        normal_path = os.path.join(output_dir, f"{obj.name}_Normal.png")
+        if os.path.exists(normal_path):
+            y_pos -= 250
+            tex = nodes.new("ShaderNodeTexImage")
+            tex.image = bpy.data.images.load(normal_path)
+            tex.image.colorspace_settings.name = 'Non-Color'
+            tex.location = (-200, y_pos)
+            tex.label = "Normal"
+            links.new(uv_node.outputs["UV"], tex.inputs["Vector"])
+            nmap = nodes.new("ShaderNodeNormalMap")
+            nmap.location = (100, y_pos)
+            nmap.label = "Normal Map"
+            # The normal bake uses Cycles NORMAL pass with tangent space,
+            # so the texture is always tangent-space regardless of the
+            # original projection material's normal mode (world/bump/tangent).
+            nmap.space = 'TANGENT'
+
+            links.new(tex.outputs["Color"], nmap.inputs["Color"])
+            if "Normal" in principled.inputs:
+                links.new(nmap.outputs["Normal"],
+                          principled.inputs["Normal"])
+
+        # Emission
+        emission_path = os.path.join(output_dir,
+                                     f"{obj.name}_Emission.png")
+        if os.path.exists(emission_path):
+            y_pos -= 250
+            tex = nodes.new("ShaderNodeTexImage")
+            tex.image = bpy.data.images.load(emission_path)
+            tex.location = (-200, y_pos)
+            tex.label = "Emission"
+            links.new(uv_node.outputs["UV"], tex.inputs["Vector"])
+            em_in = (principled.inputs.get("Emission Color")
+                     or principled.inputs.get("Emission"))
+            if em_in:
+                links.new(tex.outputs["Color"], em_in)
+            if "Emission Strength" in principled.inputs:
+                principled.inputs[
+                    "Emission Strength"].default_value = 1.0
+
+        # Height → Displacement
+        height_path = os.path.join(output_dir,
+                                   f"{obj.name}_Height.png")
+        if os.path.exists(height_path):
+            y_pos -= 250
+            tex = nodes.new("ShaderNodeTexImage")
+            tex.image = bpy.data.images.load(height_path)
+            tex.image.colorspace_settings.name = 'Non-Color'
+            tex.location = (-200, y_pos)
+            tex.label = "Height"
+            links.new(uv_node.outputs["UV"], tex.inputs["Vector"])
+            disp = nodes.new("ShaderNodeDisplacement")
+            disp.location = (600, -300)
+            disp.label = "Displacement"
+            disp.inputs["Scale"].default_value = 0.1
+            disp.inputs["Midlevel"].default_value = 0.5
+            links.new(tex.outputs["Color"], disp.inputs["Height"])
+            links.new(disp.outputs["Displacement"],
+                      output_node.inputs["Displacement"])
+
+        # AO → multiply with Base Color
+        ao_path = os.path.join(output_dir, f"{obj.name}_AO.png")
+        if (os.path.exists(ao_path)
+                and principled.inputs["Base Color"].links):
+            y_pos -= 250
+            tex_ao = nodes.new("ShaderNodeTexImage")
+            tex_ao.image = bpy.data.images.load(ao_path)
+            tex_ao.image.colorspace_settings.name = 'Non-Color'
+            tex_ao.location = (-200, y_pos)
+            tex_ao.label = "AO"
+            links.new(uv_node.outputs["UV"], tex_ao.inputs["Vector"])
+            # Intercept Base Color → Principled with a Multiply
+            old_src = principled.inputs[
+                "Base Color"].links[0].from_socket
+            mix = nodes.new("ShaderNodeMix")
+            mix.data_type = 'RGBA'
+            mix.blend_type = 'MULTIPLY'
+            mix.inputs["Factor"].default_value = 1.0
+            mix.location = (200, 150)
+            mix.label = "AO Multiply"
+            links.new(old_src, mix.inputs[6])           # A
+            links.new(tex_ao.outputs["Color"], mix.inputs[7])  # B
+            links.new(mix.outputs[2],
+                      principled.inputs["Base Color"])
+
+
 class ExportOrbitGIF(bpy.types.Operator):
     """Exports a GIF and MP4 animation orbiting the active object"""
     bl_idname = "object.export_orbit_gif"
@@ -5030,6 +5652,9 @@ class ExportOrbitGIF(bpy.types.Operator):
         items=[
             ('FIXED', "Fixed",
              "Camera orbits, HDRI stays fixed — reflections shift naturally"),
+            ('LOCKED', "Locked",
+             "HDRI co-rotates with the camera — lighting stays identical "
+             "from every angle (consistent showcase)"),
             ('COUNTER', "Counter-Rotate",
              "HDRI rotates opposite to camera — 2× apparent light change"),
             ('ENV_ONLY', "Environment Only",
@@ -5339,6 +5964,9 @@ class ExportOrbitGIF(bpy.types.Operator):
             # For env-only: rotate in positive direction
             if self.env_mode == 'COUNTER':
                 end_z = start_z - math.radians(360)
+            elif self.env_mode == 'LOCKED':
+                # Co-rotate: same direction as camera orbit (+Z)
+                end_z = start_z + math.radians(360)
             else:
                 end_z = start_z + math.radians(360)
 
@@ -5421,8 +6049,8 @@ class ExportOrbitGIF(bpy.types.Operator):
             # The preference alone doesn't always take effect on Blender 5.x.
             self._force_fcurve_interpolation(self._temp_empty, self.interpolation)
 
-        # Animate HDRI environment rotation (counter-rotate or env-only)
-        if self.use_hdri and self.env_mode in ('COUNTER', 'ENV_ONLY'):
+        # Animate HDRI environment rotation (locked, counter-rotate, or env-only)
+        if self.use_hdri and self.env_mode in ('LOCKED', 'COUNTER', 'ENV_ONLY'):
             self._animate_hdri_rotation(context, total_frames)
 
 
@@ -5849,3 +6477,153 @@ class ExportOrbitGIF(bpy.types.Operator):
             import traceback
             traceback.print_exc()
             return False
+
+
+class ExportForGameEngine(bpy.types.Operator):
+    """Export textured objects for game engines with PBR textures.
+
+    Wraps Blender's glTF / FBX exporters with game-engine-optimal settings
+    and auto-saves to the StableGen output directory."""
+    bl_idname = "object.export_game_engine"
+    bl_label = "Export for Game Engine"
+    bl_options = {'REGISTER'}
+
+    export_format: bpy.props.EnumProperty(
+        name="Format",
+        description="Export file format",
+        items=[
+            ('GLB', 'glTF Binary (.glb)',
+             'Single-file binary glTF — best for web, Unity, Godot'),
+            ('GLTF_SEPARATE', 'glTF + Textures (.gltf)',
+             'Separate .gltf, .bin and texture files'),
+            ('FBX', 'FBX (.fbx)',
+             'Autodesk FBX with embedded textures — Unreal Engine'),
+        ],
+        default='GLB'
+    ) # type: ignore
+
+    export_scope: bpy.props.EnumProperty(
+        name="Objects",
+        description="Which objects to export",
+        items=[
+            ('SELECTED', 'Selected', 'Export selected mesh objects'),
+            ('ALL_MESH', 'All Mesh', 'Export all visible mesh objects'),
+        ],
+        default='SELECTED'
+    ) # type: ignore
+
+    apply_transforms: bpy.props.BoolProperty(
+        name="Apply Transforms",
+        description="Apply location, rotation and scale before export",
+        default=True
+    ) # type: ignore
+
+    export_animations: bpy.props.BoolProperty(
+        name="Export Animations",
+        description="Include animations in the export",
+        default=False
+    ) # type: ignore
+
+    @classmethod
+    def poll(cls, context):
+        addon_prefs = context.preferences.addons[__package__].preferences
+        return os.path.exists(addon_prefs.output_dir)
+
+    def draw(self, context):
+        layout = self.layout
+        layout.prop(self, "export_format")
+        layout.prop(self, "export_scope")
+        layout.prop(self, "apply_transforms")
+        layout.prop(self, "export_animations")
+
+    def invoke(self, context, event):
+        return context.window_manager.invoke_props_dialog(self)
+
+    def execute(self, context):
+        # ── Prepare selection ─────────────────────────────────────────
+        original_selection = list(context.selected_objects)
+        original_active = context.view_layer.objects.active
+
+        if self.export_scope == 'ALL_MESH':
+            bpy.ops.object.select_all(action='DESELECT')
+            meshes = [o for o in context.view_layer.objects
+                      if o.type == 'MESH' and not o.hide_get()]
+            for o in meshes:
+                o.select_set(True)
+            if meshes:
+                context.view_layer.objects.active = meshes[0]
+        else:
+            meshes = [o for o in context.selected_objects
+                      if o.type == 'MESH']
+            if not meshes:
+                self.report({'ERROR'}, "No mesh objects selected.")
+                return {'CANCELLED'}
+
+        # ── Output path ───────────────────────────────────────────────
+        output_base = get_dir_path(context, "baked")
+        os.makedirs(output_base, exist_ok=True)
+
+        # Build filename from first object name
+        base_name = meshes[0].name if meshes else "export"
+
+        if self.export_format == 'FBX':
+            ext = ".fbx"
+        elif self.export_format == 'GLTF_SEPARATE':
+            ext = ".gltf"
+        else:
+            ext = ".glb"
+        filepath = os.path.join(output_base, f"{base_name}{ext}")
+
+        # ── Apply transforms if requested ─────────────────────────────
+        if self.apply_transforms:
+            for o in meshes:
+                o.select_set(True)
+            bpy.ops.object.transform_apply(
+                location=True, rotation=True, scale=True)
+
+        # ── Export ────────────────────────────────────────────────────
+        try:
+            if self.export_format in ('GLB', 'GLTF_SEPARATE'):
+                bpy.ops.export_scene.gltf(
+                    filepath=filepath,
+                    export_format=self.export_format,
+                    use_selection=True,
+                    export_materials='EXPORT',
+                    export_image_format='AUTO',
+                    export_tangents=True,
+                    export_yup=True,
+                    export_apply=False,
+                    export_animations=self.export_animations,
+                )
+            else:  # FBX
+                bpy.ops.export_scene.fbx(
+                    filepath=filepath,
+                    use_selection=True,
+                    apply_scale_options='FBX_SCALE_ALL',
+                    path_mode='COPY',
+                    embed_textures=True,
+                    bake_anim=self.export_animations,
+                    mesh_smooth_type='FACE',
+                )
+
+            self.report({'INFO'},
+                        f"Exported to {filepath}")
+        except Exception as e:
+            self.report({'ERROR'}, f"Export failed: {e}")
+            import traceback
+            traceback.print_exc()
+
+        # ── Restore selection ─────────────────────────────────────────
+        bpy.ops.object.select_all(action='DESELECT')
+        for o in original_selection:
+            try:
+                o.select_set(True)
+            except ReferenceError:
+                pass
+        if original_active:
+            try:
+                context.view_layer.objects.active = original_active
+            except ReferenceError:
+                pass
+
+        return {'FINISHED'}
