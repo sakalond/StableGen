@@ -150,7 +150,7 @@ def _sync_trellis2_backbone(scene):
     and texture_mode is native/none).
     """
     tex_mode = getattr(scene, 'trellis2_texture_mode', 'native')
-    if tex_mode in ('sdxl', 'flux1', 'qwen_image_edit'):
+    if tex_mode in ('sdxl', 'flux1', 'qwen_image_edit', 'flux2_klein'):
         target = tex_mode
     elif getattr(scene, 'trellis2_generate_from', 'image') == 'prompt':
         target = getattr(scene, 'trellis2_initial_image_arch', 'sdxl')
@@ -1112,6 +1112,9 @@ class RefreshCheckpointList(bpy.types.Operator):
                     if extra:
                         model_list.extend(extra)
                 model_type_desc = "UNET" if architecture == 'flux1' else "UNET (GGUF/Safetensors)"
+            elif architecture == 'flux2_klein':
+                model_list = _fetch_api_list(server_address, "/models/diffusion_models")
+                model_type_desc = "Diffusion Model"
             else:
                 model_type_desc = "Model"
             return {'model_list': model_list, 'architecture': architecture,
@@ -2327,7 +2330,8 @@ def register():
         items=[
             ('sdxl', 'SDXL', ''),
             ('flux1', 'Flux 1', ''),
-            ('qwen_image_edit', 'Qwen Image Edit', '')
+            ('qwen_image_edit', 'Qwen Image Edit', ''),
+            ('flux2_klein', 'FLUX.2 Klein', '')
         ],
         default='sdxl',
         update=update_combined
@@ -2340,6 +2344,7 @@ def register():
             ('sdxl', 'SDXL', 'Stable Diffusion XL'),
             ('flux1', 'Flux 1', 'Flux 1 architecture'),
             ('qwen_image_edit', 'Qwen Image Edit', 'Qwen Image Edit architecture'),
+            ('flux2_klein', 'FLUX.2 Klein', 'FLUX.2 Klein multi-reference edit model (Apache 2.0)'),
             ('trellis2', 'TRELLIS.2', 'Image to 3D mesh generation with TRELLIS.2'),
         ],
         default='sdxl',
@@ -2366,6 +2371,7 @@ def register():
             ('sdxl', 'SDXL', 'Use SDXL for camera-based texture projection'),
             ('flux1', 'Flux 1', 'Use Flux 1 for camera-based texture projection'),
             ('qwen_image_edit', 'Qwen Image Edit', 'Use Qwen for camera-based texture projection'),
+            ('flux2_klein', 'FLUX.2 Klein', 'Use FLUX.2 Klein for camera-based texture projection'),
         ],
         default='native',
         update=update_trellis2_texture_mode
@@ -2378,6 +2384,7 @@ def register():
             ('sdxl', 'SDXL', 'Stable Diffusion XL'),
             ('flux1', 'Flux 1', 'Flux 1 architecture'),
             ('qwen_image_edit', 'Qwen Image Edit', 'Qwen Image Edit architecture'),
+            ('flux2_klein', 'FLUX.2 Klein', 'FLUX.2 Klein multi-reference edit'),
         ],
         default='sdxl',
         update=update_trellis2_initial_image_arch

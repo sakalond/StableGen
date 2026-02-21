@@ -10,7 +10,7 @@ import urllib.request
 import urllib.parse
 from datetime import datetime, timedelta
 
-from .util.helpers import prompt_text_qwen_image_edit, prompt_text_trellis2, prompt_text_trellis2_shape_only
+from .util.helpers import prompt_text_qwen_image_edit, prompt_text_flux2_klein, prompt_text_trellis2, prompt_text_trellis2_shape_only
 from .utils import get_generation_dirs
 from .timeout_config import get_timeout
 
@@ -250,6 +250,124 @@ class WorkflowManager:
                 "_meta": {"title": "Ref Method (Neg)"}
             }
             prompt[sampler_node]['inputs']['negative'] = [tz_neg_id, 0]
+
+    # ------------------------------------------------------------------
+    # FLUX.2 Klein – build ReferenceLatent chain for multi-reference editing
+    # ------------------------------------------------------------------
+    def _build_flux2_reference_chain(self, prompt, NODES, ref_image_infos, start_node_id=700):
+        """Build a ReferenceLatent chain for FLUX.2 Klein (based on official workflow).
+
+        For each reference image, creates:
+            LoadImage (already present) → VAEEncode
+                → ReferenceLatent (positive conditioning)
+                → ReferenceLatent (negative conditioning)
+
+        The ReferenceLatent nodes are chained so each successive reference
+        appends to the previous one.  The final modified positive and negative
+        conditioning outputs are wired into CFGGuider.
+
+        Args:
+            prompt:          The ComfyUI prompt dict (modified in-place).
+            NODES:           Node-ID mapping dict.
+            ref_image_infos: List of dicts, each with at least a ``loader_node``
+                             key pointing to the LoadImage node ID.
+            start_node_id:   First dynamic node ID to use.
+        """
+        if not ref_image_infos:
+            return
+
+        pos_node = NODES['pos_prompt']
+        neg_node = NODES['neg_prompt']
+        guider_node = NODES['guider']
+        vae_ref = [NODES['vae_loader'], 0]
+
+        node_id = start_node_id
+        while str(node_id) in prompt:
+            node_id += 1
+
+        pos_cond_ref = [pos_node, 0]
+        neg_cond_ref = [neg_node, 0]
+
+        for i, ref_info in enumerate(ref_image_infos):
+            loader_node = ref_info['loader_node']
+
+            # --- VAEEncode (reference image → latent) ---
+            vae_enc_id = str(node_id); node_id += 1
+            prompt[vae_enc_id] = {
+                "inputs": {
+                    "pixels": [loader_node, 0],
+                    "vae": vae_ref
+                },
+                "class_type": "VAEEncode",
+                "_meta": {"title": f"VAE Encode Ref {i + 1}"}
+            }
+
+            # --- ReferenceLatent (positive) ---
+            ref_pos_id = str(node_id); node_id += 1
+            prompt[ref_pos_id] = {
+                "inputs": {
+                    "conditioning": pos_cond_ref,
+                    "latent": [vae_enc_id, 0]
+                },
+                "class_type": "ReferenceLatent",
+                "_meta": {"title": f"Reference Latent Pos {i + 1}"}
+            }
+            pos_cond_ref = [ref_pos_id, 0]
+
+            # --- ReferenceLatent (negative) ---
+            ref_neg_id = str(node_id); node_id += 1
+            prompt[ref_neg_id] = {
+                "inputs": {
+                    "conditioning": neg_cond_ref,
+                    "latent": [vae_enc_id, 0]
+                },
+                "class_type": "ReferenceLatent",
+                "_meta": {"title": f"Reference Latent Neg {i + 1}"}
+            }
+            neg_cond_ref = [ref_neg_id, 0]
+
+        # Wire final pos/neg conditioning into CFGGuider
+        prompt[guider_node]['inputs']['positive'] = pos_cond_ref
+        prompt[guider_node]['inputs']['negative'] = neg_cond_ref
+
+    def _get_klein_default_prompts(self, context, is_initial_image):
+        """Gets the default Klein prompts based on the current context.
+
+        Follows BFL's official Klein prompting guide: write like a novelist,
+        front-load the subject, reference image numbers explicitly, and
+        describe the desired transformation rather than the image contents.
+        Camera prompts are placed after the main prompt via {camera_suffix}
+        to reduce their weighting (Klein pays more attention to what comes
+        first).
+        """
+        is_generating = hasattr(self.operator, '_current_image')
+        is_subsequent_in_sequence = is_generating and self.operator._current_image > 0
+
+        if is_initial_image:
+            style_image_provided = context.scene.qwen_use_external_style_image
+        else:
+            style_image_provided = (
+                context.scene.qwen_use_external_style_image or
+                context.scene.sequential_ipadapter or
+                context.scene.qwen_context_render_mode in {'REPLACE_STYLE', 'ADDITIONAL'}
+            )
+        context_mode = context.scene.qwen_context_render_mode
+
+        if is_initial_image:
+            if not style_image_provided:
+                return "Reskin this into {main_prompt}{camera_suffix}, while preserve identity keep likeness replica contour."
+            else:
+                return "Reskin this into {main_prompt}{camera_suffix}, while preserve identity keep likeness replica contour, adopting the visual style from image 2."
+        else:
+            if context_mode == 'ADDITIONAL':
+                return "Reskin this into {main_prompt}{camera_suffix}, while preserve identity keep likeness replica contour. In image 2, replace all solid magenta areas with content that continues the surrounding style. Replace the background with solid gray. Image 3 represents the overall style."
+            elif context_mode == 'REPLACE_STYLE':
+                return "Reskin this into {main_prompt}{camera_suffix}, while preserve identity keep likeness replica contour. In image 2, replace all solid magenta areas with content that continues the surrounding style. Replace the background with solid gray."
+            else:
+                if not style_image_provided:
+                    return "Reskin this into {main_prompt}{camera_suffix}, while preserve identity keep likeness replica contour."
+                else:
+                    return "Reskin this into {main_prompt}{camera_suffix}, while preserve identity keep likeness replica contour, adopting the visual style from image 2."
 
     def _get_qwen_default_prompts(self, context, is_initial_image):
         """Gets the default Qwen prompts based on the current context."""
@@ -664,6 +782,247 @@ class WorkflowManager:
             return {"error": "conn_failed"}
 
         print(f"Qwen image generated with prompt: {prompt[NODES['pos_prompt']]['inputs']['prompt']}")
+        return images[NODES['save_image']][0]
+
+    # ------------------------------------------------------------------
+    # FLUX.2 Klein – multi-reference edit generation
+    # ------------------------------------------------------------------
+    def generate_flux2_klein(self, context, camera_id=None):
+        """Generates an image using the FLUX.2 Klein multi-reference edit workflow.
+
+        Klein injects reference images via ReferenceLatent chains and
+        understands image references ("image 1", "image 2") in prompts.
+        Following BFL's official prompting guide, prompts are written as
+        natural prose describing the desired transformation, front-loading
+        the subject and referencing images by number.
+
+        Reference layout:
+            Ref 1 → structure / guidance map  (depth, normal, workbench …)
+            Ref 2 → style reference           (external image or prev gen)
+            Ref 3 → context render            (sequential mode only)
+        """
+        server_address = context.preferences.addons[__package__].preferences.server_address
+        client_id = str(uuid.uuid4())
+        revision_dir = get_generation_dirs(context)["revision"]
+
+        prompt = json.loads(prompt_text_flux2_klein)
+
+        NODES = {
+            'unet_loader':  "1",
+            'clip_loader':  "2",
+            'vae_loader':   "3",
+            'pos_prompt':   "4",   # CLIPTextEncode
+            'neg_prompt':   "5",   # CLIPTextEncode (empty)
+            'empty_latent': "6",   # EmptyFlux2LatentImage
+            'scheduler':    "7",   # Flux2Scheduler
+            'ksampler':     "8",   # KSamplerSelect
+            'noise':        "9",   # RandomNoise
+            'guider':       "10",  # CFGGuider
+            'sampler':      "11",  # SamplerCustomAdvanced
+            'vae_decode':   "12",  # VAEDecode
+            'save_image':   "13",  # SaveImageWebsocket
+            'ref1_loader':  "14",  # LoadImage – structure (guidance map)
+            'ref2_loader':  "15",  # LoadImage – style
+            'ref3_loader':  "16",  # LoadImage – context render
+        }
+
+        # --- Resolution (must be multiple of 16 for FLUX.2 latent) ---
+        if context.scene.generation_method == 'grid':
+            width = self.operator._grid_width
+            height = self.operator._grid_height
+        else:
+            width = context.scene.render.resolution_x
+            height = context.scene.render.resolution_y
+        width = (width // 16) * 16
+        height = (height // 16) * 16
+        prompt[NODES['empty_latent']]['inputs']['width'] = width
+        prompt[NODES['empty_latent']]['inputs']['height'] = height
+        prompt[NODES['scheduler']]['inputs']['width'] = width
+        prompt[NODES['scheduler']]['inputs']['height'] = height
+
+        # --- Sampler settings ---
+        prompt[NODES['noise']]['inputs']['noise_seed'] = context.scene.seed
+        prompt[NODES['scheduler']]['inputs']['steps'] = context.scene.steps
+        prompt[NODES['ksampler']]['inputs']['sampler_name'] = context.scene.sampler
+        prompt[NODES['guider']]['inputs']['cfg'] = context.scene.cfg
+
+        # --- Model ---
+        prompt[NODES['unet_loader']]['inputs']['unet_name'] = context.scene.model_name
+
+        # --- CLIP: Detect 9B vs 4B from model name ---
+        # 9B uses a larger Qwen 3 8B text encoder instead of 4B.
+        # Default to fp8mixed (8.66 GB) for practical VRAM usage.
+        # Full-precision qwen_3_8b.safetensors (16.4 GB) is also compatible.
+        # Download from: Comfy-Org/vae-text-encorder-for-flux-klein-9b
+        model_lower = context.scene.model_name.lower()
+        if '9b' in model_lower:
+            prompt[NODES['clip_loader']]['inputs']['clip_name'] = "qwen_3_8b_fp8mixed.safetensors"
+
+        # --- Base user prompt + camera injection ---
+        user_prompt = context.scene.comfyui_prompt
+        camera_suffix = ""
+        if (context.scene.use_camera_prompts
+                and self.operator._cameras
+                and self.operator._current_image < len(self.operator._cameras)):
+            cam_name = self.operator._cameras[self.operator._current_image].name
+            prompt_item = next(
+                (p for p in context.scene.camera_prompts if p.name == cam_name), None)
+            if prompt_item and prompt_item.prompt:
+                camera_suffix = f", {prompt_item.prompt}"
+
+        # ─── Collect reference images ────────────────────────────────
+        ref_images = []
+        remove_ref1 = True
+        remove_ref2 = True
+        remove_ref3 = True
+
+        is_initial_image = not self.operator._current_image > 0
+        context_mode = context.scene.qwen_context_render_mode
+        context_render_info = None
+        style_image_info = None
+
+        # --- Ref 1: Structure / guidance map (always attempt) ---
+        guidance_map_type = context.scene.qwen_guidance_map_type
+        guidance_map_info = self.operator._get_uploaded_image_info(
+            context, "controlnet", subtype=guidance_map_type, camera_id=camera_id)
+        if guidance_map_info:
+            prompt[NODES['ref1_loader']]['inputs']['image'] = guidance_map_info['name']
+            ref_images.append({'loader_node': NODES['ref1_loader']})
+            remove_ref1 = False
+
+        # --- Ref 3: Context render (sequential subsequent only) ---
+        # Handled BEFORE Ref 2 so ADDITIONAL mode can swap slot ids (mirrors Qwen).
+        remove_context = True
+        if not is_initial_image and context_mode != 'NONE':
+            context_render_info = self.operator._get_uploaded_image_info(
+                context, "inpaint", subtype="render", camera_id=camera_id)
+            if not context_render_info:
+                self.operator._error = f"Klein context render enabled, but could not find context render for camera {camera_id}."
+                return {"error": "conn_failed"}
+            if context_render_info and context_mode == 'ADDITIONAL':
+                # Swap loaders so context render is Ref 2 and style is Ref 3
+                NODES['ref3_loader'], NODES['ref2_loader'] = NODES['ref2_loader'], NODES['ref3_loader']
+                prompt[NODES['ref3_loader']]['inputs']['image'] = context_render_info['name']
+                ref_images.append({'loader_node': NODES['ref3_loader']})
+                remove_context = False
+                if context.scene.qwen_use_custom_prompts:
+                    pos_prompt_text = context.scene.qwen_custom_prompt_seq_additional.format(main_prompt=user_prompt, camera_suffix=camera_suffix)
+                else:
+                    pos_prompt_text = self._get_klein_default_prompts(context, is_initial_image).format(main_prompt=user_prompt, camera_suffix=camera_suffix)
+                prompt[NODES['pos_prompt']]['inputs']['text'] = pos_prompt_text
+
+        if remove_context and not remove_ref3:
+            pass  # already assigned
+        elif remove_context:
+            pass  # will be deleted below
+
+        # --- Ref 2: Style reference (optional) ---
+        # Determine if we should use the external style image for this frame
+        use_external = context.scene.qwen_use_external_style_image
+        if use_external and not is_initial_image and context.scene.qwen_external_style_initial_only:
+            use_external = False
+            context.scene.sequential_ipadapter = True
+
+        # Case 1: External Style Image
+        if use_external:
+            style_image_info = self.operator._get_uploaded_image_info(
+                context, "custom",
+                filename=bpy.path.abspath(context.scene.qwen_external_style_image))
+            if style_image_info and context_mode != 'ADDITIONAL':
+                if context.scene.qwen_use_custom_prompts:
+                    pos_prompt_text = (context.scene.qwen_custom_prompt_initial if is_initial_image
+                                       else context.scene.qwen_custom_prompt_seq_none).format(main_prompt=user_prompt, camera_suffix=camera_suffix)
+                else:
+                    pos_prompt_text = self._get_klein_default_prompts(context, is_initial_image).format(main_prompt=user_prompt, camera_suffix=camera_suffix)
+                prompt[NODES['pos_prompt']]['inputs']['text'] = pos_prompt_text
+
+        # Case 1b: TRELLIS.2 input image as style
+        if not style_image_info and getattr(context.scene, 'qwen_use_trellis2_style', False):
+            use_t2 = True
+            if not is_initial_image and getattr(context.scene, 'qwen_trellis2_style_initial_only', False):
+                use_t2 = False
+                context.scene.sequential_ipadapter = True
+            if use_t2:
+                t2_path = getattr(context.scene, 'trellis2_last_input_image', '')
+                if t2_path and os.path.exists(bpy.path.abspath(t2_path)):
+                    style_image_info = self.operator._get_uploaded_image_info(
+                        context, "custom", filename=bpy.path.abspath(t2_path))
+                    if style_image_info:
+                        if context.scene.qwen_use_custom_prompts:
+                            pos_prompt_text = context.scene.qwen_custom_prompt_initial.format(main_prompt=user_prompt, camera_suffix=camera_suffix)
+                        else:
+                            pos_prompt_text = self._get_klein_default_prompts(context, is_initial_image).format(main_prompt=user_prompt, camera_suffix=camera_suffix)
+                        prompt[NODES['pos_prompt']]['inputs']['text'] = pos_prompt_text
+
+        # Case 2: Sequential (after first image)
+        if not style_image_info and not is_initial_image:
+            if context_mode == 'REPLACE_STYLE':
+                style_image_info = context_render_info
+                if context.scene.qwen_use_custom_prompts:
+                    pos_prompt_text = context.scene.qwen_custom_prompt_seq_replace.format(main_prompt=user_prompt, camera_suffix=camera_suffix)
+                else:
+                    pos_prompt_text = self._get_klein_default_prompts(context, is_initial_image).format(main_prompt=user_prompt, camera_suffix=camera_suffix)
+                prompt[NODES['pos_prompt']]['inputs']['text'] = pos_prompt_text
+            elif context.scene.sequential_ipadapter:
+                if context.scene.sequential_ipadapter_mode == 'original_render':
+                    # For original_render in Klein context, fall back to first mode since
+                    # the render is already used as the guidance map (Ref 1).
+                    ref_cam = 0
+                else:
+                    ref_cam = (0 if context.scene.sequential_ipadapter_mode == 'first'
+                               else self.operator._current_image - 1)
+                style_image_info = self.operator._get_uploaded_image_info(
+                    context, "generated", camera_id=ref_cam,
+                    material_id=self.operator._material_id)
+                if context_mode != 'ADDITIONAL':
+                    if context.scene.qwen_use_custom_prompts:
+                        pos_prompt_text = context.scene.qwen_custom_prompt_seq_none.format(main_prompt=user_prompt, camera_suffix=camera_suffix)
+                    else:
+                        pos_prompt_text = self._get_klein_default_prompts(context, is_initial_image).format(main_prompt=user_prompt, camera_suffix=camera_suffix)
+                    prompt[NODES['pos_prompt']]['inputs']['text'] = pos_prompt_text
+
+        # Case 3: No style image – first image or no style source
+        if style_image_info is None:
+            if context.scene.qwen_use_custom_prompts:
+                pos_prompt_text = (context.scene.qwen_custom_prompt_initial if is_initial_image
+                                   else context.scene.qwen_custom_prompt_seq_none).format(main_prompt=user_prompt, camera_suffix=camera_suffix)
+            else:
+                pos_prompt_text = self._get_klein_default_prompts(context, is_initial_image).format(main_prompt=user_prompt, camera_suffix=camera_suffix)
+            prompt[NODES['pos_prompt']]['inputs']['text'] = pos_prompt_text
+        else:
+            prompt[NODES['ref2_loader']]['inputs']['image'] = style_image_info['name']
+            ref_images.append({'loader_node': NODES['ref2_loader']})
+            remove_ref2 = False
+
+        # Remove unused LoadImage nodes
+        if remove_ref1:
+            del prompt[NODES['ref1_loader']]
+        if remove_ref2:
+            del prompt[NODES['ref2_loader']]
+        if remove_context:
+            del prompt[NODES['ref3_loader']]
+
+        # --- Build ReferenceLatent chain ---
+        self._build_flux2_reference_chain(prompt, NODES, ref_images)
+
+        # --- Execute ---
+        self._save_prompt_to_file(prompt, revision_dir)
+        ws = self._connect_to_websocket(server_address, client_id)
+        if ws is None:
+            return {"error": "conn_failed"}
+
+        images = None
+        try:
+            images = self._execute_prompt_and_get_images(
+                ws, prompt, client_id, server_address, NODES)
+        finally:
+            if ws:
+                ws.close()
+
+        if images is None or (isinstance(images, dict) and "error" in images):
+            return {"error": "conn_failed"}
+
+        print(f"FLUX.2 Klein image generated with prompt: {prompt[NODES['pos_prompt']]['inputs']['text']}")
         return images[NODES['save_image']][0]
     
 

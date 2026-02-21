@@ -1484,7 +1484,7 @@ def project_image(context, to_project, mat_id, stop_index=1000000):
             return to_float
 
         # Voronoi mode flag: keep natural weights for non-generated cameras
-        voronoi_active = (context.scene.model_architecture == 'qwen_image_edit'
+        voronoi_active = (context.scene.model_architecture in ('qwen_image_edit', 'flux2_klein')
                           and getattr(context.scene, 'qwen_voronoi_mode', False)
                           and context.scene.generation_method == 'sequential')
 

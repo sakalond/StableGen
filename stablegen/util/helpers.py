@@ -1493,6 +1493,150 @@ prompt_text_qwen_image_edit = """
 }
 """
 
+# ---------------------------------------------------------------------------
+# FLUX.2 Klein – multi-reference edit model (Apache 2.0)
+# Based on official ComfyUI Klein image-edit workflow.
+# Nodes: all built-in ComfyUI core (no custom nodes needed)
+#   UNETLoader, CLIPLoader (type=flux2, Qwen 3 4B), VAELoader,
+#   CLIPTextEncode (x2), EmptyFlux2LatentImage, Flux2Scheduler,
+#   KSamplerSelect, RandomNoise, CFGGuider (cfg=1), SamplerCustomAdvanced,
+#   VAEDecode, SaveImageWebsocket, LoadImage (x3 reference slots).
+# Reference images are wired dynamically via:
+#   VAEEncode → ReferenceLatent (pos + neg chain) → CFGGuider.
+# ---------------------------------------------------------------------------
+prompt_text_flux2_klein = """
+{
+  "1": {
+    "inputs": {
+      "unet_name": "flux-2-klein-base-4b-fp8.safetensors",
+      "weight_dtype": "default"
+    },
+    "class_type": "UNETLoader",
+    "_meta": { "title": "Load Diffusion Model (Klein)" }
+  },
+  "2": {
+    "inputs": {
+      "clip_name": "qwen_3_4b.safetensors",
+      "type": "flux2"
+    },
+    "class_type": "CLIPLoader",
+    "_meta": { "title": "Load CLIP (Qwen 3 4B)" }
+  },
+  "3": {
+    "inputs": {
+      "vae_name": "flux2-vae.safetensors"
+    },
+    "class_type": "VAELoader",
+    "_meta": { "title": "Load VAE (FLUX.2)" }
+  },
+  "4": {
+    "inputs": {
+      "text": "",
+      "clip": ["2", 0]
+    },
+    "class_type": "CLIPTextEncode",
+    "_meta": { "title": "CLIP Text Encode (Positive)" }
+  },
+  "5": {
+    "inputs": {
+      "text": "",
+      "clip": ["2", 0]
+    },
+    "class_type": "CLIPTextEncode",
+    "_meta": { "title": "CLIP Text Encode (Negative)" }
+  },
+  "6": {
+    "inputs": {
+      "width": 1024,
+      "height": 1024,
+      "batch_size": 1
+    },
+    "class_type": "EmptyFlux2LatentImage",
+    "_meta": { "title": "Empty Flux 2 Latent" }
+  },
+  "7": {
+    "inputs": {
+      "steps": 20,
+      "width": 1024,
+      "height": 1024
+    },
+    "class_type": "Flux2Scheduler",
+    "_meta": { "title": "Flux 2 Scheduler" }
+  },
+  "8": {
+    "inputs": {
+      "sampler_name": "euler"
+    },
+    "class_type": "KSamplerSelect",
+    "_meta": { "title": "KSampler Select" }
+  },
+  "9": {
+    "inputs": {
+      "noise_seed": 0
+    },
+    "class_type": "RandomNoise",
+    "_meta": { "title": "Random Noise" }
+  },
+  "10": {
+    "inputs": {
+      "model": ["1", 0],
+      "positive": ["4", 0],
+      "negative": ["5", 0],
+      "cfg": 1
+    },
+    "class_type": "CFGGuider",
+    "_meta": { "title": "CFG Guider" }
+  },
+  "11": {
+    "inputs": {
+      "noise": ["9", 0],
+      "guider": ["10", 0],
+      "sampler": ["8", 0],
+      "sigmas": ["7", 0],
+      "latent_image": ["6", 0]
+    },
+    "class_type": "SamplerCustomAdvanced",
+    "_meta": { "title": "Sampler Custom Advanced" }
+  },
+  "12": {
+    "inputs": {
+      "samples": ["11", 0],
+      "vae": ["3", 0]
+    },
+    "class_type": "VAEDecode",
+    "_meta": { "title": "VAE Decode" }
+  },
+  "13": {
+    "inputs": {
+      "images": ["12", 0]
+    },
+    "class_type": "SaveImageWebsocket",
+    "_meta": { "title": "SaveImageWebsocket" }
+  },
+  "14": {
+    "inputs": {
+      "image": ""
+    },
+    "class_type": "LoadImage",
+    "_meta": { "title": "Load Reference Image 1 (Structure)" }
+  },
+  "15": {
+    "inputs": {
+      "image": ""
+    },
+    "class_type": "LoadImage",
+    "_meta": { "title": "Load Reference Image 2 (Style)" }
+  },
+  "16": {
+    "inputs": {
+      "image": ""
+    },
+    "class_type": "LoadImage",
+    "_meta": { "title": "Load Reference Image 3 (Context)" }
+  }
+}
+"""
+
 # Workflow for TRELLIS.2 Image-to-3D generation via PozzettiAndrea/ComfyUI-TRELLIS2 nodes
 # Pipeline: LoadImage → LoadModels → RemoveBackground → GetConditioning → ImageToShape → ShapeToTexturedMesh → ExportGLB
 prompt_text_trellis2 = """

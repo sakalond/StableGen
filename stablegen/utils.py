@@ -352,7 +352,7 @@ def get_file_path(context, file_type, subtype=None, filename=None, camera_id=Non
 	elif file_type == "inpaint" and subtype:
 		base_dir = dirs["inpaint"][subtype]
 		if subtype == "render":
-			filename = f"render{camera_id}{frame_suffix}" if not filename else filename
+			filename = f"ctx_render{camera_id}{frame_suffix}" if not filename else filename
 		elif subtype == "visibility":
 			filename = f"render{camera_id}_visibility{frame_suffix}" if not filename else filename
 		return os.path.join(base_dir, f"{filename}.png")

@@ -629,8 +629,8 @@ class ComfyUIGenerate(bpy.types.Operator):
 
         print("Executing ComfyUI Generation")
 
-        if context.scene.model_architecture == 'qwen_image_edit' and not context.scene.generation_mode == 'project_only':
-            context.scene.generation_method = 'sequential' # Force sequential for Qwen Image Edit
+        if context.scene.model_architecture in ('qwen_image_edit', 'flux2_klein') and not context.scene.generation_mode == 'project_only':
+            context.scene.generation_method = 'sequential' # Force sequential for edit models
 
         render = bpy.context.scene.render
         resolution_x = render.resolution_x
@@ -640,11 +640,17 @@ class ComfyUIGenerate(bpy.types.Operator):
         # Qwen Image Edit benefits from 112-aligned resolution (LCM of VAE=8,
         # ViT patch=14, spatial merge=2×14=28, ViT window=112) to avoid
         # subtle pixel shifts between the latent, VAE and CLIP grids.
+        # FLUX.2 Klein uses 16x latent downscale, so 16-aligned is needed.
         use_qwen_alignment = (
             context.scene.model_architecture.startswith('qwen')
             and getattr(context.scene, 'qwen_rescale_alignment', False)
         )
-        align_step = 112 if use_qwen_alignment else 8
+        if use_qwen_alignment:
+            align_step = 112
+        elif context.scene.model_architecture == 'flux2_klein':
+            align_step = 16
+        else:
+            align_step = 8
 
         target_px = int(getattr(context.scene, 'auto_rescale_target_mp', 1.0) * 1_000_000)
         upper_bound = int(target_px * 1.2)
@@ -710,7 +716,7 @@ class ComfyUIGenerate(bpy.types.Operator):
         
         # Check if there is at least one ControlNet unit
         controlnet_units = getattr(context.scene, "controlnet_units", [])
-        if not controlnet_units and not (context.scene.use_flux_lora and context.scene.model_architecture == 'flux1'):
+        if not controlnet_units and not (context.scene.use_flux_lora and context.scene.model_architecture == 'flux1') and context.scene.model_architecture != 'flux2_klein':
             self.report({'ERROR'}, "At least one ControlNet unit is required to run the operator.")
             context.scene.generation_status = 'idle'
             ComfyUIGenerate._is_running = False
@@ -939,7 +945,7 @@ class ComfyUIGenerate(bpy.types.Operator):
                 
                 # Reset discard factor if enabled
                 if (context.scene.discard_factor_generation_only and
-                        (self._generation_method_on_start == 'sequential' or context.scene.model_architecture == 'qwen_image_edit')):
+                        (self._generation_method_on_start == 'sequential' or context.scene.model_architecture in ('qwen_image_edit', 'flux2_klein'))):
                     
                     new_discard_angle = context.scene.discard_factor_after_generation
                     print(f"Resetting discard angle in material nodes to {new_discard_angle}...")
@@ -962,7 +968,7 @@ class ComfyUIGenerate(bpy.types.Operator):
 
                 # Reset weight exponent if enabled
                 if (context.scene.weight_exponent_generation_only and
-                        (self._generation_method_on_start == 'sequential' or context.scene.model_architecture == 'qwen_image_edit')):
+                        (self._generation_method_on_start == 'sequential' or context.scene.model_architecture in ('qwen_image_edit', 'flux2_klein'))):
                     
                     new_exponent = context.scene.weight_exponent_after_generation
                     print(f"Resetting weight exponent in material nodes to {new_exponent}...")
@@ -1068,7 +1074,7 @@ class ComfyUIGenerate(bpy.types.Operator):
             need_depth = (
                 any(u["unit_type"] == "depth" for u in controlnet_units)
                 or (context.scene.use_flux_lora and context.scene.model_architecture == 'flux1')
-                or (context.scene.model_architecture == 'qwen_image_edit'
+                or (context.scene.model_architecture in ('qwen_image_edit', 'flux2_klein')
                     and context.scene.qwen_guidance_map_type == 'depth')
                 or (context.scene.model_architecture.startswith('qwen')
                     and context.scene.qwen_generation_method in ('refine', 'local_edit')
@@ -1113,7 +1119,7 @@ class ComfyUIGenerate(bpy.types.Operator):
 
             need_normal = (
                 any(u["unit_type"] == "normal" for u in controlnet_units)
-                or (context.scene.model_architecture == 'qwen_image_edit'
+                or (context.scene.model_architecture in ('qwen_image_edit', 'flux2_klein')
                     and context.scene.qwen_guidance_map_type == 'normal')
             )
             if need_normal and context.scene.generation_method != 'uv_inpaint':
@@ -1134,7 +1140,7 @@ class ComfyUIGenerate(bpy.types.Operator):
                         return
 
             # Qwen guidance using Workbench
-            if (context.scene.model_architecture == 'qwen_image_edit'
+            if (context.scene.model_architecture in ('qwen_image_edit', 'flux2_klein')
                     and context.scene.qwen_guidance_map_type == 'workbench'
                     and context.scene.generation_method != 'uv_inpaint'):
                 workbench_dir = get_dir_path(context, "controlnet")["workbench"]
@@ -1156,7 +1162,7 @@ class ComfyUIGenerate(bpy.types.Operator):
                         return
 
             # Qwen guidance using Viewport
-            elif (context.scene.model_architecture == 'qwen_image_edit'
+            elif (context.scene.model_architecture in ('qwen_image_edit', 'flux2_klein')
                   and context.scene.qwen_guidance_map_type == 'viewport'
                   and context.scene.generation_method != 'uv_inpaint'):
                 viewport_dir = get_dir_path(context, "controlnet")["viewport"]
@@ -1348,6 +1354,8 @@ class ComfyUIGenerate(bpy.types.Operator):
                                 image = self.workflow_manager.generate_flux(context, controlnet_info=controlnet_info, ipadapter_ref_info=ipadapter_ref_info)
                             elif context.scene.model_architecture == 'qwen_image_edit':
                                 image = self.workflow_manager.generate_qwen_edit(context, camera_id=camera_id)
+                            elif context.scene.model_architecture == 'flux2_klein':
+                                image = self.workflow_manager.generate_flux2_klein(context, camera_id=camera_id)
                             else:
                                 image = self.workflow_manager.generate(context, controlnet_info=controlnet_info, ipadapter_ref_info=ipadapter_ref_info)
                         else:
@@ -1365,7 +1373,7 @@ class ComfyUIGenerate(bpy.types.Operator):
                                         export_visibility(context, self._to_texture, camera_visibility=_vis_cam) # Export mask for current view
                                     _emit_cam = _cur_cam
                                     with _SGCameraResolution(context, _emit_cam):
-                                        if context.scene.model_architecture == 'qwen_image_edit': # export custom bg and fallback for Qwen image edit
+                                        if context.scene.model_architecture in ('qwen_image_edit', 'flux2_klein'): # export custom bg and fallback for Qwen/Klein image edit
                                             fallback_color, background_color = self._get_qwen_context_colors(context)
                                             export_emit_image(context, self._to_texture, camera_id=self._current_image, bg_color=background_color, fallback_color=fallback_color) # Export render for next view
                                             self._dilate_qwen_context_fallback(context, self._current_image, fallback_color)
@@ -1390,6 +1398,8 @@ class ComfyUIGenerate(bpy.types.Operator):
                                 image = self.workflow_manager.refine_flux(context, controlnet_info=controlnet_info, render_info=render_info, mask_info=mask_info, ipadapter_ref_info=ipadapter_ref_info)
                             elif context.scene.model_architecture == 'qwen_image_edit':
                                 image = self.workflow_manager.generate_qwen_edit(context, camera_id=camera_id)
+                            elif context.scene.model_architecture == 'flux2_klein':
+                                image = self.workflow_manager.generate_flux2_klein(context, camera_id=camera_id)
                             else:
                                 image = self.workflow_manager.refine(context, controlnet_info=controlnet_info, render_info=render_info, mask_info=mask_info, ipadapter_ref_info=ipadapter_ref_info)
                     else: # Grid or Separate
@@ -1397,13 +1407,15 @@ class ComfyUIGenerate(bpy.types.Operator):
                             image = self.workflow_manager.generate_flux(context, controlnet_info=controlnet_info, ipadapter_ref_info=ipadapter_ref_info)
                         elif context.scene.model_architecture == 'qwen_image_edit':
                             image = self.workflow_manager.generate_qwen_edit(context, camera_id=camera_id)
+                        elif context.scene.model_architecture == 'flux2_klein':
+                            image = self.workflow_manager.generate_flux2_klein(context, camera_id=camera_id)
                         else:
                             image = self.workflow_manager.generate(context, controlnet_info=controlnet_info, ipadapter_ref_info=ipadapter_ref_info)
 
                     if image == {"error": "conn_failed"}:
                         return # Error message already set
 
-                    if (context.scene.model_architecture == 'qwen_image_edit' and
+                    if (context.scene.model_architecture in ('qwen_image_edit', 'flux2_klein') and
                             context.scene.generation_method == 'sequential' and
                             self._current_image > 0 and
                             context.scene.qwen_context_cleanup and
@@ -3198,7 +3210,7 @@ class ComfyUIGenerate(bpy.types.Operator):
         is_recent_mode_ref = (
             file_type == "generated" and
             context.scene.sequential_ipadapter_mode == 'recent' and
-            (context.scene.sequential_ipadapter or context.scene.model_architecture == 'qwen_image_edit')
+            (context.scene.sequential_ipadapter or context.scene.model_architecture in ('qwen_image_edit', 'flux2_klein'))
         )
         
         temp_image_path = None

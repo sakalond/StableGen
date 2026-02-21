@@ -690,7 +690,7 @@ def export_emit_image(context, to_export, camera_id=None, bg_color=(0.5, 0.5, 0.
                 links.new(color_mix.outputs[0], output.inputs[0])
 
         output_dir = get_dir_path(context, "inpaint")["visibility"] if "visibility" in str(camera_id) else get_dir_path(context, "inpaint")["render"]
-        output_file = f"render{camera_id}" if camera_id is not None else "render"
+        output_file = f"ctx_render{camera_id}" if camera_id is not None else "ctx_render"
 
         # Store and set world settings
         world = context.scene.world

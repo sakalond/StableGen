@@ -604,6 +604,31 @@ DEPENDENCIES: Dict[str, Dict[str, Any]] = {
         "license": "Apache 2.0", "packages": ["vlm_emission"],
         "pip_packages": ["segment_anything"],
     },
+    # --- FLUX.2 Klein 4B ---
+    "model_flux2_klein_4b": {
+        "id": "model_flux2_klein_4b", "type": "model",
+        "name": "FLUX.2 Klein 4B Diffusion Model (FP8)",
+        "url": "https://huggingface.co/black-forest-labs/FLUX.2-klein-base-4b-fp8/resolve/main/flux-2-klein-base-4b-fp8.safetensors?download=true",
+        "target_path_relative": "models/diffusion_models",
+        "filename": "flux-2-klein-base-4b-fp8.safetensors",
+        "license": "Apache 2.0", "size_mb": 4070, "packages": ["flux2_klein"],
+    },
+    "model_flux2_text_encoder": {
+        "id": "model_flux2_text_encoder", "type": "model",
+        "name": "FLUX.2 Klein Qwen 3 4B Text Encoder (bf16)",
+        "url": "https://huggingface.co/Comfy-Org/z_image_turbo/resolve/main/split_files/text_encoders/qwen_3_4b.safetensors?download=true",
+        "target_path_relative": "models/text_encoders",
+        "filename": "qwen_3_4b.safetensors",
+        "license": "Apache 2.0", "size_mb": 8050, "packages": ["flux2_klein"],
+    },
+    "model_flux2_vae": {
+        "id": "model_flux2_vae", "type": "model",
+        "name": "FLUX.2 Klein VAE",
+        "url": "https://huggingface.co/Comfy-Org/flux2-dev/resolve/main/split_files/vae/flux2-vae.safetensors?download=true",
+        "target_path_relative": "models/vae",
+        "filename": "flux2-vae.safetensors",
+        "license": "Apache 2.0", "size_mb": 321, "packages": ["flux2_klein"],
+    },
 }
 
 # Define what items each menu option entails by listing package tags
@@ -662,6 +687,13 @@ MENU_PACKAGES: Dict[str, Dict[str, Any]] = {
         "description_suffix": "*Installs comfyui_segment_anything custom node for VLM-driven emission extraction.*\n"
                               "    *GroundingDINO_SwinB (~938MB) and sam_vit_h (~2.56GB) models are downloaded*\n"
                               "    *automatically on first use.*",
+    },
+    '12': {"name": "[FLUX.2 KLEIN] Klein 4B FP8 + Qwen 3 Text Encoder + VAE",
+        "tags": ["flux2_klein"],
+        "size_gb": 12.4,
+        "description_suffix": "*Downloads FLUX.2 Klein 4B FP8 diffusion model (~4.1GB), Qwen 3 4B text encoder bf16 (~8.0GB),*\n"
+                              "    *and FLUX.2 VAE (~0.3GB). All ComfyUI nodes are built-in (no custom nodes needed).*\n"
+                              "    *Apache 2.0 license. Requires ~13GB VRAM.*",
     },
 }
 
@@ -1067,7 +1099,7 @@ def main():
 
     while True:
         display_menu(comfyui_base_path)
-        choice = input("Enter your choice (1-11, or q to quit): ").strip().lower()
+        choice = input("Enter your choice (1-12, or q to quit): ").strip().lower()
 
         if choice == 'q':
             print("Exiting installer.")
