@@ -18,6 +18,30 @@ from io import BytesIO
 import numpy as np
 from PIL import Image
 
+
+def _texturing_prompt(scene):
+    """Return the texturing portion of the prompt (after ``||`` if present).
+
+    Users can write ``generation prompt || texturing prompt`` to give a
+    different prompt to the per-camera texturing step.  When the separator
+    is absent the full prompt is returned unchanged.
+    """
+    raw = scene.comfyui_prompt
+    if '||' in raw:
+        return raw.split('||', 1)[1].strip()
+    return raw
+
+
+def _generation_prompt(scene):
+    """Return the generation portion of the prompt (before ``||`` if present).
+
+    See :func:`_texturing_prompt` for the separator convention.
+    """
+    raw = scene.comfyui_prompt
+    if '||' in raw:
+        return raw.split('||', 1)[0].strip()
+    return raw
+
 class WorkflowManager:
     def __init__(self, operator):
         """
@@ -468,7 +492,7 @@ class WorkflowManager:
                      prompt[NODES['style_map_loader']]['inputs']['image'] = style_image_info['name']
             
             # Fallback to TRELLIS.2 input image as style
-            if not style_image_info and getattr(context.scene, 'qwen_use_trellis2_style', False):
+            if not style_image_info and getattr(context.scene, 'architecture_mode', '') == 'trellis2' and getattr(context.scene, 'qwen_use_trellis2_style', False):
                 t2_path = getattr(context.scene, 'trellis2_last_input_image', '')
                 if t2_path and os.path.exists(bpy.path.abspath(t2_path)):
                     style_image_info = self.operator._get_uploaded_image_info(context, "custom", filename=bpy.path.abspath(t2_path))
@@ -496,7 +520,7 @@ class WorkflowManager:
             del prompt[NODES['neg_prompt']]['inputs']['image3']
 
         # --- Prompt ---
-        user_prompt = context.scene.comfyui_prompt
+        user_prompt = _texturing_prompt(context.scene)
         final_prompt = f"Modify image1 to {user_prompt}"
         if depth_info:
             final_prompt += ". Use image3 as depth map reference."
@@ -576,7 +600,7 @@ class WorkflowManager:
         prompt[NODES['guidance_map_loader']]['inputs']['image'] = guidance_map_info['name']
 
         # --- Configure Style Image (Image 2) and Prompts ---
-        user_prompt = context.scene.comfyui_prompt
+        user_prompt = _texturing_prompt(context.scene)
         style_image_info = None
         context_render_info = None
         context_mode = context.scene.qwen_context_render_mode
@@ -645,13 +669,13 @@ class WorkflowManager:
                 prompt[NODES['pos_prompt']]['inputs']['prompt'] = pos_prompt_text
             else: # Additional mode
                 if context.scene.qwen_use_custom_prompts:
-                    pos_prompt_text = ()
+                    pos_prompt_text = (context.scene.qwen_custom_prompt_seq_additional if not is_initial_image else context.scene.qwen_custom_prompt_initial).format(main_prompt=user_prompt)
                 else:
                     pos_prompt_text = self._get_qwen_default_prompts(context, is_initial_image).format(main_prompt=user_prompt)
                 prompt[NODES['pos_prompt']]['inputs']['prompt'] = pos_prompt_text
 
         # Case 1b: TRELLIS.2 input image as style (when no external style configured)
-        elif getattr(context.scene, 'qwen_use_trellis2_style', False):
+        elif getattr(context.scene, 'architecture_mode', '') == 'trellis2' and getattr(context.scene, 'qwen_use_trellis2_style', False):
             use_t2_this_frame = True
             if not is_initial_image and getattr(context.scene, 'qwen_trellis2_style_initial_only', False):
                 # Initial-only mode: fall back to sequential style for subsequent frames
@@ -699,10 +723,19 @@ class WorkflowManager:
 
         # Case 3: First image of a sequence, or separate generation, or no style source in sequential
         if style_image_info is None:
-            # No style image is provided. For the first image, we remove image2 entirely.
+            # No style image is provided — remove the style loader node and
+            # its reference from the prompt encoders.
             del prompt[NODES['style_map_loader']]
-            del prompt[NODES['pos_prompt']]['inputs']['image2']
-            del prompt[NODES['neg_prompt']]['inputs']['image2']
+            if context_mode == 'ADDITIONAL' and not is_initial_image:
+                # In ADDITIONAL mode the context/style loader IDs were swapped
+                # above, so the style loader now sits on the node that image3
+                # originally pointed to.  Remove image3 (dangling after the
+                # delete) but keep image2 (the context render).
+                for nid in (NODES['pos_prompt'], NODES['neg_prompt']):
+                    prompt[nid]['inputs'].pop('image3', None)
+            else:
+                del prompt[NODES['pos_prompt']]['inputs']['image2']
+                del prompt[NODES['neg_prompt']]['inputs']['image2']
             if context.scene.qwen_use_custom_prompts:
                 pos_prompt_text = (context.scene.qwen_custom_prompt_initial if is_initial_image else context.scene.qwen_custom_prompt_seq_none).format(main_prompt=user_prompt)
             else:
@@ -859,7 +892,7 @@ class WorkflowManager:
             prompt[NODES['clip_loader']]['inputs']['clip_name'] = "qwen_3_8b_fp8mixed.safetensors"
 
         # --- Base user prompt + camera injection ---
-        user_prompt = context.scene.comfyui_prompt
+        user_prompt = _texturing_prompt(context.scene)
         camera_suffix = ""
         if (context.scene.use_camera_prompts
                 and self.operator._cameras
@@ -937,7 +970,7 @@ class WorkflowManager:
                 prompt[NODES['pos_prompt']]['inputs']['text'] = pos_prompt_text
 
         # Case 1b: TRELLIS.2 input image as style
-        if not style_image_info and getattr(context.scene, 'qwen_use_trellis2_style', False):
+        if not style_image_info and getattr(context.scene, 'architecture_mode', '') == 'trellis2' and getattr(context.scene, 'qwen_use_trellis2_style', False):
             use_t2 = True
             if not is_initial_image and getattr(context.scene, 'qwen_trellis2_style_initial_only', False):
                 use_t2 = False
@@ -1111,6 +1144,36 @@ class WorkflowManager:
         except Exception:
             return None, None
 
+    @staticmethod
+    def _cleanup_trellis2_temp_files():
+        """Remove TRELLIS2 IPC temp directories and voxelgrid cache files.
+
+        The ComfyUI-TRELLIS2 custom node saves intermediate tensors and
+        voxelgrid data to disk but never deletes them, gradually filling
+        the system temp directory.  This method cleans up both locations.
+        """
+        import tempfile
+        import glob
+        import shutil
+
+        tmp_root = tempfile.gettempdir()
+
+        # IPC tensor directories: <tempdir>/trellis2_*/
+        for d in glob.glob(os.path.join(tmp_root, 'trellis2_*')):
+            if os.path.isdir(d):
+                try:
+                    shutil.rmtree(d)
+                except OSError:
+                    pass  # Still locked by worker — ignore
+
+        # Voxelgrid cache (Windows: C:\tmp\trellis2_cache)
+        for cache_dir in ('/tmp/trellis2_cache', r'C:\tmp\trellis2_cache'):
+            if os.path.isdir(cache_dir):
+                try:
+                    shutil.rmtree(cache_dir)
+                except OSError:
+                    pass
+
     def _flush_comfyui_vram(self, server_address, retries=3, label="Post-generation"):
         """Unload all models and free VRAM on the ComfyUI server.
 
@@ -1233,13 +1296,15 @@ class WorkflowManager:
         # Double-check here in case the property wasn't synced yet.
         if getattr(scene, 'architecture_mode', '') == 'trellis2':
             tex_mode = getattr(scene, 'trellis2_texture_mode', 'native')
-            if tex_mode not in ('sdxl', 'flux1', 'qwen_image_edit'):
+            if tex_mode not in ('sdxl', 'flux1', 'qwen_image_edit', 'flux2_klein'):
                 architecture = getattr(scene, 'trellis2_initial_image_arch', 'sdxl')
 
         if architecture == 'qwen_image_edit':
             prompt, save_node = self._build_qwen_txt2img(context)
         elif architecture == 'flux1':
             prompt, save_node = self._build_flux_txt2img(context)
+        elif architecture == 'flux2_klein':
+            prompt, save_node = self._build_klein_txt2img(context)
         else:
             prompt, save_node = self._build_sdxl_txt2img(context)
 
@@ -1293,7 +1358,7 @@ class WorkflowManager:
             },
             "2": {
                 "class_type": "CLIPTextEncode",
-                "inputs": {"text": scene.comfyui_prompt, "clip": ["1", 1]}
+                "inputs": {"text": _generation_prompt(scene), "clip": ["1", 1]}
             },
             "3": {
                 "class_type": "CLIPTextEncode",
@@ -1666,6 +1731,88 @@ class WorkflowManager:
         # StableDelight returns a single image
         return delight_images[0] if delight_images else {"error": "StableDelight returned empty"}
 
+    def _build_klein_txt2img(self, context):
+        """Return (prompt_dict, save_node_id) for a minimal FLUX.2 Klein txt2img.
+
+        Uses the same node types as the full Klein multi-reference workflow
+        (UNETLoader, CLIPLoader with type flux2, VAELoader, Flux2Scheduler,
+        CFGGuider, SamplerCustomAdvanced) but without any reference images.
+        """
+        scene = context.scene
+        unet_name = scene.model_name
+
+        # Detect 9B vs 4B CLIP from model name
+        model_lower = unet_name.lower()
+        clip_name = "qwen_3_8b_fp8mixed.safetensors" if '9b' in model_lower else "qwen_3_4b.safetensors"
+
+        prompt = {
+            "1": {
+                "class_type": "UNETLoader",
+                "inputs": {"unet_name": unet_name, "weight_dtype": "default"}
+            },
+            "2": {
+                "class_type": "CLIPLoader",
+                "inputs": {"clip_name": clip_name, "type": "flux2"}
+            },
+            "3": {
+                "class_type": "VAELoader",
+                "inputs": {"vae_name": "flux2-vae.safetensors"}
+            },
+            "4": {
+                "class_type": "CLIPTextEncode",
+                "inputs": {"text": _generation_prompt(scene), "clip": ["2", 0]}
+            },
+            "5": {
+                "class_type": "CLIPTextEncode",
+                "inputs": {"text": "", "clip": ["2", 0]}
+            },
+            "6": {
+                "class_type": "EmptyFlux2LatentImage",
+                "inputs": {"width": 1024, "height": 1024, "batch_size": 1}
+            },
+            "7": {
+                "class_type": "Flux2Scheduler",
+                "inputs": {"steps": scene.steps, "width": 1024, "height": 1024}
+            },
+            "8": {
+                "class_type": "KSamplerSelect",
+                "inputs": {"sampler_name": scene.sampler}
+            },
+            "9": {
+                "class_type": "RandomNoise",
+                "inputs": {"noise_seed": scene.seed if scene.seed != 0 else random.randint(0, 2**31)}
+            },
+            "10": {
+                "class_type": "CFGGuider",
+                "inputs": {
+                    "model": ["1", 0],
+                    "positive": ["4", 0],
+                    "negative": ["5", 0],
+                    "cfg": scene.cfg
+                }
+            },
+            "11": {
+                "class_type": "SamplerCustomAdvanced",
+                "inputs": {
+                    "noise": ["9", 0],
+                    "guider": ["10", 0],
+                    "sampler": ["8", 0],
+                    "sigmas": ["7", 0],
+                    "latent_image": ["6", 0]
+                }
+            },
+            "12": {
+                "class_type": "VAEDecode",
+                "inputs": {"samples": ["11", 0], "vae": ["3", 0]}
+            },
+            "13": {
+                "class_type": "SaveImageWebsocket",
+                "inputs": {"images": ["12", 0]}
+            }
+        }
+
+        return prompt, "13"
+
     def _build_flux_txt2img(self, context):
         """Return (prompt_dict, save_node_id) for a minimal Flux txt2img with LoRA support."""
         scene = context.scene
@@ -1693,7 +1840,7 @@ class WorkflowManager:
             },
             "6": {
                 "class_type": "CLIPTextEncode",
-                "inputs": {"text": scene.comfyui_prompt, "clip": ["11", 0]}
+                "inputs": {"text": _generation_prompt(scene), "clip": ["11", 0]}
             },
             "26": {
                 "class_type": "FluxGuidance",
@@ -1796,7 +1943,7 @@ class WorkflowManager:
             "12": {
                 "class_type": "TextEncodeQwenImageEditPlus",
                 "inputs": {
-                    "prompt": scene.comfyui_prompt,
+                    "prompt": _generation_prompt(scene),
                     "clip": ["3", 0]
                 }
             },
@@ -2286,6 +2433,7 @@ class WorkflowManager:
             # Restore the original seed so the UI isn't silently changed
             context.scene.trellis2_seed = original_seed
             self._flush_comfyui_vram(server_address, label="Post-generation")
+            self._cleanup_trellis2_temp_files()
 
     def _generate_trellis2_inner(self, context, input_image_path, server_address, client_id):
         """Inner implementation of generate_trellis2, called within a try/finally VRAM flush."""
@@ -2831,7 +2979,7 @@ class WorkflowManager:
             'ipadapter_image': "237",
         }
         
-        base_prompt_text = context.scene.comfyui_prompt
+        base_prompt_text = _texturing_prompt(context.scene)
         # Camera Prompt Injection
         if context.scene.use_camera_prompts and context.scene.generation_method in ['separate', 'sequential', 'refine', 'local_edit'] and self.operator._cameras and self.operator._current_image < len(self.operator._cameras):
             current_camera_name = self.operator._cameras[self.operator._current_image].name
@@ -3275,6 +3423,16 @@ class WorkflowManager:
                             if hasattr(self.operator, '_update_overall'):
                                 self.operator._update_overall()
                         print(f"Progress: {progress:.1f}%")
+
+                elif message['type'] == 'execution_error':
+                    error_data = message.get('data', {})
+                    error_msg = error_data.get('exception_message', 'Unknown error')
+                    node_id = error_data.get('node_id', '?')
+                    self.operator._error = (
+                        f"ComfyUI execution error (node {node_id}): {error_msg}"
+                    )
+                    print(f"[StableGen] {self.operator._error}")
+                    break
             else:
                 # Binary data (image)
                 if current_node == NODES['save_image']:  # SaveImageWebsocket node
@@ -3453,7 +3611,7 @@ class WorkflowManager:
             'save_image': "111"
         }
         
-        base_prompt_text = context.scene.comfyui_prompt
+        base_prompt_text = _texturing_prompt(context.scene)
         # Camera Prompt Injection
         if context.scene.use_camera_prompts and context.scene.generation_method in ['separate', 'sequential', 'refine', 'local_edit'] and self.operator._cameras and self.operator._current_image < len(self.operator._cameras):
             current_camera_name = self.operator._cameras[self.operator._current_image].name
@@ -3468,7 +3626,7 @@ class WorkflowManager:
         if context.scene.generation_method in ['refine', 'local_edit', 'uv_inpaint', 'sequential']:
             prompt[NODES['pos_prompt']]["inputs"]["text"] = base_prompt_text
         else:
-            prompt[NODES['pos_prompt']]["inputs"]["text"] = context.scene.refine_prompt if context.scene.refine_prompt != "" else context.scene.comfyui_prompt
+            prompt[NODES['pos_prompt']]["inputs"]["text"] = context.scene.refine_prompt if context.scene.refine_prompt != "" else _texturing_prompt(context.scene)
         
         # Set negative prompt
         prompt[NODES['neg_prompt']]["inputs"]["text"] = context.scene.comfyui_negative_prompt
@@ -3586,7 +3744,7 @@ class WorkflowManager:
             prompt[NODES['inpaint_conditioning']]["inputs"]["noise_mask"] = context.scene.differential_noise
 
         # Create base UV prompt
-        uv_prompt = f"seamless (UV-unwrapped texture) of {context.scene.comfyui_prompt}, consistent material continuity, no visible seams or stretching, PBR material properties"
+        uv_prompt = f"seamless (UV-unwrapped texture) of {_texturing_prompt(context.scene)}, consistent material continuity, no visible seams or stretching, PBR material properties"
         uv_prompt_neg = f"seam, stitch, visible edge, texture stretching, repeating pattern, {context.scene.comfyui_negative_prompt}"
         
         prompt[NODES['pos_prompt']]["inputs"]["text"] = uv_prompt
@@ -3597,7 +3755,7 @@ class WorkflowManager:
             current_object_name = os.path.basename(render_info['name']).split('.')[0]
         
         # Use the object-specific prompt if available
-        object_prompt = self.operator._object_prompts.get(current_object_name, context.scene.comfyui_prompt)
+        object_prompt = self.operator._object_prompts.get(current_object_name, _texturing_prompt(context.scene))
         if object_prompt:
             uv_prompt = f"(UV-unwrapped texture) of {object_prompt}, consistent material continuity, no visible seams or stretching, PBR material properties"
             uv_prompt_neg = f"seam, stitch, visible edge, texture stretching, repeating pattern, {context.scene.comfyui_negative_prompt}"
@@ -3689,7 +3847,7 @@ class WorkflowManager:
             'save_image': "32"          # SaveImageWebsocket
         }
         
-        base_prompt_text = context.scene.comfyui_prompt
+        base_prompt_text = _texturing_prompt(context.scene)
         # Camera Prompt Injection
         if context.scene.use_camera_prompts and context.scene.generation_method in ['separate', 'sequential', 'refine', 'local_edit'] and self.operator._cameras and self.operator._current_image < len(self.operator._cameras):
             current_camera_name = self.operator._cameras[self.operator._current_image].name
@@ -3895,7 +4053,7 @@ class WorkflowManager:
             'save_image': "32"          # SaveImageWebsocket
         }
         
-        base_prompt_text = context.scene.comfyui_prompt
+        base_prompt_text = _texturing_prompt(context.scene)
         # Camera Prompt Injection
         if context.scene.use_camera_prompts and context.scene.generation_method in ['separate', 'sequential', 'refine', 'local_edit', 'grid'] and self.operator._cameras and self.operator._current_image < len(self.operator._cameras):
             current_camera_name = self.operator._cameras[self.operator._current_image].name
@@ -4115,13 +4273,13 @@ class WorkflowManager:
             prompt[NODES['inpaint_conditioning']]["inputs"]["noise_mask"] = context.scene.differential_noise
         
         # Create UV-specific prompt
-        uv_prompt = f"seamless (UV-unwrapped texture) of {context.scene.comfyui_prompt}, consistent material continuity, no visible seams or stretching"
+        uv_prompt = f"seamless (UV-unwrapped texture) of {_texturing_prompt(context.scene)}, consistent material continuity, no visible seams or stretching"
         prompt[NODES['pos_prompt']]["inputs"]["text"] = uv_prompt
         
         # Object-specific prompt if available
         if render_info and 'name' in render_info:
             current_object_name = os.path.basename(render_info['name']).split('.')[0]
-            object_prompt = self.operator._object_prompts.get(current_object_name, context.scene.comfyui_prompt)
+            object_prompt = self.operator._object_prompts.get(current_object_name, _texturing_prompt(context.scene))
             if object_prompt:
                 uv_prompt = f"(UV-unwrapped texture) of {object_prompt}, consistent material continuity, no visible seams or stretching"
                 prompt[NODES['pos_prompt']]["inputs"]["text"] = uv_prompt

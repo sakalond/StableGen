@@ -39,6 +39,10 @@ PRESETS = {
     "DEFAULT (MODEL + TEXTURE)": {"description": "Uses TRELLIS.2 and SDXL to generate a textured mesh. Optimized for general object generation. May not work ideally for the cases which have their specialized presets.", "control_after_generate": "fixed", "model_architecture": "sdxl", "steps": 8, "cfg": 1.5, "sampler": "dpmpp_2s_ancestral", "scheduler": "sgm_uniform", "fallback_color": mathutils.Color((0.0, 0.0, 0.0)), "discard_factor": 75.0, "discard_factor_generation_only": True, "discard_factor_after_generation": 85.0, "weight_exponent": 3.0, "weight_exponent_generation_only": False, "weight_exponent_after_generation": 15.0, "view_blend_use_color_match": False, "view_blend_color_match_method": "reinhard", "view_blend_color_match_strength": 1.0, "clip_skip": 1, "auto_rescale": True, "auto_rescale_target_mp": 1.0, "overwrite_material": True, "generation_method": "sequential", "refine_images": False, "refine_steps": 8, "refine_sampler": "dpmpp_2s_ancestral", "refine_scheduler": "sgm_uniform", "denoise": 0.800000011920929, "refine_cfg": 1.5, "refine_prompt": "", "refine_upscale_method": "lanczos", "sequential_smooth": True, "sequential_custom_camera_order": "", "sequential_factor": 0.699999988079071, "sequential_factor_smooth": 0.10000000149011612, "sequential_factor_smooth_2": 1.0, "sequential_ipadapter": True, "sequential_ipadapter_mode": "trellis2_input", "sequential_desaturate_factor": 0.0, "sequential_contrast_factor": 0.0, "sequential_ipadapter_regenerate": False, "ipadapter_weight_type": "style", "ipadapter_strength": 1.0, "ipadapter_start": 0.0, "ipadapter_end": 1.0, "early_priority": False, "early_priority_strength": 0.5, "differential_diffusion": True, "differential_noise": True, "blur_mask": True, "blur_mask_radius": 3, "blur_mask_sigma": 1.0, "grow_mask_by": 3, "canny_threshold_low": 0, "canny_threshold_high": 80, "qwen_guidance_map_type": "depth", "qwen_voronoi_mode": False, "qwen_use_external_style_image": False, "qwen_external_style_image": "", "qwen_context_render_mode": "NONE", "qwen_external_style_initial_only": False, "qwen_use_custom_prompts": False, "qwen_custom_prompt_initial": "Change and transfer the format of '{main_prompt}' in image 1 to the style from image 2", "qwen_custom_prompt_seq_none": "Change and transfer the format of '{main_prompt}' in image 1 to the style from image 2", "qwen_custom_prompt_seq_replace": "Change and transfer the format of image 1 to '{main_prompt}'. Replace all solid magenta areas in image 2. Replace the background with solid gray. The style from image 2 should smoothly continue into the previously magenta areas.", "qwen_custom_prompt_seq_additional": "Change and transfer the format of image 1 to '{main_prompt}'. Replace all solid magenta areas in image 2. Replace the background with solid gray. The style from image 2 should smoothly continue into the previously magenta areas. Image 3 represents the overall style of the object.", "qwen_guidance_fallback_color": mathutils.Color((1.0, 0.0, 1.0)), "qwen_guidance_background_color": mathutils.Color((1.0, 0.0, 1.0)), "qwen_context_cleanup": False, "qwen_context_cleanup_hue_tolerance": 5.0, "qwen_context_cleanup_value_adjust": 0.0, "qwen_context_fallback_dilation": 1, "qwen_rescale_alignment": True, "qwen_generation_method": "generate", "qwen_refine_use_prev_ref": False, "qwen_refine_use_depth": False, "qwen_timestep_zero_ref": False, "refine_angle_ramp_active": True, "refine_angle_ramp_pos_0": 0.0, "refine_angle_ramp_pos_1": 0.05000000074505806, "visibility_vignette": True, "visibility_vignette_width": 0.15000000596046448, "visibility_vignette_softness": 1.0, "visibility_vignette_blur": False, "refine_feather_ramp_pos_0": 0.0, "refine_feather_ramp_pos_1": 0.6000000238418579, "refine_edge_feather_projection": True, "refine_edge_feather_width": 30, "refine_edge_feather_softness": 1.0, "trellis2_texture_mode": "sdxl", "trellis2_initial_image_arch": "sdxl", "trellis2_camera_count": 10, "trellis2_placement_mode": "normal_weighted", "trellis2_auto_prompts": True, "trellis2_exclude_bottom": False, "trellis2_exclude_bottom_angle": 1.5533000230789185, "trellis2_auto_aspect": "per_camera", "trellis2_occlusion_mode": "none", "trellis2_consider_existing": False, "trellis2_delete_cameras": False, "trellis2_coverage_target": 0.949999988079071, "trellis2_max_auto_cameras": 12, "trellis2_fan_angle": 90.0, "trellis2_resolution": "1024_cascade", "trellis2_vram_mode": "disk_offload", "trellis2_attn_backend": "flash_attn", "trellis2_ss_guidance": 7.5, "trellis2_ss_steps": 12, "trellis2_shape_guidance": 7.5, "trellis2_shape_steps": 12, "trellis2_tex_guidance": 7.5, "trellis2_tex_steps": 12, "trellis2_max_tokens": 49152, "trellis2_texture_size": 4096, "trellis2_decimation": 1000000, "trellis2_remesh": True, "trellis2_post_processing_enabled": True, "trellis2_low_vram": False, "trellis2_bg_removal": "auto", "trellis2_background_color": "black", "trellis2_fill_holes": True, "trellis2_import_scale": 2.0, "trellis2_clamp_elevation": False, "trellis2_max_elevation": 1.2216999530792236, "trellis2_min_elevation": -1.0471975803375244, "trellis2_auto_lighting": True, "use_ipadapter": False, "sequential_ipadapter_regenerate_wo_controlnet": False, "allow_modify_existing_textures": False, "ask_object_prompts": True, "weight_exponent_mask": False, "mask_blocky": False, "architecture_mode": "trellis2", "use_camera_prompts": True, "sg_use_custom_camera_order": False, "apply_bsdf": False, "generation_mode": "standard", "texture_objects": "all", "use_flux_lora": True, "qwen_use_trellis2_style": False, "qwen_trellis2_style_initial_only": False, "trellis2_skip_texture": True, "controlnet_units": [{'unit_type': 'depth', 'model_name': 'controlnet_depth_sdxl.safetensors', 'strength': 0.6000000238418579, 'start_percent': 0.0, 'end_percent': 1.0, 'is_union': False, 'use_union_type': True}], "lora_units": [{'model_name': 'sdxl_lightning_8step_lora.safetensors', 'model_strength': 1.0, 'clip_strength': 1.0}]},
     "CHARACTERS (MODEL + TEXTURE)": {"description": "Uses TRELLIS.2 and SDXL to generate a textured mesh. Optimized settings for generating characters. Will not texture bottom facing faces.", "control_after_generate": "fixed", "model_architecture": "sdxl", "steps": 8, "cfg": 1.5, "sampler": "dpmpp_2s_ancestral", "scheduler": "sgm_uniform", "fallback_color": mathutils.Color((0.0, 0.0, 0.0)), "discard_factor": 75.0, "discard_factor_generation_only": True, "discard_factor_after_generation": 85.0, "weight_exponent": 3.0, "weight_exponent_generation_only": False, "weight_exponent_after_generation": 15.0, "view_blend_use_color_match": False, "view_blend_color_match_method": "reinhard", "view_blend_color_match_strength": 1.0, "clip_skip": 1, "auto_rescale": True, "auto_rescale_target_mp": 1.0, "overwrite_material": True, "generation_method": "sequential", "refine_images": False, "refine_steps": 8, "refine_sampler": "dpmpp_2s_ancestral", "refine_scheduler": "sgm_uniform", "denoise": 0.800000011920929, "refine_cfg": 1.5, "refine_prompt": "", "refine_upscale_method": "lanczos", "sequential_smooth": True, "sequential_custom_camera_order": "", "sequential_factor": 0.699999988079071, "sequential_factor_smooth": 0.10000000149011612, "sequential_factor_smooth_2": 1.0, "sequential_ipadapter": True, "sequential_ipadapter_mode": "trellis2_input", "sequential_desaturate_factor": 0.0, "sequential_contrast_factor": 0.0, "sequential_ipadapter_regenerate": False, "ipadapter_weight_type": "style", "ipadapter_strength": 1.0, "ipadapter_start": 0.0, "ipadapter_end": 1.0, "early_priority": False, "early_priority_strength": 0.5, "differential_diffusion": True, "differential_noise": True, "blur_mask": True, "blur_mask_radius": 1, "blur_mask_sigma": 1.0, "grow_mask_by": 3, "canny_threshold_low": 0, "canny_threshold_high": 80, "qwen_guidance_map_type": "depth", "qwen_voronoi_mode": False, "qwen_use_external_style_image": False, "qwen_external_style_image": "", "qwen_context_render_mode": "NONE", "qwen_external_style_initial_only": False, "qwen_use_custom_prompts": False, "qwen_custom_prompt_initial": "Change and transfer the format of '{main_prompt}' in image 1 to the style from image 2", "qwen_custom_prompt_seq_none": "Change and transfer the format of '{main_prompt}' in image 1 to the style from image 2", "qwen_custom_prompt_seq_replace": "Change and transfer the format of image 1 to '{main_prompt}'. Replace all solid magenta areas in image 2. Replace the background with solid gray. The style from image 2 should smoothly continue into the previously magenta areas.", "qwen_custom_prompt_seq_additional": "Change and transfer the format of image 1 to '{main_prompt}'. Replace all solid magenta areas in image 2. Replace the background with solid gray. The style from image 2 should smoothly continue into the previously magenta areas. Image 3 represents the overall style of the object.", "qwen_guidance_fallback_color": mathutils.Color((1.0, 0.0, 1.0)), "qwen_guidance_background_color": mathutils.Color((1.0, 0.0, 1.0)), "qwen_context_cleanup": False, "qwen_context_cleanup_hue_tolerance": 5.0, "qwen_context_cleanup_value_adjust": 0.0, "qwen_context_fallback_dilation": 1, "qwen_rescale_alignment": True, "qwen_generation_method": "generate", "qwen_refine_use_prev_ref": False, "qwen_refine_use_depth": False, "qwen_timestep_zero_ref": False, "refine_angle_ramp_active": True, "refine_angle_ramp_pos_0": 0.0, "refine_angle_ramp_pos_1": 0.05000000074505806, "visibility_vignette": True, "visibility_vignette_width": 0.15000000596046448, "visibility_vignette_softness": 1.0, "visibility_vignette_blur": False, "refine_feather_ramp_pos_0": 0.0, "refine_feather_ramp_pos_1": 0.6000000238418579, "refine_edge_feather_projection": True, "refine_edge_feather_width": 30, "refine_edge_feather_softness": 1.0, "trellis2_texture_mode": "sdxl", "trellis2_initial_image_arch": "sdxl", "trellis2_camera_count": 8, "trellis2_placement_mode": "normal_weighted", "trellis2_auto_prompts": True, "trellis2_exclude_bottom": True, "trellis2_exclude_bottom_angle": 1.5533000230789185, "trellis2_auto_aspect": "per_camera", "trellis2_occlusion_mode": "none", "trellis2_consider_existing": False, "trellis2_delete_cameras": False, "trellis2_coverage_target": 0.949999988079071, "trellis2_max_auto_cameras": 12, "trellis2_fan_angle": 90.0, "trellis2_resolution": "1024_cascade", "trellis2_vram_mode": "disk_offload", "trellis2_attn_backend": "flash_attn", "trellis2_ss_guidance": 7.5, "trellis2_ss_steps": 12, "trellis2_shape_guidance": 7.5, "trellis2_shape_steps": 12, "trellis2_tex_guidance": 7.5, "trellis2_tex_steps": 12, "trellis2_max_tokens": 49152, "trellis2_texture_size": 4096, "trellis2_decimation": 1000000, "trellis2_remesh": True, "trellis2_post_processing_enabled": True, "trellis2_low_vram": False, "trellis2_bg_removal": "auto", "trellis2_background_color": "black", "trellis2_fill_holes": True, "trellis2_import_scale": 2.0, "trellis2_clamp_elevation": True, "trellis2_max_elevation": 1.2216999530792236, "trellis2_min_elevation": -1.0471975803375244, "trellis2_auto_lighting": True, "use_ipadapter": False, "sequential_ipadapter_regenerate_wo_controlnet": False, "allow_modify_existing_textures": False, "ask_object_prompts": True, "weight_exponent_mask": False, "mask_blocky": False, "architecture_mode": "trellis2", "use_camera_prompts": True, "sg_use_custom_camera_order": False, "apply_bsdf": False, "generation_mode": "standard", "texture_objects": "all", "use_flux_lora": True, "qwen_use_trellis2_style": False, "qwen_trellis2_style_initial_only": False, "trellis2_skip_texture": True, "controlnet_units": [{'unit_type': 'depth', 'model_name': 'controlnet_depth_sdxl.safetensors', 'strength': 0.6000000238418579, 'start_percent': 0.0, 'end_percent': 1.0, 'is_union': False, 'use_union_type': True}], "lora_units": [{'model_name': 'sdxl_lightning_8step_lora.safetensors', 'model_strength': 1.0, 'clip_strength': 1.0}]},
     "ARCHITECTURE (MODEL + TEXTURE)": {"description": "Uses TRELLIS.2 and SDXL to generate a textured mesh. Optimized settings for architecture, and other models with flat walls and sharp angles.", "control_after_generate": "fixed", "model_architecture": "sdxl", "steps": 8, "cfg": 1.5, "sampler": "dpmpp_2s_ancestral", "scheduler": "sgm_uniform", "fallback_color": mathutils.Color((0.0, 0.0, 0.0)), "discard_factor": 80.0, "discard_factor_generation_only": True, "discard_factor_after_generation": 85.0, "weight_exponent": 10.0, "weight_exponent_generation_only": False, "weight_exponent_after_generation": 15.0, "view_blend_use_color_match": False, "view_blend_color_match_method": "reinhard", "view_blend_color_match_strength": 1.0, "clip_skip": 1, "auto_rescale": True, "auto_rescale_target_mp": 1.0, "overwrite_material": True, "generation_method": "separate", "refine_images": False, "refine_steps": 8, "refine_sampler": "dpmpp_2s_ancestral", "refine_scheduler": "sgm_uniform", "denoise": 0.800000011920929, "refine_cfg": 1.5, "refine_prompt": "", "refine_upscale_method": "lanczos", "sequential_smooth": False, "sequential_custom_camera_order": "", "sequential_factor": 0.75, "sequential_factor_smooth": 0.15000000596046448, "sequential_factor_smooth_2": 1.0, "sequential_ipadapter": True, "sequential_ipadapter_mode": "trellis2_input", "sequential_desaturate_factor": 0.0, "sequential_contrast_factor": 0.0, "sequential_ipadapter_regenerate": False, "ipadapter_weight_type": "style", "ipadapter_strength": 0.800000011920929, "ipadapter_start": 0.0, "ipadapter_end": 1.0, "early_priority": False, "early_priority_strength": 0.5, "differential_diffusion": True, "differential_noise": False, "blur_mask": True, "blur_mask_radius": 3, "blur_mask_sigma": 1.0, "grow_mask_by": 3, "canny_threshold_low": 0, "canny_threshold_high": 80, "qwen_guidance_map_type": "depth", "qwen_voronoi_mode": False, "qwen_use_external_style_image": False, "qwen_external_style_image": "", "qwen_context_render_mode": "NONE", "qwen_external_style_initial_only": False, "qwen_use_custom_prompts": False, "qwen_custom_prompt_initial": "Change and transfer the format of '{main_prompt}' in image 1 to the style from image 2", "qwen_custom_prompt_seq_none": "Change and transfer the format of '{main_prompt}' in image 1 to the style from image 2", "qwen_custom_prompt_seq_replace": "Change and transfer the format of image 1 to '{main_prompt}'. Replace all solid magenta areas in image 2. Replace the background with solid gray. The style from image 2 should smoothly continue into the previously magenta areas.", "qwen_custom_prompt_seq_additional": "Change and transfer the format of image 1 to '{main_prompt}'. Replace all solid magenta areas in image 2. Replace the background with solid gray. The style from image 2 should smoothly continue into the previously magenta areas. Image 3 represents the overall style of the object.", "qwen_guidance_fallback_color": mathutils.Color((1.0, 0.0, 1.0)), "qwen_guidance_background_color": mathutils.Color((1.0, 0.0, 1.0)), "qwen_context_cleanup": False, "qwen_context_cleanup_hue_tolerance": 5.0, "qwen_context_cleanup_value_adjust": 0.0, "qwen_context_fallback_dilation": 1, "qwen_rescale_alignment": True, "qwen_generation_method": "generate", "qwen_refine_use_prev_ref": False, "qwen_refine_use_depth": False, "qwen_timestep_zero_ref": False, "refine_angle_ramp_active": True, "refine_angle_ramp_pos_0": 0.0, "refine_angle_ramp_pos_1": 0.05000000074505806, "visibility_vignette": True, "visibility_vignette_width": 0.15000000596046448, "visibility_vignette_softness": 1.0, "visibility_vignette_blur": False, "refine_feather_ramp_pos_0": 0.0, "refine_feather_ramp_pos_1": 0.6000000238418579, "refine_edge_feather_projection": True, "refine_edge_feather_width": 30, "refine_edge_feather_softness": 1.0, "trellis2_texture_mode": "sdxl", "trellis2_initial_image_arch": "sdxl", "trellis2_camera_count": 8, "trellis2_placement_mode": "normal_weighted", "trellis2_auto_prompts": True, "trellis2_exclude_bottom": True, "trellis2_exclude_bottom_angle": 1.5533000230789185, "trellis2_auto_aspect": "per_camera", "trellis2_occlusion_mode": "none", "trellis2_consider_existing": False, "trellis2_delete_cameras": False, "trellis2_coverage_target": 0.949999988079071, "trellis2_max_auto_cameras": 12, "trellis2_fan_angle": 90.0, "trellis2_resolution": "1024_cascade", "trellis2_vram_mode": "disk_offload", "trellis2_attn_backend": "flash_attn", "trellis2_ss_guidance": 7.5, "trellis2_ss_steps": 12, "trellis2_shape_guidance": 7.5, "trellis2_shape_steps": 12, "trellis2_tex_guidance": 7.5, "trellis2_tex_steps": 12, "trellis2_max_tokens": 49152, "trellis2_texture_size": 4096, "trellis2_decimation": 1000000, "trellis2_remesh": True, "trellis2_post_processing_enabled": True, "trellis2_low_vram": False, "trellis2_bg_removal": "auto", "trellis2_background_color": "black", "trellis2_fill_holes": True, "trellis2_import_scale": 2.0, "trellis2_clamp_elevation": False, "trellis2_max_elevation": 1.2216999530792236, "trellis2_min_elevation": -1.0471975803375244, "trellis2_auto_lighting": True, "use_ipadapter": False, "sequential_ipadapter_regenerate_wo_controlnet": False, "allow_modify_existing_textures": False, "ask_object_prompts": True, "weight_exponent_mask": False, "mask_blocky": False, "architecture_mode": "trellis2", "use_camera_prompts": True, "sg_use_custom_camera_order": False, "apply_bsdf": False, "generation_mode": "standard", "texture_objects": "all", "use_flux_lora": True, "qwen_use_trellis2_style": False, "qwen_trellis2_style_initial_only": False, "trellis2_skip_texture": True, "controlnet_units": [{'unit_type': 'depth', 'model_name': 'controlnet_depth_sdxl.safetensors', 'strength': 0.6000000238418579, 'start_percent': 0.0, 'end_percent': 1.0, 'is_union': False, 'use_union_type': True}], "lora_units": [{'model_name': 'sdxl_lightning_8step_lora.safetensors', 'model_strength': 1.0, 'clip_strength': 1.0}]},
+    "QWEN PRECISE (MODEL + TEXTURE)": {"description": "Uses TRELLIS.2 and Qwen Image Edit to generate a textured mesh. Precise detail when camera overlap is good. Relies on context renders plus the prompt.", "control_after_generate": "fixed", "model_architecture": "qwen_image_edit", "steps": 4, "cfg": 1.0, "sampler": "euler", "scheduler": "simple", "fallback_color": mathutils.Color((0.0, 0.0, 0.0)), "discard_factor": 70.0, "discard_factor_generation_only": True, "discard_factor_after_generation": 90.0, "weight_exponent": 3.0, "weight_exponent_generation_only": False, "weight_exponent_after_generation": 15.0, "view_blend_use_color_match": False, "view_blend_color_match_method": "reinhard", "view_blend_color_match_strength": 1.0, "clip_skip": 1, "auto_rescale": True, "auto_rescale_target_mp": 1.0, "overwrite_material": True, "generation_method": "sequential", "refine_images": False, "refine_steps": 8, "refine_sampler": "dpmpp_2s_ancestral", "refine_scheduler": "sgm_uniform", "denoise": 0.800000011920929, "refine_cfg": 1.5, "refine_prompt": "", "refine_upscale_method": "lanczos", "sequential_smooth": True, "sequential_custom_camera_order": "", "sequential_factor": 0.699999988079071, "sequential_factor_smooth": 0.15000000596046448, "sequential_factor_smooth_2": 1.0, "sequential_ipadapter": False, "sequential_ipadapter_mode": "first", "sequential_desaturate_factor": 0.0, "sequential_contrast_factor": 0.0, "sequential_ipadapter_regenerate": False, "ipadapter_weight_type": "style", "ipadapter_strength": 1.0, "ipadapter_start": 0.0, "ipadapter_end": 1.0, "early_priority": False, "early_priority_strength": 0.5, "differential_diffusion": True, "differential_noise": True, "blur_mask": True, "blur_mask_radius": 1, "blur_mask_sigma": 1.0, "grow_mask_by": 3, "canny_threshold_low": 0, "canny_threshold_high": 80, "qwen_guidance_map_type": "depth", "qwen_voronoi_mode": False, "qwen_use_external_style_image": False, "qwen_external_style_image": "", "qwen_context_render_mode": "REPLACE_STYLE", "qwen_external_style_initial_only": False, "qwen_use_custom_prompts": False, "qwen_custom_prompt_initial": "Change the format of image 1 to '{main_prompt}'", "qwen_custom_prompt_seq_none": "Change and transfer the format of '{main_prompt}' in image 1 to the style from image 2", "qwen_custom_prompt_seq_replace": "Change and transfer the format of image 1 to '{main_prompt}'. Replace all solid magenta areas in image 2. Replace the background with solid gray. The style from image 2 should smoothly continue into the previously magenta areas.", "qwen_custom_prompt_seq_additional": "Change and transfer the format of image 1 to '{main_prompt}'. Replace all solid magenta areas in image 2. Replace the background with solid gray. The style from image 2 should smoothly continue into the previously magenta areas. Image 3 represents the overall style of the object.", "qwen_guidance_fallback_color": mathutils.Color((1.0, 0.0, 1.0)), "qwen_guidance_background_color": mathutils.Color((1.0, 0.0, 1.0)), "qwen_context_cleanup": False, "qwen_context_cleanup_hue_tolerance": 0.0, "qwen_context_cleanup_value_adjust": 0.0, "qwen_context_fallback_dilation": 1, "qwen_rescale_alignment": True, "qwen_generation_method": "generate", "qwen_refine_use_prev_ref": False, "qwen_refine_use_depth": False, "qwen_timestep_zero_ref": False, "refine_angle_ramp_active": True, "refine_angle_ramp_pos_0": 0.0, "refine_angle_ramp_pos_1": 0.05000000074505806, "visibility_vignette": True, "visibility_vignette_width": 0.15000000596046448, "visibility_vignette_softness": 1.0, "visibility_vignette_blur": False, "sg_silhouette_margin": 3, "sg_silhouette_depth": 0.05000000074505806, "sg_silhouette_rays": "4", "refine_feather_ramp_pos_0": 0.0, "refine_feather_ramp_pos_1": 0.6000000238418579, "refine_edge_feather_projection": True, "refine_edge_feather_width": 30, "refine_edge_feather_softness": 1.0, "trellis2_texture_mode": "qwen_image_edit", "trellis2_initial_image_arch": "sdxl", "trellis2_camera_count": 8, "trellis2_placement_mode": "normal_weighted", "trellis2_auto_prompts": True, "trellis2_exclude_bottom": True, "trellis2_exclude_bottom_angle": 1.5533000230789185, "trellis2_auto_aspect": "per_camera", "trellis2_occlusion_mode": "none", "trellis2_consider_existing": False, "trellis2_delete_cameras": False, "trellis2_coverage_target": 0.949999988079071, "trellis2_max_auto_cameras": 12, "trellis2_fan_angle": 90.0, "trellis2_resolution": "1024_cascade", "trellis2_vram_mode": "disk_offload", "trellis2_attn_backend": "flash_attn", "trellis2_seed": 0, "trellis2_ss_guidance": 7.5, "trellis2_ss_steps": 12, "trellis2_shape_guidance": 7.5, "trellis2_shape_steps": 12, "trellis2_tex_guidance": 7.5, "trellis2_tex_steps": 12, "trellis2_max_tokens": 32768, "trellis2_texture_size": 4096, "trellis2_decimation": 1000000, "trellis2_remesh": True, "trellis2_post_processing_enabled": True, "trellis2_low_vram": False, "trellis2_bg_removal": "auto", "trellis2_background_color": "black", "trellis2_fill_holes": True, "trellis2_import_scale": 2.0, "trellis2_clamp_elevation": True, "trellis2_max_elevation": 1.2216999530792236, "trellis2_min_elevation": -1.0471975803375244, "trellis2_auto_lighting": True, "use_ipadapter": False, "sequential_ipadapter_regenerate_wo_controlnet": False, "allow_modify_existing_textures": False, "ask_object_prompts": True, "weight_exponent_mask": False, "mask_blocky": False, "architecture_mode": "trellis2", "use_camera_prompts": True, "sg_use_custom_camera_order": False, "apply_bsdf": False, "generation_mode": "standard", "texture_objects": "all", "use_flux_lora": True, "qwen_use_trellis2_style": True, "qwen_trellis2_style_initial_only": True, "trellis2_skip_texture": True, "controlnet_units": [{'unit_type': 'depth', 'model_name': 'controlnet_depth_sdxl.safetensors', 'strength': 0.6000000238418579, 'start_percent': 0.0, 'end_percent': 1.0, 'is_union': False, 'use_union_type': True}], "lora_units": [{'model_name': 'Qwen-Image-Edit-2509-Lightning-4steps-V1.0-bf16.safetensors', 'model_strength': 1.0, 'clip_strength': 0.0}]},
+    "QWEN SAFE (MODEL + TEXTURE)": {"description": "Uses TRELLIS.2 and Qwen Image Edit to generate a textured mesh. Safer fallback when coverage is limited. Uses TRELLIS.2 input image as sequential style reference for global coherence.", "control_after_generate": "fixed", "model_architecture": "qwen_image_edit", "steps": 4, "cfg": 1.0, "sampler": "euler", "scheduler": "simple", "fallback_color": mathutils.Color((0.0, 0.0, 0.0)), "discard_factor": 70.0, "discard_factor_generation_only": True, "discard_factor_after_generation": 90.0, "weight_exponent": 6.0, "weight_exponent_generation_only": False, "weight_exponent_after_generation": 15.0, "view_blend_use_color_match": False, "view_blend_color_match_method": "reinhard", "view_blend_color_match_strength": 1.0, "clip_skip": 1, "auto_rescale": True, "auto_rescale_target_mp": 1.0, "overwrite_material": True, "generation_method": "sequential", "refine_images": False, "refine_steps": 8, "refine_sampler": "dpmpp_2s_ancestral", "refine_scheduler": "sgm_uniform", "denoise": 0.800000011920929, "refine_cfg": 1.5, "refine_prompt": "", "refine_upscale_method": "lanczos", "sequential_smooth": True, "sequential_custom_camera_order": "", "sequential_factor": 0.699999988079071, "sequential_factor_smooth": 0.15000000596046448, "sequential_factor_smooth_2": 1.0, "sequential_ipadapter": True, "sequential_ipadapter_mode": "trellis2_input", "sequential_desaturate_factor": 0.0, "sequential_contrast_factor": 0.10000000149011612, "sequential_ipadapter_regenerate": False, "ipadapter_weight_type": "style", "ipadapter_strength": 1.0, "ipadapter_start": 0.0, "ipadapter_end": 1.0, "early_priority": False, "early_priority_strength": 0.5, "differential_diffusion": True, "differential_noise": True, "blur_mask": True, "blur_mask_radius": 1, "blur_mask_sigma": 1.0, "grow_mask_by": 3, "canny_threshold_low": 0, "canny_threshold_high": 80, "qwen_guidance_map_type": "depth", "qwen_voronoi_mode": False, "qwen_use_external_style_image": False, "qwen_external_style_image": "", "qwen_context_render_mode": "NONE", "qwen_external_style_initial_only": False, "qwen_use_custom_prompts": False, "qwen_custom_prompt_initial": "Change the format of image 1 to '{main_prompt}'", "qwen_custom_prompt_seq_none": "Change and transfer the format of '{main_prompt}' in image 1 to the style from image 2", "qwen_custom_prompt_seq_replace": "Change and transfer the format of image 1 to '{main_prompt}'. Replace all solid magenta areas in image 2. Replace the background with solid gray. The style from image 2 should smoothly continue into the previously magenta areas.", "qwen_custom_prompt_seq_additional": "Change and transfer the format of image 1 to '{main_prompt}'. Replace all solid magenta areas in image 2. Replace the background with solid gray. The style from image 2 should smoothly continue into the previously magenta areas. Image 3 represents the overall style of the object.", "qwen_guidance_fallback_color": mathutils.Color((1.0, 0.0, 1.0)), "qwen_guidance_background_color": mathutils.Color((1.0, 0.0, 1.0)), "qwen_context_cleanup": False, "qwen_context_cleanup_hue_tolerance": 0.0, "qwen_context_cleanup_value_adjust": 0.0, "qwen_context_fallback_dilation": 1, "qwen_rescale_alignment": True, "qwen_generation_method": "generate", "qwen_refine_use_prev_ref": False, "qwen_refine_use_depth": False, "qwen_timestep_zero_ref": False, "refine_angle_ramp_active": True, "refine_angle_ramp_pos_0": 0.0, "refine_angle_ramp_pos_1": 0.05000000074505806, "visibility_vignette": True, "visibility_vignette_width": 0.15000000596046448, "visibility_vignette_softness": 1.0, "visibility_vignette_blur": False, "sg_silhouette_margin": 3, "sg_silhouette_depth": 0.05000000074505806, "sg_silhouette_rays": "4", "refine_feather_ramp_pos_0": 0.0, "refine_feather_ramp_pos_1": 0.6000000238418579, "refine_edge_feather_projection": True, "refine_edge_feather_width": 30, "refine_edge_feather_softness": 1.0, "trellis2_texture_mode": "qwen_image_edit", "trellis2_initial_image_arch": "sdxl", "trellis2_camera_count": 8, "trellis2_placement_mode": "normal_weighted", "trellis2_auto_prompts": True, "trellis2_exclude_bottom": True, "trellis2_exclude_bottom_angle": 1.5533000230789185, "trellis2_auto_aspect": "per_camera", "trellis2_occlusion_mode": "none", "trellis2_consider_existing": False, "trellis2_delete_cameras": False, "trellis2_coverage_target": 0.949999988079071, "trellis2_max_auto_cameras": 12, "trellis2_fan_angle": 90.0, "trellis2_resolution": "1024_cascade", "trellis2_vram_mode": "disk_offload", "trellis2_attn_backend": "flash_attn", "trellis2_seed": 0, "trellis2_ss_guidance": 7.5, "trellis2_ss_steps": 12, "trellis2_shape_guidance": 7.5, "trellis2_shape_steps": 12, "trellis2_tex_guidance": 7.5, "trellis2_tex_steps": 12, "trellis2_max_tokens": 32768, "trellis2_texture_size": 4096, "trellis2_decimation": 1000000, "trellis2_remesh": True, "trellis2_post_processing_enabled": True, "trellis2_low_vram": False, "trellis2_bg_removal": "auto", "trellis2_background_color": "black", "trellis2_fill_holes": True, "trellis2_import_scale": 2.0, "trellis2_clamp_elevation": True, "trellis2_max_elevation": 1.2216999530792236, "trellis2_min_elevation": -1.0471975803375244, "trellis2_auto_lighting": True, "use_ipadapter": False, "sequential_ipadapter_regenerate_wo_controlnet": False, "allow_modify_existing_textures": False, "ask_object_prompts": True, "weight_exponent_mask": False, "mask_blocky": False, "architecture_mode": "trellis2", "use_camera_prompts": True, "sg_use_custom_camera_order": False, "apply_bsdf": False, "generation_mode": "standard", "texture_objects": "all", "use_flux_lora": True, "qwen_use_trellis2_style": True, "qwen_trellis2_style_initial_only": True, "trellis2_skip_texture": True, "controlnet_units": [{'unit_type': 'depth', 'model_name': 'controlnet_depth_sdxl.safetensors', 'strength': 0.6000000238418579, 'start_percent': 0.0, 'end_percent': 1.0, 'is_union': False, 'use_union_type': True}], "lora_units": [{'model_name': 'Qwen-Image-Edit-2509-Lightning-4steps-V1.0-bf16.safetensors', 'model_strength': 1.0, 'clip_strength': 0.0}]},
+    "QWEN ALT (MODEL + TEXTURE)": {"description": "Uses TRELLIS.2 and Qwen Image Edit to generate a textured mesh. Uses ADDITIONAL context renders with TRELLIS.2 style transfer for consistency. Good general-purpose Qwen pipeline.", "control_after_generate": "fixed", "model_architecture": "qwen_image_edit", "steps": 4, "cfg": 1.0, "sampler": "euler", "scheduler": "simple", "fallback_color": mathutils.Color((0.0, 0.0, 0.0)), "discard_factor": 70.0, "discard_factor_generation_only": True, "discard_factor_after_generation": 90.0, "weight_exponent": 3.0, "weight_exponent_generation_only": False, "weight_exponent_after_generation": 15.0, "view_blend_use_color_match": False, "view_blend_color_match_method": "reinhard", "view_blend_color_match_strength": 1.0, "clip_skip": 1, "auto_rescale": True, "auto_rescale_target_mp": 1.0, "overwrite_material": True, "generation_method": "sequential", "refine_images": False, "refine_steps": 8, "refine_sampler": "dpmpp_2s_ancestral", "refine_scheduler": "sgm_uniform", "denoise": 0.800000011920929, "refine_cfg": 1.5, "refine_prompt": "", "refine_upscale_method": "lanczos", "sequential_smooth": True, "sequential_custom_camera_order": "", "sequential_factor": 0.699999988079071, "sequential_factor_smooth": 0.15000000596046448, "sequential_factor_smooth_2": 1.0, "sequential_ipadapter": False, "sequential_ipadapter_mode": "first", "sequential_desaturate_factor": 0.0, "sequential_contrast_factor": 0.10000000149011612, "sequential_ipadapter_regenerate": False, "ipadapter_weight_type": "style", "ipadapter_strength": 1.0, "ipadapter_start": 0.0, "ipadapter_end": 1.0, "early_priority": True, "early_priority_strength": 0.5, "differential_diffusion": True, "differential_noise": True, "blur_mask": True, "blur_mask_radius": 1, "blur_mask_sigma": 1.0, "grow_mask_by": 3, "canny_threshold_low": 0, "canny_threshold_high": 80, "qwen_guidance_map_type": "depth", "qwen_voronoi_mode": False, "qwen_use_external_style_image": False, "qwen_external_style_image": "", "qwen_context_render_mode": "ADDITIONAL", "qwen_external_style_initial_only": False, "qwen_use_custom_prompts": False, "qwen_custom_prompt_initial": "Change the format of image 1 to '{main_prompt}'", "qwen_custom_prompt_seq_none": "Change and transfer the format of '{main_prompt}' in image 1 to the style from image 2", "qwen_custom_prompt_seq_replace": "Change and transfer the format of image 1 to '{main_prompt}'. Replace all solid magenta areas in image 2. Replace the background with solid gray. The style from image 2 should smoothly continue into the previously magenta areas.", "qwen_custom_prompt_seq_additional": "Change and transfer the format of image 1 to '{main_prompt}'. Replace all solid magenta areas in image 2. Replace the background with solid gray. The style from image 2 should smoothly continue into the previously magenta areas. Image 3 represents the overall style of the object.", "qwen_guidance_fallback_color": mathutils.Color((1.0, 0.0, 1.0)), "qwen_guidance_background_color": mathutils.Color((1.0, 0.0, 1.0)), "qwen_context_cleanup": False, "qwen_context_cleanup_hue_tolerance": 0.0, "qwen_context_cleanup_value_adjust": 0.0, "qwen_context_fallback_dilation": 1, "qwen_rescale_alignment": True, "qwen_generation_method": "generate", "qwen_refine_use_prev_ref": False, "qwen_refine_use_depth": False, "qwen_timestep_zero_ref": False, "refine_angle_ramp_active": True, "refine_angle_ramp_pos_0": 0.0, "refine_angle_ramp_pos_1": 0.05000000074505806, "visibility_vignette": True, "visibility_vignette_width": 0.15000000596046448, "visibility_vignette_softness": 1.0, "visibility_vignette_blur": False, "sg_silhouette_margin": 3, "sg_silhouette_depth": 0.05000000074505806, "sg_silhouette_rays": "4", "refine_feather_ramp_pos_0": 0.0, "refine_feather_ramp_pos_1": 0.6000000238418579, "refine_edge_feather_projection": True, "refine_edge_feather_width": 30, "refine_edge_feather_softness": 1.0, "trellis2_texture_mode": "qwen_image_edit", "trellis2_initial_image_arch": "sdxl", "trellis2_camera_count": 8, "trellis2_placement_mode": "normal_weighted", "trellis2_auto_prompts": True, "trellis2_exclude_bottom": True, "trellis2_exclude_bottom_angle": 1.5533000230789185, "trellis2_auto_aspect": "per_camera", "trellis2_occlusion_mode": "none", "trellis2_consider_existing": False, "trellis2_delete_cameras": False, "trellis2_coverage_target": 0.949999988079071, "trellis2_max_auto_cameras": 12, "trellis2_fan_angle": 90.0, "trellis2_resolution": "1024_cascade", "trellis2_vram_mode": "disk_offload", "trellis2_attn_backend": "flash_attn", "trellis2_seed": 0, "trellis2_ss_guidance": 7.5, "trellis2_ss_steps": 12, "trellis2_shape_guidance": 7.5, "trellis2_shape_steps": 12, "trellis2_tex_guidance": 7.5, "trellis2_tex_steps": 12, "trellis2_max_tokens": 32768, "trellis2_texture_size": 4096, "trellis2_decimation": 1000000, "trellis2_remesh": True, "trellis2_post_processing_enabled": True, "trellis2_low_vram": False, "trellis2_bg_removal": "auto", "trellis2_background_color": "black", "trellis2_fill_holes": True, "trellis2_import_scale": 2.0, "trellis2_clamp_elevation": True, "trellis2_max_elevation": 1.2216999530792236, "trellis2_min_elevation": -1.0471975803375244, "trellis2_auto_lighting": True, "use_ipadapter": False, "sequential_ipadapter_regenerate_wo_controlnet": False, "allow_modify_existing_textures": False, "ask_object_prompts": True, "weight_exponent_mask": False, "mask_blocky": False, "architecture_mode": "trellis2", "use_camera_prompts": True, "sg_use_custom_camera_order": False, "apply_bsdf": False, "generation_mode": "standard", "texture_objects": "all", "use_flux_lora": True, "qwen_use_trellis2_style": True, "qwen_trellis2_style_initial_only": True, "trellis2_skip_texture": True, "controlnet_units": [{'unit_type': 'depth', 'model_name': 'controlnet_depth_sdxl.safetensors', 'strength': 0.6000000238418579, 'start_percent': 0.0, 'end_percent': 1.0, 'is_union': False, 'use_union_type': True}], "lora_units": [{'model_name': 'Qwen-Image-Edit-2509-Lightning-4steps-V1.0-bf16.safetensors', 'model_strength': 1.0, 'clip_strength': 0.0}]},
+    "QWEN VORONOI (MODEL + TEXTURE)": {"description": "Uses TRELLIS.2 and Qwen Image Edit to generate a textured mesh. Voronoi projection with exponent 1000 for hard camera segmentation during generation, then resets to 15 for softer blending.", "control_after_generate": "fixed", "model_architecture": "qwen_image_edit", "steps": 4, "cfg": 1.0, "sampler": "euler", "scheduler": "simple", "fallback_color": mathutils.Color((0.0, 0.0, 0.0)), "discard_factor": 70.0, "discard_factor_generation_only": True, "discard_factor_after_generation": 90.0, "weight_exponent": 1000.0, "weight_exponent_generation_only": True, "weight_exponent_after_generation": 15.0, "view_blend_use_color_match": False, "view_blend_color_match_method": "reinhard", "view_blend_color_match_strength": 1.0, "clip_skip": 1, "auto_rescale": True, "auto_rescale_target_mp": 1.0, "overwrite_material": True, "generation_method": "sequential", "refine_images": False, "refine_steps": 8, "refine_sampler": "dpmpp_2s_ancestral", "refine_scheduler": "sgm_uniform", "denoise": 0.800000011920929, "refine_cfg": 1.5, "refine_prompt": "", "refine_upscale_method": "lanczos", "sequential_smooth": True, "sequential_custom_camera_order": "", "sequential_factor": 0.699999988079071, "sequential_factor_smooth": 0.15000000596046448, "sequential_factor_smooth_2": 1.0, "sequential_ipadapter": False, "sequential_ipadapter_mode": "first", "sequential_desaturate_factor": 0.0, "sequential_contrast_factor": 0.0, "sequential_ipadapter_regenerate": False, "ipadapter_weight_type": "style", "ipadapter_strength": 1.0, "ipadapter_start": 0.0, "ipadapter_end": 1.0, "early_priority": False, "early_priority_strength": 0.5, "differential_diffusion": True, "differential_noise": True, "blur_mask": True, "blur_mask_radius": 1, "blur_mask_sigma": 1.0, "grow_mask_by": 3, "canny_threshold_low": 0, "canny_threshold_high": 80, "qwen_guidance_map_type": "depth", "qwen_voronoi_mode": True, "qwen_use_external_style_image": False, "qwen_external_style_image": "", "qwen_context_render_mode": "REPLACE_STYLE", "qwen_external_style_initial_only": False, "qwen_use_custom_prompts": False, "qwen_custom_prompt_initial": "Change the format of image 1 to '{main_prompt}'", "qwen_custom_prompt_seq_none": "Change and transfer the format of '{main_prompt}' in image 1 to the style from image 2", "qwen_custom_prompt_seq_replace": "Change and transfer the format of image 1 to '{main_prompt}'. Replace all solid magenta areas in image 2. Replace the background with solid gray. The style from image 2 should smoothly continue into the previously magenta areas.", "qwen_custom_prompt_seq_additional": "Change and transfer the format of image 1 to '{main_prompt}'. Replace all solid magenta areas in image 2. Replace the background with solid gray. The style from image 2 should smoothly continue into the previously magenta areas. Image 3 represents the overall style of the object.", "qwen_guidance_fallback_color": mathutils.Color((1.0, 0.0, 1.0)), "qwen_guidance_background_color": mathutils.Color((1.0, 0.0, 1.0)), "qwen_context_cleanup": False, "qwen_context_cleanup_hue_tolerance": 0.0, "qwen_context_cleanup_value_adjust": 0.0, "qwen_context_fallback_dilation": 1, "qwen_rescale_alignment": True, "qwen_generation_method": "generate", "qwen_refine_use_prev_ref": False, "qwen_refine_use_depth": False, "qwen_timestep_zero_ref": False, "refine_angle_ramp_active": True, "refine_angle_ramp_pos_0": 0.0, "refine_angle_ramp_pos_1": 0.05000000074505806, "visibility_vignette": True, "visibility_vignette_width": 0.15000000596046448, "visibility_vignette_softness": 1.0, "visibility_vignette_blur": False, "sg_silhouette_margin": 3, "sg_silhouette_depth": 0.05000000074505806, "sg_silhouette_rays": "4", "refine_feather_ramp_pos_0": 0.0, "refine_feather_ramp_pos_1": 0.6000000238418579, "refine_edge_feather_projection": True, "refine_edge_feather_width": 30, "refine_edge_feather_softness": 1.0, "trellis2_texture_mode": "qwen_image_edit", "trellis2_initial_image_arch": "sdxl", "trellis2_camera_count": 8, "trellis2_placement_mode": "normal_weighted", "trellis2_auto_prompts": True, "trellis2_exclude_bottom": True, "trellis2_exclude_bottom_angle": 1.5533000230789185, "trellis2_auto_aspect": "per_camera", "trellis2_occlusion_mode": "none", "trellis2_consider_existing": False, "trellis2_delete_cameras": False, "trellis2_coverage_target": 0.949999988079071, "trellis2_max_auto_cameras": 12, "trellis2_fan_angle": 90.0, "trellis2_resolution": "1024_cascade", "trellis2_vram_mode": "disk_offload", "trellis2_attn_backend": "flash_attn", "trellis2_seed": 0, "trellis2_ss_guidance": 7.5, "trellis2_ss_steps": 12, "trellis2_shape_guidance": 7.5, "trellis2_shape_steps": 12, "trellis2_tex_guidance": 7.5, "trellis2_tex_steps": 12, "trellis2_max_tokens": 32768, "trellis2_texture_size": 4096, "trellis2_decimation": 1000000, "trellis2_remesh": True, "trellis2_post_processing_enabled": True, "trellis2_low_vram": False, "trellis2_bg_removal": "auto", "trellis2_background_color": "black", "trellis2_fill_holes": True, "trellis2_import_scale": 2.0, "trellis2_clamp_elevation": True, "trellis2_max_elevation": 1.2216999530792236, "trellis2_min_elevation": -1.0471975803375244, "trellis2_auto_lighting": True, "use_ipadapter": False, "sequential_ipadapter_regenerate_wo_controlnet": False, "allow_modify_existing_textures": False, "ask_object_prompts": True, "weight_exponent_mask": False, "mask_blocky": False, "architecture_mode": "trellis2", "use_camera_prompts": True, "sg_use_custom_camera_order": False, "apply_bsdf": False, "generation_mode": "standard", "texture_objects": "all", "use_flux_lora": True, "qwen_use_trellis2_style": True, "qwen_trellis2_style_initial_only": True, "trellis2_skip_texture": True, "controlnet_units": [{'unit_type': 'depth', 'model_name': 'controlnet_depth_sdxl.safetensors', 'strength': 0.6000000238418579, 'start_percent': 0.0, 'end_percent': 1.0, 'is_union': False, 'use_union_type': True}], "lora_units": [{'model_name': 'Qwen-Image-Edit-2509-Lightning-4steps-V1.0-bf16.safetensors', 'model_strength': 1.0, 'clip_strength': 0.0}]},
 }
 
 # Global list of all generation parameter names to check for a preset.
@@ -418,42 +422,87 @@ class StableGenPanel(bpy.types.Panel):
                 action_row.operator("object.test_stable", text="Cancel Texturing", icon="CANCEL")
                 progress_col = layout.column()
 
-                # Compute overall from scene pipeline props + ComfyUI progress
-                phase_start = getattr(scene, 'trellis2_pipeline_phase_start_pct', 65.0)
-                phase_weight = 100.0 - phase_start
-                comfy_progress = getattr(comfy_tex_op, '_progress', 0) / 100.0
-                total_imgs = getattr(comfy_tex_op, '_total_images', 0)
-                cur_img_idx = getattr(comfy_tex_op, '_current_image', 0)
-                if total_imgs > 1:
-                    comfy_overall = (cur_img_idx + comfy_progress) / total_imgs
+                pbr_active = getattr(comfy_tex_op, '_pbr_active', False)
+                if pbr_active:
+                    # PBR decomposition sub-phase
+                    pbr_step = getattr(comfy_tex_op, '_pbr_step', 0)
+                    pbr_total = max(getattr(comfy_tex_op, '_pbr_total_steps', 1), 1)
+                    pbr_cam = getattr(comfy_tex_op, '_pbr_cam', 0)
+                    pbr_cam_total = max(getattr(comfy_tex_op, '_pbr_cam_total', 1), 1)
+                    cam_frac = pbr_cam / pbr_cam_total
+                    stage_text = getattr(comfy_tex_op, '_stage', 'PBR Decomposition')
+
+                    # Bar 1 — Current model (camera progress)
+                    progress_col.progress(text=stage_text, factor=max(0.0, min(cam_frac, 1.0)))
+                    # Bar 2 — PBR step N/M
+                    pbr_factor = max(0.0, min(((pbr_step - 1) + cam_frac) / pbr_total, 1.0))
+                    progress_col.progress(text=f"PBR: Step {pbr_step}/{pbr_total}", factor=pbr_factor)
                 else:
-                    comfy_overall = comfy_progress
-                overall_pct = phase_start + comfy_overall * phase_weight
-                overall_pct = max(0.0, min(overall_pct, 100.0))
+                    # Normal texturing progress
+                    # Compute overall from scene pipeline props + ComfyUI progress
+                    phase_start = getattr(scene, 'trellis2_pipeline_phase_start_pct', 65.0)
+                    phase_weight = 100.0 - phase_start
+                    comfy_progress = getattr(comfy_tex_op, '_progress', 0) / 100.0
+                    total_imgs = getattr(comfy_tex_op, '_total_images', 0)
+                    cur_img_idx = getattr(comfy_tex_op, '_current_image', 0)
+                    if total_imgs > 1:
+                        comfy_overall = (cur_img_idx + comfy_progress) / total_imgs
+                    else:
+                        comfy_overall = comfy_progress
+                    overall_pct = phase_start + comfy_overall * phase_weight
+                    overall_pct = max(0.0, min(overall_pct, 100.0))
 
-                total_phases = getattr(scene, 'trellis2_pipeline_total_phases', 3)
-                # Bar 1 — Overall
-                progress_col.progress(
-                    text=f"Phase {total_phases}/{total_phases}: Texturing ({overall_pct:.0f}%)",
-                    factor=max(0.0, min(overall_pct / 100.0, 1.0))
-                )
-
-                # Bar 2 — Per-image (same as normal ComfyUI bar)
-                stage = getattr(comfy_tex_op, '_stage', 'Generating')
-                img_pct = getattr(comfy_tex_op, '_progress', 0)
-                progress_col.progress(
-                    text=f"{stage} ({img_pct:.0f}%)",
-                    factor=max(0.0, min(img_pct / 100.0, 1.0))
-                )
-
-                # Bar 3 — Image N/M (same as normal ComfyUI overall bar)
-                if total_imgs > 1:
-                    cur_img = min(cur_img_idx + 1, total_imgs)
-                    img_overall = max(0.0, min(comfy_overall, 1.0))
+                    total_phases = getattr(scene, 'trellis2_pipeline_total_phases', 3)
+                    # Bar 1 — Overall
                     progress_col.progress(
-                        text=f"Overall: Image {cur_img}/{total_imgs}",
-                        factor=img_overall
+                        text=f"Phase {total_phases}/{total_phases}: Texturing ({overall_pct:.0f}%)",
+                        factor=max(0.0, min(overall_pct / 100.0, 1.0))
                     )
+
+                    # Bar 2 — Per-image (same as normal ComfyUI bar)
+                    stage = getattr(comfy_tex_op, '_stage', 'Generating')
+                    img_pct = getattr(comfy_tex_op, '_progress', 0)
+                    progress_col.progress(
+                        text=f"{stage} ({img_pct:.0f}%)",
+                        factor=max(0.0, min(img_pct / 100.0, 1.0))
+                    )
+
+                    # Bar 3 — Image N/M (same as normal ComfyUI overall bar)
+                    if total_imgs > 1:
+                        cur_img = min(cur_img_idx + 1, total_imgs)
+                        img_overall = max(0.0, min(comfy_overall, 1.0))
+                        progress_col.progress(
+                            text=f"Overall: Image {cur_img}/{total_imgs}",
+                            factor=img_overall
+                        )
+
+            elif comfy_tex_op and scene.generation_status == 'running':
+                # Standalone ComfyUIGenerate (e.g. Reproject with PBR)
+                # outside the TRELLIS.2 pipeline.
+                action_row.operator("object.test_stable", text="Cancel Generation", icon="CANCEL")
+                progress_col = layout.column()
+                raw_progress = getattr(comfy_tex_op, '_progress', 0) / 100.0
+                pbr_active = getattr(comfy_tex_op, '_pbr_active', False)
+
+                if pbr_active:
+                    pbr_step = getattr(comfy_tex_op, '_pbr_step', 0)
+                    pbr_total = max(getattr(comfy_tex_op, '_pbr_total_steps', 1), 1)
+                    pbr_cam = getattr(comfy_tex_op, '_pbr_cam', 0)
+                    pbr_cam_total = max(getattr(comfy_tex_op, '_pbr_cam_total', 1), 1)
+                    cam_frac = pbr_cam / pbr_cam_total
+                    stage_text = getattr(comfy_tex_op, '_stage', 'PBR Decomposition')
+                    progress_col.progress(text=stage_text, factor=max(0.0, min(cam_frac, 1.0)))
+                    pbr_factor = max(0.0, min(((pbr_step - 1) + cam_frac) / pbr_total, 1.0))
+                    progress_col.progress(text=f"PBR: Step {pbr_step}/{pbr_total}", factor=pbr_factor)
+                else:
+                    progress_text = f"{getattr(comfy_tex_op, '_stage', 'Generating')} ({getattr(comfy_tex_op, '_progress', 0):.0f}%)"
+                    progress_col.progress(text=progress_text, factor=max(0.0, min(raw_progress, 1.0)))
+                    total_images = getattr(comfy_tex_op, '_total_images', 0)
+                    if total_images > 1:
+                        current_image_idx = getattr(comfy_tex_op, '_current_image', 0)
+                        overall_progress = (current_image_idx + max(0.0, min(raw_progress, 1.0))) / total_images if total_images > 0 else 0
+                        cur_img = min(current_image_idx + 1, total_images)
+                        progress_col.progress(text=f"Overall: Image {cur_img}/{total_images}", factor=max(0.0, min(overall_progress, 1.0)))
 
             elif scene.trellis2_generate_from == 'image' and not scene.trellis2_input_image:
                 action_row.operator("object.trellis2_generate", text="Select an image first", icon="ERROR")
@@ -600,6 +649,69 @@ class StableGenPanel(bpy.types.Panel):
             if not is_stock_preset and scene.stablegen_preset != "DEFAULT": 
                  row.operator("stablegen.delete_preset", text="Delete", icon="TRASH")
 
+        # --- Scene Queue ---
+        queue_box = layout.box()
+        queue_col = queue_box.column()
+        wm = context.window_manager
+        show_queue = getattr(wm, 'sg_show_queue', False)
+        queue_header = queue_col.row()
+        queue_header.prop(wm, "sg_show_queue",
+                          text=f"Scene Queue ({len(wm.sg_scene_queue)})",
+                          icon="TRIA_DOWN" if show_queue else "TRIA_RIGHT",
+                          emboss=False)
+        if _queue_processing:
+            status_text = "Exporting GIF..." if _queue_phase == 'exporting_gif' else "Processing..."
+            queue_header.label(text=status_text, icon="SORTTIME")
+
+        if show_queue:
+            queue_content = queue_col.box()
+            row = queue_content.row()
+            row.template_list("SG_UL_SceneQueueList", "",
+                              wm, "sg_scene_queue",
+                              wm, "sg_scene_queue_index",
+                              rows=3)
+            col = row.column(align=True)
+            col.operator("stablegen.queue_move_up", text="", icon="TRIA_UP")
+            col.operator("stablegen.queue_move_down", text="", icon="TRIA_DOWN")
+            col.separator()
+            col.operator("stablegen.queue_remove", text="", icon="REMOVE")
+
+            btn_row = queue_content.row(align=True)
+            btn_row.operator("stablegen.queue_add", text="Add Scene", icon="ADD")
+            btn_row.operator("stablegen.queue_clear", text="Clear", icon="TRASH")
+            btn_row.operator("stablegen.queue_open_result", text="Open Result", icon="FILE_BLEND")
+
+            process_row = queue_content.row()
+            if _queue_processing:
+                process_row.alert = True
+                process_row.operator("stablegen.queue_process", text="Cancel Queue", icon="CANCEL")
+            else:
+                process_row.operator("stablegen.queue_process", text="Process Queue", icon="PLAY")
+                process_row.enabled = len(wm.sg_scene_queue) > 0
+
+            # ── GIF Export settings ──
+            gif_box = queue_content.box()
+            gif_row = gif_box.row()
+            gif_row.prop(wm, "sg_queue_gif_export", text="Export Orbit GIF/MP4")
+            if getattr(wm, 'sg_queue_gif_export', False):
+                gif_col = gif_box.column(align=True)
+                row = gif_col.row(align=True)
+                row.prop(wm, "sg_queue_gif_duration")
+                row.prop(wm, "sg_queue_gif_fps")
+                row = gif_col.row(align=True)
+                row.prop(wm, "sg_queue_gif_resolution")
+                row.prop(wm, "sg_queue_gif_samples")
+                gif_col.prop(wm, "sg_queue_gif_engine")
+                gif_col.prop(wm, "sg_queue_gif_interpolation")
+                gif_col.separator()
+                gif_col.prop(wm, "sg_queue_gif_use_hdri")
+                if getattr(wm, 'sg_queue_gif_use_hdri', False):
+                    gif_col.prop(wm, "sg_queue_gif_hdri_path")
+                    gif_col.prop(wm, "sg_queue_gif_hdri_strength")
+                    gif_col.prop(wm, "sg_queue_gif_hdri_rotation")
+                    gif_col.prop(wm, "sg_queue_gif_env_mode")
+                gif_col.prop(wm, "sg_queue_gif_shadow_plane")
+                gif_col.prop(wm, "sg_queue_gif_denoiser")
 
         # --- Main Parameters section ---
         if not hasattr(scene, 'show_generation_params'): 
@@ -658,10 +770,10 @@ class StableGenPanel(bpy.types.Panel):
                 split.label(text="Texture Mode:")
                 split.prop(scene, "trellis2_texture_mode", text="")
 
-                # Prompt + native/none: show initial-image architecture & checkpoint
+                # Prompt + native: show initial-image architecture & checkpoint
                 _prompt_native = (
                     scene.trellis2_generate_from == 'prompt'
-                    and trellis2_tex_mode in ('native', 'none')
+                    and trellis2_tex_mode == 'native'
                 )
                 if _prompt_native:
                     split = params_container.split(factor=0.5)
@@ -1885,6 +1997,15 @@ class ApplyPreset(bpy.types.Operator):
         if preset in PRESETS:
             values = PRESETS[preset]
             
+            # Apply architecture_mode first so dynamic enums that
+            # depend on it (e.g. sequential_ipadapter_mode) are valid
+            # when their values are set in the main loop.
+            if "architecture_mode" in values and hasattr(context.scene, "architecture_mode"):
+                try:
+                    setattr(context.scene, "architecture_mode", values["architecture_mode"])
+                except (TypeError, AttributeError):
+                    pass
+
             # Apply regular parameters
             skipped = []
             for key, value in values.items():
@@ -2069,3 +2190,793 @@ class DeletePreset(bpy.types.Operator):
         else:
             self.report({'WARNING'}, "Preset not found.")
             return {'CANCELLED'}
+
+
+# =====================================================================
+# Scene Queue System
+# =====================================================================
+# Allows users to queue multiple Blender scenes for unattended batch
+# processing.  Each queued scene is processed in order — the manager
+# switches to the scene, invokes the appropriate generation operator
+# (TRELLIS.2 or standard texturing), waits for completion, optionally
+# saves a .blend copy, then advances to the next item.
+
+_queue_timer = None          # Reference to the active timer callback
+_queue_processing = False    # Global flag: queue is being processed
+_queue_current_idx = 0       # Index of the currently-processing item
+_queue_phase = 'idle'        # 'idle' | 'switching' | 'running' | 'settling' | 'waiting_texturing' | 'exporting_gif'
+_queue_settle_deadline = 0.0 # monotonic time after which 'settling' may finish
+_queue_force_reload = False  # Force re-open of the .blend on next idle tick (for retries)
+_queue_texturing_seen = False  # Set True once generation_status='running' is observed during settling
+_QUEUE_MAX_RETRIES = 3       # how many times a failed item is retried
+
+
+class SG_UL_SceneQueueList(bpy.types.UIList):
+    """UIList for the scene generation queue."""
+    bl_idname = "SG_UL_SceneQueueList"
+
+    def draw_item(self, context, layout, data, item, icon, active_data, active_property, index):
+        if self.layout_type in {'DEFAULT', 'COMPACT'}:
+            row = layout.row(align=True)
+
+            # Label (or scene name as fallback)
+            display = item.label if item.label else item.scene_name
+            row.label(text=display, icon='SCENE_DATA')
+
+            # Status icon + retry indicator
+            if item.status == 'done':
+                row.label(text="", icon='CHECKMARK')
+            elif item.status == 'error':
+                retry_txt = f"x{item.retries}" if item.retries else ""
+                row.label(text=retry_txt, icon='ERROR')
+            elif item.status == 'processing':
+                retry_txt = f"#{item.retries + 1}" if item.retries else ""
+                row.label(text=retry_txt, icon='SORTTIME')
+        elif self.layout_type == 'GRID':
+            layout.alignment = 'CENTER'
+            display = item.label if item.label else item.scene_name
+            layout.label(text=display, icon='SCENE_DATA')
+
+
+def _persist_queue():
+    """Write the queue + processing state to a JSON file on disk."""
+    try:
+        from . import _sg_queue_save
+        _sg_queue_save(
+            processing=_queue_processing,
+            current_idx=_queue_current_idx,
+            phase=_queue_phase,
+        )
+    except Exception:
+        pass
+
+
+def _resume_queue(idx):
+    """Resume queue processing from *idx* (called after a .blend switch).
+
+    This is invoked by ``_sg_queue_load()`` in ``__init__.py`` when the
+    JSON file indicates that processing was active.
+    """
+    global _queue_processing, _queue_current_idx, _queue_phase, _queue_timer
+
+    _queue_processing = True
+    _queue_current_idx = idx
+    _queue_phase = 'idle'
+
+    # Avoid duplicate timers
+    if _queue_timer is not None:
+        try:
+            bpy.app.timers.unregister(_queue_tick)
+        except Exception:
+            pass
+
+    _queue_timer = bpy.app.timers.register(_queue_tick, first_interval=1.5)
+    print(f"[Queue] Resumed processing from item {idx}")
+    _tag_redraw()
+
+
+class SceneQueueAdd(bpy.types.Operator):
+    """Add the current scene to the generation queue.
+
+    Saves a *copy* of the current .blend into ``<output_dir>/queue_jobs/``.
+    The queue item points at that copy so the original file is never
+    modified by queue processing.
+    """
+    bl_idname = "stablegen.queue_add"
+    bl_label = "Add to Queue"
+    bl_description = "Snapshot the current .blend and add the scene to the batch queue"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    item_label: bpy.props.StringProperty(
+        name="Name",
+        description="A short label for this queue entry",
+        default="",
+    )  # type: ignore
+
+    @classmethod
+    def poll(cls, context):
+        return not _queue_processing
+
+    def invoke(self, context, event):
+        scene = context.scene
+        cur_prompt = getattr(scene, 'comfyui_prompt', '')
+        # Pre-fill with a truncated prompt
+        self.item_label = (cur_prompt[:40]) if cur_prompt else scene.name
+        return context.window_manager.invoke_props_dialog(self, width=350)
+
+    def draw(self, context):
+        layout = self.layout
+        layout.prop(self, "item_label")
+
+    def execute(self, context):
+        import time
+
+        wm = context.window_manager
+        scene = context.scene
+        scene_name = scene.name
+        cur_prompt = getattr(scene, 'comfyui_prompt', '')
+        cur_neg = getattr(scene, 'comfyui_negative_prompt', '')
+        label = self.item_label.strip() or scene_name
+
+        # Determine queue_jobs directory
+        prefs = context.preferences.addons.get(__package__)
+        output_dir = ''
+        if prefs:
+            output_dir = bpy.path.abspath(prefs.preferences.output_dir or '')
+        if not output_dir or not os.path.isdir(output_dir):
+            self.report({'ERROR'}, "Set an Output Directory in StableGen preferences first.")
+            return {'CANCELLED'}
+
+        jobs_dir = os.path.join(output_dir, "queue_jobs")
+        os.makedirs(jobs_dir, exist_ok=True)
+
+        # Build filename from the user-provided label
+        timestamp = time.strftime("%Y%m%d_%H%M%S")
+        safe_label = label.replace(" ", "_").replace("/", "_").replace("\\", "_")
+        # Truncate to keep filenames reasonable
+        safe_label = safe_label[:60]
+        copy_name = f"{safe_label}_{timestamp}.blend"
+        copy_path = os.path.join(jobs_dir, copy_name)
+
+        # Save a copy — current file stays active & untouched
+        try:
+            bpy.ops.wm.save_as_mainfile(filepath=copy_path, copy=True)
+        except Exception as e:
+            self.report({'ERROR'}, f"Failed to save queue snapshot: {e}")
+            return {'CANCELLED'}
+
+        new_item = wm.sg_scene_queue.add()
+        new_item.label = label
+        new_item.scene_name = scene_name
+        new_item.blend_file = copy_path
+        new_item.prompt = cur_prompt
+        new_item.negative_prompt = cur_neg
+        new_item.status = 'pending'
+        wm.sg_scene_queue_index = len(wm.sg_scene_queue) - 1
+        _persist_queue()
+
+        self.report({'INFO'}, f"Queued '{label}' ({copy_name})")
+        return {'FINISHED'}
+
+
+class SceneQueueRemove(bpy.types.Operator):
+    """Remove the selected scene from the queue"""
+    bl_idname = "stablegen.queue_remove"
+    bl_label = "Remove from Queue"
+
+    @classmethod
+    def poll(cls, context):
+        wm = context.window_manager
+        return not _queue_processing and len(wm.sg_scene_queue) > 0
+
+    def invoke(self, context, event):
+        wm = context.window_manager
+        idx = wm.sg_scene_queue_index
+        if 0 <= idx < len(wm.sg_scene_queue):
+            item = wm.sg_scene_queue[idx]
+            display = item.label or item.scene_name
+            # Show a confirmation popup
+            return context.window_manager.invoke_confirm(self, event,
+                message=f"Remove '{display}' from queue?",
+                confirm_text="Remove")
+        return {'CANCELLED'}
+
+    def execute(self, context):
+        wm = context.window_manager
+        idx = wm.sg_scene_queue_index
+        if 0 <= idx < len(wm.sg_scene_queue):
+            item = wm.sg_scene_queue[idx]
+            display = item.label or item.scene_name
+            # Delete the snapshot .blend if the item hasn't been processed
+            if item.status != 'done' and item.blend_file:
+                try:
+                    blend_path = item.blend_file
+                    if os.path.isfile(blend_path):
+                        os.remove(blend_path)
+                        print(f"[Queue] Deleted snapshot: {blend_path}")
+                except Exception as e:
+                    print(f"[Queue] Could not delete snapshot: {e}")
+            wm.sg_scene_queue.remove(idx)
+            wm.sg_scene_queue_index = min(idx, len(wm.sg_scene_queue) - 1)
+            _persist_queue()
+            self.report({'INFO'}, f"Removed '{display}' from queue.")
+        return {'FINISHED'}
+
+
+class SceneQueueClear(bpy.types.Operator):
+    """Clear the entire queue"""
+    bl_idname = "stablegen.queue_clear"
+    bl_label = "Clear Queue"
+
+    @classmethod
+    def poll(cls, context):
+        wm = context.window_manager
+        return not _queue_processing and len(wm.sg_scene_queue) > 0
+
+    def invoke(self, context, event):
+        wm = context.window_manager
+        count = len(wm.sg_scene_queue)
+        return context.window_manager.invoke_confirm(self, event,
+            message=f"Clear all {count} item(s) from queue?",
+            confirm_text="Clear All")
+
+    def execute(self, context):
+        wm = context.window_manager
+        # Delete snapshot .blends for unprocessed items
+        for item in wm.sg_scene_queue:
+            if item.status != 'done' and item.blend_file:
+                try:
+                    if os.path.isfile(item.blend_file):
+                        os.remove(item.blend_file)
+                        print(f"[Queue] Deleted snapshot: {item.blend_file}")
+                except Exception as e:
+                    print(f"[Queue] Could not delete snapshot: {e}")
+        wm.sg_scene_queue.clear()
+        wm.sg_scene_queue_index = 0
+        _persist_queue()
+        self.report({'INFO'}, "Queue cleared.")
+        return {'FINISHED'}
+
+
+class SceneQueueMoveUp(bpy.types.Operator):
+    """Move the selected queue item up"""
+    bl_idname = "stablegen.queue_move_up"
+    bl_label = "Move Up"
+
+    @classmethod
+    def poll(cls, context):
+        wm = context.window_manager
+        return not _queue_processing and wm.sg_scene_queue_index > 0
+
+    def execute(self, context):
+        wm = context.window_manager
+        idx = wm.sg_scene_queue_index
+        wm.sg_scene_queue.move(idx, idx - 1)
+        wm.sg_scene_queue_index -= 1
+        return {'FINISHED'}
+
+
+class SceneQueueMoveDown(bpy.types.Operator):
+    """Move the selected queue item down"""
+    bl_idname = "stablegen.queue_move_down"
+    bl_label = "Move Down"
+
+    @classmethod
+    def poll(cls, context):
+        wm = context.window_manager
+        return (not _queue_processing
+                and wm.sg_scene_queue_index < len(wm.sg_scene_queue) - 1)
+
+    def execute(self, context):
+        wm = context.window_manager
+        idx = wm.sg_scene_queue_index
+        wm.sg_scene_queue.move(idx, idx + 1)
+        wm.sg_scene_queue_index += 1
+        return {'FINISHED'}
+
+
+class SceneQueueOpenResult(bpy.types.Operator):
+    """Open the processed .blend copy for the selected queue item"""
+    bl_idname = "stablegen.queue_open_result"
+    bl_label = "Open Result"
+    bl_description = "Open the .blend snapshot of the selected processed queue item"
+
+    @classmethod
+    def poll(cls, context):
+        wm = context.window_manager
+        idx = wm.sg_scene_queue_index
+        if idx < 0 or idx >= len(wm.sg_scene_queue):
+            return False
+        item = wm.sg_scene_queue[idx]
+        return item.status == 'done' and item.blend_file and os.path.isfile(item.blend_file)
+
+    def execute(self, context):
+        wm = context.window_manager
+        item = wm.sg_scene_queue[wm.sg_scene_queue_index]
+        filepath = item.blend_file
+        try:
+            bpy.ops.wm.open_mainfile(filepath=filepath)
+        except Exception as e:
+            self.report({'ERROR'}, f"Failed to open result: {e}")
+            return {'CANCELLED'}
+        return {'FINISHED'}
+
+
+class SceneQueueProcess(bpy.types.Operator):
+    """Start or cancel batch processing of the scene queue"""
+    bl_idname = "stablegen.queue_process"
+    bl_label = "Process Queue"
+    bl_description = "Process all queued scenes sequentially"
+
+    @classmethod
+    def poll(cls, context):
+        wm = context.window_manager
+        if _queue_processing:
+            return True  # Allow clicking to cancel
+        return len(wm.sg_scene_queue) > 0
+
+    def execute(self, context):
+        global _queue_processing, _queue_timer, _queue_current_idx, _queue_phase
+
+        if _queue_processing:
+            # Cancel
+            _queue_processing = False
+            _queue_phase = 'idle'
+            _persist_queue()  # Save stopped state so load_post won't auto-resume
+            print("[Queue] Cancelled by user.")
+            self.report({'WARNING'}, "Queue processing cancelled.")
+            return {'FINISHED'}
+
+        # Reset statuses
+        wm = context.window_manager
+        for item in wm.sg_scene_queue:
+            if item.status != 'done':
+                item.status = 'pending'
+
+        _queue_processing = True
+        _queue_current_idx = 0
+        _queue_phase = 'idle'
+
+        # Find first pending item
+        while _queue_current_idx < len(wm.sg_scene_queue):
+            if wm.sg_scene_queue[_queue_current_idx].status == 'pending':
+                break
+            _queue_current_idx += 1
+
+        if _queue_current_idx >= len(wm.sg_scene_queue):
+            _queue_processing = False
+            self.report({'INFO'}, "No pending items in queue.")
+            return {'FINISHED'}
+
+        # Start the timer-based queue driver
+        _queue_timer = bpy.app.timers.register(_queue_tick, first_interval=0.5)
+        self.report({'INFO'}, f"Queue processing started ({len(wm.sg_scene_queue)} items).")
+        return {'FINISHED'}
+
+
+def _queue_tick():
+    """Timer callback that drives queue advancement.
+
+    Returns:
+        float: Seconds until next tick, or None to stop.
+    """
+    import time as _time
+    global _queue_processing, _queue_current_idx, _queue_phase, _queue_timer
+    global _queue_settle_deadline, _queue_force_reload, _queue_texturing_seen
+
+    if not _queue_processing:
+        _queue_phase = 'idle'
+        _queue_timer = None
+        _tag_redraw()
+        return None  # Stop timer
+
+    wm = bpy.context.window_manager
+    queue = wm.sg_scene_queue
+
+    if _queue_current_idx >= len(queue):
+        # All done
+        _queue_processing = False
+        _queue_phase = 'idle'
+        _queue_timer = None
+        print("[Queue] All items processed.")
+        _tag_redraw()
+        return None
+
+    item = queue[_queue_current_idx]
+
+    # ── Phase: IDLE → switch to the next scene and start ──
+    if _queue_phase == 'idle':
+        # Verify the item belongs to the currently-open .blend
+        current_blend = bpy.data.filepath or "<unsaved>"
+        need_open = (item.blend_file and item.blend_file != current_blend)
+
+        # On retry, always re-open the .blend to restore clean state
+        is_retry_reload = False
+        if _queue_force_reload and item.blend_file:
+            need_open = True
+            is_retry_reload = True
+            _queue_force_reload = False
+
+        if need_open:
+            # Need to open a different .blend file
+            target = item.blend_file
+            if not os.path.isfile(target):
+                print(f"[Queue] Blend file not found: {target} — skipping.")
+                item.status = 'error'
+                _queue_current_idx += 1
+                _persist_queue()
+                _tag_redraw()
+                return 0.5
+
+            # Save current file first so nothing is lost — BUT skip save
+            # on retry reloads; we want to discard dirty state and revert
+            # to the original clean copy.
+            if bpy.data.filepath and not is_retry_reload:
+                try:
+                    bpy.ops.wm.save_mainfile()
+                except Exception as e:
+                    print(f"[Queue] Warning: could not save current file: {e}")
+
+            # Persist state so the load_post handler can resume after
+            # the new file is opened.
+            _persist_queue()
+            print(f"[Queue] Opening '{os.path.basename(target)}' for item "
+                  f"'{item.scene_name}'...")
+
+            # Open the target file.  After this call the current WM
+            # data (and our timer) are gone — the load_post handler
+            # will restore the queue and call _resume_queue().
+            try:
+                bpy.ops.wm.open_mainfile(filepath=target)
+            except Exception as e:
+                print(f"[Queue] Failed to open '{target}': {e}")
+                # Can't recover gracefully — stop processing
+                _queue_processing = False
+                _queue_phase = 'idle'
+                _queue_timer = None
+                _persist_queue()
+                _tag_redraw()
+            return None  # Stop timer — load_post will restart it
+
+        scene_ref = bpy.data.scenes.get(item.scene_name)
+        if not scene_ref:
+            print(f"[Queue] Scene '{item.scene_name}' not found — skipping.")
+            item.status = 'error'
+            _queue_current_idx += 1
+            _tag_redraw()
+            return 0.5  # Try next immediately
+
+        # Switch to the target scene
+        bpy.context.window.scene = scene_ref
+        item.status = 'processing'
+        _queue_phase = 'switching'
+        print(f"[Queue] Switched to scene '{item.scene_name}'")
+        _tag_redraw()
+        return 1.0  # Give Blender a moment to digest
+
+    # ── Phase: SWITCHING → invoke the generation operator ──
+    if _queue_phase == 'switching':
+        scene_ref = bpy.context.scene
+        arch_mode = getattr(scene_ref, 'architecture_mode', 'sdxl')
+
+        # Clear the error flag before invoking
+        scene_ref.sg_last_gen_error = False
+
+        # Disable interactive elements for unattended batch
+        if arch_mode == 'trellis2':
+            scene_ref.trellis2_preview_gallery_enabled = False
+
+        try:
+            if arch_mode == 'trellis2':
+                bpy.ops.object.trellis2_generate('INVOKE_DEFAULT')
+                print(f"[Queue] Invoked trellis2_generate for '{item.scene_name}'")
+            else:
+                # Standard texturing — select all cameras first
+                bpy.ops.object.select_all(action='DESELECT')
+                for obj in scene_ref.objects:
+                    if obj.type == 'CAMERA':
+                        obj.select_set(True)
+                bpy.ops.object.test_stable('INVOKE_DEFAULT')
+                print(f"[Queue] Invoked test_stable for '{item.scene_name}'")
+            _queue_phase = 'running'
+        except Exception as e:
+            print(f"[Queue] Failed to invoke operator for '{item.scene_name}': {e}")
+            _queue_handle_failure(item, str(e))
+        _tag_redraw()
+        return 1.5
+
+    # ── Phase: RUNNING → poll for completion ──
+    if _queue_phase == 'running':
+        from .generator import Trellis2Generate, ComfyUIGenerate
+        scene_ref = bpy.context.scene
+        arch_mode = getattr(scene_ref, 'architecture_mode', 'sdxl')
+
+        if arch_mode == 'trellis2':
+            trellis_running = Trellis2Generate._is_running
+            gen_err = getattr(scene_ref, 'sg_last_gen_error', False)
+            tex_mode = getattr(scene_ref, 'trellis2_texture_mode', 'native')
+            pipe_active = getattr(scene_ref, 'trellis2_pipeline_active', False)
+            gen_status = getattr(scene_ref, 'generation_status', 'idle')
+            # TRELLIS.2: wait for the operator to finish
+            if trellis_running:
+                return 1.0  # Still running
+
+            # Check if Trellis2 itself failed
+            if gen_err:
+                print(f"[Queue] TRELLIS.2 generation failed for '{item.scene_name}'")
+                _queue_handle_failure(item, "TRELLIS.2 generation failed")
+                return 0.5
+
+            # Trellis2Generate finished — enter settling phase to wait for
+            # _schedule_texture_generation / _deferred_generate to fire.
+            if tex_mode in ('sdxl', 'flux1', 'qwen_image_edit', 'flux2_klein'):
+                _queue_phase = 'settling'
+                _queue_settle_deadline = _time.monotonic() + 15.0  # generous: server may need VRAM flush
+                _queue_texturing_seen = False
+                print(f"[Queue] TRELLIS.2 mesh done, entering settling (tex_mode='{tex_mode}'), "
+                      f"waiting for texturing to start (up to 15 s)...")
+            else:
+                # Native texture mode — mesh only, done
+                print(f"[Queue] tex_mode='{tex_mode}' — no diffusion texturing, finishing item")
+                _queue_finish_item(item)
+            return 1.0
+        else:
+            # Standard texturing
+            gen_status = getattr(scene_ref, 'generation_status', 'idle')
+            if gen_status in ('idle', 'waiting'):
+                if getattr(scene_ref, 'sg_last_gen_error', False):
+                    _queue_handle_failure(item, "Generation failed")
+                    return 0.5
+                _queue_finish_item(item)
+                return 0.5
+            return 1.0  # Still running
+
+    # ── Phase: SETTLING → wait for TRELLIS.2 chained texturing to start ──
+    if _queue_phase == 'settling':
+        scene_ref = bpy.context.scene
+        pipeline_active = getattr(scene_ref, 'trellis2_pipeline_active', False)
+        gen_status = getattr(scene_ref, 'generation_status', 'idle')
+        if pipeline_active or gen_status == 'running':
+            _queue_texturing_seen = True
+
+        if _queue_texturing_seen:
+            if gen_status == 'running' or pipeline_active:
+                # Texturing is actively running — transition
+                _queue_phase = 'waiting_texturing'
+                print(f"[Queue] Texturing confirmed running, waiting for completion...")
+                return 1.0
+            else:
+                # Texturing already completed (fast finish during settling)
+                if getattr(scene_ref, 'sg_last_gen_error', False):
+                    _queue_handle_failure(item, "Texturing failed")
+                else:
+                    _queue_finish_item(item)
+                return 0.5
+
+        # Texturing hasn't appeared yet — wait until deadline
+        if _time.monotonic() >= _queue_settle_deadline:
+            print(f"[Queue] Texturing never started for '{item.scene_name}' (timeout)")
+            _queue_handle_failure(item, "Diffusion texturing failed to start")
+            return 0.5
+
+        return 1.0  # Still settling
+
+    # ── Phase: WAITING_TEXTURING → poll chained ComfyUIGenerate ──
+    if _queue_phase == 'waiting_texturing':
+        scene_ref = bpy.context.scene
+        gen_status = getattr(scene_ref, 'generation_status', 'idle')
+        pipeline_active = getattr(scene_ref, 'trellis2_pipeline_active', False)
+        gen_err = getattr(scene_ref, 'sg_last_gen_error', False)
+
+        if gen_status in ('idle', 'waiting') and not pipeline_active:
+            if getattr(scene_ref, 'sg_last_gen_error', False):
+                _queue_handle_failure(item, "Texturing failed")
+                return 0.5
+            _queue_finish_item(item)
+            return 0.5
+        return 1.0  # Still running
+
+    # ── Phase: EXPORTING_GIF → poll ExportOrbitGIF completion ──
+    if _queue_phase == 'exporting_gif':
+        from .render_tools import ExportOrbitGIF
+        if ExportOrbitGIF._rendering:
+            return 1.0  # Still rendering frames
+        # GIF export finished — save and advance
+        print("[Queue] GIF export completed")
+        _queue_save_and_advance(item)
+        return 0.5
+
+    return 1.0
+
+
+def _queue_handle_failure(item, reason):
+    """Handle a failed queue item — retry if under the limit, else mark as error."""
+    global _queue_current_idx, _queue_phase, _queue_processing, _queue_timer
+    global _queue_force_reload
+
+    item.retries += 1
+    if item.retries < _QUEUE_MAX_RETRIES:
+        item.status = 'pending'
+        _queue_phase = 'idle'  # Will re-attempt on next tick
+        _queue_force_reload = True  # Force re-open to restore clean .blend state
+        print(f"[Queue] Retrying '{item.label or item.scene_name}' "
+              f"(attempt {item.retries + 1}/{_QUEUE_MAX_RETRIES}): {reason}")
+    else:
+        item.status = 'error'
+        print(f"[Queue] '{item.label or item.scene_name}' failed after "
+              f"{_QUEUE_MAX_RETRIES} attempts: {reason}")
+        _queue_current_idx += 1
+        # Find next pending
+        wm = bpy.context.window_manager
+        while _queue_current_idx < len(wm.sg_scene_queue):
+            if wm.sg_scene_queue[_queue_current_idx].status == 'pending':
+                break
+            _queue_current_idx += 1
+        if _queue_current_idx >= len(wm.sg_scene_queue):
+            _queue_processing = False
+            _queue_phase = 'idle'
+            _queue_timer = None
+            print("[Queue] All queue items processed.")
+        else:
+            _queue_phase = 'idle'
+    _persist_queue()
+    _tag_redraw()
+
+
+def _queue_finish_item(item):
+    """Mark the current queue item as done and advance to the next.
+
+    If GIF export is enabled, starts the orbit GIF export first and
+    defers the save+advance to the ``exporting_gif`` phase handler.
+    """
+    global _queue_current_idx, _queue_phase, _queue_processing, _queue_timer
+
+    item.status = 'done'
+    print(f"[Queue] Finished '{item.scene_name}'")
+
+    # ── Optional GIF export before saving ──
+    wm = bpy.context.window_manager
+    if getattr(wm, 'sg_queue_gif_export', False):
+        if _queue_start_gif_export():
+            _queue_phase = 'exporting_gif'
+            print("[Queue] GIF export started — deferring save until export finishes")
+            _tag_redraw()
+            return  # save + advance will happen in the 'exporting_gif' handler
+
+    # No GIF (or export failed to start) — save and advance immediately
+    _queue_save_and_advance(item)
+
+
+def _queue_start_gif_export():
+    """Try to invoke ExportOrbitGIF with current WM settings.
+
+    Returns True if the operator was successfully started.
+    """
+    from .render_tools import ExportOrbitGIF
+
+    scene = bpy.context.scene
+
+    # ── Always use the first camera (Camera_0 or lowest-numbered) ──
+    cameras = sorted(
+        [o for o in scene.objects if o.type == 'CAMERA'],
+        key=lambda c: c.name,
+    )
+    if not cameras:
+        print("[Queue] No cameras in scene — skipping GIF export")
+        return False
+    scene.camera = cameras[0]
+    print(f"[Queue] GIF export: using camera '{cameras[0].name}'")
+
+    # ── Ensure an active mesh/empty exists (poll requirement) ──
+    vl = bpy.context.view_layer
+    active = vl.objects.active
+    if not active or active.type not in {'MESH', 'EMPTY'}:
+        for obj in scene.objects:
+            if obj.type == 'MESH':
+                vl.objects.active = obj
+                obj.select_set(True)
+                print(f"[Queue] GIF export: activated mesh '{obj.name}'")
+                break
+        else:
+            print("[Queue] No mesh in scene — skipping GIF export")
+            return False
+
+    wm = bpy.context.window_manager
+
+    # ── Explicitly apply HDRI from the queue's file path (if set) ──
+    hdri_path = getattr(wm, 'sg_queue_gif_hdri_path', '')
+    hdri_strength = getattr(wm, 'sg_queue_gif_hdri_strength', 1.0)
+    use_hdri = getattr(wm, 'sg_queue_gif_use_hdri', False)
+
+    if use_hdri and hdri_path:
+        import os as _os
+        resolved = bpy.path.abspath(hdri_path)
+        if _os.path.isfile(resolved):
+            try:
+                bpy.ops.object.add_hdri(hdri_path=resolved,
+                                        strength=hdri_strength)
+                print(f"[Queue] Applied HDRI: {resolved}  "
+                      f"(strength={hdri_strength:.2f})")
+            except Exception as e:
+                print(f"[Queue] AddHDRI failed: {e}  — continuing anyway")
+        else:
+            print(f"[Queue] HDRI file not found: {resolved}  — skipping HDRI")
+
+    kwargs = {
+        'duration':                getattr(wm, 'sg_queue_gif_duration', 5.0),
+        'frame_rate':              getattr(wm, 'sg_queue_gif_fps', 24),
+        'resolution_percentage':   getattr(wm, 'sg_queue_gif_resolution', 50),
+        'samples':                 getattr(wm, 'sg_queue_gif_samples', 32),
+        'engine':                  getattr(wm, 'sg_queue_gif_engine', 'CYCLES'),
+        'interpolation':           getattr(wm, 'sg_queue_gif_interpolation', 'LINEAR'),
+        'use_hdri':                use_hdri,
+        'hdri_rotation':           getattr(wm, 'sg_queue_gif_hdri_rotation', 0.0),
+        'env_mode':                getattr(wm, 'sg_queue_gif_env_mode', 'FIXED'),
+        'use_shadow_plane':        getattr(wm, 'sg_queue_gif_shadow_plane', False),
+        'use_denoiser':            getattr(wm, 'sg_queue_gif_denoiser', True),
+    }
+
+    # Build a temp_override so the modal operator has a proper window
+    window = bpy.context.window
+    if not window:
+        for w in wm.windows:
+            window = w
+            break
+    if not window:
+        print("[Queue] No window available — skipping GIF export")
+        return False
+
+    try:
+        with bpy.context.temp_override(window=window):
+            result = bpy.ops.object.export_orbit_gif('EXEC_DEFAULT', **kwargs)
+        if 'RUNNING_MODAL' in result:
+            print(f"[Queue] GIF export started successfully")
+            return True
+        print(f"[Queue] GIF export returned {result} — skipping")
+        return False
+    except Exception as e:
+        print(f"[Queue] GIF export failed to start: {e}")
+        import traceback; traceback.print_exc()
+        return False
+
+
+def _queue_save_and_advance(item):
+    """Save the current .blend and advance to the next queue item."""
+    global _queue_current_idx, _queue_phase, _queue_processing, _queue_timer
+
+    # Save the result in-place on the queue copy .blend
+    if bpy.data.filepath:
+        try:
+            bpy.ops.wm.save_mainfile()
+            print(f"[Queue] Saved result: {bpy.data.filepath}")
+        except Exception as e:
+            print(f"[Queue] Save warning: {e}")
+
+    # Advance to next pending item
+    _queue_current_idx += 1
+    wm = bpy.context.window_manager
+    while _queue_current_idx < len(wm.sg_scene_queue):
+        if wm.sg_scene_queue[_queue_current_idx].status == 'pending':
+            break
+        _queue_current_idx += 1
+
+    if _queue_current_idx >= len(wm.sg_scene_queue):
+        _queue_processing = False
+        _queue_phase = 'idle'
+        _queue_timer = None
+        print("[Queue] All queue items processed.")
+    else:
+        _queue_phase = 'idle'  # Will switch to next scene on next tick
+
+    _persist_queue()
+    _tag_redraw()
+
+
+def _tag_redraw():
+    """Redraw all 3D viewports so the queue UI updates."""
+    try:
+        for window in bpy.context.window_manager.windows:
+            for area in window.screen.areas:
+                area.tag_redraw()
+    except Exception:
+        pass

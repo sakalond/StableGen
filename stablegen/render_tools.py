@@ -160,6 +160,8 @@ def render_edge_feather_mask(context, to_export, camera, camera_index, feather_w
     original_transparent = context.scene.render.film_transparent
     original_samples = context.scene.cycles.samples
     original_view_transform = bpy.context.scene.view_settings.view_transform
+    original_use_compositing = context.scene.render.use_compositing
+    original_filepath = context.scene.render.filepath
 
     world = context.scene.world
     if not world:
@@ -232,6 +234,7 @@ def render_edge_feather_mask(context, to_export, camera, camera_index, feather_w
     view_layer.use_pass_environment = True
 
     # ── Compositor ──────────────────────────────────────────────────────────
+    context.scene.render.use_compositing = True
     context.scene.use_nodes = True
     node_tree = get_compositor_node_tree(context.scene)
     comp_nodes = node_tree.nodes
@@ -285,6 +288,8 @@ def render_edge_feather_mask(context, to_export, camera, camera_index, feather_w
     context.scene.render.film_transparent = original_transparent
     context.scene.cycles.samples = original_samples
     bpy.context.scene.view_settings.view_transform = original_view_transform
+    context.scene.render.use_compositing = original_use_compositing
+    context.scene.render.filepath = original_filepath
     world.use_nodes = original_use_nodes
     world.color = original_color
     if original_bg_node_color is not None and world.node_tree:
@@ -701,6 +706,8 @@ def export_emit_image(context, to_export, camera_id=None, bg_color=(0.5, 0.5, 0.
         # Store original settings
         original_engine = context.scene.render.engine
         original_film_transparent = context.scene.render.film_transparent
+        original_use_compositing = context.scene.render.use_compositing
+        original_filepath = context.scene.render.filepath
         original_use_nodes = world.use_nodes
         original_color = world.color.copy()
         original_bg_node_color = None
@@ -754,6 +761,7 @@ def export_emit_image(context, to_export, camera_id=None, bg_color=(0.5, 0.5, 0.
 
 
         # Set up compositor nodes
+        context.scene.render.use_compositing = True
         context.scene.use_nodes = True
         node_tree = get_compositor_node_tree(context.scene)
         nodes = node_tree.nodes
@@ -812,6 +820,8 @@ def export_emit_image(context, to_export, camera_id=None, bg_color=(0.5, 0.5, 0.
         # Restore original settings
         context.scene.render.engine = original_engine
         context.scene.render.film_transparent = original_film_transparent
+        context.scene.render.use_compositing = original_use_compositing
+        context.scene.render.filepath = original_filepath
         world.use_nodes = original_use_nodes
         world.color = original_color
         if original_bg_node_color is not None and world.node_tree:
@@ -902,6 +912,7 @@ def export_render(context, camera_id=None, output_dir=None, filename=None):
     }
     original_render_filepath = context.scene.render.filepath
     original_image_settings = context.scene.render.image_settings.file_format
+    original_use_compositing = context.scene.render.use_compositing
 
     # Switch to WORKBENCH render engine and configure settings
     context.scene.render.engine = 'BLENDER_WORKBENCH'
@@ -916,6 +927,7 @@ def export_render(context, camera_id=None, output_dir=None, filename=None):
     render_layer.use_pass_combined = True
 
     # Set up output nodes (Compositor setup remains the same)
+    context.scene.render.use_compositing = True
     context.scene.use_nodes = True
     node_tree = get_compositor_node_tree(context.scene)
     nodes = node_tree.nodes
@@ -956,6 +968,7 @@ def export_render(context, camera_id=None, output_dir=None, filename=None):
     context.scene.display.shading.color_type = original_workbench_settings['color_type']
     context.scene.render.filepath = original_render_filepath
     context.scene.render.image_settings.file_format = original_image_settings
+    context.scene.render.use_compositing = original_use_compositing
 
 
     print(f"Render saved to: {os.path.join(output_dir, output_file)}0001.png") # Blender adds frame number
@@ -2769,6 +2782,17 @@ class AddCameras(bpy.types.Operator):
             layout.prop(self, "consider_existing")
 
     def draw_callback(self, context):
+        # Guard against operator being freed while draw handler is still registered
+        try:
+            _ = self._occ_phase  # probe attribute access
+        except ReferenceError:
+            # Operator freed — remove the dangling draw handler
+            if AddCameras._draw_handle:
+                bpy.types.SpaceView3D.draw_handler_remove(
+                    AddCameras._draw_handle, 'WINDOW')
+                AddCameras._draw_handle = None
+            return
+
         # ── Occlusion progress display ───────────────────────────────────
         if self._occ_phase:
             font_id = 0
@@ -2907,7 +2931,11 @@ class AddCameras(bpy.types.Operator):
         # only the manual modes (orbit_ring, fan_from_camera) need this.
         if is_auto_mode:
             # Placeholder – auto branch overrides center_location from verts
-            center_location = context.region_data.view_location.copy()
+            rv3d = getattr(context, 'region_data', None)
+            if rv3d is not None:
+                center_location = rv3d.view_location.copy()
+            else:
+                center_location = mathutils.Vector((0.0, 0.0, 0.0))
         elif self.center_type == 'object':
             obj = context.object
             cursor_loc = context.scene.cursor.location.copy()
@@ -2918,14 +2946,21 @@ class AddCameras(bpy.types.Operator):
             context.scene.cursor.location = cursor_loc
             center_location = obj.matrix_world.translation + obj.matrix_world.to_3x3() @ (center_location - obj.matrix_world.translation)
         else:
-            center_location = context.region_data.view_location.copy()
+            rv3d = getattr(context, 'region_data', None)
+            if rv3d is not None:
+                center_location = rv3d.view_location.copy()
+            else:
+                center_location = mathutils.Vector((0.0, 0.0, 0.0))
 
         # --- Set or create reference camera ---
         self._initial_camera = context.scene.camera
         using_viewport_ref = False
         if not self._initial_camera and not is_auto_mode:
             # Manual modes: create a camera from the viewport as Camera_0
-            rv3d = context.region_data
+            rv3d = getattr(context, 'region_data', None)
+            if rv3d is None:
+                self.report({'ERROR'}, "No 3D viewport available for camera placement")
+                return {'CANCELLED'}
             cam_data = bpy.data.cameras.new(name='Camera_0')
             cam_obj = bpy.data.objects.new('Camera_0', cam_data)
             context.collection.objects.link(cam_obj)
@@ -5826,41 +5861,58 @@ class ExportOrbitGIF(bpy.types.Operator):
                 break
 
         if env_tex is None:
-            # No HDRI world set up — create a procedural sky fallback
-            print("[StableGen] Orbit GIF: No HDRI found, creating sky fallback")
-            tree.nodes.clear()
+            # No HDRI world set up — create a *separate* procedural sky world
+            # so the original world node tree is never destroyed.
+            print("[StableGen] Orbit GIF: No HDRI found, creating sky fallback "
+                  "(original world preserved)")
+            fallback_world = bpy.data.worlds.new("SG_OrbitSkyFallback")
+            fallback_world.use_nodes = True
+            fb_tree = fallback_world.node_tree
+            fb_tree.nodes.clear()
 
-            tex_coord = tree.nodes.new("ShaderNodeTexCoord")
+            tex_coord = fb_tree.nodes.new("ShaderNodeTexCoord")
             tex_coord.location = (-800, 300)
 
-            mapping = tree.nodes.new("ShaderNodeMapping")
+            mapping = fb_tree.nodes.new("ShaderNodeMapping")
             mapping.location = (-600, 300)
             mapping.inputs["Rotation"].default_value[2] = self.hdri_rotation
             self._env_mapping_node = mapping
 
-            sky_tex = tree.nodes.new("ShaderNodeTexSky")
+            sky_tex = fb_tree.nodes.new("ShaderNodeTexSky")
             sky_tex.location = (-300, 300)
-            sky_tex.sky_type = 'NISHITA'
-            sky_tex.sun_elevation = math.radians(30)
-            sky_tex.sun_rotation = math.radians(45)
+            # Set sky type — Blender 5.x replaced 'NISHITA' with new names
+            for sky_type in ('NISHITA', 'HOSEK_WILKIE', 'PREETHAM'):
+                try:
+                    sky_tex.sky_type = sky_type
+                    break
+                except TypeError:
+                    continue
+            # Sun attributes vary by sky type / version
+            try:
+                sky_tex.sun_elevation = math.radians(30)
+                sky_tex.sun_rotation = math.radians(45)
+            except AttributeError:
+                pass
 
-            bg_node = tree.nodes.new("ShaderNodeBackground")
+            bg_node = fb_tree.nodes.new("ShaderNodeBackground")
             bg_node.location = (0, 300)
 
-            output_node = tree.nodes.new("ShaderNodeOutputWorld")
+            output_node = fb_tree.nodes.new("ShaderNodeOutputWorld")
             output_node.location = (200, 300)
 
-            tree.links.new(tex_coord.outputs["Generated"],
+            fb_tree.links.new(tex_coord.outputs["Generated"],
                            mapping.inputs["Vector"])
-            tree.links.new(mapping.outputs["Vector"],
+            fb_tree.links.new(mapping.outputs["Vector"],
                            sky_tex.inputs["Vector"])
-            tree.links.new(sky_tex.outputs["Color"],
+            fb_tree.links.new(sky_tex.outputs["Color"],
                            bg_node.inputs["Color"])
-            tree.links.new(bg_node.outputs["Background"],
+            fb_tree.links.new(bg_node.outputs["Background"],
                            output_node.inputs["Surface"])
 
-            # Track that we created the fallback so cleanup can remove it
+            # Swap the scene world to the fallback; original is stored for restore
+            context.scene.world = fallback_world
             self._original_world_data['created_fallback'] = True
+            self._original_world_data['fallback_world'] = fallback_world
             return
 
         # ── Inject Mapping node before the Environment Texture ────────
@@ -6059,6 +6111,23 @@ class ExportOrbitGIF(bpy.types.Operator):
         render = scene.render
         cycles = scene.cycles # Get cycles settings
 
+        # When called via EXEC_DEFAULT (e.g. from the queue) invoke()
+        # is skipped, so initialise paths / temp dir here if needed.
+        if not self._temp_dir:
+            try:
+                revision_dir = get_dir_path(context, "revision")
+                os.makedirs(revision_dir, exist_ok=True)
+                self._output_path = os.path.join(revision_dir, "orbit.gif")
+                self._output_path_mp4 = os.path.join(revision_dir, "orbit.mp4")
+            except Exception as e:
+                self.report({'ERROR'}, f"Could not determine output directory: {e}")
+                return {'CANCELLED'}
+            try:
+                self._temp_dir = tempfile.mkdtemp(prefix="blender_gif_")
+            except Exception as e:
+                self.report({'ERROR'}, f"Could not create temporary directory: {e}")
+                return {'CANCELLED'}
+
         # Store Initial Settings
         self._initial_settings = {
             'frame_start': scene.frame_start,
@@ -6135,6 +6204,7 @@ class ExportOrbitGIF(bpy.types.Operator):
 
         # Start Rendering
         self._rendering = True
+        ExportOrbitGIF._rendering = True   # class-level flag for external polling
         self._cancelled = False # Reset cancellation flag
         self._frame_paths.clear() # Clear list for new render
         self._handle_complete = bpy.app.handlers.render_complete.append(self.render_complete_handler)
@@ -6284,48 +6354,61 @@ class ExportOrbitGIF(bpy.types.Operator):
         if self._original_world_data:
             try:
                 world = self._original_world_data['world_ref']
-                if world and world.name in bpy.data.worlds:
-                    # Remove HDRI animation keyframes
+
+                if self._original_world_data.get('created_fallback'):
+                    # We swapped in a separate fallback world — restore original
+                    fallback_world = self._original_world_data.get(
+                        'fallback_world')
+
+                    # Clean up animation data on the fallback world
+                    if (fallback_world and fallback_world.node_tree
+                            and fallback_world.node_tree.animation_data):
+                        action = fallback_world.node_tree.animation_data.action
+                        if action and action.name in bpy.data.actions:
+                            bpy.data.actions.remove(action)
+                        fallback_world.node_tree.animation_data_clear()
+
+                    # Restore the original world
+                    if world and world.name in bpy.data.worlds:
+                        bpy.context.scene.world = world
+                    # Remove the temporary fallback world datablock
+                    if (fallback_world
+                            and fallback_world.name in bpy.data.worlds):
+                        bpy.data.worlds.remove(fallback_world)
+                elif world and world.name in bpy.data.worlds:
+                    # Remove HDRI animation keyframes on the original world
                     if world.node_tree and world.node_tree.animation_data:
                         action = world.node_tree.animation_data.action
                         if action and action.name in bpy.data.actions:
                             bpy.data.actions.remove(action)
                         world.node_tree.animation_data_clear()
 
-                    if self._original_world_data.get('created_fallback'):
-                        # We created a whole sky fallback — restore original
-                        world.use_nodes = self._original_world_data['use_nodes']
-                        world.color = self._original_world_data['color']
-                        if not self._original_world_data['use_nodes']:
-                            if world.node_tree:
-                                world.node_tree.nodes.clear()
-                    else:
-                        # We injected SG_OrbitMapping + SG_OrbitTexCoord
-                        # into the existing tree.  Remove them and restore
-                        # the original vector link.
-                        tree = world.node_tree
-                        if tree:
-                            # Find the env tex and restore its vector input
-                            env_tex = None
-                            for node in tree.nodes:
-                                if node.type == 'TEX_ENVIRONMENT':
-                                    env_tex = node
-                                    break
+                    # We injected SG_OrbitMapping + SG_OrbitTexCoord
+                    # into the existing tree.  Remove them and restore
+                    # the original vector link.
+                    tree = world.node_tree
+                    if tree:
+                        # Find the env tex and restore its vector input
+                        env_tex = None
+                        for node in tree.nodes:
+                            if node.type == 'TEX_ENVIRONMENT':
+                                env_tex = node
+                                break
 
-                            orig_socket = self._original_world_data.get(
-                                'env_vec_from_socket')
-                            if env_tex and orig_socket:
-                                tree.links.new(orig_socket,
-                                               env_tex.inputs["Vector"])
-                            elif env_tex:
-                                # Had no vector link originally — just remove
-                                for link in list(env_tex.inputs["Vector"].links):
-                                    tree.links.remove(link)
+                        orig_socket = self._original_world_data.get(
+                            'env_vec_from_socket')
+                        if env_tex and orig_socket:
+                            tree.links.new(orig_socket,
+                                           env_tex.inputs["Vector"])
+                        elif env_tex:
+                            # Had no vector link originally — just remove
+                            for link in list(env_tex.inputs["Vector"].links):
+                                tree.links.remove(link)
 
-                            # Remove injected nodes
-                            for name in ("SG_OrbitMapping", "SG_OrbitTexCoord"):
-                                if name in tree.nodes:
-                                    tree.nodes.remove(tree.nodes[name])
+                        # Remove injected nodes
+                        for name in ("SG_OrbitMapping", "SG_OrbitTexCoord"):
+                            if name in tree.nodes:
+                                tree.nodes.remove(tree.nodes[name])
             except Exception as e:
                 print(f"Warning: Could not restore world environment: {e}")
             self._original_world_data = None
@@ -6333,6 +6416,7 @@ class ExportOrbitGIF(bpy.types.Operator):
 
 
         self._rendering = False # Ensure rendering flag is reset
+        ExportOrbitGIF._rendering = False  # class-level flag for external polling
         self._cancelled = False # Reset cancellation flag
 
         # Clean up temporary directory if it exists

@@ -325,6 +325,30 @@ _PATCH_TRELLIS_UNLOAD_TEX_REPLACE = (
     '            print(f"[TRELLIS2] Texture pipeline offloaded", file=sys.stderr)\n'
 )
 
+# Patch for stages.py: clean up IPC tensor files from previous generations
+# inside _save_to_disk so they don't accumulate and fill the disk.
+_PATCH_TRELLIS_TEMP_CLEANUP_ANCHOR = (
+    "def _save_to_disk(data, prefix):\n"
+    "    path = os.path.join(_get_temp_dir(), f'{prefix}_{uuid.uuid4().hex[:8]}.pt')\n"
+    "    torch.save(data, path)\n"
+    "    return {'_tensor_file': path}"
+)
+
+_PATCH_TRELLIS_TEMP_CLEANUP_REPLACE = (
+    "def _save_to_disk(data, prefix):\n"
+    "    import glob as _glob\n"
+    "    temp_dir = _get_temp_dir()\n"
+    "    # StableGen patch: clean up files from previous generations\n"
+    "    for _old in _glob.glob(os.path.join(temp_dir, f'{prefix}_*.pt')):\n"
+    "        try:\n"
+    "            os.remove(_old)\n"
+    "        except OSError:\n"
+    "            pass\n"
+    "    path = os.path.join(temp_dir, f'{prefix}_{uuid.uuid4().hex[:8]}.pt')\n"
+    "    torch.save(data, path)\n"
+    "    return {'_tensor_file': path}"
+)
+
 # --- Configuration: Dependencies Data ---
 # Sizes are in MB.
 DEPENDENCIES: Dict[str, Dict[str, Any]] = {
@@ -590,6 +614,13 @@ DEPENDENCIES: Dict[str, Dict[str, Any]] = {
                 "marker": '_unregister_from_comfy_env(model, f"texture/',
                 "anchor": _PATCH_TRELLIS_UNLOAD_TEX_ANCHOR,
                 "patch": _PATCH_TRELLIS_UNLOAD_TEX_REPLACE,
+                "mode": "replace",
+            },
+            {
+                "file": "nodes/trellis_utils/stages.py",
+                "marker": "# StableGen patch: clean up files from previous generations",
+                "anchor": _PATCH_TRELLIS_TEMP_CLEANUP_ANCHOR,
+                "patch": _PATCH_TRELLIS_TEMP_CLEANUP_REPLACE,
                 "mode": "replace",
             },
         ]

@@ -625,6 +625,7 @@ class ComfyUIGenerate(bpy.types.Operator):
 
         
         context.scene.generation_status = 'running'
+        context.scene.sg_last_gen_error = False
         ComfyUIGenerate._is_running = True
 
         print("Executing ComfyUI Generation")
@@ -673,6 +674,7 @@ class ComfyUIGenerate(bpy.types.Operator):
         if not self._cameras:
             self.report({'ERROR'}, "No cameras found in the scene.")
             context.scene.generation_status = 'idle'
+            context.scene.sg_last_gen_error = True
             ComfyUIGenerate._is_running = False
             return {'CANCELLED'}
         # Sort cameras by name
@@ -719,6 +721,7 @@ class ComfyUIGenerate(bpy.types.Operator):
         if not controlnet_units and not (context.scene.use_flux_lora and context.scene.model_architecture == 'flux1') and context.scene.model_architecture != 'flux2_klein':
             self.report({'ERROR'}, "At least one ControlNet unit is required to run the operator.")
             context.scene.generation_status = 'idle'
+            context.scene.sg_last_gen_error = True
             ComfyUIGenerate._is_running = False
             return {'CANCELLED'}
         
@@ -739,6 +742,7 @@ class ComfyUIGenerate(bpy.types.Operator):
             if not self._to_texture:
                 self.report({'ERROR'}, "No mesh objects selected for texturing.")
                 context.scene.generation_status = 'idle'
+                context.scene.sg_last_gen_error = True
                 ComfyUIGenerate._is_running = False
                 return {'CANCELLED'}
         else: # all
@@ -757,6 +761,7 @@ class ComfyUIGenerate(bpy.types.Operator):
             if not has_buffer and len(obj.data.uv_layers) >= 8:
                 self.report({'ERROR'}, "Not enough UV map slots. Please remove at least 1 UV map to free a slot for the projection buffer.")
                 context.scene.generation_status = 'idle'
+                context.scene.sg_last_gen_error = True
                 ComfyUIGenerate._is_running = False
                 return {'CANCELLED'}
 
@@ -927,6 +932,7 @@ class ComfyUIGenerate(bpy.types.Operator):
                     if self._error == "'25'" or self._error == "'111'" or self._error == "'5'":
                         # Probably canceled by user, quietly return
                         context.scene.generation_status = 'idle'
+                        context.scene.sg_last_gen_error = True
                         self.report({'WARNING'}, "Generation cancelled.")
                         _sg_restore_square_display(context.scene)
                         _sg_ensure_crop_overlay()
@@ -939,6 +945,7 @@ class ComfyUIGenerate(bpy.types.Operator):
                     _sg_restore_label_overlay()
                     remove_empty_dirs(context)
                     context.scene.generation_status = 'idle'
+                    context.scene.sg_last_gen_error = True
                     return {'CANCELLED'}
                 if not context.scene.generation_mode == 'project_only':
                     self.report({'INFO'}, "Generation complete.")
@@ -999,6 +1006,7 @@ class ComfyUIGenerate(bpy.types.Operator):
                 _sg_ensure_crop_overlay()
                 _sg_restore_label_overlay()
                 context.scene.generation_status = 'idle'
+                context.scene.sg_last_gen_error = False
                 # Clear output directories which are not needed anymore
                 addon_prefs = context.preferences.addons[__package__].preferences
                 # Save blend file in the output directory if enabled
@@ -1394,6 +1402,7 @@ class ComfyUIGenerate(bpy.types.Operator):
                             # Get info for the previous render and mask
                             render_info = self._get_uploaded_image_info(context, "inpaint", subtype="render", camera_id=self._current_image)
                             mask_info = self._get_uploaded_image_info(context, "inpaint", subtype="visibility", camera_id=self._current_image)
+
                             if context.scene.model_architecture == 'flux1':
                                 image = self.workflow_manager.refine_flux(context, controlnet_info=controlnet_info, render_info=render_info, mask_info=mask_info, ipadapter_ref_info=ipadapter_ref_info)
                             elif context.scene.model_architecture == 'qwen_image_edit':
@@ -1413,7 +1422,9 @@ class ComfyUIGenerate(bpy.types.Operator):
                             image = self.workflow_manager.generate(context, controlnet_info=controlnet_info, ipadapter_ref_info=ipadapter_ref_info)
 
                     if image == {"error": "conn_failed"}:
-                        return # Error message already set
+                        if not self._error:
+                            self._error = "Connection to ComfyUI server failed."
+                        return # Error message set
 
                     if (context.scene.model_architecture in ('qwen_image_edit', 'flux2_klein') and
                             context.scene.generation_method == 'sequential' and
@@ -1433,7 +1444,7 @@ class ComfyUIGenerate(bpy.types.Operator):
                     with open(image_path, 'wb') as f:
                         f.write(image)
 
-                        
+                    
                     # Use hack to re-generate the image using IPAdapter to match IPAdapter style
                     if camera_id == 0 and (context.scene.generation_method == 'sequential' or context.scene.generation_method == 'separate' or context.scene.generation_method in ('refine', 'local_edit'))\
                             and context.scene.sequential_ipadapter and context.scene.sequential_ipadapter_regenerate and not context.scene.use_ipadapter and context.scene.sequential_ipadapter_mode == 'first':
@@ -2924,6 +2935,8 @@ class ComfyUIGenerate(bpy.types.Operator):
         original_engine = bpy.context.scene.render.engine
         original_view_transform = bpy.context.scene.view_settings.view_transform
         original_film_transparent = bpy.context.scene.render.film_transparent
+        original_use_compositing = bpy.context.scene.render.use_compositing
+        original_filepath = bpy.context.scene.render.filepath
 
         # Set animation frame to 1
         bpy.context.scene.frame_set(1)
@@ -2949,7 +2962,8 @@ class ComfyUIGenerate(bpy.types.Operator):
         # Enable depth pass in the render settings
         view_layer.use_pass_z = True
 
-        # Use the compositor to save the depth pass
+        # Enable compositor pipeline (may have been disabled by prior GIF export)
+        bpy.context.scene.render.use_compositing = True
         bpy.context.scene.use_nodes = True
         node_tree = get_compositor_node_tree(bpy.context.scene)
         nodes = node_tree.nodes
@@ -2995,6 +3009,8 @@ class ComfyUIGenerate(bpy.types.Operator):
         bpy.context.scene.render.engine = original_engine
         bpy.context.scene.view_settings.view_transform = original_view_transform
         bpy.context.scene.render.film_transparent = original_film_transparent
+        bpy.context.scene.render.use_compositing = original_use_compositing
+        bpy.context.scene.render.filepath = original_filepath
         view_layer.use_pass_z = original_pass_z
 
     def export_normal(self, context, camera_id=None):
@@ -3021,10 +3037,13 @@ class ComfyUIGenerate(bpy.types.Operator):
         original_engine = bpy.context.scene.render.engine
         original_view_transform = bpy.context.scene.view_settings.view_transform
         original_film_transparent = bpy.context.scene.render.film_transparent
+        original_use_compositing = bpy.context.scene.render.use_compositing
+        original_filepath = bpy.context.scene.render.filepath
 
         bpy.context.scene.render.engine = get_eevee_engine_id()
         bpy.context.scene.view_settings.view_transform = 'Raw'
         bpy.context.scene.render.film_transparent = True
+        bpy.context.scene.render.use_compositing = True
         bpy.context.scene.use_nodes = True
 
         # Clear existing nodes.
@@ -3063,6 +3082,8 @@ class ComfyUIGenerate(bpy.types.Operator):
         bpy.context.scene.render.engine = original_engine
         bpy.context.scene.view_settings.view_transform = original_view_transform
         bpy.context.scene.render.film_transparent = original_film_transparent
+        bpy.context.scene.render.use_compositing = original_use_compositing
+        bpy.context.scene.render.filepath = original_filepath
 
         view_layer.use_pass_normal = original_pass_normal
 
@@ -3708,6 +3729,7 @@ class Trellis2Generate(bpy.types.Operator):
                 return {'CANCELLED'}
 
         Trellis2Generate._is_running = True
+        context.scene.sg_last_gen_error = False
         self._error = None
         self._glb_data = None
         self._progress = 0.0
@@ -3725,7 +3747,7 @@ class Trellis2Generate(bpy.types.Operator):
 
         # 3-tier progress init
         has_txt2img = (gen_from == 'prompt')
-        has_texturing = (tex_mode in ('sdxl', 'flux1', 'qwen_image_edit'))
+        has_texturing = (tex_mode in ('sdxl', 'flux1', 'qwen_image_edit', 'flux2_klein'))
         if has_txt2img and has_texturing:
             self._total_phases = 3
             self._phase_layout = 'txt2img+trellis+texturing'
@@ -3852,15 +3874,18 @@ class Trellis2Generate(bpy.types.Operator):
         # User cancelled — exit silently (no error toast)
         if was_cancelled:
             context.scene.generation_status = 'idle'
+            context.scene.sg_last_gen_error = True
             return {'FINISHED'}
 
         if self._error:
             self.report({'ERROR'}, f"TRELLIS.2 error: {self._error}")
+            context.scene.sg_last_gen_error = True
             return {'CANCELLED'}
 
         if self._glb_data is None or (isinstance(self._glb_data, dict) and "error" in self._glb_data):
             error_msg = self._glb_data.get("error", "Unknown error") if isinstance(self._glb_data, dict) else "No data received"
             self.report({'ERROR'}, f"TRELLIS.2 failed: {error_msg}")
+            context.scene.sg_last_gen_error = True
             return {'CANCELLED'}
 
         # Surface mesh-corruption warning to the user (set by workflows.py
@@ -3935,7 +3960,7 @@ class Trellis2Generate(bpy.types.Operator):
                 self._setup_studio_lighting(context, target_bu)
 
             # --- Phase 3: If diffusion texturing, auto-place cameras + start generation ---
-            if tex_mode in ('sdxl', 'flux1', 'qwen_image_edit'):
+            if tex_mode in ('sdxl', 'flux1', 'qwen_image_edit', 'flux2_klein'):
                 # Place cameras NOW (while operator context is still valid)
                 camera_count = getattr(context.scene, 'trellis2_camera_count', 8)
                 imported_objects = [obj for obj in context.selected_objects]
@@ -3950,6 +3975,11 @@ class Trellis2Generate(bpy.types.Operator):
                 # consistent reference direction for sorting and auto-prompts.
                 # TRELLIS.2 always imports meshes in standard orientation so the
                 # viewport should match.
+                # Find the 3D viewport area + WINDOW region so add_cameras
+                # gets a full context (region_data etc.) even when invoked
+                # from a timer-driven modal callback.
+                _v3d_area = None
+                _v3d_region = None
                 for area in context.screen.areas:
                     if area.type == 'VIEW_3D':
                         for space in area.spaces:
@@ -3961,6 +3991,11 @@ class Trellis2Generate(bpy.types.Operator):
                                         (0.7071068, 0.7071068, 0.0, 0.0)
                                     )
                                     rv3d.view_perspective = 'PERSP'
+                        _v3d_area = area
+                        for reg in area.regions:
+                            if reg.type == 'WINDOW':
+                                _v3d_region = reg
+                                break
                         break
 
                 try:
@@ -3985,8 +4020,14 @@ class Trellis2Generate(bpy.types.Operator):
                         _cam_kwargs['max_auto_cameras'] = getattr(context.scene, 'trellis2_max_auto_cameras', 12)
                     if _pm == 'fan_from_camera':
                         _cam_kwargs['fan_angle'] = getattr(context.scene, 'trellis2_fan_angle', 90.0)
-                    bpy.ops.object.add_cameras(**_cam_kwargs)
-                    print(f"[TRELLIS2] Placed {camera_count} cameras ({_pm})")
+
+                    # Use temp_override so add_cameras gets proper region_data
+                    if _v3d_area and _v3d_region:
+                        with bpy.context.temp_override(area=_v3d_area, region=_v3d_region):
+                            bpy.ops.object.add_cameras(**_cam_kwargs)
+                    else:
+                        bpy.ops.object.add_cameras(**_cam_kwargs)
+
                 except Exception as cam_err:
                     print(f"[TRELLIS2] Warning: Camera placement failed: {cam_err}")
                     traceback.print_exc()
@@ -4062,9 +4103,9 @@ class Trellis2Generate(bpy.types.Operator):
                     print(f"[TRELLIS2] Pre-texturing flush warning: {flush_err}")
 
                 bpy.ops.object.select_all(action='DESELECT')
-                for obj in bpy.context.scene.objects:
-                    if obj.type == 'CAMERA':
-                        obj.select_set(True)
+                scene_cams = [obj for obj in bpy.context.scene.objects if obj.type == 'CAMERA']
+                for obj in scene_cams:
+                    obj.select_set(True)
 
                 bpy.ops.object.test_stable('INVOKE_DEFAULT')
                 print("[TRELLIS2] Texture generation started")

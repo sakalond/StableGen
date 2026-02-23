@@ -1,6 +1,7 @@
 """ This script registers the addon. """
 import bpy # pylint: disable=import-error
 from .stablegen import StableGenPanel, ApplyPreset, SavePreset, DeletePreset, get_preset_items, update_parameters, ResetQwenPrompt
+from .stablegen import SG_UL_SceneQueueList, SceneQueueAdd, SceneQueueRemove, SceneQueueClear, SceneQueueMoveUp, SceneQueueMoveDown, SceneQueueOpenResult, SceneQueueProcess
 from .render_tools import BakeTextures, AddCameras, CloneCamera, MirrorCamera, ToggleCameraLabels, SwitchMaterial, ExportOrbitGIF, ExportForGameEngine, CollectCameraPrompts, CameraPromptItem, CameraOrderItem, SG_UL_CameraOrderList, SyncCameraOrder, MoveCameraOrder, ApplyCameraOrderPreset
 from .debug_tools import debug_classes as _debug_classes
 from .utils import AddHDRI, ApplyModifiers, CurvesToMesh
@@ -48,6 +49,14 @@ classes = [
     Regenerate,
     MirrorReproject,
     Trellis2Generate,
+    SG_UL_SceneQueueList,
+    SceneQueueAdd,
+    SceneQueueRemove,
+    SceneQueueClear,
+    SceneQueueMoveUp,
+    SceneQueueMoveDown,
+    SceneQueueOpenResult,
+    SceneQueueProcess,
 ]
 
 # Global caches for model lists fetched via API
@@ -1441,6 +1450,137 @@ class RemoveLoRAUnit(bpy.types.Operator):
         self.report({'WARNING'}, "No LoRA unit selected or list is empty.")
         return {'CANCELLED'}
 
+# ── Scene Queue persistence (JSON file in output dir) ─────────────────
+_SG_QUEUE_FILENAME = "sg_scene_queue.json"
+
+def _sg_queue_filepath():
+    """Return the path to the queue JSON file.
+
+    Uses the addon output_dir if set; otherwise falls back to a
+    `.stablegen` folder next to the addon package.
+    """
+    try:
+        prefs = bpy.context.preferences.addons.get(__package__)
+        if prefs and prefs.preferences.output_dir:
+            d = bpy.path.abspath(prefs.preferences.output_dir)
+            if os.path.isdir(d):
+                return os.path.join(d, _SG_QUEUE_FILENAME)
+    except Exception:
+        pass
+    # Fallback: <addon_dir>/.stablegen/
+    fallback = os.path.join(os.path.dirname(__file__), ".stablegen")
+    os.makedirs(fallback, exist_ok=True)
+    return os.path.join(fallback, _SG_QUEUE_FILENAME)
+
+
+def _sg_queue_save(processing=False, current_idx=0, phase='idle'):
+    """Serialize the scene queue + processing state to a JSON file on disk."""
+    wm = bpy.context.window_manager
+    if not hasattr(wm, 'sg_scene_queue'):
+        return
+    items = [{"label": it.label,
+              "scene_name": it.scene_name,
+              "blend_file": it.blend_file,
+              "prompt": it.prompt,
+              "negative_prompt": it.negative_prompt,
+              "status": it.status,
+              "retries": it.retries}
+             for it in wm.sg_scene_queue]
+    # GIF export settings (persist across .blend switches)
+    gif_settings = {}
+    _GIF_KEYS = (
+        'sg_queue_gif_export', 'sg_queue_gif_duration', 'sg_queue_gif_fps',
+        'sg_queue_gif_resolution', 'sg_queue_gif_samples', 'sg_queue_gif_engine',
+        'sg_queue_gif_interpolation', 'sg_queue_gif_use_hdri',
+        'sg_queue_gif_hdri_path', 'sg_queue_gif_hdri_strength',
+        'sg_queue_gif_hdri_rotation', 'sg_queue_gif_env_mode',
+        'sg_queue_gif_shadow_plane', 'sg_queue_gif_denoiser',
+    )
+    for key in _GIF_KEYS:
+        if hasattr(wm, key):
+            gif_settings[key] = getattr(wm, key)
+
+    data = {
+        "items": items,
+        "processing": processing,
+        "current_idx": current_idx,
+        "phase": phase,
+        "gif_settings": gif_settings,
+    }
+    try:
+        fp = _sg_queue_filepath()
+        with open(fp, 'w', encoding='utf-8') as f:
+            json.dump(data, f)
+    except Exception as e:
+        print(f"[Queue] save error: {e}")
+
+
+def _sg_queue_load():
+    """Restore the scene queue from the JSON file on disk.
+
+    If the JSON indicates that queue processing was active (e.g. after a
+    .blend switch), automatically resume.
+    """
+    wm = bpy.context.window_manager
+    if not hasattr(wm, 'sg_scene_queue'):
+        return
+    fp = _sg_queue_filepath()
+    if not os.path.isfile(fp):
+        return
+    try:
+        with open(fp, 'r', encoding='utf-8') as f:
+            raw = json.load(f)
+
+        # Support both old (list) and new (dict) format
+        if isinstance(raw, list):
+            items = raw
+            meta = {}
+        else:
+            items = raw.get("items", [])
+            meta = raw
+
+        wm.sg_scene_queue.clear()
+        for entry in items:
+            new_item = wm.sg_scene_queue.add()
+            new_item.label = entry.get("label", "")
+            new_item.scene_name = entry.get("scene_name", "")
+            new_item.blend_file = entry.get("blend_file", "")
+            new_item.prompt = entry.get("prompt", "")
+            new_item.negative_prompt = entry.get("negative_prompt", "")
+            new_item.status = entry.get("status", "pending")
+            new_item.retries = entry.get("retries", 0)
+        wm.sg_scene_queue_index = min(0, len(wm.sg_scene_queue) - 1)
+
+        # Restore GIF export settings
+        gif_settings = meta.get("gif_settings", {})
+        for key, value in gif_settings.items():
+            if hasattr(wm, key):
+                try:
+                    setattr(wm, key, value)
+                except Exception:
+                    pass
+
+        # Auto-resume processing if it was active (e.g. after a blend switch)
+        if meta.get("processing", False):
+            try:
+                from .stablegen import _resume_queue
+                idx = meta.get("current_idx", 0)
+                _resume_queue(idx)
+                print(f"[Queue] Auto-resuming from item {idx}")
+            except Exception as e:
+                print(f"[Queue] Failed to auto-resume: {e}")
+    except Exception as e:
+        print(f"[Queue] Failed to restore queue: {e}")
+
+
+@persistent
+def _sg_queue_load_handler(dummy):
+    """load_post handler: restore the queue when a .blend is opened."""
+    def _deferred():
+        _sg_queue_load()
+        return None
+    bpy.app.timers.register(_deferred, first_interval=0.3)
+
 # load handler to set default ControlNet and LoRA units on first load
 @persistent
 def load_handler(dummy):
@@ -1529,7 +1669,17 @@ def load_handler(dummy):
                 _pending_checkpoint_refresh_architecture = current_architecture
                 bpy.app.timers.register(_refresh_checkpoint_for_architecture, first_interval=0.2)
 
-classes_to_append = [CheckServerStatus, RefreshCheckpointList, RefreshLoRAList, STABLEGEN_UL_ControlNetMappingList, ControlNetModelMappingItem, RefreshControlNetMappings, StableGenAddonPreferences, ControlNetUnit, LoRAUnit, AddControlNetUnit, RemoveControlNetUnit, AddLoRAUnit, RemoveLoRAUnit]
+class SceneQueueItem(bpy.types.PropertyGroup):
+    """A single item in the scene generation queue."""
+    label: bpy.props.StringProperty(name="Label", default="")  # type: ignore  # user display name
+    scene_name: bpy.props.StringProperty(name="Scene", default="")  # type: ignore
+    blend_file: bpy.props.StringProperty(name="Blend File", default="")  # type: ignore  # path to .blend COPY
+    prompt: bpy.props.StringProperty(name="Prompt", default="")  # type: ignore  # display-only
+    negative_prompt: bpy.props.StringProperty(name="Negative Prompt", default="")  # type: ignore
+    status: bpy.props.StringProperty(name="Status", default="pending")  # type: ignore
+    retries: bpy.props.IntProperty(name="Retries", default=0)  # type: ignore  # how many times this item has been retried
+
+classes_to_append = [CheckServerStatus, RefreshCheckpointList, RefreshLoRAList, STABLEGEN_UL_ControlNetMappingList, ControlNetModelMappingItem, RefreshControlNetMappings, StableGenAddonPreferences, ControlNetUnit, LoRAUnit, AddControlNetUnit, RemoveControlNetUnit, AddLoRAUnit, RemoveLoRAUnit, SceneQueueItem]
 for cls in classes_to_append:
     classes.append(cls)
 for cls in _debug_classes:
@@ -1542,6 +1692,91 @@ def register():
     """
     for cls in classes:
         bpy.utils.register_class(cls)
+
+    # --- Scene Queue properties (on WindowManager so they're global) ---
+    bpy.types.WindowManager.sg_scene_queue = bpy.props.CollectionProperty(
+        type=SceneQueueItem,
+        name="Scene Queue"
+    )
+    bpy.types.WindowManager.sg_scene_queue_index = bpy.props.IntProperty(
+        name="Queue Index", default=0
+    )
+    bpy.types.WindowManager.sg_show_queue = bpy.props.BoolProperty(
+        name="Show Queue", default=False
+    )
+
+    # --- Queue GIF Export settings (global, applied to all items) ---
+    bpy.types.WindowManager.sg_queue_gif_export = bpy.props.BoolProperty(
+        name="Export GIF After Each Item", default=False,
+        description="Automatically export an orbit GIF/MP4 after each queue item completes"
+    )
+    bpy.types.WindowManager.sg_queue_gif_duration = bpy.props.FloatProperty(
+        name="Duration (s)", default=5.0, min=0.1, max=60.0,
+        description="Duration of the 360-degree orbit"
+    )
+    bpy.types.WindowManager.sg_queue_gif_fps = bpy.props.IntProperty(
+        name="FPS", default=24, min=1, max=60,
+        description="Frames per second"
+    )
+    bpy.types.WindowManager.sg_queue_gif_resolution = bpy.props.IntProperty(
+        name="Resolution %", default=50, min=10, max=100, subtype='PERCENTAGE',
+        description="Percentage of scene render resolution"
+    )
+    bpy.types.WindowManager.sg_queue_gif_samples = bpy.props.IntProperty(
+        name="Samples", default=32, min=1, max=4096,
+        description="Render samples per frame"
+    )
+    bpy.types.WindowManager.sg_queue_gif_engine = bpy.props.EnumProperty(
+        name="Engine",
+        items=[
+            ('BLENDER_WORKBENCH', "Workbench", ""),
+            ('EEVEE', "Eevee", ""),
+            ('CYCLES', "Cycles", ""),
+        ],
+        default='CYCLES'
+    )
+    bpy.types.WindowManager.sg_queue_gif_interpolation = bpy.props.EnumProperty(
+        name="Rotation Curve",
+        items=[
+            ('LINEAR', "Linear", "Constant speed"),
+            ('BEZIER', "Ease In/Out", "Smooth acceleration"),
+        ],
+        default='LINEAR'
+    )
+    bpy.types.WindowManager.sg_queue_gif_use_hdri = bpy.props.BoolProperty(
+        name="HDRI Environment", default=False
+    )
+    bpy.types.WindowManager.sg_queue_gif_hdri_path = bpy.props.StringProperty(
+        name="HDRI File",
+        description="Path to the HDRI image file (.hdr / .exr). "
+                    "Applied via AddHDRI before each GIF export",
+        default="",
+        subtype='FILE_PATH',
+    )
+    bpy.types.WindowManager.sg_queue_gif_hdri_strength = bpy.props.FloatProperty(
+        name="HDRI Strength",
+        description="Brightness of the HDRI environment lighting",
+        default=1.0, min=0.01, max=10.0,
+    )
+    bpy.types.WindowManager.sg_queue_gif_hdri_rotation = bpy.props.FloatProperty(
+        name="HDRI Rotation", default=0.0, min=0.0, max=360.0, subtype='ANGLE'
+    )
+    bpy.types.WindowManager.sg_queue_gif_env_mode = bpy.props.EnumProperty(
+        name="Environment Mode",
+        items=[
+            ('FIXED', "Fixed", ""),
+            ('LOCKED', "Locked", ""),
+            ('COUNTER', "Counter-Rotate", ""),
+            ('ENV_ONLY', "Environment Only", ""),
+        ],
+        default='FIXED'
+    )
+    bpy.types.WindowManager.sg_queue_gif_shadow_plane = bpy.props.BoolProperty(
+        name="Ground Shadow", default=False
+    )
+    bpy.types.WindowManager.sg_queue_gif_denoiser = bpy.props.BoolProperty(
+        name="Denoise", default=True
+    )
 
     def initial_refresh():
         print("StableGen: Performing initial model list refresh...")
@@ -1560,6 +1795,7 @@ def register():
                  print("StableGen: Server address not set, skipping initial refresh.")
             # Run load handler to set defaults
             load_handler(None)
+            _sg_queue_load()
         except Exception as e:
             # Catch potential errors during startup refresh
             print(f"StableGen: Error during initial refresh: {e}")
@@ -1570,7 +1806,7 @@ def register():
 
     bpy.types.Scene.comfyui_prompt = bpy.props.StringProperty(
         name="ComfyUI Prompt",
-        description="Enter the text prompt for ComfyUI generation",
+        description="Text prompt for generation. Use || to separate generation (left) from texturing (right) prompt",
         default="gold cube",
         update=update_parameters
     )
@@ -1936,6 +2172,11 @@ def register():
         ],
         default='idle',
         update=update_parameters
+    )
+    bpy.types.Scene.sg_last_gen_error = bpy.props.BoolProperty(
+        name="Last Generation Error",
+        description="True if the most recent generation ended with an error",
+        default=False,
     )
     bpy.types.Scene.generation_progress = bpy.props.FloatProperty(
         name="Generation Progress",
@@ -2870,6 +3111,7 @@ def register():
     bpy.types.Scene.controlnet_units_index = bpy.props.IntProperty(default=0)
     bpy.types.Scene.lora_units_index = bpy.props.IntProperty(default=0)
     bpy.app.handlers.load_post.append(load_handler)
+    bpy.app.handlers.load_post.append(_sg_queue_load_handler)
 
     # --- TRELLIS.2 Properties ---
     bpy.types.Scene.trellis2_available = bpy.props.BoolProperty(
@@ -3549,6 +3791,7 @@ def unregister():
     del bpy.types.Scene.refine_prompt
     del bpy.types.Scene.refine_upscale_method
     del bpy.types.Scene.generation_status
+    del bpy.types.Scene.sg_last_gen_error
     del bpy.types.Scene.generation_progress
     del bpy.types.Scene.overwrite_material
     del bpy.types.Scene.bake_visibility_weights
@@ -3697,13 +3940,33 @@ def unregister():
         if hasattr(bpy.types.Scene, prop):
             delattr(bpy.types.Scene, prop)
 
+    # --- Scene Queue cleanup ---
+    if hasattr(bpy.types.WindowManager, 'sg_scene_queue'):
+        del bpy.types.WindowManager.sg_scene_queue
+    if hasattr(bpy.types.WindowManager, 'sg_scene_queue_index'):
+        del bpy.types.WindowManager.sg_scene_queue_index
+    if hasattr(bpy.types.WindowManager, 'sg_show_queue'):
+        del bpy.types.WindowManager.sg_show_queue
+
+    for attr in (
+        'sg_queue_gif_export', 'sg_queue_gif_duration', 'sg_queue_gif_fps',
+        'sg_queue_gif_resolution', 'sg_queue_gif_samples', 'sg_queue_gif_engine',
+        'sg_queue_gif_interpolation', 'sg_queue_gif_use_hdri',
+        'sg_queue_gif_hdri_path', 'sg_queue_gif_hdri_strength',
+        'sg_queue_gif_hdri_rotation', 'sg_queue_gif_env_mode',
+        'sg_queue_gif_shadow_plane', 'sg_queue_gif_denoiser',
+    ):
+        if hasattr(bpy.types.WindowManager, attr):
+            delattr(bpy.types.WindowManager, attr)
+
     for cls in reversed(classes):
         bpy.utils.unregister_class(cls)
         
     # Remove the load handler for default controlnet unit
     if load_handler in bpy.app.handlers.load_post:
         bpy.app.handlers.load_post.remove(load_handler)
-   
+    if _sg_queue_load_handler in bpy.app.handlers.load_post:
+        bpy.app.handlers.load_post.remove(_sg_queue_load_handler)
 
 if __name__ == "__main__":
     register()
