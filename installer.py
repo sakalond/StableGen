@@ -1128,6 +1128,29 @@ def apply_post_clone_patches(item_details: Dict[str, Any], comfyui_path: Path):
 def create_dir_if_not_exists(path: Path):
     path.mkdir(parents=True, exist_ok=True)
 
+
+def _get_remote_file_size(url: str) -> int:
+    """Return the remote file's total size in bytes via a HEAD request.
+    Returns 0 if the server does not provide Content-Length.
+    """
+    try:
+        r = requests.head(url, allow_redirects=True, timeout=15)
+        if r.status_code == 200:
+            return int(r.headers.get('content-length', 0))
+    except Exception:
+        pass
+    return 0
+
+
+def _rename_if_needed(item_details: Dict[str, Any], temp_filepath: Path, final_filepath: Path):
+    """Move temp_filepath -> final_filepath when rename_from is set."""
+    if item_details.get("rename_from") and temp_filepath != final_filepath:
+        if final_filepath.exists():
+            final_filepath.unlink()
+        shutil.move(str(temp_filepath), str(final_filepath))
+        print(f"  Renamed to '{final_filepath.name}'.")
+
+
 def download_file(item_details: Dict[str, Any], comfyui_path: Path):
     url = item_details["url"]
     target_dir = comfyui_path / item_details["target_path_relative"]
@@ -1135,64 +1158,109 @@ def download_file(item_details: Dict[str, Any], comfyui_path: Path):
     final_filepath = target_dir / final_filename
     temp_filename = item_details.get("rename_from", final_filename)
     temp_filepath = target_dir / temp_filename
-
-    if final_filepath.exists():
-        print(f"INFO: File '{final_filename}' already exists at '{final_filepath}'. Skipping download.")
-        print(f"      Please ensure this is the correct file as specified (License: {item_details['license']}).")
-        return
-
-    if item_details.get("rename_from") and temp_filepath.exists():
-        # This case covers if a previous download was interrupted after download but before rename
-        # or if user manually placed the file with the original name.
-        print(f"INFO: File '{temp_filename}' (to be renamed to '{final_filename}') already exists at '{temp_filepath}'.")
-        print(f"      Assuming it's the correct file. Renaming if necessary and skipping download.")
-        print(f"      Please ensure this is the correct file (License: {item_details['license']}).")
-        if temp_filepath != final_filepath: # Needs rename
-            try:
-                shutil.move(str(temp_filepath), str(final_filepath))
-                print(f"      Successfully renamed '{temp_filename}' to '{final_filename}'.")
-            except Exception as e:
-                print(f"      ERROR: Could not rename '{temp_filename}' to '{final_filename}': {e}")
-        return
+    # File we actually write to during the download
+    download_target = temp_filepath if item_details.get("rename_from") else final_filepath
 
     create_dir_if_not_exists(target_dir)
+
+    # ------------------------------------------------------------------
+    # Step 1: Check whether the final file already exists and is complete.
+    # ------------------------------------------------------------------
+    if final_filepath.exists():
+        remote_size = _get_remote_file_size(url)
+        local_size = final_filepath.stat().st_size
+        if remote_size > 0:
+            if local_size >= remote_size:
+                print(f"INFO: '{final_filename}' already complete "
+                      f"({local_size / 1024**2:.1f} MB). Skipping.")
+                return
+            else:
+                print(f"WARNING: '{final_filename}' is incomplete "
+                      f"({local_size / 1024**2:.1f} / {remote_size / 1024**2:.1f} MB). "
+                      f"Will attempt to resume.")
+                # If download_target differs from final_filepath (rename_from case),
+                # the partial final file is unusable — delete it and resume via
+                # download_target instead.  If they are the same file, keep it for resume.
+                if download_target != final_filepath:
+                    final_filepath.unlink()
+        else:
+            # Server did not return Content-Length on HEAD; trust the file's existence.
+            print(f"INFO: '{final_filename}' exists "
+                  f"(remote size unavailable, assuming complete). Skipping.")
+            print(f"      License: {item_details['license']}")
+            return
+
+    # ------------------------------------------------------------------
+    # Step 2: Check for an existing partial download to resume from.
+    # ------------------------------------------------------------------
+    existing_bytes = 0
+    if download_target.exists():
+        existing_bytes = download_target.stat().st_size
+        if existing_bytes > 0:
+            print(f"  Found partial file '{download_target.name}' "
+                  f"({existing_bytes / 1024**2:.1f} MB already downloaded). "
+                  f"Attempting to resume...")
+
     size_mb = item_details.get("size_mb", "N/A")
-    print(f"  Downloading: {item_details['name']} ({size_mb}MB) - License: {item_details['license']}")
+    print(f"  Downloading: {item_details['name']} (~{size_mb} MB)"
+          f" - License: {item_details['license']}")
     print(f"  From: {url}")
     print(f"  To:   {final_filepath}")
     if item_details.get("rename_from"):
-        print(f"  (Will be downloaded as '{temp_filename}' and then renamed to '{final_filename}')")
+        print(f"  (Downloading as '{temp_filename}', will rename to '{final_filename}')")
 
     try:
-        response = requests.get(url, stream=True, timeout=30) # Added timeout
-        response.raise_for_status()  # Raise an exception for HTTP errors
-        total_size = int(response.headers.get('content-length', 0))
-        
-        # Use temp_filepath for download, then rename to final_filepath
-        download_target = temp_filepath if item_details.get("rename_from") else final_filepath
-        # Ensure no partial file from previous attempt if not renaming
-        if not item_details.get("rename_from") and download_target.exists():
-             print(f"WARNING: '{download_target}' exists but was not caught by pre-check. This might be a partial file. Overwriting.")
+        req_headers = {}
+        if existing_bytes > 0:
+            req_headers['Range'] = f'bytes={existing_bytes}-'
 
+        response = requests.get(url, stream=True, timeout=30, headers=req_headers)
 
-        with open(download_target, 'wb') as f:
+        # 416 Range Not Satisfiable: our offset is already at or beyond the file end.
+        if response.status_code == 416:
+            print(f"  File is already fully downloaded on disk.")
+            _rename_if_needed(item_details, temp_filepath, final_filepath)
+            return
+
+        if response.status_code == 206:
+            # Server supports partial content — append to the existing partial file.
+            open_mode = 'ab'
+            content_range = response.headers.get('Content-Range', '')
+            total_size = int(content_range.split('/')[-1]) if '/' in content_range else 0
+        elif response.status_code == 200:
+            # Server returned the full file (no resume support, or no Range was sent).
+            if existing_bytes > 0:
+                print(f"  Server does not support resume. Restarting download from scratch.")
+                existing_bytes = 0
+            open_mode = 'wb'
+            total_size = int(response.headers.get('content-length', 0))
+        else:
+            response.raise_for_status()
+            return
+
+        with open(download_target, open_mode) as f:
             if TQDM_AVAILABLE and total_size > 0:
-                with tqdm(total=total_size, unit='B', unit_scale=True, unit_divisor=1024, desc=item_details['name'], ascii=True) as pbar:
-                    for chunk in response.iter_content(chunk_size=8192):
+                with tqdm(total=total_size, initial=existing_bytes,
+                          unit='B', unit_scale=True, unit_divisor=1024,
+                          desc=item_details['name'], ascii=True) as pbar:
+                    for chunk in response.iter_content(chunk_size=1024 * 1024):
                         f.write(chunk)
                         pbar.update(len(chunk))
             else:
-                print(f"  Downloading {item_details['name']} (size: {total_size/1024/1024:.2f} MB)...")
-                for chunk in response.iter_content(chunk_size=8192):
+                downloaded = existing_bytes
+                for chunk in response.iter_content(chunk_size=1024 * 1024):
                     f.write(chunk)
-        print(f"  Download complete: {download_target}")
+                    downloaded += len(chunk)
+                    if total_size > 0:
+                        pct = downloaded / total_size * 100
+                        print(f"\r  {downloaded / 1024**2:.0f} / "
+                              f"{total_size / 1024**2:.0f} MB "
+                              f"({pct:.0f}%)", end='', flush=True)
+                if total_size > 0:
+                    print()
 
-        if item_details.get("rename_from") and temp_filepath != final_filepath:
-            if final_filepath.exists():
-                print(f"WARNING: Target renamed file '{final_filepath}' already exists. Overwriting.")
-                final_filepath.unlink()
-            shutil.move(str(temp_filepath), str(final_filepath))
-            print(f"  Successfully renamed to '{final_filename}'.")
+        print(f"  Download complete: {download_target.name}")
+        _rename_if_needed(item_details, temp_filepath, final_filepath)
 
     except requests.exceptions.RequestException as e:
         print(f"  ERROR downloading {item_details['name']}: {e}")
@@ -1519,6 +1587,8 @@ def main():
         if any(item["type"] == "node" for item in items_to_process_this_round):
              print("IMPORTANT: If any custom nodes were newly cloned, restart ComfyUI to load them.")
         print_separator()
+        print("All done. Exiting installer.")
+        break
 
 if __name__ == "__main__":
     if not TQDM_AVAILABLE:
