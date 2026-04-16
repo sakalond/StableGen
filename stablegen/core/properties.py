@@ -1194,6 +1194,63 @@ def register_properties(update_model_list, ControlNetUnit, LoRAUnit,
         description="Rename each imported mesh to the stem of its source image filename",
         default=True
     )
+    bpy.types.Scene.trellis2_batch_bake_textures = bpy.props.BoolProperty(
+        name="Bake Textures after each model",
+        description="Automatically bake textures after each model is generated",
+        default=True
+    )
+    bpy.types.Scene.trellis2_batch_bake_pbr = bpy.props.BoolProperty(
+        name="Bake PBR Maps",
+        description="Bake individual PBR channel maps (BaseColor, Roughness, Metallic, Normal, Emission, Height, AO)",
+        default=True
+    )
+    bpy.types.Scene.trellis2_batch_bake_resolution = bpy.props.IntProperty(
+        name="Texture Resolution",
+        description="Resolution of the baked textures",
+        default=2048, min=128, max=8192
+    )
+    bpy.types.Scene.trellis2_batch_bake_try_unwrap = bpy.props.EnumProperty(
+        name="Unwrap Method",
+        description="Method to unwrap UVs before baking",
+        items=[
+            ('none',      'None',            'Skip UV unwrapping'),
+            ('cube',      'Cube Project',    'Fast cube projection'),
+            ('smart',     'Smart UV Project','Smart UV Project'),
+            ('basic',     'Basic Unwrap',    'Angle-based unwrap'),
+            ('lightmap',  'Lightmap Pack',   'Lightmap Pack'),
+            ('pack',      'Pack Islands',    'Pack Islands'),
+        ],
+        default='smart'
+    )
+    bpy.types.Scene.trellis2_batch_bake_overlap_only = bpy.props.BoolProperty(
+        name="Overlap Only",
+        description="Only unwrap objects with overlapping UVs",
+        default=False
+    )
+    bpy.types.Scene.trellis2_batch_bake_export_orm = bpy.props.BoolProperty(
+        name="Pack ORM Texture",
+        description="Create a packed ORM texture (R=AO, G=Roughness, B=Metallic) for Unreal Engine / glTF",
+        default=False
+    )
+    bpy.types.Scene.trellis2_batch_bake_normal_convention = bpy.props.EnumProperty(
+        name="Normal Convention",
+        description="Normal map Y-axis convention",
+        items=[
+            ('opengl',  'OpenGL (Y+)',  'Standard OpenGL / glTF / Unity / Blender convention'),
+            ('directx', 'DirectX (Y-)', 'DirectX / Unreal Engine convention'),
+        ],
+        default='opengl'
+    )
+    bpy.types.Scene.trellis2_batch_bake_add_material = bpy.props.BoolProperty(
+        name="Add Material",
+        description="Add the baked texture as a material to the objects",
+        default=True
+    )
+    bpy.types.Scene.trellis2_batch_bake_flatten = bpy.props.BoolProperty(
+        name="Bake & Continue Refining",
+        description="After baking, apply the baked texture to the StableGen projection material",
+        default=False
+    )
     # WindowManager props for live batch progress display
     bpy.types.WindowManager.sg_batch_running = bpy.props.BoolProperty(default=False)
     bpy.types.WindowManager.sg_batch_index = bpy.props.IntProperty(default=0)
@@ -1608,6 +1665,11 @@ def unregister_properties(load_handler, _sg_queue_load_handler):
         'trellis2_preview_gallery_enabled', 'trellis2_preview_gallery_count',
         'trellis2_input_image', 'trellis2_batch_folder', 'trellis2_batch_count',
         'trellis2_batch_rename_meshes',
+        'trellis2_batch_bake_textures', 'trellis2_batch_bake_pbr',
+        'trellis2_batch_bake_resolution', 'trellis2_batch_bake_try_unwrap',
+        'trellis2_batch_bake_overlap_only', 'trellis2_batch_bake_export_orm',
+        'trellis2_batch_bake_normal_convention', 'trellis2_batch_bake_add_material',
+        'trellis2_batch_bake_flatten',
         'trellis2_resolution', 'trellis2_vram_mode',
         'trellis2_attn_backend', 'trellis2_seed', 'trellis2_ss_guidance',
         'trellis2_ss_steps', 'trellis2_shape_guidance', 'trellis2_shape_steps',

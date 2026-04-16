@@ -154,7 +154,8 @@ class StableGenPanel(bpy.types.Panel):
         cam_extra_row = layout.row(align=True)
         cam_extra_row.operator("object.clone_camera", text="Clone Camera", icon="DUPLICATE")
         cam_extra_row.operator("object.mirror_camera", text="Mirror", icon="MOD_MIRROR")
-        cam_extra_row.operator("object.apply_auto_aspect", text="Auto Aspect", icon="FULLSCREEN_ENTER")
+        if hasattr(bpy.ops.object, 'apply_auto_aspect'):
+            cam_extra_row.operator("object.apply_auto_aspect", text="Auto Aspect", icon="FULLSCREEN_ENTER")
         cam_extra_row.operator("object.toggle_camera_labels", text="Labels", icon="FONT_DATA")
         
 
@@ -226,7 +227,11 @@ class StableGenPanel(bpy.types.Panel):
 
             elif trellis2_op:
                 # ── Phases 1 & 2: Trellis2Generate is alive ──
-                action_row.operator("object.trellis2_generate", text="Cancel TRELLIS.2", icon="CANCEL")
+                sg_batch_running = getattr(context.window_manager, 'sg_batch_running', False)
+                if sg_batch_running:
+                    action_row.operator("object.trellis2_batch_cancel", text="Cancel Batch", icon="CANCEL")
+                else:
+                    action_row.operator("object.trellis2_generate", text="Cancel TRELLIS.2", icon="CANCEL")
                 progress_col = layout.column()
 
                 # Bar 0 — Batch model counter (only during batch)
@@ -266,8 +271,21 @@ class StableGenPanel(bpy.types.Panel):
 
             elif comfy_tex_op and getattr(scene, 'trellis2_pipeline_active', False):
                 # ── Phase 3: Texturing via ComfyUIGenerate ──
-                action_row.operator("object.test_stable", text="Cancel Texturing", icon="CANCEL")
+                sg_batch_running = getattr(context.window_manager, 'sg_batch_running', False)
+                if sg_batch_running:
+                    action_row.operator("object.trellis2_batch_cancel", text="Cancel Batch", icon="CANCEL")
+                else:
+                    action_row.operator("object.test_stable", text="Cancel Texturing", icon="CANCEL")
                 progress_col = layout.column()
+
+                # Batch overall bar (above StableGen bars)
+                _bi = getattr(context.window_manager, 'sg_batch_index', 0)
+                _bt = getattr(context.window_manager, 'sg_batch_total', 0)
+                if sg_batch_running and _bt > 0:
+                    progress_col.progress(
+                        text=f"Batch: Model {_bi}/{_bt}",
+                        factor=max(0.0, min(_bi / _bt, 1.0))
+                    )
 
                 pbr_active = getattr(comfy_tex_op, '_pbr_active', False)
                 if pbr_active:
@@ -492,6 +510,14 @@ class StableGenPanel(bpy.types.Panel):
         bake_operator = next((op for win in context.window_manager.windows for op in win.modal_operators if op.bl_idname == 'OBJECT_OT_bake_textures'), None)
         if bake_operator:
             bake_progress_col = layout.column()
+            # Batch overall bar during bake phase
+            _bi = getattr(context.window_manager, 'sg_batch_index', 0)
+            _bt = getattr(context.window_manager, 'sg_batch_total', 0)
+            if getattr(context.window_manager, 'sg_batch_running', False) and _bt > 0:
+                bake_progress_col.progress(
+                    text=f"Batch: Model {_bi}/{_bt}",
+                    factor=max(0.0, min(_bi / _bt, 1.0))
+                )
             bake_stage = getattr(bake_operator, '_stage', 'Baking')
             bake_progress = getattr(bake_operator, '_progress', 0) / 100.0
             bake_progress_col.progress(text=bake_stage, factor=bake_progress if bake_progress <=1.0 else 1.0) # Ensure factor is <= 1.0
@@ -689,6 +715,11 @@ class StableGenPanel(bpy.types.Panel):
                                          text="", icon="X")
                         rn_row = params_container.row()
                         rn_row.prop(scene, "trellis2_batch_rename_meshes")
+                        bake_row = params_container.row(align=True)
+                        bake_row.prop(scene, "trellis2_batch_bake_textures")
+                        if getattr(scene, 'trellis2_batch_bake_textures', True):
+                            bake_row.operator("object.trellis2_batch_bake_settings",
+                                              text="Bake Settings")
 
                 # Preview gallery (only when generate_from = prompt)
                 if scene.trellis2_generate_from == 'prompt':
@@ -1906,11 +1937,12 @@ class StableGenPanel(bpy.types.Panel):
             row = tools_box.row()
         row.operator("object.curves_to_mesh", text="Convert Curves to Mesh", icon="CURVE_DATA")
 
-        row = tools_box.row()
-        row.operator("stablegen.import_dae", text="Import DAE", icon="IMPORT")
-        if width_mode == 'narrow':
+        if hasattr(bpy.ops.stablegen, 'import_dae'):
             row = tools_box.row()
-        row.operator("stablegen.batch_import_dae", text="Batch Import DAE", icon="FILE_FOLDER")
+            row.operator("stablegen.import_dae", text="Import DAE", icon="IMPORT")
+            if width_mode == 'narrow':
+                row = tools_box.row()
+            row.operator("stablegen.batch_import_dae", text="Batch Import DAE", icon="FILE_FOLDER")
         
         row = tools_box.row()
         if config_error_message:

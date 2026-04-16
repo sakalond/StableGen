@@ -38,6 +38,7 @@ from .mesh_gen.trellis2 import Trellis2Generate
 from .mesh_gen.batch import (
     TRELLIS2_OT_BatchSelectFolder, TRELLIS2_OT_BatchGenerate,
     TRELLIS2_OT_BatchCancel, TRELLIS2_OT_BatchClear,
+    TRELLIS2_OT_BatchBakeSettings,
 )
 from .dae_import import DAE_IMPORT_CLASSES
 
@@ -100,6 +101,7 @@ classes = [
     TRELLIS2_OT_BatchGenerate,
     TRELLIS2_OT_BatchCancel,
     TRELLIS2_OT_BatchClear,
+    TRELLIS2_OT_BatchBakeSettings,
     # Operators - render tools
     BakeTextures,
     AddCameras,
