@@ -36,6 +36,42 @@ _PATCH_PY310_IS_JUNCTION = (
     "# -- End StableGen patch --\n\n"
 )
 
+_PATCH_TRELLIS_PRESTARTUP = (
+    "# -- StableGen patch: Path.is_junction polyfill for Python < 3.12 --\n"
+    "import pathlib as _pathlib\n"
+    "if not hasattr(_pathlib.Path, 'is_junction'):\n"
+    "    import os as _os, stat as _stat\n"
+    "    def _is_junction(self):\n"
+    "        try:\n"
+    "            return bool(\n"
+    "                _os.lstat(str(self)).st_file_attributes\n"
+    "                & _stat.FILE_ATTRIBUTE_REPARSE_POINT\n"
+    "            )\n"
+    "        except (OSError, AttributeError):\n"
+    "            return False\n"
+    "    _pathlib.Path.is_junction = _is_junction\n"
+    "# -- End StableGen patch --\n\n"
+    "# -- StableGen patch: Auto-heal comfy-env site-packages isolation at startup --\n"
+    "try:\n"
+    "    import importlib.util as _u, os as _os, sys as _sys\n"
+    "    _s = _u.find_spec('comfy_env')\n"
+    "    if _s and _s.origin:\n"
+    "        _wrap_py = _os.path.join(_os.path.dirname(_s.origin), 'isolation', 'wrap.py')\n"
+    "        if _os.path.exists(_wrap_py):\n"
+    "            with open(_wrap_py, 'r', encoding='utf-8') as _f:\n"
+    "                _code = _f.read()\n"
+    "            if 'PYTHONNOUSERSITE' not in _code:\n"
+    "                _anchor = '    env[\"COMFYUI_ISOLATION_WORKER\"] = \"1\"'\n"
+    "                if _anchor in _code:\n"
+    "                    _code = _code.replace(_anchor, _anchor + '\\n    env[\"PYTHONNOUSERSITE\"] = \"1\"')\n"
+    "                    with open(_wrap_py, 'w', encoding='utf-8') as _f:\n"
+    "                        _f.write(_code)\n"
+    "                    print('[StableGen] Auto-applied comfy-env user site-packages isolation patch at boot', file=_sys.stderr)\n"
+    "except Exception:\n"
+    "    pass\n"
+    "# -- End StableGen patch --\n\n"
+)
+
 # Patch for lazy_manager.py: Add attn_backend to config comparison.
 # Without this, switching attention backend (e.g. xformers -> flash_attn)
 # doesn't recreate the model manager, leaving stale config.
@@ -556,7 +592,7 @@ DEPENDENCIES: Dict[str, Dict[str, Any]] = {
         "target_dir_relative": "custom_nodes",
         "repo_name": "ComfyUI-TRELLIS2",
         "license": "MIT (Note: textured pipeline uses NVIDIA non-commercial libs)", "packages": ["trellis2"],
-        "pip_packages": ["numpy<2.0.0"],
+        "pip_packages": ["numpy<2.0.0", "comfy-env"],
         "clean_envs": True,
         "run_install_script": True,
         "post_clone_patches": [
@@ -568,9 +604,9 @@ DEPENDENCIES: Dict[str, Dict[str, Any]] = {
             },
             {
                 "file": "prestartup_script.py",
-                "marker": "StableGen patch: Path.is_junction",
+                "marker": "StableGen patch: Auto-heal comfy-env",
                 "anchor": "from comfy_env import",
-                "patch": _PATCH_PY310_IS_JUNCTION,
+                "patch": _PATCH_TRELLIS_PRESTARTUP,
             },
             {
                 "file": "nodes/trellis_utils/lazy_manager.py",
@@ -1646,6 +1682,20 @@ def get_unique_item_ids_for_tags(selected_tags: List[str]) -> Set[str]:
 # --- Main Script Logic ---
 def main():
     comfyui_base_path = get_comfyui_path_from_args()
+
+    # Ensure all comfy-env patches are applied if comfy-env is already installed
+    try:
+        python_exe = find_comfyui_python(comfyui_base_path)
+        result = subprocess.run(
+            [python_exe, "-c", "import comfy_env"],
+            capture_output=True,
+            text=True,
+        )
+        if result.returncode == 0:
+            print("  Detected existing comfy-env installation. Ensuring all patches are applied...")
+            _apply_all_comfy_env_patches(comfyui_base_path)
+    except Exception as e:
+        print(f"  WARNING: Could not check/patch existing comfy-env: {e}")
 
     processed_during_this_session: Set[str] = set() # To avoid re-processing in same session if menu is re-shown
 
