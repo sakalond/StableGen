@@ -592,7 +592,7 @@ DEPENDENCIES: Dict[str, Dict[str, Any]] = {
         "target_dir_relative": "custom_nodes",
         "repo_name": "ComfyUI-TRELLIS2",
         "license": "MIT (Note: textured pipeline uses NVIDIA non-commercial libs)", "packages": ["trellis2"],
-        "pip_packages": ["numpy<2.0.0", "comfy-env"],
+        "pip_packages": ["comfy-env"],
         "clean_envs": True,
         "run_install_script": True,
         "post_clone_patches": [
@@ -1024,7 +1024,7 @@ def _patch_comfy_env_wheel_fallback(comfyui_path: Path):
         "            _tv_m = _cu_re.search(display)",
         "            if not _tv_m: continue",
         "            _tv = int(_tv_m.group(1))",
-        "            if _tv <= int(torch_short): continue",
+        "            if _tv <= int(torch_short.replace('.', '')): continue",
         "            if py_tag not in display: continue",
         "            if platform_tag and platform_tag not in display: continue",
         "            if _best_tv is None or _tv < _best_tv:",
@@ -1739,6 +1739,36 @@ def main():
 
         # Display TRELLIS.2 license notice if installing that package
         if "trellis2" in selected_option["tags"]:
+            # Check target environment's Python version
+            try:
+                python_exe = find_comfyui_python(comfyui_base_path)
+                py_version_res = subprocess.run(
+                    [python_exe, "-c", "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')"],
+                    capture_output=True, text=True, check=True
+                )
+                py_ver = py_version_res.stdout.strip()
+                is_python_313_plus = [int(x) for x in py_ver.split(".")] >= [3, 13]
+            except Exception:
+                is_python_313_plus = sys.version_info >= (3, 13)
+
+            if is_python_313_plus:
+                print_separator(char='!')
+                print("WARNING: PYTHON 3.13 COMPATIBILITY ALERT")
+                print_separator(char='!')
+                print("You are running Python 3.13+ in ComfyUI.")
+                print("TRELLIS.2 requires binary CUDA extensions (cumesh, flex_gemm_ap, nvdiffrec, etc.)")
+                print("which DO NOT currently have pre-compiled wheels for Python 3.13 on the wheel index.")
+                print("Compiling them from source requires a local MSVC compiler and CUDA Toolkit.")
+                print()
+                print("It is HIGHLY RECOMMENDED to use Python 3.12 (or a ComfyUI portable build")
+                print("that uses Python 3.12) to run the TRELLIS.2 mesh generation pipeline.")
+                print_separator(char='!')
+                ack_313 = input("Do you still want to attempt installation on Python 3.13? (y/n): ").strip().lower()
+                if ack_313 != 'y':
+                    print("Installation cancelled.")
+                    print_separator()
+                    continue
+
             print_separator(char='!')
             print("TRELLIS.2 THIRD-PARTY LICENSE NOTICE")
             print_separator(char='!')

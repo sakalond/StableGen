@@ -46,6 +46,18 @@ StableGen brings AI-powered 3D generation and texturing directly into Blender:
     * **Smart mesh handling:** Auto-recovery from mesh corruption, configurable decimation/remeshing, import scaling, and studio lighting setup.
     * VRAM-conscious: disk offloading, configurable attention backend
     * Powered by [ComfyUI-TRELLIS2](https://github.com/PozzettiAndrea/ComfyUI-TRELLIS2) (installable via `installer.py`).
+* 🖨️ **3D Printing & Slicing Suite:**
+    * Export textured meshes directly into a multi-color format (3MF/STL) compatible with OrcaSlicer, Bambu Studio, and PrusaSlicer.
+    * **Physical Color Mixing Solver:** Optimizes filament mixtures using Kubelka-Munk Theory (evaluating absorption $K$ and scattering $S$ coefficients).
+    * **Speckle Bleed Prevention:** A one-sided saturation-difference penalty prevents pigments from bleeding as dither speckles into highly saturated regions.
+    * **FDM Banding Culling:** Vectorized 8% threshold pruning filters out minor filament demands to keep layers clean.
+    * **Viewport Slices Preview:** Projects and dithers color layers onto a flat-shaded preview mesh (`SG_SlicedPreview`) directly inside the Blender viewport.
+    * *Requires enabling "Enable 3D Print Exporter Tab" in Addon Preferences.*
+* 📂 **Folder Batching for Image-to-3D:**
+    * Point StableGen at a directory of reference images to generate and texture multiple 3D assets in a single unattended run.
+    * **Auto-Baking on Completion:** Automatically run texture baking (resolution, ORM packing, normal conventions) after each model is generated.
+    * **Scene Isolation:** Automatically hides pre-existing assets during each generation stage to prevent texture bleed and projection contamination.
+    * **Batch Performance Log:** Writes execution durations (Shape, Texture, Bake, and Total time) and success/error status reports to `stablegen_batch_log.json`.
 * 🌍 **Scene-Wide Multi-Mesh Texturing:**
     * Don't just texture one mesh at a time! StableGen is designed to apply textures to **all mesh objects in your scene simultaneously** from your defined camera viewpoints. Alternatively, you can choose to texture only selected objects.
     * Achieve a cohesive look across entire environments or collections of assets in a single generation pass.
@@ -82,6 +94,9 @@ StableGen brings AI-powered 3D generation and texturing directly into Blender:
     * **Color Matching:** Match each generated view's colors to the current texture before blending, using multiple algorithms (MKL, Reinhard, Histogram, MVGD).
 * 🛠️ **Integrated Workflow Tools:**
     * **Camera Setup:** Quickly add and arrange multiple cameras with 7 placement strategies, per-camera aspect ratios, interactive occlusion preview, and customizable generation order.
+    * **Auto-Aspect Camera Framing:** Dynamically apply auto-aspect ratio and optimal framing to cameras.
+    * **SketchUp DAE Optimization:** Clean SketchUp Collada DAE imports with triangle fan fixes and interior face removal.
+    * **Run Local Post-Processing:** Decimate, solidify, or retopologize meshes locally.
     * **View-Specific Prompts:** Assign unique text prompts to individual camera viewpoints for targeted details.
     * **Texture Baking:** Convert complex procedural StableGen materials into standard UV image textures. "Flatten for Refine" option lets you bake and continue editing.
     * **Debug Tools:** Visualize projection coverage, UV alignment, and weight blending without running AI generation.
@@ -496,7 +511,10 @@ Click the arrow next to each title to expand and access detailed settings:
 
 A collection of utilities to further support your workflow:
 
-* **Scene Queue:** Queue multiple assets for unattended batch processing. Add items with prompt and label, reorder, retry on failure. Supports both texturing and TRELLIS.2 pipelines with optional auto GIF export after each item.
+* **Scene Queue:** Queue multiple assets for unattended batch processing. Add items with prompt and label, reorder, retry on failure. Supports both texturing and TRELLIS.2 pipelines with optional auto GIF export after each item. *(Must be enabled in Addon Preferences).*
+* **3D Print Exporter:** Export models to slicer-ready multi-color 3MF files with custom filament spools, a physical color solver, and dither slice preview. *(Must be enabled in Addon Preferences).*
+* **Run Local Post-Processing:** Decimate, solidify, or retopologize meshes locally.
+* **Apply Auto Aspect:** Dynamically frame and aspect-scale selected cameras.
 * **Switch Material:** For selected objects with multiple material slots, quickly set a material at a specific index as the active one.
 * **Add HDRI Light:** Prompts for an HDRI image file and sets it up as the world lighting, providing realistic illumination for your scene.
 * **Apply All Modifiers:** Iterates through all mesh objects in the scene, applies their modifier stacks, and converts geometry instances into real mesh data. Helps prepare models for texturing.
@@ -661,4 +679,4 @@ Ondřej Sakala
 * X/Twitter: `@sakalond`
 
 ---
-*Last Updated: March 5, 2026*
+*Last Updated: June 12, 2026*

@@ -276,6 +276,9 @@ Generate 3D meshes from a single image or text prompt. Models auto-download on f
 
 > **Note:** The TRELLIS.2 native textured output pipeline uses NVIDIA non-commercial libraries (nvdiffrast). Shape-only and SDXL/Qwen texture generation does not have this restriction.
 
+> [!IMPORTANT]
+> **Upgrade Action Required:** If you are upgrading from a previous version of StableGen, you **must manually delete** the old `ComfyUI-TRELLIS2` and `ComfyUI-Geometrypack` directories from your ComfyUI `custom_nodes/` directory first before cloning the new repository.
+
 * **a) Install the ComfyUI-TRELLIS2 Custom Node**
     1.  Navigate to your ComfyUI custom nodes directory:
         ```bash
