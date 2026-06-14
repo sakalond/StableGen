@@ -189,3 +189,4 @@ stablegen/texturing/debug_solver_penalty.py
 t.3mf
 test_output.3mf
 
+package_addon.py
