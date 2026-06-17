@@ -723,7 +723,6 @@ class _Trellis2WorkflowMixin:
                 # Or just check common ComfyUI locations
                 common_paths = [
                     os.path.join(os.environ.get('COMFYUI_PATH', ''), 'output'),
-                    'E:/tools/ComfyUI/output',
                     'C:/ComfyUI/output',
                     os.path.expanduser('~/ComfyUI/output'),
                 ]
@@ -758,23 +757,36 @@ class _Trellis2WorkflowMixin:
         # block for minutes, and check for cancellation each iteration.
         is_remote = not self._is_local_server(server_address)
         scan_range = 30 if is_remote else 120  # fewer guesses for remote
-        scan_timeout = 5 if is_remote else 10   # per-request timeout (seconds)
-        now = datetime.now()
+        scan_timeout = get_timeout('scan')
+        if is_remote:
+            scan_timeout = max(1.0, scan_timeout / 2.0)
+
+        clock_offset = getattr(self, '_clock_offset', timedelta(0))
+        now_local = datetime.now() + clock_offset
+        candidates = [now_local]
+        if is_remote:
+            clock_offset_utc = getattr(self, '_clock_offset_utc', None)
+            if clock_offset_utc is not None:
+                now_utc = datetime.now() + clock_offset_utc
+                if abs((now_utc - now_local).total_seconds()) > 5:
+                    candidates.append(now_utc)
+
         for delta_seconds in range(0, scan_range):
             if _cancelled():
                 return {"error": "cancelled"}
             for delta in [timedelta(seconds=-delta_seconds), timedelta(seconds=delta_seconds)]:
-                candidate_time = now + delta
-                candidate_name = f"{unique_prefix}_{candidate_time.strftime('%Y%m%d_%H%M%S')}.glb"
-                try:
-                    view_url = f"http://{server_address}/view?filename={urllib.parse.quote(candidate_name)}&type=output"
-                    glb_response = urllib.request.urlopen(view_url, timeout=scan_timeout)
-                    glb_data = glb_response.read()
-                    if glb_data and len(glb_data) > 0:
-                        print(f"[TRELLIS2] Found GLB via timestamp scan: {candidate_name} ({len(glb_data)} bytes)")
-                        return glb_data
-                except Exception:
-                    continue
+                for base_now in candidates:
+                    candidate_time = base_now + delta
+                    candidate_name = f"{unique_prefix}_{candidate_time.strftime('%Y%m%d_%H%M%S')}.glb"
+                    try:
+                        view_url = f"http://{server_address}/view?filename={urllib.parse.quote(candidate_name)}&type=output"
+                        glb_response = urllib.request.urlopen(view_url, timeout=scan_timeout)
+                        glb_data = glb_response.read()
+                        if glb_data and len(glb_data) > 0:
+                            print(f"[TRELLIS2] Found GLB via timestamp scan: {candidate_name} ({len(glb_data)} bytes)")
+                            return glb_data
+                    except Exception:
+                        continue
 
         if _cancelled():
             return {"error": "cancelled"}

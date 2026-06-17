@@ -155,6 +155,12 @@ class StableGenAddonPreferences(bpy.types.AddonPreferences):
         default=600.0, min=60.0, max=3600.0, step=100, precision=0,
     )  # type: ignore
 
+    timeout_scan: bpy.props.FloatProperty(
+        name="Scan Timeout (s)",
+        description="Timeout per request when guessing GLB filenames",
+        default=10.0, min=1.0, max=120.0, step=100, precision=0,
+    )  # type: ignore
+
     enable_scene_queue: bpy.props.BoolProperty(
         name="Enable Scene Queue",
         description="Show the Scene Queue panel in the sidebar",
@@ -212,6 +218,7 @@ class StableGenAddonPreferences(bpy.types.AddonPreferences):
             col.prop(self, "timeout_transfer")
             col.prop(self, "timeout_reboot")
             col.prop(self, "timeout_mesh_gen")
+            col.prop(self, "timeout_scan")
 
 
 # ── Server-status check operator ──────────────────────────────────────────

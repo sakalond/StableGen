@@ -6,6 +6,8 @@ import websocket
 import socket
 import urllib.request
 import urllib.parse
+import email.utils
+from datetime import datetime, timezone, timedelta
 
 from .timeout_config import get_timeout
 
@@ -28,6 +30,8 @@ class _WorkflowBase:
             operator: The instance of the ComfyUIGenerate operator.
         """
         self.operator = operator
+        self._clock_offset = timedelta(0)
+        self._clock_offset_utc = timedelta(0)
 
     def _check_server_alive(self, server_address, timeout=None):
         """Return True if the ComfyUI server responds to a lightweight request."""
@@ -38,7 +42,25 @@ class _WorkflowBase:
                 f"http://{server_address}/system_stats",
                 method='GET'
             )
-            urllib.request.urlopen(req, timeout=timeout)
+            with urllib.request.urlopen(req, timeout=timeout) as response:
+                date_header = response.headers.get('Date')
+                if date_header:
+                    try:
+                        server_time = email.utils.parsedate_to_datetime(date_header)
+                        if server_time.tzinfo is None:
+                            server_time = server_time.replace(tzinfo=timezone.utc)
+                        
+                        server_time_utc = server_time.astimezone(timezone.utc).replace(tzinfo=None)
+                        client_time_utc = datetime.now(timezone.utc).replace(tzinfo=None)
+                        client_time_local = datetime.now()
+                        
+                        self._clock_offset = server_time_utc - client_time_utc
+                        self._clock_offset_utc = server_time_utc - client_time_local
+                        
+                        print(f"[StableGen] Server UTC: {server_time_utc}, Client UTC: {client_time_utc}, Client Local: {client_time_local}")
+                        print(f"[StableGen] Clock offsets calculated -> drift: {self._clock_offset}, UTC-assumption: {self._clock_offset_utc}")
+                    except Exception as e_parse:
+                        print(f"[StableGen] Error parsing HTTP Date header: {e_parse}")
             return True
         except Exception:
             return False
