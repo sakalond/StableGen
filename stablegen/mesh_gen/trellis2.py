@@ -85,6 +85,88 @@ class Trellis2Generate(bpy.types.Operator):
         # Keep legacy _progress in sync for any code that reads it
         self._progress = self._overall_progress
 
+    @staticmethod
+    def _clear_imported_custom_normals(mesh_objects):
+        """Clear TRELLIS/GLB custom normals without changing object hierarchy."""
+        if not mesh_objects:
+            return
+
+        previous_active = bpy.context.view_layer.objects.active
+        previous_selection = list(bpy.context.selected_objects)
+        cleared = 0
+
+        try:
+            if bpy.ops.object.mode_set.poll():
+                bpy.ops.object.mode_set(mode='OBJECT')
+        except Exception:
+            pass
+
+        try:
+            for obj in mesh_objects:
+                if obj.type != 'MESH':
+                    continue
+                if hasattr(obj.data, "has_custom_normals") and not obj.data.has_custom_normals:
+                    continue
+
+                bpy.ops.object.select_all(action='DESELECT')
+                obj.select_set(True)
+                bpy.context.view_layer.objects.active = obj
+                try:
+                    bpy.ops.mesh.customdata_custom_splitnormals_clear()
+                    cleared += 1
+                except Exception as err:
+                    print(f"[TRELLIS2] Warning: Could not clear custom normals on {obj.name}: {err}")
+        finally:
+            bpy.ops.object.select_all(action='DESELECT')
+            for obj in previous_selection:
+                if bpy.context.scene.objects.get(obj.name):
+                    obj.select_set(True)
+            if previous_active and bpy.context.scene.objects.get(previous_active.name):
+                bpy.context.view_layer.objects.active = previous_active
+
+        if cleared:
+            print(f"[TRELLIS2] Cleared custom split normals on {cleared} imported mesh object(s)")
+
+    @staticmethod
+    def _disable_not_exported_render_helpers():
+        """Disable glTF control/helper geometry for render and bake."""
+        disabled_objects = 0
+        disabled_collections = 0
+
+        def iter_collection_objects(collection):
+            seen = set()
+
+            def visit(col):
+                for obj in col.objects:
+                    if obj.name in seen:
+                        continue
+                    seen.add(obj.name)
+                    yield obj
+                for child in col.children:
+                    yield from visit(child)
+
+            yield from visit(collection)
+
+        for collection in bpy.data.collections:
+            if "not_exported" not in collection.name.lower():
+                continue
+
+            if not collection.hide_render:
+                collection.hide_render = True
+                disabled_collections += 1
+
+            for obj in iter_collection_objects(collection):
+                if not obj.hide_render:
+                    obj.hide_render = True
+                    disabled_objects += 1
+
+        if disabled_objects or disabled_collections:
+            print(
+                "[TRELLIS2] Disabled render visibility for "
+                f"{disabled_objects} glTF not_exported helper object(s) "
+                f"across {disabled_collections} collection(s)."
+            )
+
     @classmethod
     def poll(cls, context):
         if cls._is_running:
@@ -160,6 +242,7 @@ class Trellis2Generate(bpy.types.Operator):
         self._progress = 0.0
         self._stage = "Initializing"
         self._texture_mode = tex_mode
+        self._autorig_enabled = False
         from ..workflows import WorkflowManager
         self.workflow_manager = WorkflowManager(self)
 
@@ -349,44 +432,51 @@ class Trellis2Generate(bpy.types.Operator):
 
             # Import GLB into Blender
             bpy.ops.import_scene.gltf(filepath=glb_path)
+            autorig_enabled = getattr(self, '_autorig_enabled', False)
 
             # --- Clean hierarchy, unparent meshes, and remove GLTF/GLB structural empties ---
             imported_objects = [obj for obj in context.selected_objects]
             for obj in imported_objects:
                 obj["sg_generated"] = True
+            self._disable_not_exported_render_helpers()
             mesh_objects = [obj for obj in imported_objects if obj.type == 'MESH']
             empty_objects = [obj for obj in imported_objects if obj.type == 'EMPTY']
 
             if mesh_objects:
-                # 1. Unparent meshes while preserving their world space transforms and clearing broken custom normals
-                for obj in mesh_objects:
-                    # Save world matrix
-                    world_mat = obj.matrix_world.copy()
-                    # Set the object as active so the operator can work on it
-                    bpy.context.view_layer.objects.active = obj
-                    # Clear custom split normals using the official operator to fix broken custom normals & convex shadowing artifacts
-                    try:
-                        bpy.ops.mesh.customdata_custom_splitnormals_clear()
-                    except Exception as err:
-                        print(f"[TRELLIS2] Warning: Could not clear custom normals on {obj.name}: {err}")
-                    # Unparent
-                    obj.parent = None
-                    # Restore world matrix
-                    obj.matrix_world = world_mat
-                    
-                # 2. Delete the structural empties (e.g. "world", "geometry_0")
-                if empty_objects:
-                    bpy.ops.object.select_all(action='DESELECT')
-                    for obj in empty_objects:
-                        obj.select_set(True)
-                    bpy.ops.object.delete()
-                    print(f"[TRELLIS2] Cleaned up {len(empty_objects)} GLB parent empty objects")
+                # TRELLIS.2/GLB exports can carry broken custom split normals.
+                # Clear them for both plain and rigged imports; this only
+                # touches mesh data and leaves armature/object hierarchy intact.
+                self._clear_imported_custom_normals(mesh_objects)
 
-                # 3. Reselect only the imported mesh objects for downstream processing
-                bpy.ops.object.select_all(action='DESELECT')
-                for obj in mesh_objects:
-                    obj.select_set(True)
-                bpy.context.view_layer.objects.active = mesh_objects[0]
+                if autorig_enabled:
+                    # Rigged GLBs need their armature/object hierarchy intact.
+                    bpy.ops.object.select_all(action='DESELECT')
+                    for obj in imported_objects:
+                        obj.select_set(True)
+                    bpy.context.view_layer.objects.active = mesh_objects[0]
+                else:
+                    # 1. Unparent meshes while preserving their world space transforms
+                    for obj in mesh_objects:
+                        # Save world matrix
+                        world_mat = obj.matrix_world.copy()
+                        # Unparent
+                        obj.parent = None
+                        # Restore world matrix
+                        obj.matrix_world = world_mat
+
+                    # 2. Delete the structural empties (e.g. "world", "geometry_0")
+                    if empty_objects:
+                        bpy.ops.object.select_all(action='DESELECT')
+                        for obj in empty_objects:
+                            obj.select_set(True)
+                        bpy.ops.object.delete()
+                        print(f"[TRELLIS2] Cleaned up {len(empty_objects)} GLB parent empty objects")
+
+                    # 3. Reselect only the imported mesh objects for downstream processing
+                    bpy.ops.object.select_all(action='DESELECT')
+                    for obj in mesh_objects:
+                        obj.select_set(True)
+                    bpy.context.view_layer.objects.active = mesh_objects[0]
 
             # --- Normalise imported mesh to a reasonable Blender-unit size ---
             target_bu = getattr(context.scene, 'trellis2_import_scale', 2.0)
@@ -408,18 +498,32 @@ class Trellis2Generate(bpy.types.Operator):
                         )
                         if extent > 1e-6:
                             scale_factor = target_bu / extent
-                            for obj in imported_meshes:
-                                obj.scale *= scale_factor
-                            # Apply scale so downstream code sees unit scale
-                            bpy.ops.object.select_all(action='DESELECT')
-                            for obj in imported_meshes:
-                                obj.select_set(True)
-                            bpy.context.view_layer.objects.active = imported_meshes[0]
-                            bpy.ops.object.transform_apply(location=False, rotation=False, scale=True)
-                            print(f"[TRELLIS2] Scaled mesh to {target_bu} BU (factor {scale_factor:.4f})")
+                            if autorig_enabled:
+                                root_objects = [obj for obj in imported_objects if obj.parent is None]
+                                if not root_objects:
+                                    root_objects = imported_objects
+                                for obj in root_objects:
+                                    obj.scale *= scale_factor
+                                print(
+                                    f"[TRELLIS2] Scaled rigged import to {target_bu} BU "
+                                    f"(factor {scale_factor:.4f}, unapplied)"
+                                )
+                            else:
+                                for obj in imported_meshes:
+                                    obj.scale *= scale_factor
+                                # Apply scale so downstream code sees unit scale
+                                bpy.ops.object.select_all(action='DESELECT')
+                                for obj in imported_meshes:
+                                    obj.select_set(True)
+                                bpy.context.view_layer.objects.active = imported_meshes[0]
+                                bpy.ops.object.transform_apply(location=False, rotation=False, scale=True)
+                                print(f"[TRELLIS2] Scaled mesh to {target_bu} BU (factor {scale_factor:.4f})")
 
             # --- Solidification ---
             solidify_mesh = getattr(context.scene, 'trellis2_solidify', False)
+            if autorig_enabled and solidify_mesh:
+                print("[TRELLIS2] Skipping solidify because SkinTokens auto-rigging is enabled")
+                solidify_mesh = False
             if solidify_mesh:
                 from ..texturing.print_export import _make_solid_mesh_object
                 imported_meshes = [obj for obj in context.selected_objects if obj.type == 'MESH']
@@ -440,7 +544,7 @@ class Trellis2Generate(bpy.types.Operator):
             remesh_method = getattr(context.scene, 'trellis2_remesh_method', 'qdc')
             
             imported_meshes = [obj for obj in context.selected_objects if obj.type == 'MESH']
-            if imported_meshes:
+            if imported_meshes and not autorig_enabled:
                 # 1. Fallback decimation on main thread if background decimation was requested but didn't run
                 if decimate_method == 'collapse' and not getattr(self, '_trimesh_decimated', False):
                     import trimesh
@@ -474,6 +578,9 @@ class Trellis2Generate(bpy.types.Operator):
                 # 2. Local remeshing retopology
                 if remesh_method == 'quadriflow':
                     self._perform_retopology(context, imported_meshes, remesh_method)
+            elif imported_meshes and autorig_enabled and (
+                    decimate_method == 'collapse' or remesh_method == 'quadriflow'):
+                print("[TRELLIS2] Skipping local decimation/retopology because SkinTokens auto-rigging is enabled")
 
             # --- Apply shading mode to imported meshes ---
             _shade_mode = getattr(context.scene, 'trellis2_shade_mode', 'flat')
@@ -897,6 +1004,7 @@ class Trellis2Generate(bpy.types.Operator):
 
             # Store the final input image path for later use (IPAdapter/Qwen style)
             self._input_image_path = image_path
+            self._autorig_enabled = bool(getattr(context.scene, 'trellis2_autorig_enabled', False))
 
             result = self.workflow_manager.generate_trellis2(context, image_path)
 
@@ -908,7 +1016,7 @@ class Trellis2Generate(bpy.types.Operator):
                 self._error = result["error"]
             else:
                 self._trimesh_decimated = False
-                if decimate_method == 'collapse':
+                if decimate_method == 'collapse' and not self._autorig_enabled:
                     self._detail_stage = "Decimating mesh via trimesh"
                     self._phase_stage = "Trimesh decimation"
                     self._phase_progress = 90
@@ -923,6 +1031,8 @@ class Trellis2Generate(bpy.types.Operator):
                     except Exception as dec_err:
                         print(f"[TRELLIS2] Background trimesh decimation failed: {dec_err}")
                         # Fallback: result is unmodified raw GLB
+                elif decimate_method == 'collapse' and self._autorig_enabled:
+                    print("[TRELLIS2] Skipping background trimesh decimation because SkinTokens auto-rigging is enabled")
                 self._glb_data = result
 
         except Exception as e:

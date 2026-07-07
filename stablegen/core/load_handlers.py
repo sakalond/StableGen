@@ -128,7 +128,11 @@ def load_handler(dummy):
     if prefs_wrapper:
         server_address = prefs_wrapper.preferences.server_address
         if server_address:
-            from .server_api import check_trellis2_available, check_pbr_available
+            from .server_api import (
+                check_pbr_available,
+                check_skintokens_autorig_available,
+                check_trellis2_available,
+            )
             from ..timeout_config import get_timeout
 
             _timeout = get_timeout('api')
@@ -137,6 +141,7 @@ def load_handler(dummy):
                 result = {}
                 result['trellis2'] = check_trellis2_available(server_address, timeout=_timeout)
                 result['pbr'] = check_pbr_available(server_address, timeout=_timeout)
+                result['skintokens'] = check_skintokens_autorig_available(server_address, timeout=_timeout)
                 return result
 
             def _apply_node_result(result):
@@ -145,5 +150,6 @@ def load_handler(dummy):
                 if hasattr(bpy.context, 'scene') and bpy.context.scene:
                     bpy.context.scene.trellis2_available = result.get('trellis2', False)
                     bpy.context.scene.pbr_nodes_available = result.get('pbr', False)
+                    bpy.context.scene.skintokens_autorig_available = result.get('skintokens', False)
 
             _state._run_async(_check_nodes, _apply_node_result)

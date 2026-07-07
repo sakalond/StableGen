@@ -6,6 +6,95 @@ from ..utils import get_dir_path, sg_modal_active
 
 _ADDON_PKG = __package__.rsplit('.', 1)[0]
 
+
+def _is_gltf_not_exported_helper(obj):
+    for collection in getattr(obj, "users_collection", []):
+        if "not_exported" in collection.name.lower():
+            return True
+    return False
+
+
+def _is_visible_export_object(obj):
+    if not obj or obj.hide_get() or _is_gltf_not_exported_helper(obj):
+        return False
+    try:
+        return obj.visible_get(view_layer=bpy.context.view_layer)
+    except TypeError:
+        try:
+            return obj.visible_get()
+        except Exception:
+            return True
+    except Exception:
+        return True
+
+
+def _armatures_for_mesh(mesh):
+    armatures = []
+    parent = mesh.parent
+    if parent and parent.type == 'ARMATURE':
+        armatures.append(parent)
+
+    for modifier in mesh.modifiers:
+        if modifier.type == 'ARMATURE' and modifier.object and modifier.object.type == 'ARMATURE':
+            armatures.append(modifier.object)
+
+    deduped = []
+    seen = set()
+    for armature in armatures:
+        if armature.name not in seen:
+            deduped.append(armature)
+            seen.add(armature.name)
+    return deduped
+
+
+def _mesh_uses_armature(mesh, armature):
+    if mesh.parent == armature:
+        return True
+    return any(
+        modifier.type == 'ARMATURE' and modifier.object == armature
+        for modifier in mesh.modifiers
+    )
+
+
+def _collect_game_export_objects(context, scope):
+    if scope == 'ALL_MESH':
+        meshes = [
+            obj for obj in context.view_layer.objects
+            if obj.type == 'MESH' and _is_visible_export_object(obj)
+        ]
+        selected_armatures = []
+    else:
+        selected = list(context.selected_objects)
+        meshes = [obj for obj in selected if obj.type == 'MESH']
+        selected_armatures = [
+            obj for obj in selected
+            if obj.type == 'ARMATURE' and _is_visible_export_object(obj)
+        ]
+
+    for armature in selected_armatures:
+        for obj in context.view_layer.objects:
+            if (
+                obj.type == 'MESH'
+                and _is_visible_export_object(obj)
+                and _mesh_uses_armature(obj, armature)
+                and obj not in meshes
+            ):
+                meshes.append(obj)
+
+    armatures = []
+    for mesh in meshes:
+        for armature in _armatures_for_mesh(mesh):
+            if _is_visible_export_object(armature) and armature not in armatures:
+                armatures.append(armature)
+
+    export_objects = []
+    for obj in [*armatures, *meshes]:
+        if obj not in export_objects:
+            export_objects.append(obj)
+
+    return meshes, armatures, export_objects
+
+
 class ExportForGameEngine(bpy.types.Operator):
     """Export textured objects for game engines with PBR textures.
 
@@ -33,15 +122,15 @@ class ExportForGameEngine(bpy.types.Operator):
         name="Objects",
         description="Which objects to export",
         items=[
-            ('SELECTED', 'Selected', 'Export selected mesh objects'),
-            ('ALL_MESH', 'All Mesh', 'Export all visible mesh objects'),
+            ('SELECTED', 'Selected', 'Export selected meshes and detected rigs'),
+            ('ALL_MESH', 'All Mesh', 'Export all visible meshes and detected rigs'),
         ],
         default='SELECTED'
     ) # type: ignore
 
     apply_transforms: bpy.props.BoolProperty(
         name="Apply Transforms",
-        description="Apply location, rotation and scale before export",
+        description="Apply location, rotation and scale before export. Skipped automatically for rigged exports",
         default=True
     ) # type: ignore
 
@@ -77,20 +166,18 @@ class ExportForGameEngine(bpy.types.Operator):
         original_selection = list(context.selected_objects)
         original_active = context.view_layer.objects.active
 
-        if self.export_scope == 'ALL_MESH':
-            bpy.ops.object.select_all(action='DESELECT')
-            meshes = [o for o in context.view_layer.objects
-                      if o.type == 'MESH' and not o.hide_get()]
-            for o in meshes:
-                o.select_set(True)
-            if meshes:
-                context.view_layer.objects.active = meshes[0]
-        else:
-            meshes = [o for o in context.selected_objects
-                      if o.type == 'MESH']
-            if not meshes:
-                self.report({'ERROR'}, "No mesh objects selected.")
-                return {'CANCELLED'}
+        meshes, armatures, export_objects = _collect_game_export_objects(
+            context, self.export_scope)
+        if not meshes:
+            self.report({'ERROR'}, "No mesh objects to export.")
+            return {'CANCELLED'}
+
+        rigged_export = bool(armatures)
+
+        bpy.ops.object.select_all(action='DESELECT')
+        for obj in export_objects:
+            obj.select_set(True)
+        context.view_layer.objects.active = meshes[0]
 
         # ── Output path ───────────────────────────────────────────────
         output_base = get_dir_path(context, "baked")
@@ -108,7 +195,12 @@ class ExportForGameEngine(bpy.types.Operator):
         filepath = os.path.join(output_base, f"{base_name}{ext}")
 
         # ── Apply transforms if requested ─────────────────────────────
-        if self.apply_transforms:
+        if self.apply_transforms and rigged_export:
+            print(
+                "[StableGen] Rigged export detected; skipping transform apply "
+                "to preserve armature bind pose"
+            )
+        elif self.apply_transforms:
             for o in meshes:
                 o.select_set(True)
             bpy.ops.object.transform_apply(
@@ -132,13 +224,21 @@ class ExportForGameEngine(bpy.types.Operator):
                 bpy.ops.export_scene.fbx(
                     filepath=filepath,
                     use_selection=True,
+                    object_types={'MESH', 'ARMATURE'},
                     apply_scale_options='FBX_SCALE_ALL',
                     path_mode='COPY',
                     embed_textures=True,
+                    add_leaf_bones=False,
                     bake_anim=self.export_animations,
+                    bake_anim_use_all_bones=True,
                     mesh_smooth_type='FACE',
                 )
 
+            if rigged_export:
+                print(
+                    f"[StableGen] Exported rigged asset with "
+                    f"{len(meshes)} mesh object(s) and {len(armatures)} armature(s)"
+                )
             self.report({'INFO'},
                         f"Exported to {filepath}")
         except Exception as e:

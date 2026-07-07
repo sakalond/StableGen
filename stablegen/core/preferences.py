@@ -18,6 +18,7 @@ from .server_api import (
     _fetch_api_list,
     check_pbr_available,
     check_server_availability,
+    check_skintokens_autorig_available,
     check_trellis2_available,
 )
 from .state import (
@@ -254,9 +255,11 @@ class CheckServerStatus(bpy.types.Operator):
             if result['online']:
                 result['trellis2'] = check_trellis2_available(server_addr, timeout=get_timeout('api'))
                 result['pbr'] = check_pbr_available(server_addr, timeout=get_timeout('api'))
+                result['skintokens'] = check_skintokens_autorig_available(server_addr, timeout=get_timeout('api'))
             else:
                 result['trellis2'] = False
                 result['pbr'] = False
+                result['skintokens'] = False
             return result
 
         def _on_done(result):
@@ -268,6 +271,7 @@ class CheckServerStatus(bpy.types.Operator):
             if hasattr(bpy.context, 'scene') and bpy.context.scene:
                 bpy.context.scene.trellis2_available = result.get('trellis2', False)
                 bpy.context.scene.pbr_nodes_available = result.get('pbr', False)
+                bpy.context.scene.skintokens_autorig_available = result.get('skintokens', False)
 
             if result.get('online', False):
                 print(f"[StableGen] ComfyUI server is online at {server_addr}.")

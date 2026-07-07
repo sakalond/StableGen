@@ -1200,7 +1200,7 @@ def export_visibility(context, to_export, obj=None, camera_visibility=None, prep
         mat = obj.active_material
         if not mat:
             return False
-        
+
         # Store original materials
         original_materials[obj] = list(obj.data.materials)
         original_active_material[obj] = obj.active_material  # Store original active material
@@ -1457,7 +1457,7 @@ def export_visibility(context, to_export, obj=None, camera_visibility=None, prep
         for mat in materials:
             if mat != original_active_material[obj]:
                 obj.data.materials.append(mat)
-                
+
     # Clean up temporary materials
     for _, temp_mat in temporary_materials.items():
         if temp_mat and temp_mat.name in bpy.data.materials:
@@ -1586,6 +1586,281 @@ def prepare_baking(context):
     # where we bake 5-7 channels of the same mesh back-to-back)
     bpy.context.scene.render.use_persistent_data = True
 
+
+_SG_BAKE_UV_NAME = "BakeUV"
+_SG_PROJECTION_BUFFER_UV_NAME = "_SG_ProjectionBuffer"
+
+
+def _is_projection_or_buffer_uv(name):
+    return name.startswith("ProjectionUV") or name == _SG_PROJECTION_BUFFER_UV_NAME
+
+
+def _first_source_uv_name(obj):
+    if not obj or not obj.data.uv_layers:
+        return None
+    for uv in obj.data.uv_layers:
+        if uv.name != _SG_BAKE_UV_NAME and not _is_projection_or_buffer_uv(uv.name):
+            return uv.name
+    return None
+
+
+def _ensure_bake_uv(obj):
+    uv_layers = obj.data.uv_layers
+    bake_uv = uv_layers.get(_SG_BAKE_UV_NAME)
+    if bake_uv is None:
+        source_uv = _first_source_uv_name(obj)
+        if source_uv and uv_layers.get(source_uv):
+            uv_layers.active = uv_layers[source_uv]
+        bake_uv = uv_layers.new(name=_SG_BAKE_UV_NAME)
+        print(f"[StableGen] Created {_SG_BAKE_UV_NAME} on {obj.name}")
+    uv_layers.active = bake_uv
+    return bake_uv
+
+
+def _set_bake_uv_active(obj):
+    uv_layers = obj.data.uv_layers
+    bake_uv = uv_layers.get(_SG_BAKE_UV_NAME)
+    if bake_uv:
+        uv_layers.active = bake_uv
+        return bake_uv
+    for uv in uv_layers:
+        if not _is_projection_or_buffer_uv(uv.name):
+            uv_layers.active = uv
+            return uv
+    return _ensure_bake_uv(obj)
+
+
+def _pin_unlinked_image_textures_to_uv(nodes, links, uv_name, exclude_nodes=()):
+    if not uv_name:
+        return None
+
+    exclude_nodes = set(exclude_nodes or ())
+    image_nodes = [
+        node for node in nodes
+        if node.type == 'TEX_IMAGE'
+        and node not in exclude_nodes
+        and node.inputs.get("Vector")
+        and not node.inputs["Vector"].links
+    ]
+    if not image_nodes:
+        return None
+
+    uv_node = nodes.new("ShaderNodeUVMap")
+    uv_node.uv_map = uv_name
+    uv_node.label = f"StableGen Source UV ({uv_name})"
+    for image_node in image_nodes:
+        links.new(uv_node.outputs["UV"], image_node.inputs["Vector"])
+    print(
+        f"[StableGen] Pinned {len(image_nodes)} source image texture node(s) "
+        f"to UV map '{uv_name}' for baking"
+    )
+    return uv_node
+
+
+def _copy_material_slots_for_bake(obj):
+    original_materials = list(obj.data.materials)
+    original_active_index = obj.active_material_index
+    copied_materials = []
+
+    obj.data.materials.clear()
+    for mat in original_materials:
+        if mat:
+            mat_copy = mat.copy()
+            obj.data.materials.append(mat_copy)
+            copied_materials.append(mat_copy)
+
+    return original_materials, original_active_index, copied_materials
+
+
+def _restore_material_slots_after_bake(obj, original_materials, original_active_index, copied_materials):
+    obj.data.materials.clear()
+    for mat in original_materials:
+        if mat:
+            obj.data.materials.append(mat)
+    if obj.data.materials:
+        obj.active_material_index = min(max(0, original_active_index), len(obj.data.materials) - 1)
+    for mat in copied_materials:
+        if mat and mat.name in bpy.data.materials:
+            bpy.data.materials.remove(mat)
+
+
+def _first_principled_node(mat):
+    if not mat or not mat.use_nodes:
+        return None
+    for node in mat.node_tree.nodes:
+        if node.type == 'BSDF_PRINCIPLED':
+            return node
+    return None
+
+
+def _socket_gray_rgba(socket, fallback=0.0):
+    try:
+        value = socket.default_value
+    except Exception:
+        value = fallback
+    if isinstance(value, (float, int)):
+        scalar = float(value)
+    else:
+        scalar = float(value[0]) if value else float(fallback)
+    return (scalar, scalar, scalar, 1.0)
+
+
+def _pbr_channel_default_rgba(mat, channel_name):
+    principled = _first_principled_node(mat)
+    if channel_name == 'base_color':
+        if principled and principled.inputs.get("Base Color"):
+            return tuple(principled.inputs["Base Color"].default_value)
+        return (1.0, 1.0, 1.0, 1.0)
+    if channel_name == 'roughness':
+        if principled and principled.inputs.get("Roughness"):
+            return _socket_gray_rgba(principled.inputs["Roughness"], 0.5)
+        return (0.5, 0.5, 0.5, 1.0)
+    if channel_name == 'metallic':
+        if principled and principled.inputs.get("Metallic"):
+            return _socket_gray_rgba(principled.inputs["Metallic"], 0.0)
+        return (0.0, 0.0, 0.0, 1.0)
+    if channel_name == 'ao':
+        return (1.0, 1.0, 1.0, 1.0)
+    return (0.0, 0.0, 0.0, 1.0)
+
+
+def _is_bone_custom_shape_object(obj):
+    for armature in bpy.context.view_layer.objects:
+        if armature.type != 'ARMATURE' or not armature.pose:
+            continue
+        for bone in armature.pose.bones:
+            if bone.custom_shape == obj:
+                return True
+    return False
+
+
+def _is_gltf_not_exported_helper(obj):
+    for collection in getattr(obj, "users_collection", []):
+        if "not_exported" in collection.name.lower():
+            return True
+    return False
+
+
+def _iter_collection_objects_recursive(collection):
+    seen = set()
+
+    def visit(col):
+        for obj in col.objects:
+            if obj.name in seen:
+                continue
+            seen.add(obj.name)
+            yield obj
+        for child in col.children:
+            yield from visit(child)
+
+    yield from visit(collection)
+
+
+def _disable_not_exported_render_helpers(context=None):
+    """Prevent glTF helper/control geometry from occluding texture bakes."""
+    disabled_objects = 0
+    disabled_collections = 0
+
+    for collection in bpy.data.collections:
+        if "not_exported" not in collection.name.lower():
+            continue
+
+        if not collection.hide_render:
+            collection.hide_render = True
+            disabled_collections += 1
+
+        for obj in _iter_collection_objects_recursive(collection):
+            if not obj.hide_render:
+                obj.hide_render = True
+                disabled_objects += 1
+
+    if disabled_objects or disabled_collections:
+        print(
+            "[StableGen] Disabled render visibility for "
+            f"{disabled_objects} glTF not_exported helper object(s) "
+            f"across {disabled_collections} collection(s)."
+        )
+
+    if context:
+        context.view_layer.update()
+
+
+def _object_visible_in_view_layer(obj):
+    if obj.hide_get():
+        return False
+    try:
+        return obj.visible_get(view_layer=bpy.context.view_layer)
+    except TypeError:
+        try:
+            return obj.visible_get()
+        except Exception:
+            return True
+    except Exception:
+        return True
+
+
+def _is_texture_bake_target(obj):
+    if obj is None or obj.type != 'MESH':
+        return False
+    if not _object_visible_in_view_layer(obj) or obj.hide_render:
+        return False
+    if _is_gltf_not_exported_helper(obj):
+        return False
+    if _is_bone_custom_shape_object(obj):
+        return False
+    if not obj.data or not obj.data.polygons:
+        return False
+    return any(mat for mat in obj.data.materials)
+
+
+def _texture_bake_targets(objects):
+    targets = []
+    skipped = []
+    for obj in objects:
+        if _is_texture_bake_target(obj):
+            targets.append(obj)
+        elif obj and obj.type == 'MESH':
+            skipped.append(obj)
+    return targets, skipped
+
+
+def _activate_mesh_for_object_ops(obj):
+    """Select and activate a mesh object for bpy.ops calls."""
+    if obj is None or obj.type != 'MESH':
+        raise RuntimeError("Bake target is not a mesh object")
+
+    if not any(view_obj == obj for view_obj in bpy.context.view_layer.objects):
+        raise RuntimeError(
+            f"Bake target '{getattr(obj, 'name', '<unknown>')}' is not in the active view layer"
+        )
+
+    if obj.hide_get():
+        obj.hide_set(False)
+    if obj.hide_select:
+        obj.hide_select = False
+
+    try:
+        if bpy.ops.object.mode_set.poll():
+            bpy.ops.object.mode_set(mode='OBJECT')
+    except Exception:
+        pass
+
+    bpy.ops.object.select_all(action='DESELECT')
+    bpy.context.view_layer.objects.active = obj
+    obj.select_set(True)
+    bpy.context.view_layer.update()
+
+    if bpy.context.view_layer.objects.active != obj:
+        raise RuntimeError(f"Could not activate bake target '{obj.name}'")
+
+    return {
+        'active_object': obj,
+        'object': obj,
+        'selected_objects': [obj],
+        'selected_editable_objects': [obj],
+    }
+
+
 def unwrap(obj, method, overlap_only):
         """     
         Unwraps the UVs of the given object using the selected method.         
@@ -1595,85 +1870,67 @@ def unwrap(obj, method, overlap_only):
         if method == 'none':
             return
         
-        # Deselect all objects
-        bpy.ops.object.select_all(action='DESELECT')
-        # Set object as active and select it
-        bpy.context.view_layer.objects.active = obj
-        obj.select_set(True)
+        op_context = _activate_mesh_for_object_ops(obj)
 
-        is_new = False
+        _ensure_bake_uv(obj)
 
-        # If all UV maps are ProjectionUV or buffer, add new one
-        if all(["ProjectionUV" in uv.name or uv.name == "_SG_ProjectionBuffer" for uv in obj.data.uv_layers]):
-            # Add a new UV map
-            obj.data.uv_layers.new(name=f"BakeUV")
-            is_new = True
-            obj.data.uv_layers.active_index = len(obj.data.uv_layers) - 1
-            # Set it for rendering
-            obj.data.uv_layers.active = obj.data.uv_layers[-1]
-        else:
-            # Ensure the active UV is a non-ProjectionUV/buffer map
-            for uv_layer in obj.data.uv_layers:
-                if "ProjectionUV" not in uv_layer.name and uv_layer.name != "_SG_ProjectionBuffer":
-                    obj.data.uv_layers.active = uv_layer
-                    break
-        
-        bpy.ops.object.mode_set(mode='EDIT')
+        with bpy.context.temp_override(**op_context):
+            bpy.ops.object.mode_set(mode='EDIT')
 
-        # Ensure UV selection sync is OFF
-        bpy.context.scene.tool_settings.use_uv_select_sync = False
+            # Ensure UV selection sync is OFF
+            bpy.context.scene.tool_settings.use_uv_select_sync = False
 
-        if overlap_only:
-            # Deselect
-            bpy.ops.uv.select_all(action='DESELECT')
-            # Check if the object has overlapping UVs, if not, skip unwrapping
-            bpy.ops.uv.select_overlap()
-            # Get a BMesh representation of the mesh
-            bm = bmesh.from_edit_mesh(obj.data)
-            bm.faces.ensure_lookup_table()
-            # Use the active UV layer (this is a BMUVLayer)
-            uv_layer = bm.loops.layers.uv.active
-            uv_layer = bm.loops.layers.uv.active
-            if not uv_layer:
-                bpy.ops.object.mode_set(mode='OBJECT')
-                return
+            if overlap_only:
+                # Deselect
+                bpy.ops.uv.select_all(action='DESELECT')
+                # Check if the object has overlapping UVs, if not, skip unwrapping
+                bpy.ops.uv.select_overlap()
+                # Get a BMesh representation of the mesh
+                bm = bmesh.from_edit_mesh(obj.data)
+                bm.faces.ensure_lookup_table()
+                # Use the active UV layer (this is a BMUVLayer)
+                uv_layer = bm.loops.layers.uv.active
+                uv_layer = bm.loops.layers.uv.active
+                if not uv_layer:
+                    bpy.ops.object.mode_set(mode='OBJECT')
+                    return
+
+                # Check for ANY selected UV elements
+                if bpy.app.version >= (5, 0, 0):
+                    # Blender 5.0+ uses loop.uv_select_vert
+                    has_overlap = any(
+                        loop.uv_select_vert
+                        for face in bm.faces
+                        for loop in face.loops
+                    )
+                else:
+                    has_overlap = any(
+                        loop[uv_layer].select
+                        for face in bm.faces
+                        for loop in face.loops
+                    )
+
+                if not has_overlap:
+                    bpy.ops.object.mode_set(mode='OBJECT')
+                    return
+
+            bpy.context.scene.tool_settings.use_uv_select_sync = True
+            # Select all faces
+            bpy.ops.mesh.select_all(action='SELECT')
             
-            # Check for ANY selected UV elements
-            if bpy.app.version >= (5, 0, 0):
-                # Blender 5.0+ uses loop.uv_select_vert
-                has_overlap = any(
-                    loop.uv_select_vert
-                    for face in bm.faces 
-                    for loop in face.loops
-                )
-            else:
-                has_overlap = any(
-                    loop[uv_layer].select 
-                    for face in bm.faces 
-                    for loop in face.loops
-                )
+            if method == 'basic':
+                bpy.ops.uv.unwrap(method='ANGLE_BASED', margin=0.001)
+            elif method == 'smart':
+                bpy.ops.uv.smart_project()
+            elif method == 'cube':
+                bpy.ops.uv.cube_project(cube_size=1.0)
+            elif method == 'lightmap':
+                bpy.ops.uv.lightmap_pack()
+            elif method == 'pack':
+                bpy.ops.uv.pack_islands()
 
-            if not has_overlap:
-                bpy.ops.object.mode_set(mode='OBJECT')
-                return
-
-        bpy.context.scene.tool_settings.use_uv_select_sync = True
-        # Select all faces
-        bpy.ops.mesh.select_all(action='SELECT')
-        
-        if method == 'basic':
-            bpy.ops.uv.unwrap(method='ANGLE_BASED', margin=0.001)
-        elif method == 'smart':
-            bpy.ops.uv.smart_project()
-        elif method == 'cube':
-            bpy.ops.uv.cube_project(cube_size=1.0)
-        elif method == 'lightmap':
-            bpy.ops.uv.lightmap_pack()
-        elif method == 'pack':
-            bpy.ops.uv.pack_islands()
-
-        bpy.ops.uv.select_all(action='DESELECT')
-        bpy.ops.object.mode_set(mode='OBJECT')
+            bpy.ops.uv.select_all(action='DESELECT')
+            bpy.ops.object.mode_set(mode='OBJECT')
 
 def bake_texture(context, obj, texture_resolution, suffix = "", view_transform = 'Standard', output_dir = None):
         """     
@@ -1682,6 +1939,10 @@ def bake_texture(context, obj, texture_resolution, suffix = "", view_transform =
         :param obj: Blender object.         
         :return: True if successful, False otherwise. 
         """
+        _disable_not_exported_render_helpers(context)
+        if _is_gltf_not_exported_helper(obj) or _is_bone_custom_shape_object(obj):
+            print(f"[StableGen] Skipping helper mesh during bake: {obj.name}")
+            return False
         bpy.context.scene.display_settings.display_device = 'sRGB'
         # Backup original view transform
         original_view_transform = bpy.context.scene.view_settings.view_transform
@@ -1692,79 +1953,74 @@ def bake_texture(context, obj, texture_resolution, suffix = "", view_transform =
         # Set the object to be rendered
         obj.hide_render = False
 
+        source_uv_name = _first_source_uv_name(obj)
+        _set_bake_uv_active(obj)
+
         # Create a new image for baking
         image_name = f"{obj.name}_baked{suffix}" 
         image = bpy.data.images.new(name=image_name, width=texture_resolution, height=texture_resolution)
 
-        # Create a new texture node in the object's material
         if not obj.data.materials:
-            # Cancel
             print("[StableGen] No materials found")
             return False
-        else:
-            # Temporarily remove all original materials
-            mat = obj.active_material.copy()
-            original_materials = list(obj.data.materials)
-            original_active_material = obj.active_material
-            obj.data.materials.clear()
-            obj.data.materials.append(mat)
 
-        mat.use_nodes = True
-        nodes = mat.node_tree.nodes
-        links = mat.node_tree.links
+        original_materials, original_active_index, copied_materials = _copy_material_slots_for_bake(obj)
+        if not copied_materials:
+            _restore_material_slots_after_bake(
+                obj, original_materials, original_active_index, copied_materials)
+            print("[StableGen] No material slots found")
+            return False
 
-        tex_image = nodes.new("ShaderNodeTexImage")
-        tex_image.image = image
-        tex_image.location = (0, 0)
+        op_context = _activate_mesh_for_object_ops(obj)
+        _set_bake_uv_active(obj)
 
-        # Deselect all objects
-        bpy.ops.object.select_all(action='DESELECT')
-        # Set object as active and select it
-        bpy.context.view_layer.objects.active = obj
-        obj.select_set(True)
-        # Set the image node as the active bake target
-        nodes.active = tex_image    
+        for mat in copied_materials:
+            mat.use_nodes = True
+            nodes = mat.node_tree.nodes
+            links = mat.node_tree.links
 
-        # Ensure the active UV is a non-ProjectionUV/buffer map for correct baking
-        for uv_layer in obj.data.uv_layers:
-            if "ProjectionUV" not in uv_layer.name and uv_layer.name != "_SG_ProjectionBuffer":
-                obj.data.uv_layers.active = uv_layer
-                break
+            tex_image = nodes.new("ShaderNodeTexImage")
+            tex_image.image = image
+            tex_image.location = (0, 0)
+            nodes.active = tex_image
+
+            _pin_unlinked_image_textures_to_uv(
+                nodes, links, source_uv_name, exclude_nodes={tex_image})
         
-        # Check if there is a BSDF node before the output node
-        output = None
-        had_bsdf = False
-        for node in nodes:
-            if node.type == 'OUTPUT_MATERIAL':
-                output = node
-                break
-            
-        before_output = output.inputs[0].links[0].from_node if output and output.inputs[0].is_linked else None
-        if before_output and before_output.type != 'BSDF_PRINCIPLED':
-            bsdf_node = nodes.new("ShaderNodeBsdfPrincipled")
-            bsdf_node.location = (before_output.location[0] + 200, before_output.location[1])
-            # Connect the before output node to the BSDF node
-            links.new(before_output.outputs[0], bsdf_node.inputs[0])
-            # Connect the BSDF node to the output node
-            links.new(bsdf_node.outputs[0], output.inputs[0])
+            # Check if there is a BSDF node before the output node
+            output = None
+            for node in nodes:
+                if node.type == 'OUTPUT_MATERIAL':
+                    output = node
+                    break
 
-        # Disconnect Metallic so the DIFFUSE color-only pass returns the
-        # true Base Color.  Principled BSDF multiplies diffuse by
-        # (1 - Metallic), which would dim metallic areas incorrectly.
-        for node in nodes:
-            if node.type == 'BSDF_PRINCIPLED':
-                met = node.inputs.get("Metallic")
-                if met:
-                    for link in list(met.links):
-                        links.remove(link)
-                    met.default_value = 0.0
-                break
+            before_output = output.inputs[0].links[0].from_node if output and output.inputs[0].is_linked else None
+            if before_output and before_output.type != 'BSDF_PRINCIPLED':
+                bsdf_node = nodes.new("ShaderNodeBsdfPrincipled")
+                bsdf_node.location = (before_output.location[0] + 200, before_output.location[1])
+                # Connect the before output node to the BSDF node
+                links.new(before_output.outputs[0], bsdf_node.inputs[0])
+                # Connect the BSDF node to the output node
+                links.new(bsdf_node.outputs[0], output.inputs[0])
+
+            # Disconnect Metallic so the DIFFUSE color-only pass returns the
+            # true Base Color.  Principled BSDF multiplies diffuse by
+            # (1 - Metallic), which would dim metallic areas incorrectly.
+            for node in nodes:
+                if node.type == 'BSDF_PRINCIPLED':
+                    met = node.inputs.get("Metallic")
+                    if met:
+                        for link in list(met.links):
+                            links.remove(link)
+                        met.default_value = 0.0
+                    break
             
         # Bake the texture
         # Ensure OBJECT mode — bake fails silently in EDIT mode
-        if bpy.context.mode != 'OBJECT':
-            bpy.ops.object.mode_set(mode='OBJECT')
-        bpy.ops.object.bake(type='DIFFUSE', width=texture_resolution, height=texture_resolution)
+        with bpy.context.temp_override(**op_context):
+            if bpy.context.mode != 'OBJECT':
+                bpy.ops.object.mode_set(mode='OBJECT')
+            bpy.ops.object.bake(type='DIFFUSE', width=texture_resolution, height=texture_resolution)
        
         # Save the image if required
         if not os.path.exists(output_dir):
@@ -1784,17 +2040,8 @@ def bake_texture(context, obj, texture_resolution, suffix = "", view_transform =
         # Restore original render settings
         obj.hide_render = original_render
 
-        # Restore original materials
-        obj.data.materials.clear()
-        # First append the original active material
-        if original_active_material:
-            obj.data.materials.append(original_active_material)
-        for mat_item in original_materials:
-            if mat_item != original_active_material:
-                obj.data.materials.append(mat_item)
-
-        # Remove the temporary material copy (prevent leak)
-        bpy.data.materials.remove(mat)
+        _restore_material_slots_after_bake(
+            obj, original_materials, original_active_index, copied_materials)
                 
         return True
 
@@ -1803,18 +2050,14 @@ def _has_non_projection_uv(obj):
     for baking (not a StableGen projection UV or buffer)."""
     if not obj or obj.type != 'MESH':
         return False
-    if not obj.data.uv_layers:
-        return False
-    for uv in obj.data.uv_layers:
-        if (not uv.name.startswith("ProjectionUV")
-                and uv.name != "_SG_ProjectionBuffer"):
-            return True
-    return False
+    return obj.data.uv_layers.get(_SG_BAKE_UV_NAME) is not None
 
 def _uvs_likely_overlap(obj, uv_name=None):
     me = obj.data
     if not me.uv_layers:
         return False
+    if uv_name is None:
+        uv_name = _SG_BAKE_UV_NAME
     uv_layer = me.uv_layers.get(uv_name) if uv_name else me.uv_layers.active
     if not uv_layer:
         return False
@@ -1967,14 +2210,14 @@ def _has_pbr_channels(mat):
     return any(ch in sources for ch in ('roughness', 'metallic', 'normal', 'emission', 'height', 'ao'))
 
 
-def _restore_materials(obj, original_materials, original_active):
-    """Restore an object's material slots back to their original state."""
-    obj.data.materials.clear()
-    if original_active:
-        obj.data.materials.append(original_active)
-    for m in original_materials:
-        if m != original_active:
-            obj.data.materials.append(m)
+def _object_pbr_channels(obj):
+    channels = []
+    for mat in obj.data.materials:
+        if mat and _has_pbr_channels(mat):
+            for channel in _find_pbr_bake_sources(mat):
+                if channel not in channels:
+                    channels.append(channel)
+    return channels
 
 
 def bake_pbr_channel(context, obj, channel_name, texture_resolution, output_dir):
@@ -1990,11 +2233,18 @@ def bake_pbr_channel(context, obj, channel_name, texture_resolution, output_dir)
     if not obj.data.materials or not obj.active_material:
         return None
 
+    _disable_not_exported_render_helpers(context)
+    if _is_gltf_not_exported_helper(obj) or _is_bone_custom_shape_object(obj):
+        print(f"[StableGen] Skipping helper mesh during PBR bake: {obj.name}")
+        return None
+
     # ── Save state ─────────────────────────────────────────────────
     orig_vt = context.scene.view_settings.view_transform
     orig_render = obj.hide_render
     context.scene.view_settings.view_transform = 'Standard'
     obj.hide_render = False
+    source_uv_name = _first_source_uv_name(obj)
+    _set_bake_uv_active(obj)
 
     # ── Copy material onto the object ──────────────────────────────
     original_materials = list(obj.data.materials)
@@ -2082,27 +2332,25 @@ def bake_pbr_channel(context, obj, channel_name, texture_resolution, output_dir)
     nodes.active = tex_node
 
     # ── Select object + non-projection UV ──────────────────────────
-    bpy.ops.object.select_all(action='DESELECT')
-    context.view_layer.objects.active = obj
-    obj.select_set(True)
-    for uv in obj.data.uv_layers:
-        if "ProjectionUV" not in uv.name and uv.name != "_SG_ProjectionBuffer":
-            obj.data.uv_layers.active = uv
-            break
+    op_context = _activate_mesh_for_object_ops(obj)
+    _pin_unlinked_image_textures_to_uv(
+        nodes, links, source_uv_name, exclude_nodes={tex_node})
+    _set_bake_uv_active(obj)
 
     # ── Bake ─────────────────────────────────────────────────────
     # Ensure OBJECT mode — bake fails silently in EDIT mode
-    if bpy.context.mode != 'OBJECT':
-        bpy.ops.object.mode_set(mode='OBJECT')
-    if bake_type == 'NORMAL':
-        bpy.ops.object.bake(type='NORMAL',
-                            normal_space='TANGENT',
-                            width=texture_resolution,
-                            height=texture_resolution)
-    else:
-        bpy.ops.object.bake(type='EMIT',
-                            width=texture_resolution,
-                            height=texture_resolution)
+    with bpy.context.temp_override(**op_context):
+        if bpy.context.mode != 'OBJECT':
+            bpy.ops.object.mode_set(mode='OBJECT')
+        if bake_type == 'NORMAL':
+            bpy.ops.object.bake(type='NORMAL',
+                                normal_space='TANGENT',
+                                width=texture_resolution,
+                                height=texture_resolution)
+        else:
+            bpy.ops.object.bake(type='EMIT',
+                                width=texture_resolution,
+                                height=texture_resolution)
 
     # ── Save ───────────────────────────────────────────────────────
     os.makedirs(output_dir, exist_ok=True)
@@ -2323,9 +2571,20 @@ class BakeTextures(bpy.types.Operator):
         :return: {'RUNNING_MODAL'}     
         """
         if context.scene.texture_objects == 'all':
-            self._objects = [obj for obj in context.view_layer.objects if obj.type == 'MESH' and not obj.hide_get()]
+            candidates = [obj for obj in context.view_layer.objects if obj.type == 'MESH']
         else: # 'selected'
-            self._objects = [obj for obj in context.selected_objects if obj.type == 'MESH']
+            candidates = [obj for obj in context.selected_objects if obj.type == 'MESH']
+        self._objects, skipped = _texture_bake_targets(candidates)
+        if skipped:
+            names = ", ".join(obj.name for obj in skipped[:5])
+            more = "" if len(skipped) <= 5 else f", +{len(skipped) - 5} more"
+            print(
+                f"[StableGen] Skipping {len(skipped)} non-texture helper mesh(es) "
+                f"during bake: {names}{more}"
+            )
+        if not self._objects:
+            self.report({'ERROR'}, "No textureable mesh objects found to bake.")
+            return {'CANCELLED'}
         self._current_index = 0
         self._phase = 'unwrap'
         self._total_objects = len(self._objects)
@@ -2338,6 +2597,19 @@ class BakeTextures(bpy.types.Operator):
         :param context: Blender context.         
         :return: {'RUNNING_MODAL'}     
         """
+
+        _disable_not_exported_render_helpers(context)
+        self._objects, skipped = _texture_bake_targets(self._objects)
+        if skipped:
+            names = ", ".join(obj.name for obj in skipped[:5])
+            more = "" if len(skipped) <= 5 else f", +{len(skipped) - 5} more"
+            print(
+                f"[StableGen] Skipping {len(skipped)} non-texture helper mesh(es) "
+                f"during bake: {names}{more}"
+            )
+        if not self._objects:
+            self.report({'ERROR'}, "No textureable mesh objects found to bake.")
+            return {'CANCELLED'}
 
         self.original_engine = bpy.context.scene.render.engine
         if bpy.context.space_data and hasattr(bpy.context.space_data, 'shading'):

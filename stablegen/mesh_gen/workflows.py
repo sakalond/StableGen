@@ -763,12 +763,26 @@ class _Trellis2WorkflowMixin:
 
         # Configure export with unique prefix for identification
         unique_prefix = f"trellis2_{uuid.uuid4().hex[:8]}"
+        autorig_enabled = bool(getattr(scene, 'trellis2_autorig_enabled', False))
+        if autorig_enabled and not getattr(scene, 'skintokens_autorig_available', False):
+            return {
+                "error": (
+                    "SkinTokens auto-rigging is enabled, but the "
+                    "StableGenSkinTokensAutoRig node was not detected in ComfyUI."
+                )
+            }
 
         # When post-processing is disabled, maximize the decimation target
         # and disable remeshing so the user gets the rawest possible mesh.
         use_pp = getattr(scene, 'trellis2_post_processing_enabled', True)
         decimate_method = getattr(scene, 'trellis2_decimate_method', 'server')
         remesh_method = getattr(scene, 'trellis2_remesh_method', 'qdc')
+        if autorig_enabled and decimate_method == 'collapse':
+            print(
+                "[TRELLIS2] SkinTokens auto-rigging runs on the ComfyUI host; "
+                "using server-side decimation instead of local collapse decimation"
+            )
+            decimate_method = 'server'
 
         if skip_texture:
             bypass_server_simplify = (not use_pp) or (remesh_method != 'qdc' and decimate_method != 'server')
@@ -798,9 +812,6 @@ class _Trellis2WorkflowMixin:
             prompt[NODES['shape_to_textured_mesh']]["inputs"]["tex_sampling_steps"] = scene.trellis2_tex_steps
  
             # Configure GLB export via process/rasterize/export pipeline
-            decimate_method = getattr(scene, 'trellis2_decimate_method', 'server')
-            remesh_method = getattr(scene, 'trellis2_remesh_method', 'qdc')
-            
             bypass_server_process = (not use_pp) or (remesh_method != 'qdc' and decimate_method != 'server')
             if bypass_server_process:
                 # Local decimation and/or local remeshing, or post-processing disabled: bypass server process_mesh entirely
@@ -818,6 +829,33 @@ class _Trellis2WorkflowMixin:
             
             prompt[NODES['rasterize_pbr']]["inputs"]["texture_size"] = scene.trellis2_texture_size
             prompt[NODES['export_glb']]["inputs"]["filename_prefix"] = unique_prefix
+
+        if autorig_enabled:
+            rig_node_id = str(
+                max(int(node_id) for node_id in prompt.keys() if str(node_id).isdigit()) + 1
+            )
+            prompt[rig_node_id] = {
+                "class_type": "StableGenSkinTokensAutoRig",
+                "inputs": {
+                    "input_glb": [NODES[export_node_key], 0],
+                    "input_path": "",
+                    "output_prefix": f"{unique_prefix}_skintokens",
+                    "install_policy": "auto",
+                    "use_transfer": bool(getattr(scene, 'trellis2_autorig_use_transfer', True)),
+                    "use_skeleton": bool(getattr(scene, 'trellis2_autorig_use_skeleton', False)),
+                    "use_postprocess": bool(getattr(scene, 'trellis2_autorig_use_postprocess', False)),
+                    "top_k": int(getattr(scene, 'trellis2_autorig_top_k', 5)),
+                    "top_p": float(getattr(scene, 'trellis2_autorig_top_p', 0.95)),
+                    "temperature": float(getattr(scene, 'trellis2_autorig_temperature', 1.0)),
+                    "repetition_penalty": float(getattr(scene, 'trellis2_autorig_repetition_penalty', 2.0)),
+                    "num_beams": int(getattr(scene, 'trellis2_autorig_num_beams', 10)),
+                    "model_ckpt": getattr(scene, 'trellis2_autorig_model_ckpt', ''),
+                    "hf_path": getattr(scene, 'trellis2_autorig_hf_path', ''),
+                },
+            }
+            NODES['autorig'] = rig_node_id
+            export_node_key = 'autorig'
+            print(f"[TRELLIS2] SkinTokens auto-rigging enabled via node {rig_node_id}")
 
         # Save prompt for debugging
         revision_dir = get_generation_dirs(context).get("revision", "")
@@ -877,6 +915,8 @@ class _Trellis2WorkflowMixin:
                 }
                 if not skip_bg:
                     NODE_PROGRESS[NODES['remove_bg']] = 5
+            if autorig_enabled:
+                NODE_PROGRESS[NODES['autorig']] = 99
 
             # Wait for execution to complete via WebSocket
             # Also capture 'executed' events which may contain the output path
@@ -896,6 +936,7 @@ class _Trellis2WorkflowMixin:
                 'simplify':                 'Simplifying Mesh',
                 'export_trimesh':           'Exporting Mesh',
                 'export_glb':               'Exporting GLB',
+                'autorig':                  'Auto-Rigging',
             }
 
             # Build a lookup of known step counts so we can identify

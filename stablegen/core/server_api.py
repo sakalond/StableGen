@@ -105,6 +105,24 @@ def check_pbr_available(server_address, timeout=1.0):
         return False
 
 
+def check_skintokens_autorig_available(server_address, timeout=1.0):
+    """Checks if the StableGen SkinTokens auto-rig custom node is installed."""
+    if not server_address:
+        return False
+    node_class = 'StableGenSkinTokensAutoRig'
+    try:
+        url = f"http://{server_address}/object_info/{node_class}"
+        response = requests.get(url, timeout=timeout)
+        if response.status_code == 200 and node_class in response.json():
+            print("[SkinTokens] Auto-detect: StableGen SkinTokens node found in ComfyUI.")
+            return True
+        print("[SkinTokens] Auto-detect: StableGen SkinTokens node NOT found in ComfyUI.")
+        return False
+    except Exception as e:
+        print(f"[SkinTokens] Auto-detect failed: {e}")
+        return False
+
+
 # ── API data retrieval ─────────────────────────────────────────────────────
 
 def fetch_from_comfyui_api(context, endpoint):

@@ -738,6 +738,16 @@ class StableGenPanel(bpy.types.Panel):
                 split.label(text="Texture Mode:")
                 split.prop(scene, "trellis2_texture_mode", text="")
 
+                split = params_container.split(factor=0.5)
+                split.label(text="Auto-Rig:")
+                rig_row = split.row(align=True)
+                rig_available = getattr(scene, 'skintokens_autorig_available', False)
+                rig_toggle = rig_row.row(align=True)
+                rig_toggle.enabled = rig_available
+                rig_toggle.prop(scene, "trellis2_autorig_enabled", text="", toggle=True, icon="ARMATURE_DATA")
+                if not rig_available:
+                    rig_row.operator("stablegen.check_server_status", text="", icon="FILE_REFRESH")
+
                 # Prompt + native/none: show initial-image architecture & checkpoint
                 _prompt_needs_initial = (
                     scene.trellis2_generate_from == 'prompt'
@@ -923,6 +933,41 @@ class StableGenPanel(bpy.types.Panel):
                     split.label(text="Shading:")
                     split.prop(scene, "trellis2_shade_mode", text="")
                     content_box.separator()
+
+            # --- TRELLIS.2: Auto-Rigging Settings ---
+            if is_trellis2:
+                content_box = draw_collapsible_section(advanced_params_box, "show_trellis2_autorig_settings", "Auto-Rigging (SkinTokens)", icon="ARMATURE_DATA")
+                if content_box:
+                    rig_available = getattr(scene, 'skintokens_autorig_available', False)
+                    row = content_box.row(align=True)
+                    toggle_row = row.row(align=True)
+                    toggle_row.enabled = rig_available
+                    toggle_row.prop(scene, "trellis2_autorig_enabled", text="Auto-Rig", toggle=True, icon="ARMATURE_DATA")
+                    if not rig_available:
+                        row.operator("stablegen.check_server_status", text="", icon="FILE_REFRESH")
+
+                    if rig_available and getattr(scene, 'trellis2_autorig_enabled', False):
+                        row = content_box.row(align=True)
+                        row.prop(scene, "trellis2_autorig_use_transfer", text="Transfer Original", toggle=True)
+                        row.prop(scene, "trellis2_autorig_use_postprocess", text="Skin Postprocess", toggle=True)
+                        row = content_box.row()
+                        row.prop(scene, "trellis2_autorig_use_skeleton", text="Use Existing Skeleton", toggle=True)
+
+                        content_box.separator()
+                        row = content_box.row(align=True)
+                        row.prop(scene, "trellis2_autorig_top_k", text="Top K")
+                        row.prop(scene, "trellis2_autorig_top_p", text="Top P")
+                        row = content_box.row(align=True)
+                        row.prop(scene, "trellis2_autorig_temperature", text="Temperature")
+                        row.prop(scene, "trellis2_autorig_repetition_penalty", text="Repeat Penalty")
+                        row = content_box.row()
+                        row.prop(scene, "trellis2_autorig_num_beams", text="Beams")
+
+                        content_box.separator()
+                        row = content_box.row()
+                        row.prop(scene, "trellis2_autorig_model_ckpt", text="Model Checkpoint")
+                        row = content_box.row()
+                        row.prop(scene, "trellis2_autorig_hf_path", text="HF Path")
 
             # --- TRELLIS.2: Native Texture Settings ---
             if is_trellis2 and trellis2_tex_mode == 'native':

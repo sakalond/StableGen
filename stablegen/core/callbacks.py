@@ -18,6 +18,7 @@ from .state import (
 from .server_api import (
     check_pbr_available,
     check_server_availability,
+    check_skintokens_autorig_available,
     check_trellis2_available,
 )
 from ..timeout_config import get_timeout
@@ -126,9 +127,11 @@ def update_combined(self, context):
         if result['online']:
             result['trellis2'] = check_trellis2_available(server_address, timeout=get_timeout('api'))
             result['pbr'] = check_pbr_available(server_address, timeout=get_timeout('api'))
+            result['skintokens'] = check_skintokens_autorig_available(server_address, timeout=get_timeout('api'))
         else:
             result['trellis2'] = False
             result['pbr'] = False
+            result['skintokens'] = False
         return result
 
     def _on_done(result):
@@ -140,6 +143,7 @@ def update_combined(self, context):
         if hasattr(bpy.context, 'scene') and bpy.context.scene:
             bpy.context.scene.trellis2_available = result.get('trellis2', False)
             bpy.context.scene.pbr_nodes_available = result.get('pbr', False)
+            bpy.context.scene.skintokens_autorig_available = result.get('skintokens', False)
 
         if not result.get('online', False):
             print("[StableGen] ComfyUI server is not reachable.")
@@ -309,4 +313,3 @@ def update_palette_color(self, context):
 
 def update_print_dithered(self, context):
     check_print_preset_match(self.id_data)
-

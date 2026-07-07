@@ -1254,6 +1254,11 @@ def register_properties(update_model_list, ControlNetUnit, LoRAUnit,
         description="Whether PBR decomposition nodes (Marigold IID + StableDelight) are available on the ComfyUI server (auto-detected)",
         default=False
     )
+    bpy.types.Scene.skintokens_autorig_available = bpy.props.BoolProperty(
+        name="SkinTokens Auto-Rig Available",
+        description="Whether the StableGen SkinTokens auto-rig node is available on the ComfyUI server (auto-detected)",
+        default=False
+    )
     bpy.types.Scene.show_trellis2_params = bpy.props.BoolProperty(
         name="Show TRELLIS.2 Section", description="Toggle TRELLIS.2 Image-to-3D section", default=False
     )
@@ -1268,6 +1273,9 @@ def register_properties(update_model_list, ControlNetUnit, LoRAUnit,
     )
     bpy.types.Scene.show_trellis2_camera_settings = bpy.props.BoolProperty(
         name="Show Camera Placement Settings", description="Toggle TRELLIS.2 camera placement settings", default=False
+    )
+    bpy.types.Scene.show_trellis2_autorig_settings = bpy.props.BoolProperty(
+        name="Show Auto-Rig Settings", description="Toggle TRELLIS.2 SkinTokens auto-rig settings", default=False
     )
     bpy.types.Scene.trellis2_last_input_image = bpy.props.StringProperty(
         name="TRELLIS.2 Last Input Image",
@@ -1495,6 +1503,56 @@ def register_properties(update_model_list, ControlNetUnit, LoRAUnit,
         name="Solidify Mesh",
         description="Apply watertight capping and hollowing to delete internal geometry, saving UV and texture space",
         default=False, update=update_parameters
+    )
+    bpy.types.Scene.trellis2_autorig_enabled = bpy.props.BoolProperty(
+        name="Auto-Rig",
+        description="Run the generated GLB through the StableGen SkinTokens ComfyUI node before importing it",
+        default=False, update=update_parameters
+    )
+    bpy.types.Scene.trellis2_autorig_use_transfer = bpy.props.BoolProperty(
+        name="Transfer Original",
+        description="Ask SkinTokens to transfer the generated rig back to the original mesh to preserve texture and scale",
+        default=True, update=update_parameters
+    )
+    bpy.types.Scene.trellis2_autorig_use_skeleton = bpy.props.BoolProperty(
+        name="Use Existing Skeleton",
+        description="Ask SkinTokens to use an existing skeleton and only generate skin weights when the input already has one",
+        default=False, update=update_parameters
+    )
+    bpy.types.Scene.trellis2_autorig_use_postprocess = bpy.props.BoolProperty(
+        name="Skin Postprocess",
+        description="Enable SkinTokens voxel skin post-processing before export",
+        default=False, update=update_parameters
+    )
+    bpy.types.Scene.trellis2_autorig_top_k = bpy.props.IntProperty(
+        name="Top K", description="SkinTokens sampling top-k",
+        default=5, min=1, max=200, update=update_parameters
+    )
+    bpy.types.Scene.trellis2_autorig_top_p = bpy.props.FloatProperty(
+        name="Top P", description="SkinTokens nucleus sampling top-p",
+        default=0.95, min=0.1, max=1.0, step=0.01, update=update_parameters
+    )
+    bpy.types.Scene.trellis2_autorig_temperature = bpy.props.FloatProperty(
+        name="Temperature", description="SkinTokens sampling temperature",
+        default=1.0, min=0.1, max=2.0, step=0.1, update=update_parameters
+    )
+    bpy.types.Scene.trellis2_autorig_repetition_penalty = bpy.props.FloatProperty(
+        name="Repetition Penalty", description="SkinTokens repetition penalty",
+        default=2.0, min=0.5, max=3.0, step=0.1, update=update_parameters
+    )
+    bpy.types.Scene.trellis2_autorig_num_beams = bpy.props.IntProperty(
+        name="Beams", description="SkinTokens beam count",
+        default=10, min=1, max=20, update=update_parameters
+    )
+    bpy.types.Scene.trellis2_autorig_model_ckpt = bpy.props.StringProperty(
+        name="Model Checkpoint",
+        description="Optional SkinTokens checkpoint path relative to SKINTOKENS_ROOT",
+        default="", update=update_parameters
+    )
+    bpy.types.Scene.trellis2_autorig_hf_path = bpy.props.StringProperty(
+        name="HF Path",
+        description="Optional Hugging Face path passed to SkinTokens",
+        default="", update=update_parameters
     )
 
     bpy.types.Scene.trellis2_auto_lighting = bpy.props.BoolProperty(
@@ -1806,10 +1864,10 @@ def unregister_properties(load_handler, _sg_queue_load_handler):
 
     # --- TRELLIS.2 Properties ---
     trellis2_props = [
-        'trellis2_available', 'pbr_nodes_available',
+        'trellis2_available', 'pbr_nodes_available', 'skintokens_autorig_available',
         'show_trellis2_params', 'show_trellis2_advanced',
         'show_trellis2_mesh_settings', 'show_trellis2_texture_settings',
-        'show_trellis2_camera_settings',
+        'show_trellis2_camera_settings', 'show_trellis2_autorig_settings',
         'trellis2_last_input_image', 'qwen_use_trellis2_style', 'qwen_trellis2_style_initial_only',
         'trellis2_pipeline_active', 'trellis2_pipeline_phase_start_pct',
         'trellis2_pipeline_total_phases',
@@ -1839,6 +1897,12 @@ def unregister_properties(load_handler, _sg_queue_load_handler):
         'trellis2_decimate_method', 'trellis2_remesh_method',
         'trellis2_post_processing_enabled',
         'trellis2_solidify',
+        'trellis2_autorig_enabled', 'trellis2_autorig_use_transfer',
+        'trellis2_autorig_use_skeleton', 'trellis2_autorig_use_postprocess',
+        'trellis2_autorig_top_k', 'trellis2_autorig_top_p',
+        'trellis2_autorig_temperature', 'trellis2_autorig_repetition_penalty',
+        'trellis2_autorig_num_beams', 'trellis2_autorig_model_ckpt',
+        'trellis2_autorig_hf_path',
         'trellis2_auto_lighting',
         'trellis2_skip_texture', 'trellis2_bg_removal', 'trellis2_background_color',
     ]
