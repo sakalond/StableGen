@@ -23,6 +23,15 @@ from .texturing.rendering import (
 )
 from .texturing.orbit_export import ExportOrbitGIF
 from .texturing.game_export import ExportForGameEngine
+from .animation import (
+    StableGenCharacterizeRig, StableGenApplyRigPosePreset,
+    StableGenSetRetargetReferencePose,
+    StableGenMatchSourceReferencePose,
+    StableGenToggleRigMappingOverlay,
+    StableGenEditRigMapping,
+    StableGenExportRetargetDebugBundle,
+    StableGenApplyAnimationToRig,
+)
 from .texturing.print_export import (
     StableGenPaletteColor, StableGenAddPaletteColor, StableGenRemovePaletteColor,
     StableGenPreviewQuantization, StableGenClearQuantizationPreview,
@@ -40,7 +49,9 @@ from .utils import AddHDRI, ApplyModifiers, CurvesToMesh
 from .texturing.generator import (
     ComfyUIGenerate, Reproject, Regenerate, MirrorReproject,
 )
-from .mesh_gen.trellis2 import Trellis2Generate, StableGenLocalPostProcess
+from .mesh_gen.trellis2 import (
+    Trellis2Generate, StableGenAutoRigSelectedMesh, StableGenLocalPostProcess,
+)
 from .mesh_gen.batch import (
     TRELLIS2_OT_BatchSelectFolder, TRELLIS2_OT_BatchGenerate,
     TRELLIS2_OT_BatchCancel, TRELLIS2_OT_BatchClear,
@@ -104,6 +115,7 @@ classes = [
     Regenerate,
     MirrorReproject,
     Trellis2Generate,
+    StableGenAutoRigSelectedMesh,
     StableGenLocalPostProcess,
     TRELLIS2_OT_BatchSelectFolder,
     TRELLIS2_OT_BatchGenerate,
@@ -120,6 +132,14 @@ classes = [
     SwitchMaterial,
     ExportOrbitGIF,
     ExportForGameEngine,
+    StableGenCharacterizeRig,
+    StableGenApplyRigPosePreset,
+    StableGenSetRetargetReferencePose,
+    StableGenMatchSourceReferencePose,
+    StableGenToggleRigMappingOverlay,
+    StableGenEditRigMapping,
+    StableGenExportRetargetDebugBundle,
+    StableGenApplyAnimationToRig,
     StableGenAddPaletteColor,
     StableGenRemovePaletteColor,
     StableGenPreviewQuantization,

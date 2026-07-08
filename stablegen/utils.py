@@ -9,6 +9,7 @@ _SG_BLOCKED_MODALS = frozenset({
     'OBJECT_OT_add_cameras',
     'OBJECT_OT_collect_camera_prompts',
     'OBJECT_OT_trellis2_generate',
+    'OBJECT_OT_stablegen_autorig_selected_mesh',
     'OBJECT_OT_stablegen_reproject',
     'OBJECT_OT_stablegen_regenerate',
     'OBJECT_OT_stablegen_mirror_reproject',

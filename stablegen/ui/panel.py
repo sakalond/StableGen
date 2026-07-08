@@ -216,6 +216,12 @@ class StableGenPanel(bpy.types.Panel):
                  if op.bl_idname == 'OBJECT_OT_test_stable'),
                 None
             ) if not trellis2_op else None
+            autorig_op = next(
+                (op for win in context.window_manager.windows
+                 for op in win.modal_operators
+                 if op.bl_idname == 'OBJECT_OT_stablegen_autorig_selected_mesh'),
+                None
+            ) if not trellis2_op and not comfy_tex_op else None
 
             if config_error_message:
                 if config_error_message == "Cannot reach server":
@@ -269,6 +275,16 @@ class StableGenPanel(bpy.types.Panel):
                         text=f"{detail_label} ({detail_pct:.0f}%)",
                         factor=max(0.0, min(detail_pct / 100.0, 1.0))
                     )
+
+            elif autorig_op:
+                action_row.operator("object.stablegen_autorig_selected_mesh", text="Cancel Auto-Rigging", icon="CANCEL")
+                progress_col = layout.column()
+                progress = getattr(autorig_op, '_progress', 0)
+                stage = getattr(autorig_op, '_stage', 'Auto-Rigging')
+                progress_col.progress(
+                    text=f"{stage} ({progress:.0f}%)",
+                    factor=max(0.0, min(progress / 100.0, 1.0))
+                )
 
             elif comfy_tex_op and getattr(scene, 'trellis2_pipeline_active', False):
                 # ── Phase 3: Texturing via ComfyUIGenerate ──
@@ -738,16 +754,6 @@ class StableGenPanel(bpy.types.Panel):
                 split.label(text="Texture Mode:")
                 split.prop(scene, "trellis2_texture_mode", text="")
 
-                split = params_container.split(factor=0.5)
-                split.label(text="Auto-Rig:")
-                rig_row = split.row(align=True)
-                rig_available = getattr(scene, 'skintokens_autorig_available', False)
-                rig_toggle = rig_row.row(align=True)
-                rig_toggle.enabled = rig_available
-                rig_toggle.prop(scene, "trellis2_autorig_enabled", text="", toggle=True, icon="ARMATURE_DATA")
-                if not rig_available:
-                    rig_row.operator("stablegen.check_server_status", text="", icon="FILE_REFRESH")
-
                 # Prompt + native/none: show initial-image architecture & checkpoint
                 _prompt_needs_initial = (
                     scene.trellis2_generate_from == 'prompt'
@@ -946,7 +952,46 @@ class StableGenPanel(bpy.types.Panel):
                     if not rig_available:
                         row.operator("stablegen.check_server_status", text="", icon="FILE_REFRESH")
 
+                    row = content_box.row(align=True)
+                    row.operator("stablegen.characterize_rig",
+                                 text="Analyze Rig",
+                                 icon="ARMATURE_DATA")
+                    row.operator("stablegen.edit_rig_mapping",
+                                 text="Edit Mapping",
+                                 icon="BONE_DATA")
+                    row.operator("stablegen.toggle_rig_mapping_overlay",
+                                 text="",
+                                 icon="HIDE_OFF")
+
+                    row = content_box.row(align=True)
+                    row.operator_context = "INVOKE_DEFAULT"
+                    op = row.operator("stablegen.apply_rig_pose_preset",
+                                      text="Rest",
+                                      icon="POSE_HLT")
+                    op.preset = "REST"
+                    op = row.operator("stablegen.apply_rig_pose_preset",
+                                      text="A-Pose",
+                                      icon="POSE_HLT")
+                    op.preset = "A_POSE"
+                    op = row.operator("stablegen.apply_rig_pose_preset",
+                                      text="T-Pose",
+                                      icon="POSE_HLT")
+                    op.preset = "T_POSE"
+
+                    row = content_box.row(align=True)
+                    row.operator("stablegen.match_source_reference_pose",
+                                 text="Match Source Ref",
+                                 icon="ARMATURE_DATA")
+                    row = content_box.row(align=True)
+                    row.operator("stablegen.set_retarget_reference_pose",
+                                 text="Set Ref Pose",
+                                 icon="POSE_HLT")
+                    row.operator("stablegen.apply_animation_to_rig",
+                                 text="Apply Animation",
+                                 icon="ANIM_DATA")
+
                     if rig_available and getattr(scene, 'trellis2_autorig_enabled', False):
+                        content_box.separator()
                         row = content_box.row(align=True)
                         row.prop(scene, "trellis2_autorig_use_transfer", text="Transfer Original", toggle=True)
                         row.prop(scene, "trellis2_autorig_use_postprocess", text="Skin Postprocess", toggle=True)
@@ -2036,6 +2081,9 @@ class StableGenPanel(bpy.types.Panel):
             row = tools_box.row()
         row.operator("object.stablegen_local_postprocess", text="Run Local Post-Processing", icon="MODIFIER")
 
+        row = tools_box.row()
+        row.operator("object.stablegen_autorig_selected_mesh", text="Auto-Rig Selected Mesh", icon="ARMATURE_DATA")
+
         # --- Debug Tools ---
         prefs = context.preferences.addons.get(_ADDON_PKG)
         if prefs and prefs.preferences.enable_debug:
@@ -2044,6 +2092,11 @@ class StableGenPanel(bpy.types.Panel):
             row = debug_box.row()
             row.alignment = 'CENTER'
             row.label(text="Debug / Diagnostics", icon="GHOST_ENABLED")
+
+            row = debug_box.row()
+            row.operator("stablegen.export_retarget_debug_bundle",
+                         text="Export Retarget Test Bundle",
+                         icon="EXPORT")
 
             row = debug_box.row()
             row.operator("stablegen.debug_solid_colors", text="Draw Solid Colors", icon="COLOR")

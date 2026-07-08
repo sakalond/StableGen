@@ -1303,7 +1303,7 @@ def register_properties(update_model_list, ControlNetUnit, LoRAUnit,
     )
     bpy.types.Scene.trellis2_pipeline_total_phases = bpy.props.IntProperty(
         name="Total Phases", description="Total number of phases in the TRELLIS.2 pipeline",
-        default=3, min=1, max=3
+        default=3, min=1, max=4
     )
     bpy.types.Scene.trellis2_input_image = bpy.props.StringProperty(
         name="Input Image", description="Path to the reference image for 3D mesh generation",

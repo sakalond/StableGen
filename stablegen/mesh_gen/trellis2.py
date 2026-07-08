@@ -62,22 +62,34 @@ class Trellis2Generate(bpy.types.Operator):
     _detail_stage: str = ""
     _current_phase: int = 0
     _total_phases: int = 3  # 2 when gen_from == 'image'
+    _phase_layout: str = "trellis_only"
+    _autorig_phase: int = 0
+
+    _PHASE_LAYOUTS = {
+        'txt2img+trellis+rigging+texturing': ([1, 2, 3, 4], [0, 15, 60, 75], [15, 45, 15, 25]),
+        'trellis+rigging+texturing': ([1, 2, 3], [0, 60, 75], [60, 15, 25]),
+        'txt2img+trellis+texturing': ([1, 2, 3], [0, 15, 65], [15, 50, 35]),
+        'trellis+texturing': ([1, 2], [0, 65], [65, 35]),
+        'txt2img+trellis+rigging': ([1, 2, 3], [0, 15, 75], [15, 60, 25]),
+        'trellis+rigging': ([1, 2], [0, 75], [75, 25]),
+        'txt2img+trellis': ([1, 2], [0, 15], [15, 85]),
+        'trellis_only': ([1], [0], [100]),
+    }
+
+    def _phase_spec(self):
+        phases, starts, weights = self._PHASE_LAYOUTS.get(
+            getattr(self, '_phase_layout', 'trellis_only'),
+            self._PHASE_LAYOUTS['trellis_only'],
+        )
+        return dict(zip(phases, starts)), dict(zip(phases, weights))
+
+    def _phase_start_pct(self, phase_number):
+        starts, _weights = self._phase_spec()
+        return starts.get(phase_number, 0.0)
 
     def _update_overall(self):
         """Recompute *_overall_progress* from current phase + phase progress."""
-        layout = getattr(self, '_phase_layout', '')
-        if layout == 'txt2img+trellis+texturing':  # 3 phases
-            starts  = {1: 0,  2: 15, 3: 65}
-            weights = {1: 15, 2: 50, 3: 35}
-        elif layout == 'trellis+texturing':  # 2 phases: big mesh, then texturing
-            starts  = {1: 0,  2: 65}
-            weights = {1: 65, 2: 35}
-        elif layout == 'txt2img+trellis':  # 2 phases: quick txt2img, then big mesh+native tex
-            starts  = {1: 0,  2: 15}
-            weights = {1: 15, 2: 85}
-        else:  # Single phase — scale to full 0-100
-            starts  = {1: 0}
-            weights = {1: 100}
+        starts, weights = self._phase_spec()
         s = starts.get(self._current_phase, 0)
         w = weights.get(self._current_phase, 0)
         self._overall_progress = s + (self._phase_progress / 100.0) * w
@@ -257,9 +269,22 @@ class Trellis2Generate(bpy.types.Operator):
         # 3-tier progress init
         has_txt2img = (gen_from == 'prompt')
         has_texturing = (tex_mode in ('sdxl', 'flux1', 'qwen_image_edit', 'flux2_klein'))
-        if has_txt2img and has_texturing:
+        has_autorig = bool(getattr(scene, 'trellis2_autorig_enabled', False))
+        if has_txt2img and has_autorig and has_texturing:
+            self._total_phases = 4
+            self._phase_layout = 'txt2img+trellis+rigging+texturing'
+        elif has_autorig and has_texturing:
+            self._total_phases = 3
+            self._phase_layout = 'trellis+rigging+texturing'
+        elif has_txt2img and has_texturing:
             self._total_phases = 3
             self._phase_layout = 'txt2img+trellis+texturing'
+        elif has_txt2img and has_autorig:
+            self._total_phases = 3
+            self._phase_layout = 'txt2img+trellis+rigging'
+        elif has_autorig:
+            self._total_phases = 2
+            self._phase_layout = 'trellis+rigging'
         elif has_txt2img:
             self._total_phases = 2
             self._phase_layout = 'txt2img+trellis'
@@ -276,6 +301,8 @@ class Trellis2Generate(bpy.types.Operator):
         self._phase_stage = ""
         self._detail_progress = 0.0
         self._detail_stage = ""
+        self._autorig_enabled = has_autorig
+        self._autorig_phase = (2 if has_txt2img else 1) + 1 if has_autorig else 0
 
         # Compute revision directory on the main thread (may write output_timestamp)
         from ..utils import get_generation_dirs
@@ -722,12 +749,7 @@ class Trellis2Generate(bpy.types.Operator):
         progress bar on top of the ComfyUIGenerate bars.
         """
         # Compute the overall-% at which texturing begins
-        if self._total_phases == 3:
-            phase_start = 65.0
-        elif self._total_phases == 2:
-            phase_start = 65.0
-        else:
-            phase_start = 0.0
+        phase_start = float(self._phase_start_pct(self._total_phases))
 
         scene = context.scene
         scene.trellis2_pipeline_active = True
@@ -1040,6 +1062,244 @@ class Trellis2Generate(bpy.types.Operator):
                 return  # Swallow exceptions caused by cancel-time WS close
             self._error = str(e)
             traceback.print_exc()
+
+
+class StableGenAutoRigSelectedMesh(bpy.types.Operator):
+    """Run SkinTokens auto-rigging on the currently selected mesh objects."""
+
+    bl_idname = "object.stablegen_autorig_selected_mesh"
+    bl_label = "Auto-Rig Selected Mesh"
+    bl_description = "Export the selected mesh to GLB, run SkinTokens in ComfyUI, and import the rigged GLB"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    hide_source: bpy.props.BoolProperty(
+        name="Hide Source Mesh",
+        description="Hide the original selected mesh objects after the rigged duplicate is imported",
+        default=True,
+    )  # type: ignore
+
+    _timer = None
+    _thread = None
+    _error = None
+    _rigged_data = None
+    _is_running = False
+    _cancelled = False
+    _active_ws = None
+    _progress = 0.0
+    _stage = "Initializing"
+    workflow_manager: object = None
+
+    @classmethod
+    def poll(cls, context):
+        if cls._is_running:
+            return True
+        addon_prefs = context.preferences.addons[_ADDON_PKG].preferences
+        if not addon_prefs.server_address or not addon_prefs.server_online:
+            cls.poll_message_set("ComfyUI server is not connected")
+            return False
+        if bpy.app.online_access == False:
+            cls.poll_message_set("Blender's online access is disabled (File -> Preferences -> System)")
+            return False
+        if not getattr(context.scene, 'skintokens_autorig_available', False):
+            cls.poll_message_set("StableGen SkinTokens node was not detected in ComfyUI")
+            return False
+        if sg_modal_active(context):
+            cls.poll_message_set("Another operation is in progress")
+            return False
+        if not any(obj.type == 'MESH' for obj in context.selected_objects):
+            cls.poll_message_set("Select at least one mesh object to auto-rig")
+            return False
+        return True
+
+    def execute(self, context):
+        if StableGenAutoRigSelectedMesh._is_running:
+            StableGenAutoRigSelectedMesh._cancelled = True
+            StableGenAutoRigSelectedMesh._is_running = False
+
+            try:
+                server_address = context.preferences.addons[_ADDON_PKG].preferences.server_address
+                data = json.dumps({"client_id": str(uuid.uuid4())}).encode('utf-8')
+                req = urllib.request.Request(f"http://{server_address}/interrupt", data=data)
+                urllib.request.urlopen(req, timeout=get_timeout('api'))
+            except Exception:
+                pass
+
+            ws = StableGenAutoRigSelectedMesh._active_ws
+            if ws:
+                try:
+                    ws.close()
+                except Exception:
+                    pass
+                StableGenAutoRigSelectedMesh._active_ws = None
+
+            self.report({'WARNING'}, "Auto-rigging cancelled")
+            return {'FINISHED'}
+
+        selected_objects = list(context.selected_objects)
+        selected_meshes = [obj for obj in selected_objects if obj.type == 'MESH']
+        if not selected_meshes:
+            self.report({'ERROR'}, "Select at least one mesh object to auto-rig")
+            return {'CANCELLED'}
+
+        server_address = context.preferences.addons[_ADDON_PKG].preferences.server_address
+        if not self._server_is_localish(server_address):
+            self.report({
+                'WARNING'
+            }, "ComfyUI must be able to read the exported GLB path for this operator to work")
+
+        try:
+            gen_dirs = get_generation_dirs(context)
+            save_dir = gen_dirs.get("revision", "") or context.preferences.addons[_ADDON_PKG].preferences.output_dir
+            os.makedirs(save_dir, exist_ok=True)
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            export_path = os.path.join(save_dir, f"stablegen_autorig_source_{timestamp}.glb")
+
+            export_objects = []
+            for obj in selected_objects:
+                if obj.type in {'MESH', 'ARMATURE'} and obj not in export_objects:
+                    export_objects.append(obj)
+            for obj in selected_meshes:
+                if obj.parent and obj.parent.type == 'ARMATURE' and obj.parent not in export_objects:
+                    export_objects.append(obj.parent)
+
+            previous_active = context.view_layer.objects.active
+            bpy.ops.object.select_all(action='DESELECT')
+            try:
+                for obj in export_objects:
+                    obj.select_set(True)
+                context.view_layer.objects.active = selected_meshes[0]
+                bpy.ops.export_scene.gltf(
+                    filepath=export_path,
+                    export_format='GLB',
+                    use_selection=True,
+                )
+            finally:
+                bpy.ops.object.select_all(action='DESELECT')
+                for obj in selected_objects:
+                    if context.scene.objects.get(obj.name):
+                        obj.select_set(True)
+                if previous_active and context.scene.objects.get(previous_active.name):
+                    context.view_layer.objects.active = previous_active
+
+            if not os.path.isfile(export_path) or os.path.getsize(export_path) == 0:
+                self.report({'ERROR'}, "Selected mesh export did not create a valid GLB")
+                return {'CANCELLED'}
+        except Exception as exc:
+            self.report({'ERROR'}, f"Failed to export selected mesh for auto-rigging: {exc}")
+            traceback.print_exc()
+            return {'CANCELLED'}
+
+        StableGenAutoRigSelectedMesh._is_running = True
+        StableGenAutoRigSelectedMesh._cancelled = False
+        self._error = None
+        self._rigged_data = None
+        self._progress = 0.0
+        self._stage = "Queued"
+        self._source_names = [obj.name for obj in selected_meshes]
+        self._export_path = export_path
+
+        from ..workflows import WorkflowManager
+        self.workflow_manager = WorkflowManager(self)
+        self._thread = threading.Thread(
+            target=self._run_autorig,
+            args=(context, export_path),
+            daemon=True,
+        )
+        self._thread.start()
+
+        context.window_manager.modal_handler_add(self)
+        self._timer = context.window_manager.event_timer_add(0.5, window=context.window)
+        self.report({'INFO'}, "Auto-rigging started")
+        return {'RUNNING_MODAL'}
+
+    @staticmethod
+    def _server_is_localish(server_address):
+        host = (server_address or '').split(':')[0].strip().lower()
+        return host in ('', '127.0.0.1', 'localhost', '0.0.0.0', '::1')
+
+    def _run_autorig(self, context, export_path):
+        try:
+            self._stage = "Auto-Rigging"
+            result = self.workflow_manager.generate_skintokens_autorig_file(context, export_path)
+            if self._cancelled:
+                return
+            if isinstance(result, dict) and "error" in result:
+                self._error = result["error"]
+            else:
+                self._rigged_data = result
+        except Exception as exc:
+            if self._cancelled:
+                return
+            self._error = str(exc)
+            traceback.print_exc()
+
+    def modal(self, context, event):
+        if event.type != 'TIMER':
+            return {'PASS_THROUGH'}
+
+        for area in context.screen.areas:
+            area.tag_redraw()
+
+        if self._thread and self._thread.is_alive():
+            return {'RUNNING_MODAL'}
+
+        context.window_manager.event_timer_remove(self._timer)
+        self._timer = None
+        was_cancelled = StableGenAutoRigSelectedMesh._cancelled
+        StableGenAutoRigSelectedMesh._is_running = False
+        StableGenAutoRigSelectedMesh._cancelled = False
+        StableGenAutoRigSelectedMesh._active_ws = None
+
+        if was_cancelled:
+            return {'FINISHED'}
+        if self._error:
+            self.report({'ERROR'}, f"Auto-rigging failed: {self._error}")
+            return {'CANCELLED'}
+        if not self._rigged_data:
+            self.report({'ERROR'}, "Auto-rigging failed: no rigged GLB was returned")
+            return {'CANCELLED'}
+
+        try:
+            gen_dirs = get_generation_dirs(context)
+            save_dir = gen_dirs.get("revision", "") or context.preferences.addons[_ADDON_PKG].preferences.output_dir
+            os.makedirs(save_dir, exist_ok=True)
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            output_path = os.path.join(save_dir, f"stablegen_autorig_rigged_{timestamp}.glb")
+            with open(output_path, 'wb') as handle:
+                handle.write(self._rigged_data)
+
+            bpy.ops.import_scene.gltf(filepath=output_path)
+            imported_objects = list(context.selected_objects)
+            for obj in imported_objects:
+                obj["sg_generated"] = True
+
+            Trellis2Generate._disable_not_exported_render_helpers()
+            mesh_objects = [obj for obj in imported_objects if obj.type == 'MESH']
+            if mesh_objects:
+                Trellis2Generate._clear_imported_custom_normals(mesh_objects)
+
+            bpy.ops.object.select_all(action='DESELECT')
+            for obj in imported_objects:
+                obj.select_set(True)
+            if mesh_objects:
+                context.view_layer.objects.active = mesh_objects[0]
+            elif imported_objects:
+                context.view_layer.objects.active = imported_objects[0]
+
+            if self.hide_source:
+                imported_names = {obj.name for obj in imported_objects}
+                for name in getattr(self, '_source_names', []):
+                    obj = bpy.data.objects.get(name)
+                    if obj and obj.name not in imported_names:
+                        obj.hide_viewport = True
+                        obj.hide_render = True
+
+            self.report({'INFO'}, f"Auto-rigged mesh imported: {os.path.basename(output_path)}")
+            return {'FINISHED'}
+        except Exception as exc:
+            self.report({'ERROR'}, f"Failed to import rigged GLB: {exc}")
+            traceback.print_exc()
+            return {'CANCELLED'}
 
 
 # ---------------------------------------------------------------------------

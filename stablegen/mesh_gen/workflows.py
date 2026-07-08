@@ -660,6 +660,189 @@ class _Trellis2WorkflowMixin:
             self._flush_comfyui_vram(server_address, label="Post-generation")
             self._cleanup_trellis2_temp_files()
 
+    def generate_skintokens_autorig_file(self, context, input_glb_path):
+        """Run the StableGen SkinTokens node on a GLB path accessible to ComfyUI."""
+        server_address = context.preferences.addons[_ADDON_PKG].preferences.server_address
+        scene = context.scene
+
+        if not getattr(scene, 'skintokens_autorig_available', False):
+            return {
+                "error": (
+                    "StableGenSkinTokensAutoRig node was not detected in ComfyUI. "
+                    "Use the server refresh button after installing the SkinTokens node."
+                )
+            }
+        if not self._check_server_alive(server_address):
+            return {"error": "ComfyUI server is not responding. Please restart it and try again."}
+
+        self._flush_comfyui_vram(server_address, label="Pre-auto-rigging")
+
+        unique_prefix = f"stablegen_autorig_{uuid.uuid4().hex[:8]}"
+        prompt = {
+            "1": {
+                "class_type": "StableGenSkinTokensAutoRig",
+                "inputs": {
+                    "input_path": input_glb_path,
+                    "output_prefix": unique_prefix,
+                    "install_policy": "auto",
+                    "use_transfer": bool(getattr(scene, 'trellis2_autorig_use_transfer', True)),
+                    "use_skeleton": bool(getattr(scene, 'trellis2_autorig_use_skeleton', False)),
+                    "use_postprocess": bool(getattr(scene, 'trellis2_autorig_use_postprocess', False)),
+                    "top_k": int(getattr(scene, 'trellis2_autorig_top_k', 5)),
+                    "top_p": float(getattr(scene, 'trellis2_autorig_top_p', 0.95)),
+                    "temperature": float(getattr(scene, 'trellis2_autorig_temperature', 1.0)),
+                    "repetition_penalty": float(getattr(scene, 'trellis2_autorig_repetition_penalty', 2.0)),
+                    "num_beams": int(getattr(scene, 'trellis2_autorig_num_beams', 10)),
+                    "model_ckpt": getattr(scene, 'trellis2_autorig_model_ckpt', ''),
+                    "hf_path": getattr(scene, 'trellis2_autorig_hf_path', ''),
+                },
+            }
+        }
+
+        client_id = str(uuid.uuid4())
+        ws = self._connect_to_websocket(server_address, client_id)
+        if ws is None:
+            return {"error": getattr(self, '_error', 'Could not connect to ComfyUI WebSocket.')}
+        ws.settimeout(get_timeout('mesh_gen'))
+        if hasattr(self.operator, '_active_ws'):
+            self.operator._active_ws = ws
+            type(self.operator)._active_ws = ws
+
+        prompt_id = None
+        output_refs = []
+
+        def _cancelled():
+            return getattr(self.operator, '_cancelled', False)
+
+        try:
+            prompt_id = self._queue_prompt(prompt, client_id, server_address)
+            if hasattr(self.operator, '_stage'):
+                self.operator._stage = "Auto-Rigging"
+            if hasattr(self.operator, '_progress'):
+                self.operator._progress = 5
+
+            while True:
+                if _cancelled():
+                    return {"error": "cancelled"}
+                try:
+                    out = ws.recv()
+                except websocket.WebSocketTimeoutException:
+                    print("[StableGen] SkinTokens WebSocket recv timed out; still waiting...")
+                    continue
+                except (ConnectionError, OSError, Exception) as ws_err:
+                    if _cancelled():
+                        return {"error": "cancelled"}
+                    return {"error": f"ComfyUI connection failed during SkinTokens auto-rigging: {ws_err}"}
+
+                if not isinstance(out, str):
+                    continue
+
+                message = json.loads(out)
+                if message.get('type') == 'executing':
+                    data = message.get('data', {})
+                    if data.get('prompt_id') != prompt_id:
+                        continue
+                    if data.get('node') is None:
+                        if hasattr(self.operator, '_progress'):
+                            self.operator._progress = 100
+                        break
+                    if data.get('node') == "1":
+                        print("[StableGen] Executing node: Auto-Rigging")
+                        if hasattr(self.operator, '_stage'):
+                            self.operator._stage = "Auto-Rigging"
+                        if hasattr(self.operator, '_progress'):
+                            self.operator._progress = max(self.operator._progress, 10)
+
+                elif message.get('type') == 'executed':
+                    data = message.get('data', {})
+                    if data.get('node') == "1":
+                        refs = self._extract_trellis2_file_refs(data.get('output', {}))
+                        if refs:
+                            output_refs.extend(refs)
+
+                elif message.get('type') == 'execution_error':
+                    error_data = message.get('data', {})
+                    error_msg = error_data.get('exception_message', 'Unknown error')
+                    return {"error": f"SkinTokens execution error: {error_msg}"}
+        finally:
+            if hasattr(self.operator, '_active_ws'):
+                self.operator._active_ws = None
+                type(self.operator)._active_ws = None
+            try:
+                ws.close()
+            except Exception:
+                pass
+
+        if not output_refs and prompt_id and not _cancelled():
+            try:
+                history_url = f"http://{server_address}/history/{prompt_id}"
+                history_response = json.loads(urllib.request.urlopen(
+                    history_url, timeout=get_timeout('api')).read())
+                history_entry = history_response.get(prompt_id, {})
+                output_refs = self._extract_trellis2_file_refs(
+                    history_entry.get("outputs", {}).get("1", {})
+                )
+            except Exception as hist_err:
+                print(f"[StableGen] SkinTokens history lookup failed: {hist_err}")
+
+        for file_ref in output_refs:
+            path = file_ref.get('path') or ''
+            if path and os.path.isfile(path):
+                try:
+                    with open(path, 'rb') as handle:
+                        data = handle.read()
+                    if data:
+                        return data
+                except OSError as read_err:
+                    print(f"[StableGen] SkinTokens direct file read failed: {read_err}")
+
+            view_url = self._comfyui_view_url_for_file_ref(server_address, file_ref)
+            if not view_url:
+                continue
+            try:
+                data = urllib.request.urlopen(view_url, timeout=get_timeout('transfer')).read()
+                if data:
+                    return data
+            except Exception as view_err:
+                print(f"[StableGen] SkinTokens HTTP download failed: {view_err}")
+
+        comfyui_output_dir = None
+        try:
+            system_url = f"http://{server_address}/system_stats"
+            system_response = json.loads(urllib.request.urlopen(
+                system_url, timeout=get_timeout('api')).read())
+            comfyui_output_dir = system_response.get("output_dir")
+        except Exception:
+            pass
+
+        if comfyui_output_dir and os.path.isdir(comfyui_output_dir):
+            try:
+                matching_files = sorted(
+                    [
+                        name for name in os.listdir(comfyui_output_dir)
+                        if name.startswith(unique_prefix) and name.lower().endswith(".glb")
+                    ],
+                    key=lambda name: os.path.getmtime(os.path.join(comfyui_output_dir, name)),
+                    reverse=True,
+                )
+                if matching_files:
+                    found_path = os.path.join(comfyui_output_dir, matching_files[0])
+                    with open(found_path, 'rb') as handle:
+                        data = handle.read()
+                    if data:
+                        return data
+            except Exception as scan_err:
+                print(f"[StableGen] SkinTokens output scan failed: {scan_err}")
+
+        if _cancelled():
+            return {"error": "cancelled"}
+        return {
+            "error": (
+                "SkinTokens completed, but StableGen could not retrieve the rigged GLB. "
+                f"Output prefix: {unique_prefix}"
+            )
+        }
+
     def _generate_trellis2_inner(self, context, input_image_path, server_address, client_id):
         """Inner implementation of generate_trellis2, called within a try/finally VRAM flush."""
         import urllib.parse
@@ -882,6 +1065,7 @@ class _Trellis2WorkflowMixin:
         # Let the operator close this WS on cancel
         if hasattr(self.operator, '_active_ws'):
             self.operator._active_ws = ws
+            type(self.operator)._active_ws = ws
 
         prompt_id = None
         try:
@@ -916,7 +1100,7 @@ class _Trellis2WorkflowMixin:
                 if not skip_bg:
                     NODE_PROGRESS[NODES['remove_bg']] = 5
             if autorig_enabled:
-                NODE_PROGRESS[NODES['autorig']] = 99
+                NODE_PROGRESS[NODES['autorig']] = 5
 
             # Wait for execution to complete via WebSocket
             # Also capture 'executed' events which may contain the output path
@@ -996,7 +1180,22 @@ class _Trellis2WorkflowMixin:
                                 node_key = node_names.get(node_id, node_id)
                                 node_label = NODE_LABELS.get(node_key, node_key)
                                 print(f"[TRELLIS2] Executing: {node_label}")
-                                self.operator._phase_stage = f"TRELLIS.2: {node_label}"
+                                if autorig_enabled and node_key == 'autorig':
+                                    autorig_phase = getattr(self.operator, '_autorig_phase', 0)
+                                    if autorig_phase:
+                                        if getattr(self.operator, '_current_phase', 0) != autorig_phase:
+                                            self.operator._phase_progress = 100
+                                            if hasattr(self.operator, '_update_overall'):
+                                                self.operator._update_overall()
+                                            self.operator._current_phase = autorig_phase
+                                            self.operator._phase_progress = 0
+                                        total_phases = getattr(self.operator, '_total_phases', autorig_phase)
+                                        self.operator._overall_stage = (
+                                            f"Phase {autorig_phase}/{total_phases}: Auto-Rigging"
+                                        )
+                                    self.operator._phase_stage = "Auto-Rigging"
+                                else:
+                                    self.operator._phase_stage = f"TRELLIS.2: {node_label}"
                                 # Update progress based on node weight
                                 if node_id in NODE_PROGRESS:
                                     self.operator._phase_progress = max(self.operator._phase_progress, NODE_PROGRESS[node_id])
@@ -1052,7 +1251,17 @@ class _Trellis2WorkflowMixin:
                             _current_exec_node = node_names.get(p_node, p_node)
                             node_label = NODE_LABELS.get(_current_exec_node, _current_exec_node)
                             print(f"[TRELLIS2] Early transition to node {_current_exec_node} via progress event")
-                            self.operator._phase_stage = f"TRELLIS.2: {node_label}"
+                            if autorig_enabled and _current_exec_node == 'autorig':
+                                autorig_phase = getattr(self.operator, '_autorig_phase', 0)
+                                if autorig_phase:
+                                    self.operator._current_phase = autorig_phase
+                                    total_phases = getattr(self.operator, '_total_phases', autorig_phase)
+                                    self.operator._overall_stage = (
+                                        f"Phase {autorig_phase}/{total_phases}: Auto-Rigging"
+                                    )
+                                self.operator._phase_stage = "Auto-Rigging"
+                            else:
+                                self.operator._phase_stage = f"TRELLIS.2: {node_label}"
                             self.operator._detail_stage = node_label
                             self.operator._detail_progress = 0
 
@@ -1143,6 +1352,7 @@ class _Trellis2WorkflowMixin:
         finally:
             if hasattr(self.operator, '_active_ws'):
                 self.operator._active_ws = None
+                type(self.operator)._active_ws = None
             if ws:
                 try:
                     ws.close()
