@@ -962,6 +962,9 @@ class StableGenPanel(bpy.types.Panel):
                     row.operator("stablegen.toggle_rig_mapping_overlay",
                                  text="",
                                  icon="HIDE_OFF")
+                    row.operator("stablegen.toggle_collision_proxy_overlay",
+                                 text="Proxy",
+                                 icon="MOD_WIREFRAME")
 
                     row = content_box.row(align=True)
                     row.operator_context = "INVOKE_DEFAULT"
@@ -989,6 +992,9 @@ class StableGenPanel(bpy.types.Panel):
                     row.operator("stablegen.apply_animation_to_rig",
                                  text="Apply Animation",
                                  icon="ANIM_DATA")
+                    row.operator("stablegen.toggle_retarget_source_preview",
+                                 text="",
+                                 icon="HIDE_OFF")
 
                     if rig_available and getattr(scene, 'trellis2_autorig_enabled', False):
                         content_box.separator()

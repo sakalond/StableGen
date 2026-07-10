@@ -5,7 +5,9 @@ bone names may be generic (``bone_0``), so the first step is to infer a
 semantic profile from the rest pose and store it on the armature.
 """
 
+import hashlib
 import json
+import math
 import os
 import traceback
 from datetime import datetime
@@ -21,13 +23,19 @@ from ..utils import sg_modal_active
 
 _PROFILE_PROP = "sg_retarget_profile"
 _REFERENCE_POSE_PROP = "sg_retarget_reference_pose"
-_PROFILE_VERSION = 12
-_REFERENCE_POSE_VERSION = 1
+_SOURCE_PREVIEW_PROP = "sg_retarget_source_preview"
+_COLLISION_PROXY_PROP = "sg_retarget_collision_proxy"
+_PROFILE_VERSION = 14
+_REFERENCE_POSE_VERSION = 2
+_COLLISION_PROXY_VERSION = 2
+_LEGACY_REFERENCE_POSE_VERSION = 1
 _CONSTRAINT_PREFIX = "SG_Retarget_"
 _BONE_ENUM_ITEMS_CACHE = {}
 _rig_mapping_draw_handle = None
 _rig_mapping_label_draw_handle = None
 _rig_mapping_armature_name = None
+_collision_proxy_draw_handle = None
+_collision_proxy_armature_name = None
 
 _CHAIN_COLORS = {
     "spine": (0.45, 0.75, 1.0, 0.95),
@@ -54,6 +62,31 @@ _BASIS_LABELS = {
     "forward": "Forward",
     "left": "Left",
 }
+
+_COLLISION_PROXY_COLORS = {
+    "body": (1.0, 0.2, 0.35, 0.82),
+    "left_arm": (0.2, 0.95, 0.55, 0.82),
+    "right_arm": (1.0, 0.55, 0.16, 0.82),
+    "inactive": (0.55, 0.55, 0.6, 0.38),
+}
+
+_ARM_CORRECTION_DRIVER_ITEMS = (
+    (
+        "AUTO",
+        "Automatic (Recommended)",
+        "Use the upper arm only when a disconnected mechanical shoulder topology is detected",
+    ),
+    (
+        "SHOULDER",
+        "Shoulder / Clavicle",
+        "Apply direction and collision correction from the first mapped arm bone",
+    ),
+    (
+        "UPPER_ARM",
+        "Upper Arm",
+        "Preserve the clavicle and apply direction and collision correction from the upper arm",
+    ),
+)
 
 
 def _norm_name(name):
@@ -481,7 +514,7 @@ def characterize_armature(armature):
 def _profile_summary(profile):
     if not profile:
         return "no profile"
-    chains = profile.get("chains", {})
+    chains = _profile_chains(profile)
     parts = []
     for name in ("spine", "left_arm", "right_arm", "left_leg", "right_leg"):
         chain = chains.get(name, [])
@@ -552,11 +585,86 @@ def _safe_file_stem(value):
     return stem or "rig"
 
 
+def _profile_forward_flipped(profile):
+    return (profile or {}).get("orientation_correction") == "ROTATE_180"
+
+
+def _profile_chains(profile, oriented=True):
+    chains = dict((profile or {}).get("chains", {}))
+    if oriented and _profile_forward_flipped(profile):
+        for suffix in ("arm", "leg"):
+            left_key = f"left_{suffix}"
+            right_key = f"right_{suffix}"
+            chains[left_key], chains[right_key] = (
+                chains.get(right_key, []),
+                chains.get(left_key, []),
+            )
+    return chains
+
+
+def _profile_signature(profile):
+    if not profile:
+        return None
+    payload = {
+        "version": profile.get("version"),
+        "pelvis": profile.get("pelvis"),
+        "head": profile.get("head"),
+        "chains": profile.get("chains", {}),
+        "orientation_correction": profile.get("orientation_correction", "NORMAL"),
+    }
+    encoded = json.dumps(
+        payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _animation_file_identity(filepath):
+    path = os.path.normcase(os.path.abspath(bpy.path.abspath(filepath))) if filepath else None
+    result = {"path": path}
+    if path and os.path.exists(path):
+        stat = os.stat(path)
+        result["size"] = int(stat.st_size)
+        result["mtime_ns"] = int(stat.st_mtime_ns)
+    return result
+
+
+def _reference_provenance(
+        filepath, source_profile, target_profile, source_frame,
+        source_reference_mode, swap_target_sides=False):
+    return {
+        "animation": _animation_file_identity(filepath),
+        "source_frame": int(source_frame),
+        "source_reference_mode": source_reference_mode,
+        "source_profile_signature": _profile_signature(source_profile),
+        "target_profile_signature": _profile_signature(target_profile),
+        "swap_target_sides": bool(swap_target_sides),
+    }
+
+
+def _reference_provenance_matches(reference_pose, expected):
+    actual = (reference_pose or {}).get("provenance")
+    if not actual or not expected:
+        return False, "target reference has no source provenance"
+    for key in (
+            "source_frame", "source_reference_mode", "source_profile_signature",
+            "target_profile_signature", "swap_target_sides"):
+        if actual.get(key) != expected.get(key):
+            return False, f"target reference {key} does not match"
+    actual_file = actual.get("animation", {})
+    expected_file = expected.get("animation", {})
+    if actual_file.get("path") != expected_file.get("path"):
+        return False, "target reference was made from another animation file"
+    for key in ("size", "mtime_ns"):
+        if key in actual_file and key in expected_file and actual_file[key] != expected_file[key]:
+            return False, "source animation file changed after the target reference was stored"
+    return True, "reference provenance matches"
+
+
 def _rows_to_matrix(rows):
     return mathutils.Matrix(rows)
 
 
-def _capture_reference_pose(armature, bone_names=None, label="current_pose"):
+def _capture_reference_pose(
+        armature, bone_names=None, label="current_pose", provenance=None):
     if not armature or armature.type != "ARMATURE":
         return None
     names = list(bone_names) if bone_names else [bone.name for bone in armature.pose.bones]
@@ -566,12 +674,15 @@ def _capture_reference_pose(armature, bone_names=None, label="current_pose"):
         if not pose_bone:
             continue
         matrices[name] = _matrix_to_rows(pose_bone.matrix_basis.copy())
-    return {
+    result = {
         "version": _REFERENCE_POSE_VERSION,
         "armature": armature.name,
         "label": label,
         "bones": matrices,
     }
+    if provenance:
+        result["provenance"] = provenance
+    return result
 
 
 def _rest_reference_pose(armature, bone_names):
@@ -581,6 +692,7 @@ def _rest_reference_pose(armature, bone_names):
         "armature": armature.name,
         "label": "rest_pose",
         "bones": {name: identity for name in bone_names},
+        "provenance": {"source_reference_mode": "REST"},
     }
 
 
@@ -601,7 +713,8 @@ def _load_reference_pose(armature):
 def _reference_pose_is_usable(armature, reference_pose, bone_names):
     if not armature or not reference_pose:
         return False
-    if reference_pose.get("version") != _REFERENCE_POSE_VERSION:
+    if reference_pose.get("version") not in {
+            _LEGACY_REFERENCE_POSE_VERSION, _REFERENCE_POSE_VERSION}:
         return False
     matrices = reference_pose.get("bones", {})
     available = {bone.name for bone in armature.pose.bones}
@@ -639,29 +752,38 @@ def _active_rig_mapping_armature():
     return None
 
 
+def _active_collision_proxy_armature():
+    if not _collision_proxy_armature_name:
+        return None
+    obj = bpy.data.objects.get(_collision_proxy_armature_name)
+    if obj and obj.type == "ARMATURE":
+        return obj
+    return None
+
+
 def _chain_world_points(armature, chain):
     points = []
     for bone_name in chain:
-        bone = armature.data.bones.get(bone_name)
-        if not bone:
+        pose_bone = armature.pose.bones.get(bone_name)
+        if not pose_bone:
             continue
-        points.append(armature.matrix_world @ bone.head_local)
+        points.append(armature.matrix_world @ pose_bone.head)
     return points
 
 
 def _profile_world_points(armature, profile):
     points = []
-    chains = profile.get("chains", {}) if profile else {}
+    chains = _profile_chains(profile) if profile else {}
     names = {profile.get("pelvis"), profile.get("head")} if profile else set()
     for chain in chains.values():
         names.update(chain)
 
     for name in names:
-        bone = armature.data.bones.get(name) if name else None
-        if not bone:
+        pose_bone = armature.pose.bones.get(name) if name else None
+        if not pose_bone:
             continue
-        points.append(armature.matrix_world @ bone.head_local)
-        points.append(armature.matrix_world @ bone.tail_local)
+        points.append(armature.matrix_world @ pose_bone.head)
+        points.append(armature.matrix_world @ pose_bone.tail)
     return points
 
 
@@ -680,11 +802,11 @@ def _basis_overlay_scale(armature, profile):
 
 
 def _rig_basis_overlay_vectors(armature, profile):
-    pelvis = _profile_point(armature, profile.get("pelvis"), use_tail=False)
+    pelvis = _pose_point(armature, profile.get("pelvis"), use_tail=False)
     if pelvis is None:
         return {}
 
-    basis = _profile_body_basis(armature, profile)
+    basis = _pose_body_basis(armature, profile)
     left, forward, up = _basis_axes(basis)
     world_basis = armature.matrix_world.to_3x3()
     origin = armature.matrix_world @ pelvis
@@ -734,6 +856,13 @@ def _tag_view3d_redraw():
                 area.tag_redraw()
 
 
+def _rig_mapping_frame_change(_scene, _depsgraph=None):
+    if (
+            _rig_mapping_draw_handle is not None
+            or _collision_proxy_draw_handle is not None):
+        _tag_view3d_redraw()
+
+
 def _draw_rig_mapping_overlay():
     armature = _active_rig_mapping_armature()
     profile = _load_profile(armature) if armature else None
@@ -747,7 +876,7 @@ def _draw_rig_mapping_overlay():
     gpu.state.line_width_set(4.0)
 
     try:
-        for chain_name, chain in profile.get("chains", {}).items():
+        for chain_name, chain in _profile_chains(profile).items():
             points = _chain_world_points(armature, chain)
             if len(points) < 2:
                 continue
@@ -798,7 +927,7 @@ def _draw_rig_mapping_labels():
     blf.size(font_id, 19)
     gpu.state.blend_set("ALPHA")
     try:
-        for chain_name, chain in profile.get("chains", {}).items():
+        for chain_name, chain in _profile_chains(profile).items():
             points = _chain_world_points(armature, chain)
             if not points:
                 continue
@@ -842,6 +971,8 @@ def _ensure_rig_mapping_overlay(armature):
     if _rig_mapping_label_draw_handle is None:
         _rig_mapping_label_draw_handle = bpy.types.SpaceView3D.draw_handler_add(
             _draw_rig_mapping_labels, (), "WINDOW", "POST_PIXEL")
+    if _rig_mapping_frame_change not in bpy.app.handlers.frame_change_post:
+        bpy.app.handlers.frame_change_post.append(_rig_mapping_frame_change)
     _tag_view3d_redraw()
 
 
@@ -855,8 +986,177 @@ def _remove_rig_mapping_overlay():
     if _rig_mapping_label_draw_handle is not None:
         bpy.types.SpaceView3D.draw_handler_remove(_rig_mapping_label_draw_handle, "WINDOW")
         _rig_mapping_label_draw_handle = None
+    if (
+            _collision_proxy_draw_handle is None
+            and _rig_mapping_frame_change in bpy.app.handlers.frame_change_post):
+        bpy.app.handlers.frame_change_post.remove(_rig_mapping_frame_change)
     _rig_mapping_armature_name = None
     _tag_view3d_redraw()
+
+
+def _cached_collision_proxy(armature):
+    raw = armature.get(_COLLISION_PROXY_PROP) if armature else None
+    if not raw:
+        return None
+    try:
+        proxy = json.loads(raw)
+    except Exception:
+        return None
+    if proxy.get("version") != _COLLISION_PROXY_VERSION:
+        return None
+    return proxy
+
+
+def _capsule_wire_segments(
+        start, end, radius, world_matrix, ring_sides=12, cap_steps=3):
+    axis = end - start
+    if radius <= 1e-6:
+        return []
+    if axis.length < 1e-6:
+        segments = []
+        circle_axes = (
+            (mathutils.Vector((1.0, 0.0, 0.0)), mathutils.Vector((0.0, 1.0, 0.0))),
+            (mathutils.Vector((1.0, 0.0, 0.0)), mathutils.Vector((0.0, 0.0, 1.0))),
+            (mathutils.Vector((0.0, 1.0, 0.0)), mathutils.Vector((0.0, 0.0, 1.0))),
+        )
+        for side_a, side_b in circle_axes:
+            points = []
+            for side_index in range(ring_sides):
+                angle = (math.pi * 2.0) * side_index / ring_sides
+                point = start + (
+                    side_a * (math.cos(angle) * radius)
+                    + side_b * (math.sin(angle) * radius)
+                )
+                points.append(world_matrix @ point)
+            for side_index, point in enumerate(points):
+                segments.extend([point, points[(side_index + 1) % ring_sides]])
+        return segments
+    axis.normalize()
+    helper = mathutils.Vector((0.0, 0.0, 1.0))
+    if abs(axis.dot(helper)) > 0.9:
+        helper = mathutils.Vector((1.0, 0.0, 0.0))
+    side_a = axis.cross(helper).normalized()
+    side_b = axis.cross(side_a).normalized()
+
+    rings = []
+    cap_steps = max(2, int(cap_steps))
+    for step in range(cap_steps + 1):
+        angle = (-math.pi * 0.5) + ((math.pi * 0.5) * step / cap_steps)
+        rings.append((start + (axis * (math.sin(angle) * radius)), math.cos(angle) * radius))
+    for step in range(cap_steps + 1):
+        angle = (math.pi * 0.5) * step / cap_steps
+        rings.append((end + (axis * (math.sin(angle) * radius)), math.cos(angle) * radius))
+
+    ring_points = []
+    for center, ring_radius in rings:
+        points = []
+        for side_index in range(ring_sides):
+            angle = (math.pi * 2.0) * side_index / ring_sides
+            point = center + (
+                side_a * (math.cos(angle) * ring_radius)
+                + side_b * (math.sin(angle) * ring_radius)
+            )
+            points.append(world_matrix @ point)
+        ring_points.append(points)
+
+    segments = []
+    for ring_index, points in enumerate(ring_points):
+        if rings[ring_index][1] > 1e-6:
+            for side_index, point in enumerate(points):
+                segments.extend([point, points[(side_index + 1) % ring_sides]])
+        if ring_index:
+            previous = ring_points[ring_index - 1]
+            for side_index, point in enumerate(points):
+                segments.extend([previous[side_index], point])
+    segments.extend([world_matrix @ start, world_matrix @ end])
+    return segments
+
+
+def _collision_proxy_bone_groups(proxy):
+    groups = []
+    seen = set()
+    for name in proxy.get("body_bones", []):
+        if name not in seen:
+            seen.add(name)
+            groups.append((name, "body"))
+    for role in ("left_arm", "right_arm"):
+        chain = proxy.get("arm_chains", {}).get(role, [])
+        active_bones = set(_distal_arm_proxy_bones(chain))
+        for name in chain:
+            if name not in seen:
+                seen.add(name)
+                groups.append((name, role if name in active_bones else "inactive"))
+    return groups
+
+
+def _draw_collision_proxy_overlay():
+    armature = _active_collision_proxy_armature()
+    proxy = _cached_collision_proxy(armature)
+    if not armature or not proxy:
+        return
+
+    shader = gpu.shader.from_builtin("UNIFORM_COLOR")
+    gpu.state.blend_set("ALPHA")
+    gpu.state.depth_test_set("NONE")
+    gpu.state.depth_mask_set(False)
+    gpu.state.line_width_set(1.6)
+    try:
+        for bone_name, role in _collision_proxy_bone_groups(proxy):
+            capsule = _proxy_pose_capsule(armature, proxy, bone_name)
+            if not capsule:
+                continue
+            segments = _capsule_wire_segments(
+                capsule["start"],
+                capsule["end"],
+                capsule["radius"],
+                armature.matrix_world,
+            )
+            if not segments:
+                continue
+            shader.uniform_float(
+                "color",
+                _COLLISION_PROXY_COLORS.get(role, (0.8, 0.8, 0.8, 0.8)),
+            )
+            batch = batch_for_shader(shader, "LINES", {"pos": segments})
+            batch.draw(shader)
+    finally:
+        gpu.state.depth_test_set("NONE")
+        gpu.state.depth_mask_set(True)
+        gpu.state.blend_set("NONE")
+        gpu.state.line_width_set(1.0)
+
+
+def _ensure_collision_proxy_overlay(armature):
+    global _collision_proxy_draw_handle, _collision_proxy_armature_name
+
+    _collision_proxy_armature_name = armature.name
+    if _collision_proxy_draw_handle is None:
+        _collision_proxy_draw_handle = bpy.types.SpaceView3D.draw_handler_add(
+            _draw_collision_proxy_overlay, (), "WINDOW", "POST_VIEW")
+    if _rig_mapping_frame_change not in bpy.app.handlers.frame_change_post:
+        bpy.app.handlers.frame_change_post.append(_rig_mapping_frame_change)
+    _tag_view3d_redraw()
+
+
+def _remove_collision_proxy_overlay():
+    global _collision_proxy_draw_handle, _collision_proxy_armature_name
+
+    if _collision_proxy_draw_handle is not None:
+        bpy.types.SpaceView3D.draw_handler_remove(
+            _collision_proxy_draw_handle, "WINDOW")
+        _collision_proxy_draw_handle = None
+    if (
+            _rig_mapping_draw_handle is None
+            and _rig_mapping_frame_change in bpy.app.handlers.frame_change_post):
+        bpy.app.handlers.frame_change_post.remove(_rig_mapping_frame_change)
+    _collision_proxy_armature_name = None
+    _tag_view3d_redraw()
+
+
+def cleanup_retarget_overlays():
+    """Remove viewport handlers before the add-on is unregistered or reloaded."""
+    _remove_collision_proxy_overlay()
+    _remove_rig_mapping_overlay()
 
 
 def _bone_enum_items(self, context):
@@ -890,6 +1190,8 @@ def _initialize_mapping_operator(operator, armature, profile):
 
     _set_property_if_bone(operator, "pelvis", armature, profile.get("pelvis"))
     _set_property_if_bone(operator, "head", armature, profile.get("head"))
+    if hasattr(operator, "rotate_180"):
+        operator.rotate_180 = _profile_forward_flipped(profile)
 
     mapping = {
         "spine": ("spine_start", "spine_end"),
@@ -956,8 +1258,8 @@ def _active_or_selected_armature(context):
 def _common_chain_pairs(
         source_profile, target_profile, swap_target_sides=False,
         source_armature=None, target_armature=None, trim_feet=False):
-    source_chains = source_profile.get("chains", {})
-    target_chains = target_profile.get("chains", {})
+    source_chains = _profile_chains(source_profile)
+    target_chains = _profile_chains(target_profile)
     pairs = []
 
     def target_key(key):
@@ -1145,24 +1447,244 @@ def _source_rest_pose_baseline(source_armature, pairs):
 
 
 def _height_from_profile(armature, profile):
-    chains = profile.get("chains", {})
+    chains = _profile_chains(profile)
     names = set([profile.get("pelvis"), profile.get("head")])
     for chain in chains.values():
         names.update(chain)
 
-    coords = []
+    terminal_arm_bones = {
+        chain[-1]
+        for role, chain in chains.items()
+        if role in {"left_arm", "right_arm"} and chain
+    }
+    up_axis = _profile_up_axis(armature, profile)
+
+    heights = []
     for name in names:
         bone = armature.data.bones.get(name)
         if not bone:
             continue
-        coords.append(bone.head_local)
-        coords.append(bone.tail_local)
-    if not coords:
+        heights.append(bone.head_local.dot(up_axis))
+        if name not in terminal_arm_bones:
+            heights.append(bone.tail_local.dot(up_axis))
+    if not heights:
         return 1.0
 
-    min_z = min(coord.z for coord in coords)
-    max_z = max(coord.z for coord in coords)
-    return max(max_z - min_z, 1e-5)
+    return max(max(heights) - min(heights), 1e-5)
+
+
+def _target_skin_meshes(armature):
+    return [
+        obj for obj in bpy.data.objects
+        if obj.type == "MESH" and _mesh_armature(obj) == armature
+    ]
+
+
+def _collision_mesh_signature(armature):
+    payload = []
+    for obj in sorted(_target_skin_meshes(armature), key=lambda item: item.name):
+        payload.append({
+            "name": obj.name,
+            "data": obj.data.name,
+            "vertices": len(obj.data.vertices),
+            "groups": sorted(group.name for group in obj.vertex_groups),
+            "matrix_world": [
+                [round(float(value), 6) for value in row]
+                for row in obj.matrix_world
+            ],
+            "bounds": [
+                [round(float(value), 6) for value in corner]
+                for corner in obj.bound_box
+            ],
+        })
+    signature_payload = {
+        "armature_matrix_world": [
+            [round(float(value), 6) for value in row]
+            for row in armature.matrix_world
+        ],
+        "meshes": payload,
+    }
+    encoded = json.dumps(
+        signature_payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _point_segment_distance(point, start, end):
+    segment = end - start
+    length_squared = segment.length_squared
+    if length_squared < 1e-12:
+        return (point - start).length, 0.0
+    parameter = (point - start).dot(segment) / length_squared
+    closest = start + (segment * max(0.0, min(1.0, parameter)))
+    return (point - closest).length, parameter
+
+
+def _percentile(values, fraction):
+    if not values:
+        return None
+    ordered = sorted(values)
+    index = int(round((len(ordered) - 1) * max(0.0, min(1.0, fraction))))
+    return ordered[index]
+
+
+def _proxy_bone_role(bone_name, target_profile, chains):
+    if bone_name == target_profile.get("head"):
+        return "head"
+    if bone_name == target_profile.get("pelvis") or bone_name in chains.get("spine", []):
+        return "body"
+    for role in ("left_arm", "right_arm"):
+        if bone_name in chains.get(role, []):
+            return "arm"
+    return "limb"
+
+
+def _default_proxy_radius(bone, role, target_height):
+    bone_length = max(float(bone.length), target_height * 0.01)
+    if role == "head":
+        return max(target_height * 0.055, bone_length * 0.45)
+    if role == "body":
+        return max(target_height * 0.065, bone_length * 0.32)
+    return max(target_height * 0.016, bone_length * 0.16)
+
+
+def _proxy_radius_limits(bone, role, target_height):
+    bone_length = max(float(bone.length), target_height * 0.01)
+    if role == "head":
+        return target_height * 0.025, max(target_height * 0.12, bone_length * 0.8)
+    if role == "body":
+        return target_height * 0.035, max(target_height * 0.20, bone_length * 0.75)
+    return target_height * 0.010, max(target_height * 0.075, bone_length * 0.42)
+
+
+def _build_collision_proxy(armature, target_profile):
+    """Estimate a compact rest-space capsule rig from dominant skin weights."""
+    chains = _profile_chains(target_profile)
+    body_bones = []
+    for name in [
+            target_profile.get("pelvis"),
+            *chains.get("spine", []),
+            target_profile.get("head")]:
+        if name and name not in body_bones and armature.data.bones.get(name):
+            body_bones.append(name)
+
+    arm_chains = {}
+    for role in ("left_arm", "right_arm"):
+        arm_chains[role] = [
+            name for name in chains.get(role, [])
+            if armature.data.bones.get(name)
+        ]
+    terminal_arm_bones = [
+        chain[-1] for chain in arm_chains.values() if chain
+    ]
+
+    proxy_bones = list(body_bones)
+    for chain in arm_chains.values():
+        for name in chain:
+            if name not in proxy_bones:
+                proxy_bones.append(name)
+    if not body_bones or any(len(chain) < 2 for chain in arm_chains.values()):
+        return None
+
+    radial_samples = {name: [] for name in proxy_bones}
+    terminal_head_samples = {name: [] for name in terminal_arm_bones}
+    target_height = _height_from_profile(armature, target_profile)
+    armature_inverse = armature.matrix_world.inverted_safe()
+    sampled_vertices = 0
+    meshes = _target_skin_meshes(armature)
+
+    for obj in meshes:
+        if not obj.vertex_groups or not obj.data.vertices:
+            continue
+        group_names = {
+            group.index: group.name
+            for group in obj.vertex_groups
+            if group.name in radial_samples
+        }
+        if not group_names:
+            continue
+        to_armature = armature_inverse @ obj.matrix_world
+        stride = max(1, len(obj.data.vertices) // 25000)
+        for vertex_index, vertex in enumerate(obj.data.vertices):
+            if vertex_index % stride:
+                continue
+            dominant_name = None
+            dominant_weight = 0.0
+            for membership in vertex.groups:
+                name = group_names.get(membership.group)
+                if name and membership.weight > dominant_weight:
+                    dominant_name = name
+                    dominant_weight = float(membership.weight)
+            if dominant_name is None or dominant_weight < 0.05:
+                continue
+            bone = armature.data.bones.get(dominant_name)
+            if not bone:
+                continue
+            point = to_armature @ vertex.co
+            distance, parameter = _point_segment_distance(
+                point, bone.head_local, bone.tail_local)
+            if parameter < -0.35 or parameter > 1.35:
+                continue
+            radial_samples[dominant_name].append(float(distance))
+            if (
+                    dominant_name in terminal_head_samples
+                    and -0.35 <= parameter <= 0.45):
+                terminal_head_samples[dominant_name].append(
+                    float((point - bone.head_local).length))
+            sampled_vertices += 1
+
+    radii = {}
+    sample_counts = {}
+    for name in proxy_bones:
+        bone = armature.data.bones.get(name)
+        role = _proxy_bone_role(name, target_profile, chains)
+        estimate = _percentile(radial_samples[name], 0.88)
+        if estimate is None:
+            estimate = _default_proxy_radius(bone, role, target_height)
+        minimum, maximum = _proxy_radius_limits(bone, role, target_height)
+        if name in terminal_head_samples:
+            hand_estimate = _percentile(terminal_head_samples[name], 0.88)
+            if hand_estimate is not None:
+                estimate = hand_estimate
+            minimum = target_height * 0.012
+            maximum = target_height * 0.055
+        radii[name] = float(max(minimum, min(maximum, estimate)))
+        sample_counts[name] = len(radial_samples[name])
+
+    proxy = {
+        "version": _COLLISION_PROXY_VERSION,
+        "profile_signature": _profile_signature(target_profile),
+        "mesh_signature": _collision_mesh_signature(armature),
+        "height": float(target_height),
+        "body_bones": body_bones,
+        "arm_chains": arm_chains,
+        "terminal_arm_bones": terminal_arm_bones,
+        "radii": radii,
+        "sample_counts": sample_counts,
+    }
+    armature[_COLLISION_PROXY_PROP] = json.dumps(proxy, sort_keys=True)
+    print(
+        f"[StableGen] Built skeletal collision proxy for {armature.name}: "
+        f"{len(proxy_bones)} capsule bone(s), {sampled_vertices} weighted vertex sample(s)."
+    )
+    return proxy
+
+
+def _collision_proxy_for_armature(armature, target_profile, rebuild=False):
+    expected_profile = _profile_signature(target_profile)
+    expected_mesh = _collision_mesh_signature(armature)
+    if not rebuild:
+        raw = armature.get(_COLLISION_PROXY_PROP)
+        if raw:
+            try:
+                proxy = json.loads(raw)
+                if (
+                        proxy.get("version") == _COLLISION_PROXY_VERSION
+                        and proxy.get("profile_signature") == expected_profile
+                        and proxy.get("mesh_signature") == expected_mesh):
+                    return proxy
+            except Exception:
+                pass
+    return _build_collision_proxy(armature, target_profile)
 
 
 def _profile_point(armature, bone_name, use_tail=False):
@@ -1179,16 +1701,18 @@ def _pose_point(armature, bone_name, use_tail=False):
     return pose_bone.tail.copy() if use_tail else pose_bone.head.copy()
 
 
-def _chain_end_point(armature, chain):
+def _chain_end_point(armature, chain, use_terminal_head=False):
     if not chain:
         return None
-    return _profile_point(armature, chain[-1], use_tail=True)
+    return _profile_point(
+        armature, chain[-1], use_tail=not use_terminal_head)
 
 
-def _pose_chain_end_point(armature, chain):
+def _pose_chain_end_point(armature, chain, use_terminal_head=False):
     if not chain:
         return None
-    return _pose_point(armature, chain[-1], use_tail=True)
+    return _pose_point(
+        armature, chain[-1], use_tail=not use_terminal_head)
 
 
 def _average_points(points):
@@ -1232,13 +1756,15 @@ def _pose_up_axis(armature, profile):
 
 
 def _profile_side_axis(armature, profile, up):
-    chains = profile.get("chains", {})
+    chains = _profile_chains(profile)
     left_point = _average_points([
-        _chain_end_point(armature, chains.get("left_arm", [])),
+        _chain_end_point(
+            armature, chains.get("left_arm", []), use_terminal_head=True),
         _chain_end_point(armature, chains.get("left_leg", [])),
     ])
     right_point = _average_points([
-        _chain_end_point(armature, chains.get("right_arm", [])),
+        _chain_end_point(
+            armature, chains.get("right_arm", []), use_terminal_head=True),
         _chain_end_point(armature, chains.get("right_leg", [])),
     ])
     side = (left_point - right_point) if left_point is not None and right_point is not None else None
@@ -1247,13 +1773,15 @@ def _profile_side_axis(armature, profile, up):
 
 
 def _pose_side_axis(armature, profile, up):
-    chains = profile.get("chains", {})
+    chains = _profile_chains(profile)
     left_point = _average_points([
-        _pose_chain_end_point(armature, chains.get("left_arm", [])),
+        _pose_chain_end_point(
+            armature, chains.get("left_arm", []), use_terminal_head=True),
         _pose_chain_end_point(armature, chains.get("left_leg", [])),
     ])
     right_point = _average_points([
-        _pose_chain_end_point(armature, chains.get("right_arm", [])),
+        _pose_chain_end_point(
+            armature, chains.get("right_arm", []), use_terminal_head=True),
         _pose_chain_end_point(armature, chains.get("right_leg", [])),
     ])
     side = (left_point - right_point) if left_point is not None and right_point is not None else None
@@ -1262,7 +1790,7 @@ def _pose_side_axis(armature, profile, up):
 
 
 def _rest_foot_front_hint(armature, profile, up):
-    chains = profile.get("chains", {})
+    chains = _profile_chains(profile)
     pelvis = _profile_point(armature, profile.get("pelvis"), use_tail=False)
     return _front_hint_from_chain_names(
         armature,
@@ -1290,8 +1818,9 @@ def _profile_body_basis(armature, profile, flip_forward=False):
     up = _profile_up_axis(armature, profile)
     left = _profile_side_axis(armature, profile, up)
     left, forward = _body_axes_from_side_up(armature, profile, left, up)
-    if flip_forward:
+    if bool(flip_forward) ^ _profile_forward_flipped(profile):
         forward = -forward
+        left = _safe_normalized(up.cross(forward), -left)
     return mathutils.Matrix((left, forward, up)).transposed()
 
 
@@ -1299,8 +1828,9 @@ def _pose_body_basis(armature, profile, flip_forward=False):
     up = _pose_up_axis(armature, profile)
     left = _pose_side_axis(armature, profile, up)
     left, forward = _body_axes_from_side_up(armature, profile, left, up)
-    if flip_forward:
+    if bool(flip_forward) ^ _profile_forward_flipped(profile):
         forward = -forward
+        left = _safe_normalized(up.cross(forward), -left)
     return mathutils.Matrix((left, forward, up)).transposed()
 
 
@@ -1538,6 +2068,281 @@ def _bake_pose_delta_retarget(
         )
 
 
+def _armature_reference_matrices(armature, use_rest=False):
+    if use_rest:
+        return {
+            bone.name: bone.matrix_local.copy()
+            for bone in armature.data.bones
+        }
+    return {
+        pose_bone.name: pose_bone.matrix.copy()
+        for pose_bone in armature.pose.bones
+    }
+
+
+def _reference_local_matrix(reference_matrices, pose_bone):
+    matrix = reference_matrices.get(pose_bone.name)
+    if matrix is None:
+        return None
+    if not pose_bone.parent:
+        return matrix.copy()
+    parent_matrix = reference_matrices.get(pose_bone.parent.name)
+    if parent_matrix is None:
+        return matrix.copy()
+    return parent_matrix.inverted_safe() @ matrix
+
+
+def _current_local_matrix(pose_bone):
+    if not pose_bone.parent:
+        return pose_bone.matrix.copy()
+    return pose_bone.parent.matrix.inverted_safe() @ pose_bone.matrix
+
+
+def _pose_bone_depth(pose_bone):
+    depth = 0
+    parent = pose_bone.parent
+    while parent:
+        depth += 1
+        parent = parent.parent
+    return depth
+
+
+def _rest_space_pair_records(
+        source_armature, target_armature, pairs, source_reference_matrices,
+        target_reference_matrices, body_alignment):
+    body_alignment_q = body_alignment.to_quaternion()
+    records = []
+    for source_name, target_name, role in pairs:
+        source_pose = source_armature.pose.bones.get(source_name)
+        target_pose = target_armature.pose.bones.get(target_name)
+        if not source_pose or not target_pose:
+            continue
+        source_reference_local = _reference_local_matrix(
+            source_reference_matrices, source_pose)
+        target_reference_local = _reference_local_matrix(
+            target_reference_matrices, target_pose)
+        if source_reference_local is None or target_reference_local is None:
+            continue
+
+        if source_pose.parent:
+            source_parent_reference = source_reference_matrices.get(
+                source_pose.parent.name, mathutils.Matrix.Identity(4))
+        else:
+            source_parent_reference = mathutils.Matrix.Identity(4)
+        if target_pose.parent:
+            target_parent_reference = target_reference_matrices.get(
+                target_pose.parent.name, mathutils.Matrix.Identity(4))
+        else:
+            target_parent_reference = mathutils.Matrix.Identity(4)
+
+        source_parent_rotation = source_parent_reference.to_quaternion()
+        target_parent_rotation = target_parent_reference.to_quaternion()
+        parent_alignment = (
+            target_parent_rotation.inverted()
+            @ body_alignment_q
+            @ source_parent_rotation
+        )
+        source_reference_rotation = source_reference_matrices[source_name].to_quaternion()
+        target_reference_rotation = target_reference_matrices[target_name].to_quaternion()
+        bone_alignment = (
+            target_reference_rotation.inverted()
+            @ body_alignment_q
+            @ source_reference_rotation
+        )
+        records.append({
+            "source": source_pose,
+            "target": target_pose,
+            "role": role,
+            "source_reference_local": source_reference_local,
+            "target_reference_local": target_reference_local,
+            "parent_alignment": parent_alignment,
+            "bone_alignment": bone_alignment,
+        })
+    records.sort(key=lambda record: _pose_bone_depth(record["target"]))
+    return records
+
+
+def _apply_rest_space_pose(
+        records, copy_root_motion, location_scale, context):
+    for record in records:
+        source_pose = record["source"]
+        target_pose = record["target"]
+        source_reference_local = record["source_reference_local"]
+        target_reference_local = record["target_reference_local"]
+        parent_alignment = record["parent_alignment"]
+        bone_alignment = record["bone_alignment"]
+
+        source_pose_local = _current_local_matrix(source_pose)
+        source_loc, source_rot, _source_scale = source_pose_local.decompose()
+        source_ref_loc, source_ref_rot, _source_ref_scale = source_reference_local.decompose()
+        target_ref_loc, target_ref_rot, target_ref_scale = target_reference_local.decompose()
+
+        source_delta = source_ref_rot.inverted() @ source_rot
+        target_delta = bone_alignment @ source_delta @ bone_alignment.inverted()
+        desired_local_rotation = target_ref_rot @ target_delta
+        desired_local_location = target_ref_loc.copy()
+        if record["role"] == "pelvis" and copy_root_motion:
+            source_location_delta = source_loc - source_ref_loc
+            desired_local_location += (
+                parent_alignment @ source_location_delta
+            ) * location_scale
+
+        desired_local_matrix = mathutils.Matrix.LocRotScale(
+            desired_local_location,
+            desired_local_rotation,
+            target_ref_scale,
+        )
+        if target_pose.parent:
+            desired_matrix = target_pose.parent.matrix @ desired_local_matrix
+        else:
+            desired_matrix = desired_local_matrix
+        target_pose.rotation_mode = "QUATERNION"
+        target_pose.matrix = desired_matrix
+        context.view_layer.update()
+
+
+def _bake_rest_space_retarget(
+        context, source_armature, target_armature, pairs,
+        source_profile, target_profile, start, end, frame_step,
+        copy_root_motion, target_reference_pose, source_reference_mode="START_FRAME",
+        swap_target_sides=False, limb_match_strength=0.65,
+        collision_proxy=None, collision_adaptation=True,
+        collision_strength=0.75, collision_margin=0.008,
+        collision_iterations=2, collision_max_deviation=0.08,
+        arm_correction_driver="AUTO"):
+    """Bake parent-local motion deltas through corresponding reference frames."""
+    target_names = _mapped_target_bones(pairs)
+    all_target_names = [pose_bone.name for pose_bone in target_armature.pose.bones]
+    source_height = _height_from_profile(source_armature, source_profile)
+    target_height = _height_from_profile(target_armature, target_profile)
+    location_scale = target_height / source_height if source_height > 1e-5 else 1.0
+
+    context.scene.frame_set(start)
+    context.view_layer.update()
+    source_reference_matrices = _armature_reference_matrices(
+        source_armature,
+        use_rest=source_reference_mode == "REST",
+    )
+    source_basis = _profile_rotation_basis(source_armature, source_profile)
+    target_basis = _profile_rotation_basis(target_armature, target_profile)
+    body_alignment = target_basis @ source_basis.inverted()
+    source_reference_body_directions = _limb_reference_body_directions(
+        source_armature,
+        source_profile,
+        _profile_body_basis(source_armature, source_profile),
+        use_rest=source_reference_mode == "REST",
+    )
+
+    if target_reference_pose.get("label") == "rest_pose":
+        _reset_target_pose(target_armature, all_target_names)
+    else:
+        _apply_target_reference_pose(
+            target_armature, all_target_names, target_reference_pose)
+    context.view_layer.update()
+    target_reference_body_directions = _limb_reference_body_directions(
+        target_armature,
+        target_profile,
+        _profile_body_basis(target_armature, target_profile),
+        use_rest=False,
+    )
+    collision_baseline = {}
+    if collision_adaptation and collision_proxy:
+        collision_baseline = _capture_proxy_collision_baseline(
+            target_armature,
+            collision_proxy,
+            margin=collision_margin,
+        )
+    target_reference_matrices = _armature_reference_matrices(target_armature)
+    records = _rest_space_pair_records(
+        source_armature,
+        target_armature,
+        pairs,
+        source_reference_matrices,
+        target_reference_matrices,
+        body_alignment,
+    )
+    if len(records) < 6:
+        raise RuntimeError("Not enough parent-local retarget records could be constructed")
+
+    target_chains = _profile_chains(target_profile)
+    resolved_arm_drivers = {
+        role: _resolved_arm_correction_driver(
+            target_armature,
+            target_profile,
+            role,
+            target_chains.get(role, []),
+            driver_mode=arm_correction_driver,
+        )
+        for role in ("left_arm", "right_arm")
+    }
+    print(
+        "[StableGen] Arm correction drivers: "
+        + ", ".join(
+            f"{role}={driver.lower()}"
+            for role, driver in resolved_arm_drivers.items()
+        )
+    )
+
+    collision_adjusted_frames = 0
+    for frame in range(start, end + 1, frame_step):
+        context.scene.frame_set(frame)
+        context.view_layer.update()
+        if target_reference_pose.get("label") == "rest_pose":
+            _reset_target_pose(target_armature, all_target_names)
+        else:
+            _apply_target_reference_pose(
+                target_armature, all_target_names, target_reference_pose)
+        context.view_layer.update()
+        _apply_rest_space_pose(
+            records,
+            copy_root_motion=copy_root_motion,
+            location_scale=location_scale,
+            context=context,
+        )
+        if limb_match_strength > 0.0:
+            _match_limb_chain_directions(
+                context,
+                source_armature,
+                target_armature,
+                source_profile,
+                target_profile,
+                strength=limb_match_strength,
+                swap_target_sides=swap_target_sides,
+                use_reference_basis=True,
+                source_reference_body_directions=source_reference_body_directions,
+                target_reference_body_directions=target_reference_body_directions,
+                arm_correction_driver=arm_correction_driver,
+            )
+        if collision_adaptation and collision_proxy:
+            adjusted = _resolve_skeletal_proxy_collisions(
+                context,
+                target_armature,
+                target_profile,
+                collision_proxy,
+                strength=collision_strength,
+                margin=collision_margin,
+                iterations=collision_iterations,
+                max_pose_deviation=collision_max_deviation,
+                accepted_penetrations=collision_baseline,
+                arm_correction_driver=arm_correction_driver,
+            )
+            if adjusted:
+                collision_adjusted_frames += 1
+        _keyframe_retarget_pose(
+            target_armature,
+            target_names,
+            frame,
+            copy_root_motion=copy_root_motion,
+            key_locations=target_reference_pose.get("label") != "rest_pose",
+            key_scale=target_reference_pose.get("label") != "rest_pose",
+        )
+    if collision_adaptation and collision_proxy:
+        print(
+            f"[StableGen] Skeletal proxy collision pass adjusted "
+            f"{collision_adjusted_frames} baked frame(s)."
+        )
+
+
 def _target_chain_key(source_chain_key, swap_target_sides=False):
     if not swap_target_sides:
         return source_chain_key
@@ -1548,17 +2353,97 @@ def _target_chain_key(source_chain_key, swap_target_sides=False):
     return source_chain_key
 
 
-def _pose_chain_direction(armature, chain):
+def _resolved_arm_correction_driver(
+        armature, profile, role, chain, driver_mode="AUTO"):
+    if role not in {"left_arm", "right_arm"} or len(chain) < 3:
+        return "SHOULDER"
+    if driver_mode in {"SHOULDER", "UPPER_ARM"}:
+        return driver_mode
+
+    shoulder = armature.data.bones.get(chain[0])
+    upper_arm = armature.data.bones.get(chain[1])
+    if not shoulder or not upper_arm:
+        return "SHOULDER"
+    gap = (upper_arm.head_local - shoulder.tail_local).length
+    target_height = _height_from_profile(armature, profile)
+    disconnected_threshold = max(
+        target_height * 0.035,
+        max(float(shoulder.length), float(upper_arm.length)) * 0.45,
+    )
+    if not upper_arm.use_connect and gap > disconnected_threshold:
+        return "UPPER_ARM"
+    return "SHOULDER"
+
+
+def _arm_correction_chain(
+        armature, profile, role, chain, driver_mode="AUTO"):
+    driver = _resolved_arm_correction_driver(
+        armature, profile, role, chain, driver_mode=driver_mode)
+    if driver == "UPPER_ARM" and len(chain) >= 3:
+        return chain[1:]
+    return chain
+
+
+def _pose_chain_direction(armature, chain, use_terminal_head=False):
     if len(chain) < 2:
         return None
     start = _pose_point(armature, chain[0], use_tail=False)
-    end = _pose_point(armature, chain[-1], use_tail=True)
+    end = _pose_point(
+        armature, chain[-1], use_tail=not use_terminal_head)
     if start is None or end is None:
         return None
     direction = end - start
     if direction.length < 1e-6:
         return None
     return direction.normalized()
+
+
+def _rest_chain_direction(armature, chain, use_terminal_head=False):
+    if len(chain) < 2:
+        return None
+    start = _profile_point(armature, chain[0], use_tail=False)
+    end = _profile_point(
+        armature, chain[-1], use_tail=not use_terminal_head)
+    if start is None or end is None:
+        return None
+    direction = end - start
+    if direction.length < 1e-6:
+        return None
+    return direction.normalized()
+
+
+def _limb_reference_body_directions(
+        armature, profile, basis, use_rest=False):
+    directions = {}
+    for role in ("left_arm", "right_arm", "left_leg", "right_leg"):
+        chain = _profile_chains(profile).get(role, [])
+        chain = _retarget_chain_for_role(armature, profile, role, chain)
+        use_terminal_head = role in {"left_arm", "right_arm"}
+        if use_rest:
+            direction = _rest_chain_direction(
+                armature, chain, use_terminal_head=use_terminal_head)
+        else:
+            direction = _pose_chain_direction(
+                armature, chain, use_terminal_head=use_terminal_head)
+        if direction is None:
+            continue
+        body_direction = basis.inverted_safe() @ direction
+        if body_direction.length > 1e-6:
+            directions[role] = body_direction.normalized()
+        if role in {"left_arm", "right_arm"} and len(chain) >= 3:
+            upper_chain = chain[1:]
+            if use_rest:
+                upper_direction = _rest_chain_direction(
+                    armature, upper_chain, use_terminal_head=True)
+            else:
+                upper_direction = _pose_chain_direction(
+                    armature, upper_chain, use_terminal_head=True)
+            if upper_direction is not None:
+                upper_body_direction = basis.inverted_safe() @ upper_direction
+                if upper_body_direction.length > 1e-6:
+                    directions[f"{role}:upper_arm"] = (
+                        upper_body_direction.normalized())
+    return directions
 
 
 def _rotate_pose_bone_in_armature_space(pose_bone, delta_quat):
@@ -1574,11 +2459,18 @@ def _rotate_pose_bone_in_armature_space(pose_bone, delta_quat):
 def _match_limb_chain_directions(
         context, source_armature, target_armature,
         source_profile, target_profile, strength=1.0,
-        swap_target_sides=False):
-    source_basis = _pose_body_basis(source_armature, source_profile)
-    target_basis = _pose_body_basis(target_armature, target_profile)
-    source_chains = source_profile.get("chains", {})
-    target_chains = target_profile.get("chains", {})
+        swap_target_sides=False, use_reference_basis=False,
+        source_reference_body_directions=None,
+        target_reference_body_directions=None,
+        arm_correction_driver="AUTO"):
+    if use_reference_basis:
+        source_basis = _profile_body_basis(source_armature, source_profile)
+        target_basis = _profile_body_basis(target_armature, target_profile)
+    else:
+        source_basis = _pose_body_basis(source_armature, source_profile)
+        target_basis = _pose_body_basis(target_armature, target_profile)
+    source_chains = _profile_chains(source_profile)
+    target_chains = _profile_chains(target_profile)
     strength = max(0.0, min(float(strength), 1.0))
     matched = 0
 
@@ -1586,13 +2478,55 @@ def _match_limb_chain_directions(
         target_key = _target_chain_key(source_key, swap_target_sides=swap_target_sides)
         source_chain = source_chains.get(source_key, [])
         target_chain = target_chains.get(target_key, [])
-        source_direction = _pose_chain_direction(source_armature, source_chain)
-        target_direction = _pose_chain_direction(target_armature, target_chain)
+        source_chain = _retarget_chain_for_role(
+            source_armature, source_profile, source_key, source_chain)
+        target_chain = _retarget_chain_for_role(
+            target_armature, target_profile, target_key, target_chain)
+        use_terminal_head = source_key in {"left_arm", "right_arm"}
+        reference_key = source_key
+        target_reference_key = target_key
+        if use_terminal_head:
+            target_driver = _resolved_arm_correction_driver(
+                target_armature,
+                target_profile,
+                target_key,
+                target_chain,
+                driver_mode=arm_correction_driver,
+            )
+            if target_driver == "UPPER_ARM" and len(source_chain) >= 3:
+                source_chain = source_chain[1:]
+                target_chain = target_chain[1:]
+                reference_key = f"{source_key}:upper_arm"
+                target_reference_key = f"{target_key}:upper_arm"
+        source_direction = _pose_chain_direction(
+            source_armature,
+            source_chain,
+            use_terminal_head=use_terminal_head,
+        )
+        target_direction = _pose_chain_direction(
+            target_armature,
+            target_chain,
+            use_terminal_head=use_terminal_head,
+        )
         if source_direction is None or target_direction is None:
             continue
 
         source_body_direction = source_basis.inverted() @ source_direction
-        desired_target_direction = target_basis @ source_body_direction
+        source_reference_direction = (
+            source_reference_body_directions or {}).get(reference_key)
+        target_reference_direction = (
+            target_reference_body_directions or {}).get(target_reference_key)
+        if source_reference_direction is not None and target_reference_direction is not None:
+            try:
+                source_direction_delta = source_reference_direction.rotation_difference(
+                    source_body_direction)
+            except ValueError:
+                continue
+            desired_target_body_direction = (
+                source_direction_delta @ target_reference_direction)
+        else:
+            desired_target_body_direction = source_body_direction
+        desired_target_direction = target_basis @ desired_target_body_direction
         if desired_target_direction.length < 1e-6:
             continue
         desired_target_direction.normalize()
@@ -1614,10 +2548,405 @@ def _match_limb_chain_directions(
     return matched
 
 
+def _rotate_chain_endpoint_toward(
+        context, armature, chain, desired_endpoint, strength=1.0,
+        use_terminal_head=False):
+    if len(chain) < 2:
+        return False
+    root_point = _pose_point(armature, chain[0], use_tail=False)
+    current_endpoint = _pose_point(
+        armature, chain[-1], use_tail=not use_terminal_head)
+    if root_point is None or current_endpoint is None:
+        return False
+    current_direction = current_endpoint - root_point
+    desired_direction = desired_endpoint - root_point
+    if current_direction.length < 1e-6 or desired_direction.length < 1e-6:
+        return False
+    try:
+        delta = current_direction.rotation_difference(desired_direction)
+    except ValueError:
+        return False
+    strength = max(0.0, min(float(strength), 1.0))
+    if strength < 1.0:
+        delta = mathutils.Quaternion((1.0, 0.0, 0.0, 0.0)).slerp(delta, strength)
+    root_pose = armature.pose.bones.get(chain[0])
+    if not root_pose:
+        return False
+    _rotate_pose_bone_in_armature_space(root_pose, delta)
+    context.view_layer.update()
+    return True
+
+
+def _closest_points_on_segments(start_a, end_a, start_b, end_b):
+    """Return the closest points on two finite 3D line segments."""
+    direction_a = end_a - start_a
+    direction_b = end_b - start_b
+    offset = start_a - start_b
+    length_a = direction_a.dot(direction_a)
+    length_b = direction_b.dot(direction_b)
+    epsilon = 1e-12
+
+    if length_a <= epsilon and length_b <= epsilon:
+        return start_a.copy(), start_b.copy()
+    if length_a <= epsilon:
+        parameter_a = 0.0
+        parameter_b = max(0.0, min(1.0, direction_b.dot(offset) / length_b))
+    else:
+        cross_ab = direction_a.dot(direction_b)
+        cross_ao = direction_a.dot(offset)
+        if length_b <= epsilon:
+            parameter_b = 0.0
+            parameter_a = max(0.0, min(1.0, -cross_ao / length_a))
+        else:
+            cross_bo = direction_b.dot(offset)
+            denominator = (length_a * length_b) - (cross_ab * cross_ab)
+            if abs(denominator) > epsilon:
+                parameter_a = max(
+                    0.0,
+                    min(1.0, ((cross_ab * cross_bo) - (cross_ao * length_b)) / denominator),
+                )
+            else:
+                parameter_a = 0.0
+            parameter_b = ((cross_ab * parameter_a) + cross_bo) / length_b
+            if parameter_b < 0.0:
+                parameter_b = 0.0
+                parameter_a = max(0.0, min(1.0, -cross_ao / length_a))
+            elif parameter_b > 1.0:
+                parameter_b = 1.0
+                parameter_a = max(
+                    0.0,
+                    min(1.0, (cross_ab - cross_ao) / length_a),
+                )
+
+    return (
+        start_a + (direction_a * parameter_a),
+        start_b + (direction_b * parameter_b),
+    )
+
+
+def _proxy_pose_capsule(armature, proxy, bone_name, radius_scale=1.0):
+    pose_bone = armature.pose.bones.get(bone_name)
+    if not pose_bone:
+        return None
+    radius = float(proxy.get("radii", {}).get(bone_name, 0.0)) * radius_scale
+    if radius <= 1e-6:
+        return None
+    start = pose_bone.head.copy()
+    end = (
+        start.copy()
+        if bone_name in set(proxy.get("terminal_arm_bones", []))
+        else pose_bone.tail.copy()
+    )
+    return {
+        "bone": bone_name,
+        "start": start,
+        "end": end,
+        "radius": radius,
+    }
+
+
+def _proxy_capsules_for_bones(armature, proxy, bone_names, radius_scale=1.0):
+    result = []
+    seen = set()
+    for name in bone_names:
+        if name in seen:
+            continue
+        seen.add(name)
+        capsule = _proxy_pose_capsule(
+            armature, proxy, name, radius_scale=radius_scale)
+        if capsule:
+            result.append(capsule)
+    return result
+
+
+def _distal_arm_proxy_bones(chain):
+    # Shoulder and upper-arm capsules normally enter the torso volume at their
+    # attachment. Only forearm/hand geometry should drive endpoint correction.
+    return chain[-2:] if len(chain) >= 2 else chain
+
+
+def _capsule_pair_key(moving, obstacle):
+    return f"{moving['bone']}|{obstacle['bone']}"
+
+
+def _capsule_pair_penetration(moving, obstacle, margin):
+    point_a, point_b = _closest_points_on_segments(
+        moving["start"], moving["end"], obstacle["start"], obstacle["end"])
+    distance = (point_a - point_b).length
+    return max(
+        0.0,
+        moving["radius"] + obstacle["radius"] + margin - distance,
+    )
+
+
+def _capture_proxy_collision_baseline(
+        target_armature, collision_proxy, margin=0.0, radius_scale=1.0):
+    """Record intersections that already exist in an accepted reference pose."""
+    if not collision_proxy:
+        return {}
+    target_height = max(float(collision_proxy.get("height", 0.0)), 1e-5)
+    margin_distance = max(0.0, float(margin)) * target_height
+    radius_scale = max(0.25, min(2.0, float(radius_scale)))
+    arm_chains = collision_proxy.get("arm_chains", {})
+    body_capsules = _proxy_capsules_for_bones(
+        target_armature,
+        collision_proxy,
+        collision_proxy.get("body_bones", []),
+        radius_scale=radius_scale,
+    )
+    baseline = {}
+    for role in ("left_arm", "right_arm"):
+        moving_capsules = _proxy_capsules_for_bones(
+            target_armature,
+            collision_proxy,
+            _distal_arm_proxy_bones(arm_chains.get(role, [])),
+            radius_scale=radius_scale,
+        )
+        other_role = "right_arm" if role == "left_arm" else "left_arm"
+        other_capsules = _proxy_capsules_for_bones(
+            target_armature,
+            collision_proxy,
+            _distal_arm_proxy_bones(arm_chains.get(other_role, [])),
+            radius_scale=radius_scale,
+        )
+        for moving in moving_capsules:
+            for obstacle in body_capsules + other_capsules:
+                baseline[_capsule_pair_key(moving, obstacle)] = (
+                    _capsule_pair_penetration(
+                        moving, obstacle, margin_distance)
+                )
+    return baseline
+
+
+def _strongest_capsule_push(
+        moving_capsules, obstacle_capsules, margin, fallback,
+        accepted_penetrations=None):
+    strongest = None
+    strongest_depth = 0.0
+    accepted_penetrations = accepted_penetrations or {}
+    for moving in moving_capsules:
+        for obstacle in obstacle_capsules:
+            point_a, point_b = _closest_points_on_segments(
+                moving["start"], moving["end"], obstacle["start"], obstacle["end"])
+            separation = point_a - point_b
+            distance = separation.length
+            penetration = (
+                moving["radius"] + obstacle["radius"] + margin - distance
+                - float(accepted_penetrations.get(
+                    _capsule_pair_key(moving, obstacle), 0.0))
+            )
+            if penetration <= strongest_depth:
+                continue
+            if distance > 1e-6:
+                normal = separation / distance
+            else:
+                normal = fallback.copy()
+            if normal.length < 1e-6:
+                normal = mathutils.Vector((1.0, 0.0, 0.0))
+            strongest = normal.normalized() * penetration
+            strongest_depth = penetration
+    return strongest
+
+
+def _resolve_skeletal_proxy_collisions(
+        context, target_armature, target_profile, collision_proxy,
+        strength=0.75, margin=0.008, iterations=2,
+        max_pose_deviation=0.08, radius_scale=1.0,
+        accepted_penetrations=None, arm_correction_driver="AUTO"):
+    """Push distal arm capsules out of body/opposite-arm proxy capsules."""
+    if not collision_proxy:
+        return 0
+    arm_chains = collision_proxy.get("arm_chains", {})
+    if any(len(arm_chains.get(role, [])) < 2 for role in ("left_arm", "right_arm")):
+        return 0
+
+    target_height = max(
+        float(collision_proxy.get("height", 0.0)),
+        _height_from_profile(target_armature, target_profile),
+    )
+    margin_distance = max(0.0, float(margin)) * target_height
+    maximum_deviation = max(0.0, float(max_pose_deviation)) * target_height
+    strength = max(0.0, min(1.0, float(strength)))
+    iterations = max(1, min(8, int(iterations)))
+    radius_scale = max(0.25, min(2.0, float(radius_scale)))
+
+    original_endpoints = {}
+    for role, chain in arm_chains.items():
+        endpoint = _pose_point(target_armature, chain[-1], use_tail=False)
+        if endpoint is not None:
+            original_endpoints[role] = endpoint.copy()
+    body_capsules = _proxy_capsules_for_bones(
+        target_armature,
+        collision_proxy,
+        collision_proxy.get("body_bones", []),
+        radius_scale=radius_scale,
+    )
+    basis = _pose_body_basis(target_armature, target_profile)
+    left_axis = basis @ mathutils.Vector((1.0, 0.0, 0.0))
+    adjusted_roles = set()
+
+    for _iteration in range(iterations):
+        changed = False
+        for role in ("left_arm", "right_arm"):
+            chain = arm_chains.get(role, [])
+            correction_chain = _arm_correction_chain(
+                target_armature,
+                target_profile,
+                role,
+                chain,
+                driver_mode=arm_correction_driver,
+            )
+            endpoint = _pose_point(target_armature, chain[-1], use_tail=False)
+            original_endpoint = original_endpoints.get(role)
+            if endpoint is None or original_endpoint is None:
+                continue
+            moving_capsules = _proxy_capsules_for_bones(
+                target_armature,
+                collision_proxy,
+                _distal_arm_proxy_bones(chain),
+                radius_scale=radius_scale,
+            )
+            other_role = "right_arm" if role == "left_arm" else "left_arm"
+            other_capsules = _proxy_capsules_for_bones(
+                target_armature,
+                collision_proxy,
+                _distal_arm_proxy_bones(arm_chains.get(other_role, [])),
+                radius_scale=radius_scale,
+            )
+            fallback = left_axis if role == "left_arm" else -left_axis
+            push = _strongest_capsule_push(
+                moving_capsules,
+                body_capsules + other_capsules,
+                margin_distance,
+                fallback,
+                accepted_penetrations=accepted_penetrations,
+            )
+            if push is None or push.length < 1e-6:
+                continue
+
+            desired_endpoint = endpoint + (push * strength)
+            correction = desired_endpoint - original_endpoint
+            if maximum_deviation > 0.0 and correction.length > maximum_deviation:
+                desired_endpoint = (
+                    original_endpoint + (correction.normalized() * maximum_deviation)
+                )
+            if _rotate_chain_endpoint_toward(
+                    context,
+                    target_armature,
+                    correction_chain,
+                    desired_endpoint,
+                    strength=1.0,
+                    use_terminal_head=True):
+                adjusted_roles.add(role)
+                changed = True
+        if not changed:
+            break
+    return len(adjusted_roles)
+
+
+def _protect_reference_pose_clearance(
+        context, target_armature, target_profile, clearance=1.0,
+        collision_proxy=None, accepted_penetrations=None,
+        arm_correction_driver="AUTO"):
+    """Keep matched hands outside conservative torso and hand proxy colliders."""
+    if collision_proxy:
+        return _resolve_skeletal_proxy_collisions(
+            context,
+            target_armature,
+            target_profile,
+            collision_proxy,
+            strength=1.0,
+            margin=0.01,
+            iterations=4,
+            max_pose_deviation=0.08,
+            radius_scale=clearance,
+            accepted_penetrations=accepted_penetrations,
+            arm_correction_driver=arm_correction_driver,
+        )
+
+    chains = _profile_chains(target_profile)
+    arm_chains = {
+        role: chains.get(role, [])
+        for role in ("left_arm", "right_arm")
+    }
+    if any(len(chain) < 2 for chain in arm_chains.values()):
+        return 0
+
+    pelvis = _pose_point(target_armature, target_profile.get("pelvis"), use_tail=False)
+    if pelvis is None:
+        return 0
+    basis = _pose_body_basis(target_armature, target_profile)
+    basis_inv = basis.inverted_safe()
+    target_height = _height_from_profile(target_armature, target_profile)
+
+    roots = {}
+    hands = {}
+    for role, chain in arm_chains.items():
+        root = _pose_point(target_armature, chain[0], use_tail=False)
+        hand = _pose_point(target_armature, chain[-1], use_tail=False)
+        if root is None or hand is None:
+            return 0
+        roots[role] = basis_inv @ (root - pelvis)
+        hands[role] = basis_inv @ (hand - pelvis)
+
+    shoulder_half_width = abs(
+        roots["left_arm"].x - roots["right_arm"].x
+    ) * 0.5
+    clearance = max(0.25, min(float(clearance), 2.0))
+    torso_radius = max(shoulder_half_width * 0.9, target_height * 0.11) * clearance
+    torso_bottom = -target_height * 0.25
+    torso_top = max(roots["left_arm"].z, roots["right_arm"].z) + target_height * 0.08
+
+    corrected = {role: point.copy() for role, point in hands.items()}
+    for role, point in corrected.items():
+        if point.z < torso_bottom or point.z > torso_top:
+            continue
+        forward_component = point.y * 0.65
+        if abs(forward_component) >= torso_radius:
+            continue
+        required_lateral = max(
+            0.0,
+            (torso_radius * torso_radius - forward_component * forward_component) ** 0.5,
+        )
+        side_sign = 1.0 if role == "left_arm" else -1.0
+        if point.x * side_sign < required_lateral:
+            point.x = side_sign * required_lateral
+
+    separation = corrected["left_arm"] - corrected["right_arm"]
+    minimum_hand_separation = torso_radius * 1.1
+    if separation.length < minimum_hand_separation:
+        deficit = (minimum_hand_separation - separation.length) * 0.5
+        corrected["left_arm"].x += deficit
+        corrected["right_arm"].x -= deficit
+
+    adjusted = 0
+    for role, body_point in corrected.items():
+        if (body_point - hands[role]).length < 1e-6:
+            continue
+        desired_endpoint = pelvis + (basis @ body_point)
+        correction_chain = _arm_correction_chain(
+            target_armature,
+            target_profile,
+            role,
+            arm_chains[role],
+            driver_mode=arm_correction_driver,
+        )
+        if _rotate_chain_endpoint_toward(
+                context,
+                target_armature,
+                correction_chain,
+                desired_endpoint,
+                strength=1.0,
+                use_terminal_head=True):
+            adjusted += 1
+    return adjusted
+
+
 def _match_source_reference_pose(
         context, source_armature, target_armature, pairs,
         source_profile, target_profile, strength=1.0,
-        swap_target_sides=False):
+        swap_target_sides=False, protect_mesh=True, clearance=1.0,
+        collision_proxy=None, arm_correction_driver="AUTO"):
     target_names = _mapped_target_bones(pairs)
     all_target_names = [pose_bone.name for pose_bone in target_armature.pose.bones]
     source_height = _height_from_profile(source_armature, source_profile)
@@ -1626,6 +2955,14 @@ def _match_source_reference_pose(
 
     _reset_target_pose(target_armature, all_target_names)
     context.view_layer.update()
+    collision_baseline = {}
+    if protect_mesh and collision_proxy:
+        collision_baseline = _capture_proxy_collision_baseline(
+            target_armature,
+            collision_proxy,
+            margin=0.01,
+            radius_scale=clearance,
+        )
     source_baseline = _source_rest_pose_baseline(source_armature, pairs)
     source_basis = _profile_rotation_basis(source_armature, source_profile)
     target_basis = _profile_rotation_basis(target_armature, target_profile)
@@ -1651,7 +2988,23 @@ def _match_source_reference_pose(
         target_profile,
         strength=strength,
         swap_target_sides=swap_target_sides,
+        arm_correction_driver=arm_correction_driver,
     )
+    if protect_mesh:
+        adjusted = _protect_reference_pose_clearance(
+            context,
+            target_armature,
+            target_profile,
+            clearance=clearance,
+            collision_proxy=collision_proxy,
+            accepted_penetrations=collision_baseline,
+            arm_correction_driver=arm_correction_driver,
+        )
+        if adjusted:
+            print(
+                f"[StableGen] Reference clearance adjusted {adjusted} arm chain(s) "
+                "away from skeletal proxy colliders."
+            )
     return matched_chains
 
 
@@ -1749,10 +3102,13 @@ def _pose_preset_direction(current_direction, basis, body_direction, preserve_fo
     return desired.normalized()
 
 
-def _apply_pose_chain_direction(context, armature, chain, desired_direction, strength=1.0):
+def _apply_pose_chain_direction(
+        context, armature, chain, desired_direction, strength=1.0,
+        use_terminal_head=False):
     if len(chain) < 2:
         return False
-    current_direction = _pose_chain_direction(armature, chain)
+    current_direction = _pose_chain_direction(
+        armature, chain, use_terminal_head=use_terminal_head)
     if current_direction is None or desired_direction.length < 1e-6:
         return False
 
@@ -1785,7 +3141,7 @@ def _apply_rig_pose_preset(
         _tag_view3d_redraw()
         return 0
 
-    chains = profile.get("chains", {})
+    chains = _profile_chains(profile)
     directions = _POSE_PRESET_DIRECTIONS.get(preset, {})
     if not directions:
         return 0
@@ -1800,7 +3156,12 @@ def _apply_rig_pose_preset(
 
         chain = chains.get(chain_key, [])
         solve_chain = _pose_preset_solve_chain(armature, chain, chain_key, basis)
-        current_direction = _pose_chain_direction(armature, solve_chain)
+        use_terminal_head = chain_key.endswith("_arm")
+        current_direction = _pose_chain_direction(
+            armature,
+            solve_chain,
+            use_terminal_head=use_terminal_head,
+        )
         if current_direction is None:
             continue
         preserve_forward_limit = None if chain_key.endswith("_leg") else 0.2
@@ -1812,7 +3173,13 @@ def _apply_rig_pose_preset(
         )
         if desired is None:
             continue
-        if _apply_pose_chain_direction(context, armature, solve_chain, desired, strength=strength):
+        if _apply_pose_chain_direction(
+                context,
+                armature,
+                solve_chain,
+                desired,
+                strength=strength,
+                use_terminal_head=use_terminal_head):
             applied += 1
 
     _tag_view3d_redraw()
@@ -1832,6 +3199,92 @@ def _delete_objects(objects):
         if obj.name in bpy.data.objects:
             obj.select_set(True)
     bpy.ops.object.delete()
+
+
+def _source_preview_objects():
+    return [obj for obj in bpy.data.objects if obj.get(_SOURCE_PREVIEW_PROP)]
+
+
+def _clear_source_preview():
+    preview_objects = _source_preview_objects()
+    if preview_objects:
+        _delete_objects(preview_objects)
+
+
+def _objects_world_bound_points(objects):
+    points = []
+    for obj in objects:
+        if obj.name not in bpy.data.objects:
+            continue
+        if obj.type == "MESH":
+            points.extend(
+                obj.matrix_world @ mathutils.Vector(corner)
+                for corner in obj.bound_box
+            )
+        elif obj.type == "ARMATURE":
+            for pose_bone in obj.pose.bones:
+                points.append(obj.matrix_world @ pose_bone.head)
+                points.append(obj.matrix_world @ pose_bone.tail)
+    return points
+
+
+def _preview_root_objects(objects):
+    object_set = set(objects)
+    return [obj for obj in objects if obj.parent not in object_set]
+
+
+def _prepare_source_preview(
+        context, imported_objects, target_armature, target_profile):
+    imported_objects = [
+        obj for obj in imported_objects if obj.name in bpy.data.objects
+    ]
+    if not imported_objects:
+        return 0
+    for obj in imported_objects:
+        obj[_SOURCE_PREVIEW_PROP] = True
+        obj.hide_viewport = False
+        obj.hide_render = True
+        if obj.type == "ARMATURE":
+            obj.show_in_front = True
+
+    roots = _preview_root_objects(imported_objects)
+    target_objects = _rig_export_objects(target_armature)
+    target_points = _objects_world_bound_points(target_objects)
+    source_points = _objects_world_bound_points(imported_objects)
+    if not target_points or not source_points:
+        return len(imported_objects)
+
+    target_height = max(point.z for point in target_points) - min(
+        point.z for point in target_points)
+    source_height = max(point.z for point in source_points) - min(
+        point.z for point in source_points)
+    if target_height > 1e-5 and source_height > 1e-5:
+        scale_factor = max(0.25, min(target_height / source_height, 4.0))
+        for root in roots:
+            root.scale *= scale_factor
+        context.view_layer.update()
+        source_points = _objects_world_bound_points(imported_objects)
+
+    target_basis = _profile_body_basis(target_armature, target_profile)
+    left_local = target_basis @ mathutils.Vector((1.0, 0.0, 0.0))
+    left_world = target_armature.matrix_world.to_3x3() @ left_local
+    if left_world.length < 1e-6:
+        left_world = mathutils.Vector((1.0, 0.0, 0.0))
+    left_world.normalize()
+
+    target_projection = [point.dot(left_world) for point in target_points]
+    source_projection = [point.dot(left_world) for point in source_points]
+    target_center = (min(target_projection) + max(target_projection)) * 0.5
+    source_center = (min(source_projection) + max(source_projection)) * 0.5
+    target_half = (max(target_projection) - min(target_projection)) * 0.5
+    source_half = (max(source_projection) - min(source_projection)) * 0.5
+    margin = max(target_height * 0.2, 0.15)
+    desired_source_center = target_center - target_half - source_half - margin
+    translation = left_world * (desired_source_center - source_center)
+    for root in roots:
+        root.matrix_world.translation += translation
+    context.view_layer.update()
+    return len(imported_objects)
 
 
 def _default_debug_bundle_directory():
@@ -1914,7 +3367,7 @@ def _pose_bone_diagnostics(armature):
 
 def _chain_point_diagnostics(armature, profile):
     result = {}
-    for chain_name, chain in profile.get("chains", {}).items():
+    for chain_name, chain in _profile_chains(profile).items():
         points = []
         for bone_name in chain:
             bone = armature.data.bones.get(bone_name)
@@ -2325,7 +3778,13 @@ class StableGenSetRetargetReferencePose(bpy.types.Operator):
             self.report({"ERROR"}, "Analyze or edit the rig mapping before setting a reference pose.")
             return {"CANCELLED"}
 
-        reference_pose = _capture_reference_pose(armature, label="stored_reference")
+        previous_reference = _load_reference_pose(armature)
+        provenance = (previous_reference or {}).get("provenance")
+        reference_pose = _capture_reference_pose(
+            armature,
+            label="stored_reference",
+            provenance=provenance,
+        )
         if not reference_pose or not reference_pose.get("bones"):
             self.report({"ERROR"}, "Could not capture the current rig pose.")
             return {"CANCELLED"}
@@ -2357,6 +3816,23 @@ class StableGenMatchSourceReferencePose(bpy.types.Operator):
         options={"HIDDEN"},
     )  # type: ignore
 
+    match_engine: bpy.props.EnumProperty(
+        name="Reference Matching",
+        items=(
+            (
+                "REFERENCE_AWARE",
+                "Reference-Aware (Recommended)",
+                "Use the analyzed target orientation and same-side semantic chains",
+            ),
+            (
+                "LEGACY",
+                "Legacy Compatibility",
+                "Keep the previous manual side-swap behavior",
+            ),
+        ),
+        default="REFERENCE_AWARE",
+    )  # type: ignore
+
     match_strength: bpy.props.FloatProperty(
         name="Auto Match Strength",
         description="How strongly limb directions are matched to the source reference frame",
@@ -2365,15 +3841,36 @@ class StableGenMatchSourceReferencePose(bpy.types.Operator):
         max=1.0,
     )  # type: ignore
 
+    arm_correction_driver: bpy.props.EnumProperty(
+        name="Arm Correction Driver",
+        description="Choose which joint post-processing may rotate to position each wrist",
+        items=_ARM_CORRECTION_DRIVER_ITEMS,
+        default="AUTO",
+    )  # type: ignore
+
     store_reference: bpy.props.BoolProperty(
         name="Store As Ref Pose",
         description="Save the matched target pose as the retarget reference pose immediately",
         default=True,
     )  # type: ignore
 
+    protect_mesh: bpy.props.BoolProperty(
+        name="Protect Body Clearance",
+        description="Keep matched hands outside conservative torso and hand proxy colliders",
+        default=True,
+    )  # type: ignore
+
+    clearance: bpy.props.FloatProperty(
+        name="Body Clearance",
+        description="Scale the conservative torso and hand separation margin",
+        default=1.0,
+        min=0.25,
+        max=2.0,
+    )  # type: ignore
+
     swap_target_sides: bpy.props.BoolProperty(
         name="Swap Target Left/Right",
-        description="Use this if the detected target left/right side is inverted",
+        description="Manual override in addition to the target profile orientation correction",
         default=True,
     )  # type: ignore
 
@@ -2399,9 +3896,16 @@ class StableGenMatchSourceReferencePose(bpy.types.Operator):
 
     def draw(self, context):
         layout = self.layout
+        layout.prop(self, "match_engine")
         layout.prop(self, "match_strength")
+        if self.match_engine == "REFERENCE_AWARE":
+            layout.prop(self, "arm_correction_driver")
         layout.prop(self, "store_reference")
-        layout.prop(self, "swap_target_sides")
+        layout.prop(self, "protect_mesh")
+        if self.protect_mesh:
+            layout.prop(self, "clearance")
+        if self.match_engine == "LEGACY":
+            layout.prop(self, "swap_target_sides")
         layout.prop(self, "keep_source_rig")
 
     def execute(self, context):
@@ -2423,10 +3927,15 @@ class StableGenMatchSourceReferencePose(bpy.types.Operator):
             if not source_profile:
                 raise RuntimeError("Could not infer a humanoid profile for the source animation rig")
 
+            effective_swap = (
+                bool(self.swap_target_sides)
+                if self.match_engine == "LEGACY"
+                else False
+            )
             pairs = _common_chain_pairs(
                 source_profile,
                 target_profile,
-                swap_target_sides=self.swap_target_sides,
+                swap_target_sides=effective_swap,
                 source_armature=source_armature,
                 target_armature=target_armature,
                 trim_feet=True,
@@ -2441,6 +3950,11 @@ class StableGenMatchSourceReferencePose(bpy.types.Operator):
             context.scene.frame_set(start)
             context.view_layer.update()
 
+            collision_proxy = None
+            if self.protect_mesh and self.match_engine == "REFERENCE_AWARE":
+                collision_proxy = _collision_proxy_for_armature(
+                    target_armature, target_profile)
+
             print(f"[StableGen] Source reference rig profile for {source_armature.name}: {_profile_summary(source_profile)}")
             print(f"[StableGen] Target rig profile for {target_armature.name}: {_profile_summary(target_profile)}")
             print(f"[StableGen] Reference match mapping: {_pair_summary(pairs)}")
@@ -2452,13 +3966,29 @@ class StableGenMatchSourceReferencePose(bpy.types.Operator):
                 source_profile,
                 target_profile,
                 strength=self.match_strength,
-                swap_target_sides=self.swap_target_sides,
+                swap_target_sides=effective_swap,
+                protect_mesh=self.protect_mesh,
+                clearance=self.clearance,
+                collision_proxy=collision_proxy,
+                arm_correction_driver=(
+                    self.arm_correction_driver
+                    if self.match_engine == "REFERENCE_AWARE"
+                    else "SHOULDER"
+                ),
             )
 
             if self.store_reference:
                 reference_pose = _capture_reference_pose(
                     target_armature,
                     label="matched_source_reference",
+                    provenance=_reference_provenance(
+                        self.filepath,
+                        source_profile,
+                        target_profile,
+                        start,
+                        "START_FRAME",
+                        swap_target_sides=effective_swap,
+                    ),
                 )
                 if not reference_pose or not reference_pose.get("bones"):
                     raise RuntimeError("Could not capture the matched target reference pose")
@@ -2530,6 +4060,75 @@ class StableGenToggleRigMappingOverlay(bpy.types.Operator):
         _ensure_rig_mapping_overlay(armature)
         print(f"[StableGen] Showing rig mapping overlay for {armature.name}: {_profile_summary(profile)}")
         self.report({"INFO"}, "Rig mapping overlay visible")
+        return {"FINISHED"}
+
+
+class StableGenToggleCollisionProxyOverlay(bpy.types.Operator):
+    """Show collision capsules; gray proximal arm capsules are visualization-only."""
+
+    bl_idname = "stablegen.toggle_collision_proxy_overlay"
+    bl_label = "Show Collision Proxy"
+    bl_options = {"REGISTER"}
+
+    @classmethod
+    def poll(cls, context):
+        if sg_modal_active(context):
+            cls.poll_message_set("Another StableGen operation is in progress")
+            return False
+        if _collision_proxy_draw_handle is not None:
+            return True
+        if not _active_or_selected_armature(context):
+            cls.poll_message_set("Select a rigged mesh or armature")
+            return False
+        return True
+
+    def execute(self, context):
+        if _collision_proxy_draw_handle is not None:
+            _remove_collision_proxy_overlay()
+            self.report({"INFO"}, "Collision proxy hidden")
+            return {"FINISHED"}
+
+        armature = _active_or_selected_armature(context)
+        profile = _profile_for_armature(armature)
+        if not _profile_is_usable(armature, profile):
+            self.report({"ERROR"}, "Analyze or edit the rig mapping first.")
+            return {"CANCELLED"}
+        proxy = _collision_proxy_for_armature(armature, profile)
+        if not proxy:
+            self.report({"ERROR"}, "Could not generate a collision proxy for this rig.")
+            return {"CANCELLED"}
+
+        _ensure_collision_proxy_overlay(armature)
+        capsule_count = len(_collision_proxy_bone_groups(proxy))
+        print(
+            f"[StableGen] Showing {capsule_count} collision capsule(s) "
+            f"for {armature.name}."
+        )
+        self.report({"INFO"}, f"Showing {capsule_count} collision capsules")
+        return {"FINISHED"}
+
+
+class StableGenToggleSourcePreview(bpy.types.Operator):
+    """Show or hide the retained source animation preview objects."""
+
+    bl_idname = "stablegen.toggle_retarget_source_preview"
+    bl_label = "Toggle Source Preview"
+    bl_options = {"REGISTER"}
+
+    @classmethod
+    def poll(cls, _context):
+        if not _source_preview_objects():
+            cls.poll_message_set("Apply an animation with Show Source Preview enabled first")
+            return False
+        return True
+
+    def execute(self, _context):
+        objects = _source_preview_objects()
+        hide = any(not obj.hide_viewport for obj in objects)
+        for obj in objects:
+            obj.hide_viewport = hide
+        _tag_view3d_redraw()
+        self.report({"INFO"}, "Source preview hidden" if hide else "Source preview shown")
         return {"FINISHED"}
 
 
@@ -2612,6 +4211,15 @@ class StableGenEditRigMapping(bpy.types.Operator):
         items=_bone_enum_items,
     )  # type: ignore
 
+    rotate_180: bpy.props.BoolProperty(
+        name="Rotate Target Interpretation 180°",
+        description=(
+            "Treat the character as facing the opposite direction and update "
+            "left/right pairing as one profile-level correction"
+        ),
+        default=False,
+    )  # type: ignore
+
     @classmethod
     def poll(cls, context):
         if sg_modal_active(context):
@@ -2634,6 +4242,7 @@ class StableGenEditRigMapping(bpy.types.Operator):
         layout = self.layout
         layout.prop(self, "pelvis")
         layout.prop(self, "head")
+        layout.prop(self, "rotate_180")
         layout.separator()
 
         for label, start_prop, end_prop in (
@@ -2673,6 +4282,7 @@ class StableGenEditRigMapping(bpy.types.Operator):
             "pelvis": self.pelvis,
             "head": self.head,
             "chains": chains,
+            "orientation_correction": "ROTATE_180" if self.rotate_180 else "NORMAL",
         }
         if not _profile_is_usable(armature, profile):
             self.report({"ERROR"}, "Manual mapping references missing bones.")
@@ -2704,6 +4314,24 @@ class StableGenApplyAnimationToRig(bpy.types.Operator):
         options={"HIDDEN"},
     )  # type: ignore
 
+    retarget_engine: bpy.props.EnumProperty(
+        name="Retarget Engine",
+        description="Choose the reference-aware solver or the previous compatibility behavior",
+        items=(
+            (
+                "REST_SPACE",
+                "Reference-Aware (Recommended)",
+                "Transfer parent-local motion through matching source and target reference frames",
+            ),
+            (
+                "LEGACY",
+                "Legacy Compatibility",
+                "Use the previous armature-space pose-delta behavior for comparison",
+            ),
+        ),
+        default="REST_SPACE",
+    )  # type: ignore
+
     frame_step: bpy.props.IntProperty(
         name="Key Every N Frames",
         description="Bake keyframes at this interval",
@@ -2731,6 +4359,90 @@ class StableGenApplyAnimationToRig(bpy.types.Operator):
             ("REST", "Source Rest Pose", "Use the source rig rest pose as neutral; useful for some clips but can over-rotate generated rigs"),
         ),
         default="START_FRAME",
+    )  # type: ignore
+
+    auto_match_reference: bpy.props.BoolProperty(
+        name="Auto-Match First Frame",
+        description=(
+            "Temporarily reshape the target reference to resemble the source first frame; "
+            "disable this to preserve the selected target rest/stored reference pose"
+        ),
+        default=True,
+    )  # type: ignore
+
+    protect_auto_match: bpy.props.BoolProperty(
+        name="Protect Body Clearance",
+        description="Keep auto-matched hands outside conservative torso and hand proxy colliders",
+        default=True,
+    )  # type: ignore
+
+    auto_match_clearance: bpy.props.FloatProperty(
+        name="Body Clearance",
+        description="Scale the conservative torso and hand separation margin",
+        default=1.0,
+        min=0.25,
+        max=2.0,
+    )  # type: ignore
+
+    limb_match_strength: bpy.props.FloatProperty(
+        name="Limb Direction Match",
+        description=(
+            "Stabilize arm and leg chain directions after rest-space rotation transfer; "
+            "set to zero to test pure per-bone transfer"
+        ),
+        default=0.65,
+        min=0.0,
+        max=1.0,
+    )  # type: ignore
+
+    arm_correction_driver: bpy.props.EnumProperty(
+        name="Arm Correction Driver",
+        description="Choose which joint post-processing may rotate to position each wrist",
+        items=_ARM_CORRECTION_DRIVER_ITEMS,
+        default="AUTO",
+    )  # type: ignore
+
+    collision_adaptation: bpy.props.BoolProperty(
+        name="Skeletal Proxy Collisions",
+        description=(
+            "Generate lightweight capsules from the target mesh's skin weights and "
+            "keep forearms/hands out of the torso and opposite arm while baking"
+        ),
+        default=True,
+    )  # type: ignore
+
+    collision_strength: bpy.props.FloatProperty(
+        name="Collision Strength",
+        description="How strongly each collision pass pushes intersecting arm capsules apart",
+        default=0.75,
+        min=0.0,
+        max=1.0,
+    )  # type: ignore
+
+    collision_margin: bpy.props.FloatProperty(
+        name="Collision Margin",
+        description="Extra capsule spacing as a fraction of the character height",
+        default=0.008,
+        min=0.0,
+        max=0.05,
+        precision=3,
+    )  # type: ignore
+
+    collision_iterations: bpy.props.IntProperty(
+        name="Collision Passes",
+        description="Maximum lightweight collision correction passes per baked frame",
+        default=2,
+        min=1,
+        max=8,
+    )  # type: ignore
+
+    collision_max_deviation: bpy.props.FloatProperty(
+        name="Maximum Correction",
+        description="Maximum hand displacement from the transferred pose as a fraction of height",
+        default=0.08,
+        min=0.01,
+        max=0.35,
+        precision=3,
     )  # type: ignore
 
     replace_action: bpy.props.BoolProperty(
@@ -2763,6 +4475,14 @@ class StableGenApplyAnimationToRig(bpy.types.Operator):
         default=False,
     )  # type: ignore
 
+    show_source_preview: bpy.props.BoolProperty(
+        name="Show Source Preview",
+        description=(
+            "Keep the imported source animation beside the target; both update from the same scene frame"
+        ),
+        default=False,
+    )  # type: ignore
+
     @classmethod
     def poll(cls, context):
         if sg_modal_active(context):
@@ -2779,13 +4499,38 @@ class StableGenApplyAnimationToRig(bpy.types.Operator):
 
     def draw(self, context):
         layout = self.layout
+        layout.prop(self, "retarget_engine")
         layout.prop(self, "reference_mode")
         layout.prop(self, "source_reference_mode")
+        if self.retarget_engine == "REST_SPACE" and self.source_reference_mode == "START_FRAME":
+            layout.prop(self, "auto_match_reference")
+            if self.auto_match_reference:
+                layout.label(
+                    text="First frame replaces the target neutral pose",
+                    icon="INFO",
+                )
+                layout.prop(self, "protect_auto_match")
+                if self.protect_auto_match:
+                    layout.prop(self, "auto_match_clearance")
+        if self.retarget_engine == "REST_SPACE":
+            layout.prop(self, "limb_match_strength")
+            layout.prop(self, "arm_correction_driver")
+            layout.prop(self, "collision_adaptation")
+            if self.collision_adaptation:
+                collision_box = layout.box()
+                collision_box.prop(self, "collision_strength")
+                collision_box.prop(self, "collision_margin")
+                collision_box.prop(self, "collision_iterations")
+                collision_box.prop(self, "collision_max_deviation")
         layout.prop(self, "frame_step")
         layout.prop(self, "replace_action")
         layout.prop(self, "copy_root_motion")
-        layout.prop(self, "swap_target_sides")
-        layout.prop(self, "flip_target_forward")
+        if self.retarget_engine == "LEGACY":
+            box = layout.box()
+            box.label(text="Legacy compatibility overrides")
+            box.prop(self, "swap_target_sides")
+            box.prop(self, "flip_target_forward")
+        layout.prop(self, "show_source_preview")
         layout.prop(self, "keep_source_rig")
 
     def execute(self, context):
@@ -2799,7 +4544,15 @@ class StableGenApplyAnimationToRig(bpy.types.Operator):
             self.report({"ERROR"}, "Could not infer the target rig profile.")
             return {"CANCELLED"}
 
-        if self.reference_mode == "SAVED" and not _load_reference_pose(target_armature):
+        can_auto_match_missing_reference = (
+            self.retarget_engine == "REST_SPACE"
+            and self.source_reference_mode == "START_FRAME"
+            and self.auto_match_reference
+        )
+        if (
+                self.reference_mode == "SAVED"
+                and not _load_reference_pose(target_armature)
+                and not can_auto_match_missing_reference):
             self.report({
                 "ERROR"
             }, "No retarget reference pose is stored. Pose the rig, then use Set Ref Pose.")
@@ -2816,16 +4569,25 @@ class StableGenApplyAnimationToRig(bpy.types.Operator):
 
         source_armature = None
         imported_objects = []
+        operation_succeeded = False
         try:
+            if self.show_source_preview:
+                _clear_source_preview()
             source_armature, imported_objects = _import_animation_source(self.filepath)
             source_profile = characterize_armature(source_armature)
             if not source_profile:
                 raise RuntimeError("Could not infer a humanoid profile for the source animation rig")
 
+            if self.retarget_engine == "LEGACY":
+                effective_swap = bool(self.swap_target_sides)
+                effective_flip = bool(self.flip_target_forward)
+            else:
+                effective_swap = False
+                effective_flip = False
             pairs = _common_chain_pairs(
                 source_profile,
                 target_profile,
-                swap_target_sides=self.swap_target_sides,
+                swap_target_sides=effective_swap,
                 source_armature=source_armature,
                 target_armature=target_armature,
                 trim_feet=True,
@@ -2835,15 +4597,32 @@ class StableGenApplyAnimationToRig(bpy.types.Operator):
                     "Not enough source/target bone pairs were found. "
                     "Try analyzing the rig or using a different source animation."
                 )
+            collision_proxy = None
+            needs_reference_proxy = (
+                self.source_reference_mode == "START_FRAME"
+                and self.auto_match_reference
+                and self.protect_auto_match
+            )
+            if (
+                    self.retarget_engine == "REST_SPACE"
+                    and (self.collision_adaptation or needs_reference_proxy)):
+                collision_proxy = _collision_proxy_for_armature(
+                    target_armature, target_profile)
+                if collision_proxy is None:
+                    print(
+                        "[StableGen] WARNING: Could not build a skeletal collision proxy; "
+                        "continuing without per-frame proxy correction."
+                    )
             print(f"[StableGen] Source rig profile for {source_armature.name}: {_profile_summary(source_profile)}")
             print(f"[StableGen] Target rig profile for {target_armature.name}: {_profile_summary(target_profile)}")
             print(f"[StableGen] Retarget mapping: {_pair_summary(pairs)}")
+            print(f"[StableGen] Retarget engine: {self.retarget_engine}")
             print(f"[StableGen] {_axis_summary('Source', source_armature, source_profile)}")
             print(
-                f"[StableGen] {_axis_summary('Target', target_armature, target_profile, self.flip_target_forward)}"
+                f"[StableGen] {_axis_summary('Target', target_armature, target_profile, effective_flip)}"
             )
-            if self.flip_target_forward:
-                print("[StableGen] Retarget option: target forward axis flipped.")
+            if effective_flip:
+                print("[StableGen] Legacy retarget option: target forward axis flipped.")
 
             target_names = _mapped_target_bones(pairs)
             if self.reference_mode == "SAVED":
@@ -2859,6 +4638,58 @@ class StableGenApplyAnimationToRig(bpy.types.Operator):
                 target_reference_pose = _rest_reference_pose(target_armature, target_names)
                 reference_label = "rig rest pose"
 
+            start, end = _action_frame_range(source_armature, context.scene)
+            context.scene.frame_set(start)
+            context.view_layer.update()
+            if (
+                    self.retarget_engine == "REST_SPACE"
+                    and self.source_reference_mode == "START_FRAME"):
+                expected_provenance = _reference_provenance(
+                    self.filepath,
+                    source_profile,
+                    target_profile,
+                    start,
+                    self.source_reference_mode,
+                    swap_target_sides=effective_swap,
+                )
+                reference_matches, mismatch_reason = _reference_provenance_matches(
+                    target_reference_pose,
+                    expected_provenance,
+                )
+                if not reference_matches and self.auto_match_reference:
+                    matched_chains = _match_source_reference_pose(
+                        context,
+                        source_armature,
+                        target_armature,
+                        pairs,
+                        source_profile,
+                        target_profile,
+                        strength=1.0,
+                        swap_target_sides=effective_swap,
+                        protect_mesh=self.protect_auto_match,
+                        clearance=self.auto_match_clearance,
+                        collision_proxy=collision_proxy,
+                        arm_correction_driver=self.arm_correction_driver,
+                    )
+                    target_reference_pose = _capture_reference_pose(
+                        target_armature,
+                        label="auto_matched_source_reference",
+                        provenance=expected_provenance,
+                    )
+                    reference_label = (
+                        f"temporary source-matched reference ({matched_chains} limb chains)"
+                    )
+                    print(
+                        f"[StableGen] {mismatch_reason}; automatically matched source frame {start}."
+                    )
+                elif not reference_matches:
+                    warning = (
+                        f"Reference mismatch: {mismatch_reason}. "
+                        "Enable Auto-Match First Frame or run Match Source Ref."
+                    )
+                    print(f"[StableGen] WARNING: {warning}")
+                    self.report({"WARNING"}, warning)
+
             if not _reference_pose_is_usable(target_armature, target_reference_pose, target_names):
                 raise RuntimeError(
                     "The selected target rig does not have a usable retarget reference pose. "
@@ -2873,10 +4704,10 @@ class StableGenApplyAnimationToRig(bpy.types.Operator):
             )
             print(f"[StableGen] Source retarget neutral: {source_reference_label}")
 
-            start, end = _action_frame_range(source_armature, context.scene)
             action_name = (
                 f"{target_armature.name}_"
-                f"{os.path.splitext(os.path.basename(self.filepath))[0]}"
+                f"{os.path.splitext(os.path.basename(self.filepath))[0]}_"
+                f"{self.retarget_engine.lower()}"
             )
             target_armature.animation_data_create()
             if self.replace_action or not target_armature.animation_data.action:
@@ -2887,29 +4718,55 @@ class StableGenApplyAnimationToRig(bpy.types.Operator):
             context.view_layer.objects.active = target_armature
             context.view_layer.update()
             _clear_retarget_constraints(target_armature)
-            _bake_pose_delta_retarget(
-                context,
-                source_armature,
-                target_armature,
-                pairs,
-                source_profile,
-                target_profile,
-                start,
-                end,
-                self.frame_step,
-                copy_root_motion=self.copy_root_motion,
-                target_reference_pose=target_reference_pose,
-                flip_target_forward=self.flip_target_forward,
-                source_reference_mode=self.source_reference_mode,
-            )
+            if self.retarget_engine == "LEGACY":
+                _bake_pose_delta_retarget(
+                    context,
+                    source_armature,
+                    target_armature,
+                    pairs,
+                    source_profile,
+                    target_profile,
+                    start,
+                    end,
+                    self.frame_step,
+                    copy_root_motion=self.copy_root_motion,
+                    target_reference_pose=target_reference_pose,
+                    flip_target_forward=effective_flip,
+                    source_reference_mode=self.source_reference_mode,
+                )
+            else:
+                _bake_rest_space_retarget(
+                    context,
+                    source_armature,
+                    target_armature,
+                    pairs,
+                    source_profile,
+                    target_profile,
+                    start,
+                    end,
+                    self.frame_step,
+                    copy_root_motion=self.copy_root_motion,
+                    target_reference_pose=target_reference_pose,
+                    source_reference_mode=self.source_reference_mode,
+                    swap_target_sides=effective_swap,
+                    limb_match_strength=self.limb_match_strength,
+                    collision_proxy=collision_proxy,
+                    collision_adaptation=self.collision_adaptation,
+                    collision_strength=self.collision_strength,
+                    collision_margin=self.collision_margin,
+                    collision_iterations=self.collision_iterations,
+                    collision_max_deviation=self.collision_max_deviation,
+                    arm_correction_driver=self.arm_correction_driver,
+                )
 
             context.scene.frame_set(start)
             print(
                 f"[StableGen] Retargeted {len(pairs)} bone pair(s) "
                 f"from {source_armature.name} to {target_armature.name}; "
-                f"baked pose-delta frames {start}-{end}."
+                f"baked {self.retarget_engine.lower()} frames {start}-{end}."
             )
             self.report({"INFO"}, f"Animation baked to {target_armature.name}.")
+            operation_succeeded = True
         except Exception as exc:
             _clear_retarget_constraints(target_armature)
             self.report({"ERROR"}, f"Animation retarget failed: {exc}")
@@ -2921,8 +4778,20 @@ class StableGenApplyAnimationToRig(bpy.types.Operator):
                     bpy.ops.object.mode_set(mode="OBJECT")
             except Exception:
                 pass
-            if imported_objects and not self.keep_source_rig:
-                _delete_objects(imported_objects)
+            if imported_objects:
+                if self.show_source_preview and operation_succeeded:
+                    preview_count = _prepare_source_preview(
+                        context,
+                        imported_objects,
+                        target_armature,
+                        target_profile,
+                    )
+                    print(
+                        f"[StableGen] Source preview retained beside target "
+                        f"({preview_count} object(s)); scene frame is synchronized."
+                    )
+                elif not self.keep_source_rig:
+                    _delete_objects(imported_objects)
             bpy.ops.object.select_all(action="DESELECT")
             for obj in original_selection:
                 if obj.name in bpy.data.objects:

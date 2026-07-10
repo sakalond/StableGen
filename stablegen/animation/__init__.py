@@ -6,7 +6,10 @@ from .retargeting import (  # noqa: F401
     StableGenSetRetargetReferencePose,
     StableGenMatchSourceReferencePose,
     StableGenToggleRigMappingOverlay,
+    StableGenToggleCollisionProxyOverlay,
+    StableGenToggleSourcePreview,
     StableGenEditRigMapping,
     StableGenExportRetargetDebugBundle,
     StableGenApplyAnimationToRig,
+    cleanup_retarget_overlays,
 )

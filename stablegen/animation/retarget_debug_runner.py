@@ -81,6 +81,12 @@ def _args():
         choices=("rest", "start"),
         help="Source neutral baseline: source rig rest pose or first animation frame",
     )
+    parser.add_argument(
+        "--engine",
+        default="legacy",
+        choices=("legacy", "rest_space"),
+        help="Retarget engine used for the exported variants",
+    )
     parser.add_argument("--frame-step", type=int, default=1, help="Bake every Nth frame")
     parser.add_argument("--copy-root-motion", action="store_true", help="Transfer pelvis/root location")
     return parser.parse_args(argv)
@@ -151,7 +157,8 @@ def _reference_from_bundle(bundle, target_armature, target_names, mode):
 
 def _run_variant(
         bundle, target_fbx, animation_path, output_dir, variant_name,
-        frame_step, copy_root_motion, reference_mode, source_reference_mode):
+        frame_step, copy_root_motion, reference_mode, source_reference_mode,
+        engine):
     swap_target_sides, flip_target_forward = VARIANTS[variant_name]
     _clear_scene()
     target_armature, _target_objects = _import_target_fbx(target_fbx)
@@ -187,29 +194,51 @@ def _run_variant(
     )
 
     target_armature.animation_data_create()
+    output_stem = variant_name if engine == "legacy" else f"{engine}_{variant_name}"
     target_armature.animation_data.action = bpy.data.actions.new(
-        f"{target_armature.name}_{variant_name}_retarget"
+        f"{target_armature.name}_{output_stem}_retarget"
     )
     rt._clear_retarget_constraints(target_armature)  # pylint: disable=protected-access
-    rt._bake_pose_delta_retarget(  # pylint: disable=protected-access
-        bpy.context,
-        source_armature,
-        target_armature,
-        pairs,
-        source_profile,
-        target_profile,
-        start,
-        end,
-        max(1, frame_step),
-        copy_root_motion=copy_root_motion,
-        target_reference_pose=reference_pose,
-        flip_target_forward=flip_target_forward,
-        source_reference_mode=source_reference_mode,
-    )
+    if engine == "legacy":
+        rt._bake_pose_delta_retarget(  # pylint: disable=protected-access
+            bpy.context,
+            source_armature,
+            target_armature,
+            pairs,
+            source_profile,
+            target_profile,
+            start,
+            end,
+            max(1, frame_step),
+            copy_root_motion=copy_root_motion,
+            target_reference_pose=reference_pose,
+            flip_target_forward=flip_target_forward,
+            source_reference_mode=source_reference_mode,
+        )
+    else:
+        collision_proxy = rt._collision_proxy_for_armature(  # pylint: disable=protected-access
+            target_armature, target_profile)
+        rt._bake_rest_space_retarget(  # pylint: disable=protected-access
+            bpy.context,
+            source_armature,
+            target_armature,
+            pairs,
+            source_profile,
+            target_profile,
+            start,
+            end,
+            max(1, frame_step),
+            copy_root_motion=copy_root_motion,
+            target_reference_pose=reference_pose,
+            source_reference_mode=source_reference_mode,
+            swap_target_sides=swap_target_sides,
+            collision_proxy=collision_proxy,
+        )
 
-    output_fbx = os.path.join(output_dir, f"{variant_name}_retarget.fbx")
+    output_fbx = os.path.join(output_dir, f"{output_stem}_retarget.fbx")
     _export_result_fbx(target_armature, output_fbx)
     return {
+        "engine": engine,
         "variant": variant_name,
         "output_fbx": output_fbx,
         "swap_target_sides": swap_target_sides,
@@ -255,6 +284,7 @@ def main():
         "animation": os.path.abspath(args.animation),
         "output_dir": os.path.abspath(output_dir),
         "source_reference": args.source_reference,
+        "engine": args.engine,
         "variants": [],
     }
 
@@ -271,6 +301,7 @@ def main():
                 args.copy_root_motion,
                 args.reference,
                 source_reference_mode,
+                args.engine,
             )
             report["variants"].append(result)
             print(f"[StableGen Retarget Runner] Wrote {result['output_fbx']}")

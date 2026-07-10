@@ -57,6 +57,12 @@ def _args():
         choices=("rest", "start"),
         help="Source neutral baseline: source rig rest pose or first animation frame",
     )
+    parser.add_argument(
+        "--engine",
+        default="both",
+        choices=("legacy", "rest_space", "both"),
+        help="Retarget engine to probe",
+    )
     return parser.parse_args(argv)
 
 
@@ -122,6 +128,8 @@ def _sample_leg_motion(armature, profile, frames, flip_measure_forward=False):
     )
     pelvis_name = profile.get("pelvis")
     endpoints = {
+        "left_arm": _chain_endpoint(armature, profile, "left_arm"),
+        "right_arm": _chain_endpoint(armature, profile, "right_arm"),
         "left_leg": _chain_endpoint(armature, profile, "left_leg"),
         "right_leg": _chain_endpoint(armature, profile, "right_leg"),
     }
@@ -193,6 +201,29 @@ def _motion_scores(source_samples, target_samples):
     }
 
 
+def _role_motion_scores(source_samples, target_samples, role, axis):
+    source_left = _series(source_samples, f"left_{role}", axis)
+    source_right = _series(source_samples, f"right_{role}", axis)
+    target_left = _series(target_samples, f"left_{role}", axis)
+    target_right = _series(target_samples, f"right_{role}", axis)
+    return {
+        "same_left_corr": _corr(source_left, target_left),
+        "same_right_corr": _corr(source_right, target_right),
+        "cross_left_corr": _corr(source_left, target_right),
+        "cross_right_corr": _corr(source_right, target_left),
+    }
+
+
+def _asymmetric_motion_scores(source_samples, target_samples):
+    return {
+        role: {
+            axis: _role_motion_scores(source_samples, target_samples, role, axis)
+            for axis in ("forward", "lateral", "up")
+        }
+        for role in ("arm", "leg")
+    }
+
+
 def _frame_leg_order(samples):
     result = []
     for row in samples:
@@ -219,7 +250,8 @@ def _reference_from_bundle(bundle, target_armature, target_names):
     return rt._rest_reference_pose(target_armature, target_names), "rest"  # pylint: disable=protected-access
 
 
-def _sample_baked_variant(bundle, target_fbx, animation_path, variant, source_reference_mode):
+def _sample_baked_variant(
+        bundle, target_fbx, animation_path, variant, source_reference_mode, engine):
     swap_target_sides, flip_target_forward = VARIANTS[variant]
     _clear_scene()
     target_armature = _import_fbx_armature(target_fbx)
@@ -248,21 +280,38 @@ def _sample_baked_variant(bundle, target_fbx, animation_path, variant, source_re
 
     target_armature.animation_data_create()
     target_armature.animation_data.action = bpy.data.actions.new(f"{variant}_probe")
-    rt._bake_pose_delta_retarget(  # pylint: disable=protected-access
-        bpy.context,
-        source_armature,
-        target_armature,
-        pairs,
-        source_profile,
-        target_profile,
-        start,
-        end,
-        1,
-        copy_root_motion=False,
-        target_reference_pose=reference_pose,
-        flip_target_forward=flip_target_forward,
-        source_reference_mode=source_reference_mode,
-    )
+    if engine == "legacy":
+        rt._bake_pose_delta_retarget(  # pylint: disable=protected-access
+            bpy.context,
+            source_armature,
+            target_armature,
+            pairs,
+            source_profile,
+            target_profile,
+            start,
+            end,
+            1,
+            copy_root_motion=False,
+            target_reference_pose=reference_pose,
+            flip_target_forward=flip_target_forward,
+            source_reference_mode=source_reference_mode,
+        )
+    else:
+        rt._bake_rest_space_retarget(  # pylint: disable=protected-access
+            bpy.context,
+            source_armature,
+            target_armature,
+            pairs,
+            source_profile,
+            target_profile,
+            start,
+            end,
+            1,
+            copy_root_motion=False,
+            target_reference_pose=reference_pose,
+            source_reference_mode=source_reference_mode,
+            swap_target_sides=swap_target_sides,
+        )
     frames = list(range(start, end + 1))
     unflipped_samples = _sample_leg_motion(
         target_armature,
@@ -277,6 +326,7 @@ def _sample_baked_variant(bundle, target_fbx, animation_path, variant, source_re
         flip_measure_forward=True,
     )
     return {
+        "engine": engine,
         "variant": variant,
         "swap_target_sides": swap_target_sides,
         "flip_target_forward": flip_target_forward,
@@ -285,6 +335,8 @@ def _sample_baked_variant(bundle, target_fbx, animation_path, variant, source_re
         "mapping": rt._pair_summary(pairs),  # pylint: disable=protected-access
         "unflipped_measure": {
             "scores": _motion_scores(bundle["_source_samples"], unflipped_samples),
+            "asymmetric_scores": _asymmetric_motion_scores(
+                bundle["_source_samples"], unflipped_samples),
             "forward_order": _frame_leg_order(unflipped_samples),
         },
         "flipped_measure": {
@@ -325,20 +377,28 @@ def main():
         "variants": [],
     }
 
-    for variant in VARIANTS:
-        try:
-            report["variants"].append(
-                _sample_baked_variant(
-                    bundle,
-                    target_fbx,
-                    args.animation,
-                    variant,
-                    source_reference_mode,
+    engines = ("legacy", "rest_space") if args.engine == "both" else (args.engine,)
+    for engine in engines:
+        variants = VARIANTS if engine == "legacy" else {"normal": VARIANTS["normal"]}
+        for variant in variants:
+            try:
+                report["variants"].append(
+                    _sample_baked_variant(
+                        bundle,
+                        target_fbx,
+                        args.animation,
+                        variant,
+                        source_reference_mode,
+                        engine,
+                    )
                 )
-            )
-        except Exception as exc:  # pylint: disable=broad-except
-            traceback.print_exc()
-            report["variants"].append({"variant": variant, "error": str(exc)})
+            except Exception as exc:  # pylint: disable=broad-except
+                traceback.print_exc()
+                report["variants"].append({
+                    "engine": engine,
+                    "variant": variant,
+                    "error": str(exc),
+                })
 
     output_path = os.path.join(runs_dir, "retarget_motion_probe.json")
     with open(output_path, "w", encoding="utf-8") as handle:

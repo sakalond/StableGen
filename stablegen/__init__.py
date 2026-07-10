@@ -28,9 +28,12 @@ from .animation import (
     StableGenSetRetargetReferencePose,
     StableGenMatchSourceReferencePose,
     StableGenToggleRigMappingOverlay,
+    StableGenToggleCollisionProxyOverlay,
+    StableGenToggleSourcePreview,
     StableGenEditRigMapping,
     StableGenExportRetargetDebugBundle,
     StableGenApplyAnimationToRig,
+    cleanup_retarget_overlays,
 )
 from .texturing.print_export import (
     StableGenPaletteColor, StableGenAddPaletteColor, StableGenRemovePaletteColor,
@@ -137,6 +140,8 @@ classes = [
     StableGenSetRetargetReferencePose,
     StableGenMatchSourceReferencePose,
     StableGenToggleRigMappingOverlay,
+    StableGenToggleCollisionProxyOverlay,
+    StableGenToggleSourcePreview,
     StableGenEditRigMapping,
     StableGenExportRetargetDebugBundle,
     StableGenApplyAnimationToRig,
@@ -202,6 +207,7 @@ def register():
 def unregister():
     from .mesh_gen.batch import unregister_batch
     unregister_batch()
+    cleanup_retarget_overlays()
 
     unregister_properties(
         load_handler=load_handler,
