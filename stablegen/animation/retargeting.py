@@ -25,9 +25,19 @@ _PROFILE_PROP = "sg_retarget_profile"
 _REFERENCE_POSE_PROP = "sg_retarget_reference_pose"
 _SOURCE_PREVIEW_PROP = "sg_retarget_source_preview"
 _COLLISION_PROXY_PROP = "sg_retarget_collision_proxy"
+_COLLISION_SEGMENT_MODE_PROP = "sg_retarget_collision_segment_mode"
+_UPPER_ARM_COLLISION_PROP = "sg_retarget_upper_arm_collision"
+_ARM_CORRECTION_DRIVER_PROP = "sg_retarget_arm_correction_driver"
+_HAND_MATCH_ENABLED_PROP = "sg_retarget_match_hand_orientation"
+_HAND_MATCH_STRENGTH_PROP = "sg_retarget_hand_match_strength"
+_HAND_ROLL_MODE_PROP = "sg_retarget_hand_roll_mode"
+_HAND_ROLL_LIMIT_PROP = "sg_retarget_hand_roll_limit"
+_TWIST_CHAIN_VERSION_PROP = "sg_retarget_twist_chain_version"
 _PROFILE_VERSION = 14
 _REFERENCE_POSE_VERSION = 2
-_COLLISION_PROXY_VERSION = 2
+_COLLISION_PROXY_VERSION = 3
+_HAND_MATCH_ALGORITHM_VERSION = 4
+_TWIST_CHAIN_VERSION = 1
 _LEGACY_REFERENCE_POSE_VERSION = 1
 _CONSTRAINT_PREFIX = "SG_Retarget_"
 _BONE_ENUM_ITEMS_CACHE = {}
@@ -53,6 +63,11 @@ _CHAIN_LABELS = {
     "right_leg": "R Leg",
 }
 
+_HAND_LABELS = {
+    "left_arm": "L Hand",
+    "right_arm": "R Hand",
+}
+
 _BASIS_COLORS = {
     "forward": (1.0, 0.25, 0.95, 0.98),
     "left": (0.15, 0.55, 1.0, 0.98),
@@ -68,6 +83,7 @@ _COLLISION_PROXY_COLORS = {
     "left_arm": (0.2, 0.95, 0.55, 0.82),
     "right_arm": (1.0, 0.55, 0.16, 0.82),
     "inactive": (0.55, 0.55, 0.6, 0.38),
+    "driver": (0.3, 0.65, 1.0, 0.62),
 }
 
 _ARM_CORRECTION_DRIVER_ITEMS = (
@@ -85,6 +101,60 @@ _ARM_CORRECTION_DRIVER_ITEMS = (
         "UPPER_ARM",
         "Upper Arm",
         "Preserve the clavicle and apply direction and collision correction from the upper arm",
+    ),
+)
+
+_COLLISION_SEGMENT_MODE_ITEMS = (
+    (
+        "BONE_TAILS",
+        "Bone Heads to Tails",
+        "Build capsules from each Blender bone head to its raw tail",
+    ),
+    (
+        "JOINT_HEADS",
+        "Joint to Joint",
+        "Build capsules between consecutive mapped joint heads; recommended for disconnected rigs",
+    ),
+)
+
+_UPPER_ARM_COLLISION_ITEMS = (
+    (
+        "DISABLED",
+        "Disabled",
+        "Do not use the upper-arm capsule for collision detection",
+    ),
+    (
+        "DISTAL",
+        "Distal 75% (Recommended)",
+        "Check the upper arm while excluding its proximal shoulder-attachment region",
+    ),
+    (
+        "FULL",
+        "Full Upper Arm",
+        "Check the complete upper-arm capsule and preserve reference-pose intersections",
+    ),
+)
+
+_HAND_ROLL_MODE_ITEMS = (
+    (
+        "FOREARM",
+        "Single Forearm",
+        "Apply palm roll to the mapped forearm and leave only flexion at the wrist",
+    ),
+    (
+        "TWIST_CHAIN",
+        "Generated Twist Chain",
+        "Create deform helpers and distribute palm roll gradually along the forearm",
+    ),
+    (
+        "LIMITED",
+        "Limited Roll",
+        "Limit transferred palm roll to protect meshes that cannot tolerate full torsion",
+    ),
+    (
+        "WRIST",
+        "Wrist Only",
+        "Apply the complete palm correction directly to the hand bone",
     ),
 )
 
@@ -629,7 +699,9 @@ def _animation_file_identity(filepath):
 
 def _reference_provenance(
         filepath, source_profile, target_profile, source_frame,
-        source_reference_mode, swap_target_sides=False):
+        source_reference_mode, swap_target_sides=False,
+        match_hand_orientation=False, hand_match_strength=1.0,
+        hand_roll_mode="FOREARM", hand_roll_limit=60.0):
     return {
         "animation": _animation_file_identity(filepath),
         "source_frame": int(source_frame),
@@ -637,6 +709,21 @@ def _reference_provenance(
         "source_profile_signature": _profile_signature(source_profile),
         "target_profile_signature": _profile_signature(target_profile),
         "swap_target_sides": bool(swap_target_sides),
+        "match_hand_orientation": bool(match_hand_orientation),
+        "hand_match_strength": (
+            round(float(hand_match_strength), 6)
+            if match_hand_orientation else None
+        ),
+        "hand_match_algorithm_version": (
+            _HAND_MATCH_ALGORITHM_VERSION
+            if match_hand_orientation else None
+        ),
+        "hand_roll_mode": hand_roll_mode if match_hand_orientation else None,
+        "hand_roll_limit": (
+            round(float(hand_roll_limit), 4)
+            if match_hand_orientation and hand_roll_mode == "LIMITED"
+            else None
+        ),
     }
 
 
@@ -646,8 +733,12 @@ def _reference_provenance_matches(reference_pose, expected):
         return False, "target reference has no source provenance"
     for key in (
             "source_frame", "source_reference_mode", "source_profile_signature",
-            "target_profile_signature", "swap_target_sides"):
-        if actual.get(key) != expected.get(key):
+            "target_profile_signature", "swap_target_sides",
+            "match_hand_orientation", "hand_match_strength",
+            "hand_match_algorithm_version", "hand_roll_mode",
+            "hand_roll_limit"):
+        default = False if key == "match_hand_orientation" else None
+        if actual.get(key, default) != expected.get(key):
             return False, f"target reference {key} does not match"
     actual_file = actual.get("animation", {})
     expected_file = expected.get("animation", {})
@@ -771,6 +862,65 @@ def _chain_world_points(armature, chain):
     return points
 
 
+def _hand_mapping_overlay_data(armature, profile):
+    """Return mapped palm/digit segments without assuming exactly five digits."""
+    result = []
+    world_matrix = armature.matrix_world
+    for role in ("left_arm", "right_arm"):
+        chain = _profile_chains(profile).get(role, [])
+        if not chain:
+            continue
+        hand_name = chain[-1]
+        hand_pose = armature.pose.bones.get(hand_name)
+        if not hand_pose:
+            continue
+
+        segments = [
+            world_matrix @ hand_pose.head,
+            world_matrix @ hand_pose.tail,
+        ]
+        label_points = [world_matrix @ hand_pose.tail]
+        digit_roots = _hand_digit_root_names(armature, hand_name)
+        visited = set()
+        stack = []
+        for root_name in digit_roots:
+            cursor = armature.data.bones.get(root_name)
+            while cursor and cursor.name != hand_name:
+                stack.append(cursor.name)
+                cursor = cursor.parent
+        while stack:
+            bone_name = stack.pop()
+            if bone_name in visited:
+                continue
+            visited.add(bone_name)
+            pose_bone = armature.pose.bones.get(bone_name)
+            data_bone = armature.data.bones.get(bone_name)
+            if not pose_bone or not data_bone:
+                continue
+            head = world_matrix @ pose_bone.head
+            tail = world_matrix @ pose_bone.tail
+            if pose_bone.parent:
+                parent_tail = world_matrix @ pose_bone.parent.tail
+                if (head - parent_tail).length > 1e-6:
+                    segments.extend((parent_tail, head))
+            segments.extend((head, tail))
+            label_points.extend((head, tail))
+            stack.extend(child.name for child in data_bone.children)
+
+        center = sum(
+            label_points,
+            mathutils.Vector((0.0, 0.0, 0.0)),
+        ) / len(label_points)
+        result.append({
+            "role": role,
+            "hand": hand_name,
+            "segments": segments,
+            "center": center,
+            "digit_count": len(digit_roots),
+        })
+    return result
+
+
 def _profile_world_points(armature, profile):
     points = []
     chains = _profile_chains(profile) if profile else {}
@@ -887,6 +1037,19 @@ def _draw_rig_mapping_overlay():
             batch = batch_for_shader(shader, "LINE_STRIP", {"pos": points})
             batch.draw(shader)
 
+        gpu.state.line_width_set(2.2)
+        for hand_data in _hand_mapping_overlay_data(armature, profile):
+            segments = hand_data["segments"]
+            if len(segments) < 2:
+                continue
+            shader.uniform_float(
+                "color",
+                _CHAIN_COLORS.get(
+                    hand_data["role"], (1.0, 1.0, 1.0, 0.9)),
+            )
+            batch = batch_for_shader(shader, "LINES", {"pos": segments})
+            batch.draw(shader)
+
         gpu.state.line_width_set(5.0)
         for name, vector in _rig_basis_overlay_vectors(armature, profile).items():
             segments = _basis_arrow_segments(
@@ -937,6 +1100,21 @@ def _draw_rig_mapping_labels():
                 continue
             label = _CHAIN_LABELS.get(chain_name, chain_name)
             color = _CHAIN_COLORS.get(chain_name, (1.0, 1.0, 1.0, 0.9))
+            blf.color(font_id, 0.0, 0.0, 0.0, 0.75)
+            blf.position(font_id, co_2d.x + 8, co_2d.y + 4, 0)
+            blf.draw(font_id, label)
+            blf.color(font_id, color[0], color[1], color[2], 0.98)
+            blf.position(font_id, co_2d.x + 6, co_2d.y + 6, 0)
+            blf.draw(font_id, label)
+
+        for hand_data in _hand_mapping_overlay_data(armature, profile):
+            co_2d = view3d_utils.location_3d_to_region_2d(
+                region, rv3d, hand_data["center"])
+            if co_2d is None:
+                continue
+            label = _HAND_LABELS.get(hand_data["role"], "Hand")
+            color = _CHAIN_COLORS.get(
+                hand_data["role"], (1.0, 1.0, 1.0, 0.9))
             blf.color(font_id, 0.0, 0.0, 0.0, 0.75)
             blf.position(font_id, co_2d.x + 8, co_2d.y + 4, 0)
             blf.draw(font_id, label)
@@ -1072,20 +1250,51 @@ def _capsule_wire_segments(
     return segments
 
 
-def _collision_proxy_bone_groups(proxy):
+def _collision_proxy_bone_groups(proxy, armature=None, profile=None):
     groups = []
     seen = set()
     for name in proxy.get("body_bones", []):
         if name not in seen:
             seen.add(name)
-            groups.append((name, "body"))
+            groups.append((name, "body", 0.0))
+    upper_arm_collision = (
+        armature.get(_UPPER_ARM_COLLISION_PROP, "DISABLED")
+        if armature else "DISABLED"
+    )
+    arm_correction_driver = (
+        armature.get(_ARM_CORRECTION_DRIVER_PROP, "AUTO")
+        if armature else "AUTO"
+    )
     for role in ("left_arm", "right_arm"):
         chain = proxy.get("arm_chains", {}).get(role, [])
-        active_bones = set(_distal_arm_proxy_bones(chain))
+        active_bone_list, start_fractions = _arm_collision_probe_spec(
+            chain, upper_arm_collision)
+        active_bones = set(active_bone_list)
+        correction_driver_bone = None
+        if armature and profile:
+            correction_chain = _arm_correction_chain(
+                armature,
+                profile,
+                role,
+                chain,
+                driver_mode=arm_correction_driver,
+            )
+            if correction_chain:
+                correction_driver_bone = correction_chain[0]
         for name in chain:
             if name not in seen:
                 seen.add(name)
-                groups.append((name, role if name in active_bones else "inactive"))
+                if name in active_bones:
+                    display_role = role
+                elif name == correction_driver_bone:
+                    display_role = "driver"
+                else:
+                    display_role = "inactive"
+                groups.append((
+                    name,
+                    display_role,
+                    float(start_fractions.get(name, 0.0)),
+                ))
     return groups
 
 
@@ -1094,6 +1303,7 @@ def _draw_collision_proxy_overlay():
     proxy = _cached_collision_proxy(armature)
     if not armature or not proxy:
         return
+    profile = _load_profile(armature)
 
     shader = gpu.shader.from_builtin("UNIFORM_COLOR")
     gpu.state.blend_set("ALPHA")
@@ -1101,10 +1311,14 @@ def _draw_collision_proxy_overlay():
     gpu.state.depth_mask_set(False)
     gpu.state.line_width_set(1.6)
     try:
-        for bone_name, role in _collision_proxy_bone_groups(proxy):
+        for bone_name, role, start_fraction in _collision_proxy_bone_groups(
+                proxy, armature=armature, profile=profile):
             capsule = _proxy_pose_capsule(armature, proxy, bone_name)
             if not capsule:
                 continue
+            if start_fraction > 0.0:
+                capsule["start"] = capsule["start"].lerp(
+                    capsule["end"], start_fraction)
             segments = _capsule_wire_segments(
                 capsule["start"],
                 capsule["end"],
@@ -1253,6 +1467,57 @@ def _active_or_selected_armature(context):
         if armature:
             return armature
     return None
+
+
+def _initialize_collision_operator_settings(operator, context):
+    armature = _active_or_selected_armature(context)
+    if not armature:
+        return
+    stored_values = (
+        (
+            "collision_segment_mode",
+            _COLLISION_SEGMENT_MODE_PROP,
+            {"BONE_TAILS", "JOINT_HEADS"},
+        ),
+        (
+            "upper_arm_collision",
+            _UPPER_ARM_COLLISION_PROP,
+            {"DISABLED", "DISTAL", "FULL"},
+        ),
+        (
+            "arm_correction_driver",
+            _ARM_CORRECTION_DRIVER_PROP,
+            {"AUTO", "SHOULDER", "UPPER_ARM"},
+        ),
+    )
+    for attribute, property_name, valid_values in stored_values:
+        value = armature.get(property_name)
+        if hasattr(operator, attribute) and value in valid_values:
+            setattr(operator, attribute, value)
+    if (
+            hasattr(operator, "match_hand_orientation")
+            and _HAND_MATCH_ENABLED_PROP in armature):
+        operator.match_hand_orientation = bool(
+            armature[_HAND_MATCH_ENABLED_PROP])
+    if (
+            hasattr(operator, "hand_match_strength")
+            and _HAND_MATCH_STRENGTH_PROP in armature):
+        operator.hand_match_strength = max(
+            0.0,
+            min(1.0, float(armature[_HAND_MATCH_STRENGTH_PROP])),
+        )
+    if (
+            hasattr(operator, "hand_roll_mode")
+            and armature.get(_HAND_ROLL_MODE_PROP) in {
+                "WRIST", "FOREARM", "TWIST_CHAIN", "LIMITED"}):
+        operator.hand_roll_mode = armature[_HAND_ROLL_MODE_PROP]
+    if (
+            hasattr(operator, "hand_roll_limit")
+            and _HAND_ROLL_LIMIT_PROP in armature):
+        operator.hand_roll_limit = max(
+            0.0,
+            min(180.0, float(armature[_HAND_ROLL_LIMIT_PROP])),
+        )
 
 
 def _common_chain_pairs(
@@ -1556,7 +1821,8 @@ def _proxy_radius_limits(bone, role, target_height):
     return target_height * 0.010, max(target_height * 0.075, bone_length * 0.42)
 
 
-def _build_collision_proxy(armature, target_profile):
+def _build_collision_proxy(
+        armature, target_profile, segment_mode="BONE_TAILS"):
     """Estimate a compact rest-space capsule rig from dominant skin weights."""
     chains = _profile_chains(target_profile)
     body_bones = []
@@ -1576,6 +1842,10 @@ def _build_collision_proxy(armature, target_profile):
     terminal_arm_bones = [
         chain[-1] for chain in arm_chains.values() if chain
     ]
+    segment_end_bones = {}
+    for chain in [body_bones, *arm_chains.values()]:
+        for name, next_name in zip(chain, chain[1:]):
+            segment_end_bones[name] = next_name
 
     proxy_bones = list(body_bones)
     for chain in arm_chains.values():
@@ -1620,8 +1890,19 @@ def _build_collision_proxy(armature, target_profile):
             if not bone:
                 continue
             point = to_armature @ vertex.co
+            segment_end = bone.tail_local
+            if (
+                    segment_mode == "JOINT_HEADS"
+                    and dominant_name not in terminal_arm_bones):
+                next_name = segment_end_bones.get(dominant_name)
+                next_bone = (
+                    armature.data.bones.get(next_name)
+                    if next_name else None
+                )
+                if next_bone:
+                    segment_end = next_bone.head_local
             distance, parameter = _point_segment_distance(
-                point, bone.head_local, bone.tail_local)
+                point, bone.head_local, segment_end)
             if parameter < -0.35 or parameter > 1.35:
                 continue
             radial_samples[dominant_name].append(float(distance))
@@ -1654,6 +1935,8 @@ def _build_collision_proxy(armature, target_profile):
         "version": _COLLISION_PROXY_VERSION,
         "profile_signature": _profile_signature(target_profile),
         "mesh_signature": _collision_mesh_signature(armature),
+        "segment_mode": segment_mode,
+        "segment_end_bones": segment_end_bones,
         "height": float(target_height),
         "body_bones": body_bones,
         "arm_chains": arm_chains,
@@ -1669,7 +1952,13 @@ def _build_collision_proxy(armature, target_profile):
     return proxy
 
 
-def _collision_proxy_for_armature(armature, target_profile, rebuild=False):
+def _collision_proxy_for_armature(
+        armature, target_profile, segment_mode=None, rebuild=False):
+    if segment_mode not in {"BONE_TAILS", "JOINT_HEADS"}:
+        segment_mode = armature.get(
+            _COLLISION_SEGMENT_MODE_PROP, "BONE_TAILS")
+    if segment_mode not in {"BONE_TAILS", "JOINT_HEADS"}:
+        segment_mode = "BONE_TAILS"
     expected_profile = _profile_signature(target_profile)
     expected_mesh = _collision_mesh_signature(armature)
     if not rebuild:
@@ -1680,11 +1969,13 @@ def _collision_proxy_for_armature(armature, target_profile, rebuild=False):
                 if (
                         proxy.get("version") == _COLLISION_PROXY_VERSION
                         and proxy.get("profile_signature") == expected_profile
-                        and proxy.get("mesh_signature") == expected_mesh):
+                        and proxy.get("mesh_signature") == expected_mesh
+                        and proxy.get("segment_mode") == segment_mode):
                     return proxy
             except Exception:
                 pass
-    return _build_collision_proxy(armature, target_profile)
+    return _build_collision_proxy(
+        armature, target_profile, segment_mode=segment_mode)
 
 
 def _profile_point(armature, bone_name, use_tail=False):
@@ -2000,11 +2291,19 @@ def _apply_pose_delta(
 
 def _keyframe_retarget_pose(
         target_armature, target_names, frame, copy_root_motion,
-        key_locations=False, key_scale=False):
+        key_locations=False, key_scale=False,
+        previous_rotations=None):
     for name in target_names:
         pose_bone = target_armature.pose.bones.get(name)
         if not pose_bone:
             continue
+        if previous_rotations is not None:
+            rotation = pose_bone.rotation_quaternion.copy()
+            previous = previous_rotations.get(name)
+            if previous is not None:
+                rotation.make_compatible(previous)
+                pose_bone.rotation_quaternion = rotation
+            previous_rotations[name] = rotation.copy()
         pose_bone.keyframe_insert(data_path="rotation_quaternion", frame=frame)
         if copy_root_motion or key_locations:
             pose_bone.keyframe_insert(data_path="location", frame=frame)
@@ -2209,9 +2508,25 @@ def _bake_rest_space_retarget(
         collision_proxy=None, collision_adaptation=True,
         collision_strength=0.75, collision_margin=0.008,
         collision_iterations=2, collision_max_deviation=0.08,
-        arm_correction_driver="AUTO"):
+        arm_correction_driver="AUTO",
+        upper_arm_collision="DISABLED",
+        match_hand_orientation=False, hand_match_strength=1.0,
+        hand_roll_mode="FOREARM", hand_roll_limit=60.0):
     """Bake parent-local motion deltas through corresponding reference frames."""
+    twist_helper_names = []
+    if match_hand_orientation:
+        twist_helper_names = _ensure_hand_roll_setup(
+            context,
+            target_armature,
+            target_profile,
+            hand_roll_mode,
+        )
+    else:
+        _configure_twist_helpers(
+            target_armature, target_profile, use_twist_chain=False)
     target_names = _mapped_target_bones(pairs)
+    target_names.extend(
+        name for name in twist_helper_names if name not in target_names)
     all_target_names = [pose_bone.name for pose_bone in target_armature.pose.bones]
     source_height = _height_from_profile(source_armature, source_profile)
     target_height = _height_from_profile(target_armature, target_profile)
@@ -2232,6 +2547,14 @@ def _bake_rest_space_retarget(
         _profile_body_basis(source_armature, source_profile),
         use_rest=source_reference_mode == "REST",
     )
+    source_reference_hand_frames = {}
+    if match_hand_orientation:
+        source_reference_hand_frames = _hand_reference_body_frames(
+            source_armature,
+            source_profile,
+            _profile_rotation_basis(source_armature, source_profile),
+            use_rest=source_reference_mode == "REST",
+        )
 
     if target_reference_pose.get("label") == "rest_pose":
         _reset_target_pose(target_armature, all_target_names)
@@ -2245,12 +2568,21 @@ def _bake_rest_space_retarget(
         _profile_body_basis(target_armature, target_profile),
         use_rest=False,
     )
+    target_reference_hand_frames = {}
+    if match_hand_orientation:
+        target_reference_hand_frames = _hand_reference_body_frames(
+            target_armature,
+            target_profile,
+            _profile_rotation_basis(target_armature, target_profile),
+            use_rest=False,
+        )
     collision_baseline = {}
     if collision_adaptation and collision_proxy:
         collision_baseline = _capture_proxy_collision_baseline(
             target_armature,
             collision_proxy,
             margin=collision_margin,
+            upper_arm_collision=upper_arm_collision,
         )
     target_reference_matrices = _armature_reference_matrices(target_armature)
     records = _rest_space_pair_records(
@@ -2282,8 +2614,16 @@ def _bake_rest_space_retarget(
             for role, driver in resolved_arm_drivers.items()
         )
     )
+    if collision_proxy:
+        print(
+            f"[StableGen] Collision proxy mode: "
+            f"segments={collision_proxy.get('segment_mode', 'BONE_TAILS').lower()}, "
+            f"upper_arm={upper_arm_collision.lower()}"
+        )
 
     collision_adjusted_frames = 0
+    hand_matched_frames = 0
+    previous_keyed_rotations = {}
     for frame in range(start, end + 1, frame_step):
         context.scene.frame_set(frame)
         context.view_layer.update()
@@ -2325,9 +2665,34 @@ def _bake_rest_space_retarget(
                 max_pose_deviation=collision_max_deviation,
                 accepted_penetrations=collision_baseline,
                 arm_correction_driver=arm_correction_driver,
+                upper_arm_collision=upper_arm_collision,
             )
             if adjusted:
                 collision_adjusted_frames += 1
+        if match_hand_orientation and hand_roll_mode == "TWIST_CHAIN":
+            _sync_twist_helpers_from_reference(
+                target_armature,
+                target_profile,
+                target_reference_matrices,
+            )
+            context.view_layer.update()
+        if match_hand_orientation and hand_match_strength > 0.0:
+            matched_hands = _match_hand_orientations(
+                context,
+                source_armature,
+                target_armature,
+                source_profile,
+                target_profile,
+                strength=hand_match_strength,
+                swap_target_sides=swap_target_sides,
+                use_reference_basis=True,
+                source_reference_body_frames=source_reference_hand_frames,
+                target_reference_body_frames=target_reference_hand_frames,
+                hand_roll_mode=hand_roll_mode,
+                hand_roll_limit=hand_roll_limit,
+            )
+            if matched_hands:
+                hand_matched_frames += 1
         _keyframe_retarget_pose(
             target_armature,
             target_names,
@@ -2335,11 +2700,17 @@ def _bake_rest_space_retarget(
             copy_root_motion=copy_root_motion,
             key_locations=target_reference_pose.get("label") != "rest_pose",
             key_scale=target_reference_pose.get("label") != "rest_pose",
+            previous_rotations=previous_keyed_rotations,
         )
     if collision_adaptation and collision_proxy:
         print(
             f"[StableGen] Skeletal proxy collision pass adjusted "
             f"{collision_adjusted_frames} baked frame(s)."
+        )
+    if match_hand_orientation:
+        print(
+            f"[StableGen] Palm-frame matching adjusted "
+            f"{hand_matched_frames} baked frame(s)."
         )
 
 
@@ -2444,6 +2815,558 @@ def _limb_reference_body_directions(
                     directions[f"{role}:upper_arm"] = (
                         upper_body_direction.normalized())
     return directions
+
+
+def _hand_digit_root_names(armature, hand_name):
+    """Find a palm branch with three to ten digit roots, allowing extra digits."""
+    hand_bone = armature.data.bones.get(hand_name) if hand_name else None
+    if not hand_bone:
+        return []
+    candidates = [(hand_bone, 0)]
+    cursor = 0
+    branching = []
+    while cursor < len(candidates):
+        bone, depth = candidates[cursor]
+        cursor += 1
+        children = list(bone.children)
+        if 3 <= len(children) <= 10:
+            branching.append((depth, -len(children), bone.name, children))
+        if depth < 3:
+            candidates.extend((child, depth + 1) for child in children)
+    if not branching:
+        return []
+    _depth, _count, _name, roots = min(branching)
+    return sorted(root.name for root in roots)
+
+
+def _hand_landmark_point(armature, bone_name, use_rest=False, use_tail=False):
+    if use_rest:
+        return _profile_point(armature, bone_name, use_tail=use_tail)
+    return _pose_point(armature, bone_name, use_tail=use_tail)
+
+
+def _hand_thumb_root_name(armature, hand_name, digit_roots=None):
+    """Identify the thumb by semantics or its rest-pose offset toward the wrist."""
+    digit_roots = list(
+        digit_roots or _hand_digit_root_names(armature, hand_name))
+    if len(digit_roots) < 3:
+        return None
+    for root_name in digit_roots:
+        normalized = _norm_name(root_name)
+        if "thumb" in normalized or "pollex" in normalized:
+            return root_name
+
+    wrist = _profile_point(armature, hand_name, use_tail=False)
+    points = {
+        name: _profile_point(armature, name, use_tail=False)
+        for name in digit_roots
+    }
+    if wrist is None or any(point is None for point in points.values()):
+        return None
+    center = sum(
+        points.values(), mathutils.Vector((0.0, 0.0, 0.0))) / len(points)
+    forward = center - wrist
+    if forward.length < 1e-6:
+        return None
+    forward.normalize()
+    return min(
+        digit_roots,
+        key=lambda name: (points[name] - wrist).dot(forward),
+    )
+
+
+def _hand_frame(armature, hand_name, use_rest=False):
+    digit_roots = _hand_digit_root_names(armature, hand_name)
+    if len(digit_roots) < 3:
+        return None
+    thumb_name = _hand_thumb_root_name(
+        armature, hand_name, digit_roots=digit_roots)
+    if not thumb_name:
+        return None
+    wrist = _hand_landmark_point(armature, hand_name, use_rest=use_rest)
+    root_points = [
+        _hand_landmark_point(armature, name, use_rest=use_rest)
+        for name in digit_roots
+    ]
+    if wrist is None or any(point is None for point in root_points):
+        return None
+
+    def frame_from_points(points):
+        center = sum(
+            points, mathutils.Vector((0.0, 0.0, 0.0))) / len(points)
+        forward = center - wrist
+        if forward.length < 1e-6:
+            return None
+        forward.normalize()
+        thumb_index = digit_roots.index(thumb_name)
+        thumb_point = points[thumb_index]
+        other_points = [
+            point for index, point in enumerate(points)
+            if index != thumb_index
+        ]
+        other_center = sum(
+            other_points,
+            mathutils.Vector((0.0, 0.0, 0.0)),
+        ) / len(other_points)
+        across = thumb_point - other_center
+        across -= forward * across.dot(forward)
+        if across.length < 1e-6:
+            return None
+        across.normalize()
+        normal = across.cross(forward)
+        if normal.length < 1e-6:
+            return None
+        normal.normalize()
+        forward = normal.cross(across).normalized()
+        return mathutils.Matrix((across, forward, normal)).transposed()
+
+    frame = frame_from_points(root_points)
+    if frame is None:
+        root_points = [
+            _hand_landmark_point(
+                armature, name, use_rest=use_rest, use_tail=True)
+            for name in digit_roots
+        ]
+        if any(point is None for point in root_points):
+            return None
+        frame = frame_from_points(root_points)
+    return frame
+
+
+def _hand_reference_body_frames(armature, profile, basis, use_rest=False):
+    frames = {}
+    chains = _profile_chains(profile)
+    for role in ("left_arm", "right_arm"):
+        chain = chains.get(role, [])
+        if not chain:
+            continue
+        frame = _hand_frame(armature, chain[-1], use_rest=use_rest)
+        if frame is not None:
+            frames[role] = basis.inverted_safe() @ frame
+    return frames
+
+
+def _quaternion_twist_about_axis(rotation, axis):
+    """Extract the shortest quaternion component around an armature-space axis."""
+    if axis is None or axis.length < 1e-6:
+        return None
+    axis = axis.normalized()
+    rotation = rotation.normalized()
+    if rotation.w < 0.0:
+        rotation = mathutils.Quaternion(
+            (-rotation.w, -rotation.x, -rotation.y, -rotation.z))
+    vector = mathutils.Vector((rotation.x, rotation.y, rotation.z))
+    projected = axis * vector.dot(axis)
+    twist = mathutils.Quaternion(
+        (rotation.w, projected.x, projected.y, projected.z))
+    if twist.magnitude < 1e-8:
+        return None
+    return twist.normalized()
+
+
+def _twist_helper_specs(role):
+    side = "L" if role == "left_arm" else "R"
+    return (
+        (f"SG_{side}_ForearmTwist_00", 0.0),
+        (f"SG_{side}_ForearmTwist_33", 1.0 / 3.0),
+        (f"SG_{side}_ForearmTwist_67", 2.0 / 3.0),
+    )
+
+
+def _twist_helper_names(armature, profile):
+    names = []
+    chains = _profile_chains(profile)
+    for role in ("left_arm", "right_arm"):
+        if len(chains.get(role, [])) < 2:
+            continue
+        names.extend(
+            name for name, _fraction in _twist_helper_specs(role)
+            if armature.data.bones.get(name)
+        )
+    return names
+
+
+def _twist_follow_constraint(pose_bone):
+    if not pose_bone:
+        return None
+    constraint = pose_bone.constraints.get("SG_Follow_Forearm")
+    if constraint and constraint.type == "COPY_TRANSFORMS":
+        return constraint
+    constraint = pose_bone.constraints.new("COPY_TRANSFORMS")
+    constraint.name = "SG_Follow_Forearm"
+    return constraint
+
+
+def _ensure_twist_helper_bones(context, armature, profile):
+    chains = _profile_chains(profile)
+    required = []
+    for role in ("left_arm", "right_arm"):
+        chain = chains.get(role, [])
+        if len(chain) < 2:
+            continue
+        required.extend(
+            (role, chain[-2], name, fraction)
+            for name, fraction in _twist_helper_specs(role)
+        )
+    if not required:
+        return []
+
+    missing = [
+        item for item in required
+        if not armature.data.bones.get(item[2])
+    ]
+    if missing:
+        original_active = context.view_layer.objects.active
+        original_selection = list(context.selected_objects)
+        try:
+            if bpy.ops.object.mode_set.poll():
+                bpy.ops.object.mode_set(mode="OBJECT")
+            bpy.ops.object.select_all(action="DESELECT")
+            armature.select_set(True)
+            context.view_layer.objects.active = armature
+            bpy.ops.object.mode_set(mode="EDIT")
+            edit_bones = armature.data.edit_bones
+            for _role, forearm_name, helper_name, _fraction in missing:
+                forearm = edit_bones.get(forearm_name)
+                if not forearm or edit_bones.get(helper_name):
+                    continue
+                helper = edit_bones.new(helper_name)
+                helper.head = forearm.head
+                helper.tail = forearm.tail
+                helper.roll = forearm.roll
+                helper.parent = None
+                helper.use_connect = False
+                helper.use_deform = True
+                helper.head_radius = forearm.head_radius
+                helper.tail_radius = forearm.tail_radius
+                helper.envelope_distance = forearm.envelope_distance
+                helper.envelope_weight = forearm.envelope_weight
+            bpy.ops.object.mode_set(mode="OBJECT")
+        finally:
+            try:
+                if bpy.ops.object.mode_set.poll():
+                    bpy.ops.object.mode_set(mode="OBJECT")
+            except Exception:
+                pass
+            bpy.ops.object.select_all(action="DESELECT")
+            for obj in original_selection:
+                if obj.name in bpy.data.objects:
+                    obj.select_set(True)
+            if original_active and original_active.name in bpy.data.objects:
+                context.view_layer.objects.active = original_active
+
+    helper_names = []
+    for role, forearm_name, helper_name, fraction in required:
+        data_bone = armature.data.bones.get(helper_name)
+        pose_bone = armature.pose.bones.get(helper_name)
+        if not data_bone or not pose_bone:
+            continue
+        data_bone["sg_twist_source"] = forearm_name
+        data_bone["sg_twist_fraction"] = float(fraction)
+        data_bone["sg_twist_role"] = role
+        pose_bone.rotation_mode = "QUATERNION"
+        constraint = _twist_follow_constraint(pose_bone)
+        constraint.target = armature
+        constraint.subtarget = forearm_name
+        constraint.target_space = "POSE"
+        constraint.owner_space = "POSE"
+        constraint.influence = 1.0
+        helper_names.append(helper_name)
+    context.view_layer.update()
+    return helper_names
+
+
+def _armature_deformed_meshes(armature):
+    result = []
+    for obj in bpy.data.objects:
+        if obj.type != "MESH":
+            continue
+        if any(
+                modifier.type == "ARMATURE" and modifier.object == armature
+                for modifier in obj.modifiers):
+            result.append(obj)
+    return result
+
+
+def _redistribute_forearm_twist_weights(armature, profile):
+    chains = _profile_chains(profile)
+    total_vertices = 0
+    for mesh_obj in _armature_deformed_meshes(armature):
+        mesh_to_armature = armature.matrix_world.inverted_safe() @ mesh_obj.matrix_world
+        for modifier in mesh_obj.modifiers:
+            if modifier.type == "ARMATURE" and modifier.object == armature:
+                modifier.use_deform_preserve_volume = True
+
+        for role in ("left_arm", "right_arm"):
+            chain = chains.get(role, [])
+            if len(chain) < 2:
+                continue
+            forearm_name = chain[-2]
+            hand_name = chain[-1]
+            marker = f"sg_twist_weights_{armature.name}_{role}"
+            if mesh_obj.get(marker) == _TWIST_CHAIN_VERSION:
+                continue
+            source_group = mesh_obj.vertex_groups.get(forearm_name)
+            forearm = armature.data.bones.get(forearm_name)
+            hand = armature.data.bones.get(hand_name)
+            if not source_group or not forearm or not hand:
+                continue
+            helper_groups = [
+                mesh_obj.vertex_groups.get(name)
+                or mesh_obj.vertex_groups.new(name=name)
+                for name, _fraction in _twist_helper_specs(role)
+            ]
+            elbow = forearm.head_local.copy()
+            wrist = hand.head_local.copy()
+            axis = wrist - elbow
+            length_squared = axis.length_squared
+            if length_squared < 1e-12:
+                continue
+
+            assignments = []
+            source_index = source_group.index
+            for vertex in mesh_obj.data.vertices:
+                source_weight = next(
+                    (
+                        item.weight for item in vertex.groups
+                        if item.group == source_index
+                    ),
+                    0.0,
+                )
+                if source_weight <= 1e-8:
+                    continue
+                point = mesh_to_armature @ vertex.co
+                parameter = max(
+                    0.0,
+                    min(1.0, (point - elbow).dot(axis) / length_squared),
+                )
+                scaled = parameter * 3.0
+                lower = min(2, int(math.floor(scaled)))
+                blend = scaled - lower
+                weights = [0.0, 0.0, 0.0, 0.0]
+                weights[lower] = 1.0 - blend
+                weights[lower + 1] = blend
+                assignments.append((vertex.index, source_weight, weights))
+
+            for vertex_index, source_weight, weights in assignments:
+                for group, weight in zip(helper_groups, weights[:3]):
+                    if weight > 1e-8:
+                        group.add(
+                            [vertex_index], source_weight * weight, "REPLACE")
+                    else:
+                        try:
+                            group.remove([vertex_index])
+                        except RuntimeError:
+                            pass
+                if weights[3] > 1e-8:
+                    source_group.add(
+                        [vertex_index], source_weight * weights[3], "REPLACE")
+                else:
+                    source_group.remove([vertex_index])
+            mesh_obj[marker] = _TWIST_CHAIN_VERSION
+            total_vertices += len(assignments)
+    if total_vertices:
+        print(
+            f"[StableGen] Distributed {total_vertices} forearm-weighted "
+            "vertices across generated twist chains."
+        )
+    return total_vertices
+
+
+def _configure_twist_helpers(armature, profile, use_twist_chain):
+    chains = _profile_chains(profile)
+    for role in ("left_arm", "right_arm"):
+        chain = chains.get(role, [])
+        if len(chain) < 2:
+            continue
+        forearm_name = chain[-2]
+        forearm_pose = armature.pose.bones.get(forearm_name)
+        for helper_name, _fraction in _twist_helper_specs(role):
+            pose_bone = armature.pose.bones.get(helper_name)
+            if not pose_bone:
+                continue
+            constraint = _twist_follow_constraint(pose_bone)
+            constraint.target = armature
+            constraint.subtarget = forearm_name
+            constraint.target_space = "POSE"
+            constraint.owner_space = "POSE"
+            if use_twist_chain:
+                followed_matrix = (
+                    forearm_pose.matrix.copy() if forearm_pose else None)
+                constraint.influence = 0.0
+                if followed_matrix is not None:
+                    pose_bone.matrix = followed_matrix
+            else:
+                constraint.influence = 1.0
+
+
+def _ensure_hand_roll_setup(context, armature, profile, hand_roll_mode):
+    use_twist_chain = hand_roll_mode == "TWIST_CHAIN"
+    if use_twist_chain:
+        _ensure_twist_helper_bones(context, armature, profile)
+        _redistribute_forearm_twist_weights(armature, profile)
+        armature[_TWIST_CHAIN_VERSION_PROP] = _TWIST_CHAIN_VERSION
+    _configure_twist_helpers(
+        armature,
+        profile,
+        use_twist_chain=use_twist_chain,
+    )
+    context.view_layer.update()
+    return _twist_helper_names(armature, profile) if use_twist_chain else []
+
+
+def _apply_twist_to_helper_pose(armature, role, twist):
+    for helper_name, fraction in _twist_helper_specs(role):
+        pose_bone = armature.pose.bones.get(helper_name)
+        if not pose_bone:
+            continue
+        partial_twist = mathutils.Quaternion(
+            (1.0, 0.0, 0.0, 0.0)).slerp(twist, fraction)
+        _rotate_pose_bone_in_armature_space(pose_bone, partial_twist)
+
+
+def _sync_twist_helpers_from_reference(
+        armature, profile, reference_matrices):
+    chains = _profile_chains(profile)
+    for role in ("left_arm", "right_arm"):
+        chain = chains.get(role, [])
+        if len(chain) < 2:
+            continue
+        forearm_pose = armature.pose.bones.get(chain[-2])
+        reference_forearm = reference_matrices.get(chain[-2])
+        if not forearm_pose or reference_forearm is None:
+            continue
+        motion_delta = forearm_pose.matrix @ reference_forearm.inverted_safe()
+        for helper_name, _fraction in _twist_helper_specs(role):
+            helper_pose = armature.pose.bones.get(helper_name)
+            reference_helper = reference_matrices.get(helper_name)
+            if helper_pose and reference_helper is not None:
+                helper_pose.matrix = motion_delta @ reference_helper
+
+
+def _sync_twist_helpers_to_forearms(armature, profile):
+    chains = _profile_chains(profile)
+    for role in ("left_arm", "right_arm"):
+        chain = chains.get(role, [])
+        if len(chain) < 2:
+            continue
+        forearm_pose = armature.pose.bones.get(chain[-2])
+        if not forearm_pose:
+            continue
+        for helper_name, _fraction in _twist_helper_specs(role):
+            helper_pose = armature.pose.bones.get(helper_name)
+            if helper_pose:
+                helper_pose.matrix = forearm_pose.matrix.copy()
+
+
+def _match_hand_orientations(
+        context, source_armature, target_armature,
+        source_profile, target_profile, strength=1.0,
+        swap_target_sides=False, use_reference_basis=True,
+        source_reference_body_frames=None,
+        target_reference_body_frames=None,
+        absolute_alignment=False,
+        hand_roll_mode="FOREARM", hand_roll_limit=60.0):
+    if use_reference_basis:
+        source_basis = _profile_rotation_basis(source_armature, source_profile)
+        target_basis = _profile_rotation_basis(target_armature, target_profile)
+    else:
+        source_basis = _pose_rotation_basis(source_armature, source_profile)
+        target_basis = _pose_rotation_basis(target_armature, target_profile)
+    source_chains = _profile_chains(source_profile)
+    target_chains = _profile_chains(target_profile)
+    strength = max(0.0, min(1.0, float(strength)))
+    hand_roll_mode = (
+        hand_roll_mode
+        if hand_roll_mode in {"WRIST", "FOREARM", "TWIST_CHAIN", "LIMITED"}
+        else "FOREARM"
+    )
+    hand_roll_limit = max(0.0, min(180.0, float(hand_roll_limit)))
+    matched = 0
+
+    for source_role in ("left_arm", "right_arm"):
+        target_role = _target_chain_key(
+            source_role, swap_target_sides=swap_target_sides)
+        source_chain = source_chains.get(source_role, [])
+        target_chain = target_chains.get(target_role, [])
+        if not source_chain or not target_chain:
+            continue
+        source_frame = _hand_frame(source_armature, source_chain[-1])
+        target_frame = _hand_frame(target_armature, target_chain[-1])
+        if source_frame is None or target_frame is None:
+            continue
+        source_body_frame = source_basis.inverted_safe() @ source_frame
+        source_reference = (source_reference_body_frames or {}).get(source_role)
+        target_reference = (target_reference_body_frames or {}).get(target_role)
+        if absolute_alignment:
+            desired_target_body_frame = source_body_frame
+        elif use_reference_basis and (
+                source_reference is None or target_reference is None):
+            continue
+        elif source_reference is not None and target_reference is not None:
+            # Transfer the reference-to-current palm rotation in body space.
+            source_delta = source_body_frame @ source_reference.inverted_safe()
+            desired_target_body_frame = source_delta @ target_reference
+        else:
+            desired_target_body_frame = source_body_frame
+        desired_target_frame = target_basis @ desired_target_body_frame
+        try:
+            # The pose-bone helper left-multiplies an armature-space rotation,
+            # so construct that delta explicitly in armature space. Quaternion
+            # rotation_difference() instead returns a local/right-side delta.
+            current_rotation = target_frame.to_quaternion()
+            desired_rotation = desired_target_frame.to_quaternion()
+            delta = desired_rotation @ current_rotation.inverted()
+        except ValueError:
+            continue
+        if strength < 1.0:
+            delta = mathutils.Quaternion((1.0, 0.0, 0.0, 0.0)).slerp(
+                delta, strength)
+        hand_pose = target_armature.pose.bones.get(target_chain[-1])
+        if not hand_pose:
+            continue
+        forearm_pose = (
+            target_armature.pose.bones.get(target_chain[-2])
+            if len(target_chain) >= 2 else None
+        )
+        forearm_axis = (
+            hand_pose.head - forearm_pose.head if forearm_pose else None)
+        twist = _quaternion_twist_about_axis(delta, forearm_axis)
+
+        if hand_roll_mode == "LIMITED" and twist is not None:
+            twist_angle = min(twist.angle, (2.0 * math.pi) - twist.angle)
+            limit_radians = math.radians(hand_roll_limit)
+            if twist_angle > limit_radians and twist_angle > 1e-8:
+                limited_twist = mathutils.Quaternion(
+                    (1.0, 0.0, 0.0, 0.0)).slerp(
+                        twist, limit_radians / twist_angle)
+                swing = delta @ twist.inverted()
+                delta = swing @ limited_twist
+                twist = limited_twist
+
+        applied_desired_rotation = delta @ current_rotation
+
+        if (
+                hand_roll_mode != "WRIST"
+                and forearm_pose is not None
+                and twist is not None):
+            _rotate_pose_bone_in_armature_space(forearm_pose, twist)
+            context.view_layer.update()
+        if hand_roll_mode == "TWIST_CHAIN" and twist is not None:
+            _apply_twist_to_helper_pose(
+                target_armature, target_role, twist)
+            context.view_layer.update()
+
+        updated_target_frame = _hand_frame(
+            target_armature, target_chain[-1])
+        if updated_target_frame is None:
+            continue
+        updated_rotation = updated_target_frame.to_quaternion()
+        residual = applied_desired_rotation @ updated_rotation.inverted()
+        _rotate_pose_bone_in_armature_space(hand_pose, residual)
+        context.view_layer.update()
+        matched += 1
+    return matched
 
 
 def _rotate_pose_bone_in_armature_space(pose_bone, delta_quat):
@@ -2632,11 +3555,15 @@ def _proxy_pose_capsule(armature, proxy, bone_name, radius_scale=1.0):
     if radius <= 1e-6:
         return None
     start = pose_bone.head.copy()
-    end = (
-        start.copy()
-        if bone_name in set(proxy.get("terminal_arm_bones", []))
-        else pose_bone.tail.copy()
-    )
+    if bone_name in set(proxy.get("terminal_arm_bones", [])):
+        end = start.copy()
+    elif proxy.get("segment_mode") == "JOINT_HEADS":
+        end_name = proxy.get("segment_end_bones", {}).get(bone_name)
+        end_pose_bone = (
+            armature.pose.bones.get(end_name) if end_name else None)
+        end = end_pose_bone.head.copy() if end_pose_bone else pose_bone.tail.copy()
+    else:
+        end = pose_bone.tail.copy()
     return {
         "bone": bone_name,
         "start": start,
@@ -2645,7 +3572,9 @@ def _proxy_pose_capsule(armature, proxy, bone_name, radius_scale=1.0):
     }
 
 
-def _proxy_capsules_for_bones(armature, proxy, bone_names, radius_scale=1.0):
+def _proxy_capsules_for_bones(
+        armature, proxy, bone_names, radius_scale=1.0,
+        start_fractions=None):
     result = []
     seen = set()
     for name in bone_names:
@@ -2655,6 +3584,11 @@ def _proxy_capsules_for_bones(armature, proxy, bone_names, radius_scale=1.0):
         capsule = _proxy_pose_capsule(
             armature, proxy, name, radius_scale=radius_scale)
         if capsule:
+            start_fraction = float((start_fractions or {}).get(name, 0.0))
+            if start_fraction > 0.0:
+                start_fraction = max(0.0, min(0.95, start_fraction))
+                capsule["start"] = capsule["start"].lerp(
+                    capsule["end"], start_fraction)
             result.append(capsule)
     return result
 
@@ -2663,6 +3597,18 @@ def _distal_arm_proxy_bones(chain):
     # Shoulder and upper-arm capsules normally enter the torso volume at their
     # attachment. Only forearm/hand geometry should drive endpoint correction.
     return chain[-2:] if len(chain) >= 2 else chain
+
+
+def _arm_collision_probe_spec(chain, upper_arm_collision="DISABLED"):
+    bones = list(_distal_arm_proxy_bones(chain))
+    start_fractions = {}
+    if upper_arm_collision in {"DISTAL", "FULL"} and len(chain) >= 3:
+        upper_arm = chain[-3]
+        if upper_arm not in bones:
+            bones.insert(0, upper_arm)
+        if upper_arm_collision == "DISTAL":
+            start_fractions[upper_arm] = 0.25
+    return bones, start_fractions
 
 
 def _capsule_pair_key(moving, obstacle):
@@ -2680,7 +3626,8 @@ def _capsule_pair_penetration(moving, obstacle, margin):
 
 
 def _capture_proxy_collision_baseline(
-        target_armature, collision_proxy, margin=0.0, radius_scale=1.0):
+        target_armature, collision_proxy, margin=0.0, radius_scale=1.0,
+        upper_arm_collision="DISABLED"):
     """Record intersections that already exist in an accepted reference pose."""
     if not collision_proxy:
         return {}
@@ -2696,18 +3643,24 @@ def _capture_proxy_collision_baseline(
     )
     baseline = {}
     for role in ("left_arm", "right_arm"):
+        moving_bones, moving_start_fractions = _arm_collision_probe_spec(
+            arm_chains.get(role, []), upper_arm_collision)
         moving_capsules = _proxy_capsules_for_bones(
             target_armature,
             collision_proxy,
-            _distal_arm_proxy_bones(arm_chains.get(role, [])),
+            moving_bones,
             radius_scale=radius_scale,
+            start_fractions=moving_start_fractions,
         )
         other_role = "right_arm" if role == "left_arm" else "left_arm"
+        other_bones, other_start_fractions = _arm_collision_probe_spec(
+            arm_chains.get(other_role, []), upper_arm_collision)
         other_capsules = _proxy_capsules_for_bones(
             target_armature,
             collision_proxy,
-            _distal_arm_proxy_bones(arm_chains.get(other_role, [])),
+            other_bones,
             radius_scale=radius_scale,
+            start_fractions=other_start_fractions,
         )
         for moving in moving_capsules:
             for obstacle in body_capsules + other_capsules:
@@ -2752,7 +3705,8 @@ def _resolve_skeletal_proxy_collisions(
         context, target_armature, target_profile, collision_proxy,
         strength=0.75, margin=0.008, iterations=2,
         max_pose_deviation=0.08, radius_scale=1.0,
-        accepted_penetrations=None, arm_correction_driver="AUTO"):
+        accepted_penetrations=None, arm_correction_driver="AUTO",
+        upper_arm_collision="DISABLED"):
     """Push distal arm capsules out of body/opposite-arm proxy capsules."""
     if not collision_proxy:
         return 0
@@ -2800,18 +3754,24 @@ def _resolve_skeletal_proxy_collisions(
             original_endpoint = original_endpoints.get(role)
             if endpoint is None or original_endpoint is None:
                 continue
+            moving_bones, moving_start_fractions = _arm_collision_probe_spec(
+                chain, upper_arm_collision)
             moving_capsules = _proxy_capsules_for_bones(
                 target_armature,
                 collision_proxy,
-                _distal_arm_proxy_bones(chain),
+                moving_bones,
                 radius_scale=radius_scale,
+                start_fractions=moving_start_fractions,
             )
             other_role = "right_arm" if role == "left_arm" else "left_arm"
+            other_bones, other_start_fractions = _arm_collision_probe_spec(
+                arm_chains.get(other_role, []), upper_arm_collision)
             other_capsules = _proxy_capsules_for_bones(
                 target_armature,
                 collision_proxy,
-                _distal_arm_proxy_bones(arm_chains.get(other_role, [])),
+                other_bones,
                 radius_scale=radius_scale,
+                start_fractions=other_start_fractions,
             )
             fallback = left_axis if role == "left_arm" else -left_axis
             push = _strongest_capsule_push(
@@ -2847,7 +3807,8 @@ def _resolve_skeletal_proxy_collisions(
 def _protect_reference_pose_clearance(
         context, target_armature, target_profile, clearance=1.0,
         collision_proxy=None, accepted_penetrations=None,
-        arm_correction_driver="AUTO"):
+        arm_correction_driver="AUTO",
+        upper_arm_collision="DISABLED"):
     """Keep matched hands outside conservative torso and hand proxy colliders."""
     if collision_proxy:
         return _resolve_skeletal_proxy_collisions(
@@ -2862,6 +3823,7 @@ def _protect_reference_pose_clearance(
             radius_scale=clearance,
             accepted_penetrations=accepted_penetrations,
             arm_correction_driver=arm_correction_driver,
+            upper_arm_collision=upper_arm_collision,
         )
 
     chains = _profile_chains(target_profile)
@@ -2946,7 +3908,20 @@ def _match_source_reference_pose(
         context, source_armature, target_armature, pairs,
         source_profile, target_profile, strength=1.0,
         swap_target_sides=False, protect_mesh=True, clearance=1.0,
-        collision_proxy=None, arm_correction_driver="AUTO"):
+        collision_proxy=None, arm_correction_driver="AUTO",
+        upper_arm_collision="DISABLED",
+        match_hand_orientation=False, hand_match_strength=1.0,
+        hand_roll_mode="FOREARM", hand_roll_limit=60.0):
+    if match_hand_orientation:
+        _ensure_hand_roll_setup(
+            context,
+            target_armature,
+            target_profile,
+            hand_roll_mode,
+        )
+    else:
+        _configure_twist_helpers(
+            target_armature, target_profile, use_twist_chain=False)
     target_names = _mapped_target_bones(pairs)
     all_target_names = [pose_bone.name for pose_bone in target_armature.pose.bones]
     source_height = _height_from_profile(source_armature, source_profile)
@@ -2955,6 +3930,21 @@ def _match_source_reference_pose(
 
     _reset_target_pose(target_armature, all_target_names)
     context.view_layer.update()
+    source_reference_hand_frames = {}
+    target_reference_hand_frames = {}
+    if match_hand_orientation:
+        source_reference_hand_frames = _hand_reference_body_frames(
+            source_armature,
+            source_profile,
+            _profile_rotation_basis(source_armature, source_profile),
+            use_rest=True,
+        )
+        target_reference_hand_frames = _hand_reference_body_frames(
+            target_armature,
+            target_profile,
+            _profile_rotation_basis(target_armature, target_profile),
+            use_rest=False,
+        )
     collision_baseline = {}
     if protect_mesh and collision_proxy:
         collision_baseline = _capture_proxy_collision_baseline(
@@ -2962,6 +3952,7 @@ def _match_source_reference_pose(
             collision_proxy,
             margin=0.01,
             radius_scale=clearance,
+            upper_arm_collision=upper_arm_collision,
         )
     source_baseline = _source_rest_pose_baseline(source_armature, pairs)
     source_basis = _profile_rotation_basis(source_armature, source_profile)
@@ -2999,12 +3990,37 @@ def _match_source_reference_pose(
             collision_proxy=collision_proxy,
             accepted_penetrations=collision_baseline,
             arm_correction_driver=arm_correction_driver,
+            upper_arm_collision=upper_arm_collision,
         )
         if adjusted:
             print(
                 f"[StableGen] Reference clearance adjusted {adjusted} arm chain(s) "
                 "away from skeletal proxy colliders."
             )
+    if match_hand_orientation and hand_match_strength > 0.0:
+        if hand_roll_mode == "TWIST_CHAIN":
+            _sync_twist_helpers_to_forearms(
+                target_armature, target_profile)
+            context.view_layer.update()
+        matched_hands = _match_hand_orientations(
+            context,
+            source_armature,
+            target_armature,
+            source_profile,
+            target_profile,
+            strength=hand_match_strength,
+            swap_target_sides=swap_target_sides,
+            use_reference_basis=True,
+            source_reference_body_frames=source_reference_hand_frames,
+            target_reference_body_frames=target_reference_hand_frames,
+            absolute_alignment=True,
+            hand_roll_mode=hand_roll_mode,
+            hand_roll_limit=hand_roll_limit,
+        )
+        print(
+            f"[StableGen] Reference palm-frame matching adjusted "
+            f"{matched_hands} hand(s)."
+        )
     return matched_chains
 
 
@@ -3382,6 +4398,50 @@ def _chain_point_diagnostics(armature, profile):
     return result
 
 
+def _hand_mapping_diagnostics(armature, profile):
+    result = {}
+    for role in ("left_arm", "right_arm"):
+        chain = _profile_chains(profile).get(role, [])
+        if not chain:
+            continue
+        hand_name = chain[-1]
+        rest_frame = _hand_frame(armature, hand_name, use_rest=True)
+        pose_frame = _hand_frame(armature, hand_name, use_rest=False)
+        result[role] = {
+            "hand": hand_name,
+            "digit_roots": _hand_digit_root_names(armature, hand_name),
+            "thumb_root": _hand_thumb_root_name(armature, hand_name),
+            "rest_palm_frame": (
+                _matrix3_to_rows(rest_frame) if rest_frame is not None else None
+            ),
+            "pose_palm_frame": (
+                _matrix3_to_rows(pose_frame) if pose_frame is not None else None
+            ),
+        }
+    return result
+
+
+def _retarget_setting_diagnostics(armature):
+    return {
+        "match_hand_orientation": bool(
+            armature.get(_HAND_MATCH_ENABLED_PROP, False)),
+        "hand_match_strength": float(
+            armature.get(_HAND_MATCH_STRENGTH_PROP, 1.0)),
+        "hand_match_algorithm_version": _HAND_MATCH_ALGORITHM_VERSION,
+        "hand_roll_mode": armature.get(_HAND_ROLL_MODE_PROP, "FOREARM"),
+        "hand_roll_limit": float(
+            armature.get(_HAND_ROLL_LIMIT_PROP, 60.0)),
+        "twist_chain_version": int(
+            armature.get(_TWIST_CHAIN_VERSION_PROP, 0)),
+        "collision_segment_mode": armature.get(
+            _COLLISION_SEGMENT_MODE_PROP, "BONE_TAILS"),
+        "upper_arm_collision": armature.get(
+            _UPPER_ARM_COLLISION_PROP, "DISABLED"),
+        "arm_correction_driver": armature.get(
+            _ARM_CORRECTION_DRIVER_PROP, "AUTO"),
+    }
+
+
 def _alignment_diagnostics(source_armature, source_profile, target_armature, target_profile, flip_target_forward=False):
     source_basis = _profile_rotation_basis(source_armature, source_profile)
     target_basis = _profile_rotation_basis(
@@ -3466,6 +4526,7 @@ def _animation_source_diagnostics(context, filepath, target_armature, target_pro
             "bones": _bone_diagnostics(source_armature),
             "pose_bones_at_start": _pose_bone_diagnostics(source_armature),
             "basis": _basis_diagnostics(source_armature, source_profile),
+            "hands": _hand_mapping_diagnostics(source_armature, source_profile),
             "mapping_options": _mapping_option_diagnostics(
                 source_armature,
                 source_profile,
@@ -3493,7 +4554,7 @@ def _retarget_bundle_diagnostics(context, armature, profile, target_fbx_path, an
     )
     return {
         "schema": "stablegen_retarget_debug_bundle",
-        "schema_version": 1,
+        "schema_version": 2,
         "created_utc": datetime.utcnow().replace(microsecond=0).isoformat() + "Z",
         "blender_version": bpy.app.version_string,
         "stablegen_profile_version": _PROFILE_VERSION,
@@ -3515,6 +4576,8 @@ def _retarget_bundle_diagnostics(context, armature, profile, target_fbx_path, an
             "bones": _bone_diagnostics(armature),
             "pose_bones": _pose_bone_diagnostics(armature),
             "chains": _chain_point_diagnostics(armature, profile),
+            "hands": _hand_mapping_diagnostics(armature, profile),
+            "retarget_settings": _retarget_setting_diagnostics(armature),
             "stored_reference_pose": stored_reference,
             "current_reference_pose": current_reference,
         },
@@ -3841,11 +4904,57 @@ class StableGenMatchSourceReferencePose(bpy.types.Operator):
         max=1.0,
     )  # type: ignore
 
+    match_hand_orientation: bpy.props.BoolProperty(
+        name="Match Hand Orientation",
+        description=(
+            "Align palm frames when both rigs expose at least three digit branches; "
+            "supports generated hands with additional digits"
+        ),
+        default=False,
+    )  # type: ignore
+
+    hand_match_strength: bpy.props.FloatProperty(
+        name="Hand Match Strength",
+        description="How strongly explicit palm-frame orientation is applied",
+        default=1.0,
+        min=0.0,
+        max=1.0,
+    )  # type: ignore
+
+    hand_roll_mode: bpy.props.EnumProperty(
+        name="Hand Roll Handling",
+        description="Choose where palm roll is applied and how the mesh is protected",
+        items=_HAND_ROLL_MODE_ITEMS,
+        default="FOREARM",
+    )  # type: ignore
+
+    hand_roll_limit: bpy.props.FloatProperty(
+        name="Maximum Hand Roll (Degrees)",
+        description="Maximum axial palm correction transferred in Limited Roll mode",
+        default=60.0,
+        min=0.0,
+        max=180.0,
+    )  # type: ignore
+
     arm_correction_driver: bpy.props.EnumProperty(
         name="Arm Correction Driver",
         description="Choose which joint post-processing may rotate to position each wrist",
         items=_ARM_CORRECTION_DRIVER_ITEMS,
         default="AUTO",
+    )  # type: ignore
+
+    collision_segment_mode: bpy.props.EnumProperty(
+        name="Proxy Segments",
+        description="Choose how skeletal collision capsule endpoints are constructed",
+        items=_COLLISION_SEGMENT_MODE_ITEMS,
+        default="BONE_TAILS",
+    )  # type: ignore
+
+    upper_arm_collision: bpy.props.EnumProperty(
+        name="Upper Arm Collision",
+        description="Choose how much of the upper-arm capsule participates in collision tests",
+        items=_UPPER_ARM_COLLISION_ITEMS,
+        default="DISABLED",
     )  # type: ignore
 
     store_reference: bpy.props.BoolProperty(
@@ -3891,6 +5000,7 @@ class StableGenMatchSourceReferencePose(bpy.types.Operator):
         return True
 
     def invoke(self, context, event):
+        _initialize_collision_operator_settings(self, context)
         context.window_manager.fileselect_add(self)
         return {"RUNNING_MODAL"}
 
@@ -3900,10 +5010,24 @@ class StableGenMatchSourceReferencePose(bpy.types.Operator):
         layout.prop(self, "match_strength")
         if self.match_engine == "REFERENCE_AWARE":
             layout.prop(self, "arm_correction_driver")
+            layout.prop(self, "match_hand_orientation")
+            if self.match_hand_orientation:
+                layout.prop(self, "hand_match_strength")
+                layout.prop(self, "hand_roll_mode")
+                if self.hand_roll_mode == "LIMITED":
+                    layout.prop(self, "hand_roll_limit")
+                elif self.hand_roll_mode == "TWIST_CHAIN":
+                    layout.label(
+                        text="Creates deform bones and redistributes forearm weights",
+                        icon="INFO",
+                    )
         layout.prop(self, "store_reference")
         layout.prop(self, "protect_mesh")
         if self.protect_mesh:
             layout.prop(self, "clearance")
+            if self.match_engine == "REFERENCE_AWARE":
+                layout.prop(self, "collision_segment_mode")
+                layout.prop(self, "upper_arm_collision")
         if self.match_engine == "LEGACY":
             layout.prop(self, "swap_target_sides")
         layout.prop(self, "keep_source_rig")
@@ -3950,10 +5074,28 @@ class StableGenMatchSourceReferencePose(bpy.types.Operator):
             context.scene.frame_set(start)
             context.view_layer.update()
 
+            effective_hand_match = (
+                self.match_engine == "REFERENCE_AWARE"
+                and self.match_hand_orientation
+            )
+            target_armature[_HAND_MATCH_ENABLED_PROP] = effective_hand_match
+            target_armature[_HAND_MATCH_STRENGTH_PROP] = self.hand_match_strength
+            target_armature[_HAND_ROLL_MODE_PROP] = self.hand_roll_mode
+            target_armature[_HAND_ROLL_LIMIT_PROP] = self.hand_roll_limit
+
             collision_proxy = None
             if self.protect_mesh and self.match_engine == "REFERENCE_AWARE":
+                target_armature[_COLLISION_SEGMENT_MODE_PROP] = (
+                    self.collision_segment_mode)
+                target_armature[_UPPER_ARM_COLLISION_PROP] = (
+                    self.upper_arm_collision)
+                target_armature[_ARM_CORRECTION_DRIVER_PROP] = (
+                    self.arm_correction_driver)
                 collision_proxy = _collision_proxy_for_armature(
-                    target_armature, target_profile)
+                    target_armature,
+                    target_profile,
+                    segment_mode=self.collision_segment_mode,
+                )
 
             print(f"[StableGen] Source reference rig profile for {source_armature.name}: {_profile_summary(source_profile)}")
             print(f"[StableGen] Target rig profile for {target_armature.name}: {_profile_summary(target_profile)}")
@@ -3975,6 +5117,11 @@ class StableGenMatchSourceReferencePose(bpy.types.Operator):
                     if self.match_engine == "REFERENCE_AWARE"
                     else "SHOULDER"
                 ),
+                upper_arm_collision=self.upper_arm_collision,
+                match_hand_orientation=effective_hand_match,
+                hand_match_strength=self.hand_match_strength,
+                hand_roll_mode=self.hand_roll_mode,
+                hand_roll_limit=self.hand_roll_limit,
             )
 
             if self.store_reference:
@@ -3988,6 +5135,10 @@ class StableGenMatchSourceReferencePose(bpy.types.Operator):
                         start,
                         "START_FRAME",
                         swap_target_sides=effective_swap,
+                        match_hand_orientation=effective_hand_match,
+                        hand_match_strength=self.hand_match_strength,
+                        hand_roll_mode=self.hand_roll_mode,
+                        hand_roll_limit=self.hand_roll_limit,
                     ),
                 )
                 if not reference_pose or not reference_pose.get("bones"):
@@ -4064,7 +5215,7 @@ class StableGenToggleRigMappingOverlay(bpy.types.Operator):
 
 
 class StableGenToggleCollisionProxyOverlay(bpy.types.Operator):
-    """Show collision capsules; gray proximal arm capsules are visualization-only."""
+    """Show collision capsules; blue is driver-only and gray is inactive."""
 
     bl_idname = "stablegen.toggle_collision_proxy_overlay"
     bl_label = "Show Collision Proxy"
@@ -4395,11 +5546,57 @@ class StableGenApplyAnimationToRig(bpy.types.Operator):
         max=1.0,
     )  # type: ignore
 
+    match_hand_orientation: bpy.props.BoolProperty(
+        name="Match Hand Orientation",
+        description=(
+            "Align palm frames when both rigs expose at least three digit branches; "
+            "supports generated hands with additional digits"
+        ),
+        default=False,
+    )  # type: ignore
+
+    hand_match_strength: bpy.props.FloatProperty(
+        name="Hand Match Strength",
+        description="How strongly explicit palm-frame orientation is applied",
+        default=1.0,
+        min=0.0,
+        max=1.0,
+    )  # type: ignore
+
+    hand_roll_mode: bpy.props.EnumProperty(
+        name="Hand Roll Handling",
+        description="Choose where palm roll is applied and how the mesh is protected",
+        items=_HAND_ROLL_MODE_ITEMS,
+        default="FOREARM",
+    )  # type: ignore
+
+    hand_roll_limit: bpy.props.FloatProperty(
+        name="Maximum Hand Roll (Degrees)",
+        description="Maximum axial palm correction transferred in Limited Roll mode",
+        default=60.0,
+        min=0.0,
+        max=180.0,
+    )  # type: ignore
+
     arm_correction_driver: bpy.props.EnumProperty(
         name="Arm Correction Driver",
         description="Choose which joint post-processing may rotate to position each wrist",
         items=_ARM_CORRECTION_DRIVER_ITEMS,
         default="AUTO",
+    )  # type: ignore
+
+    collision_segment_mode: bpy.props.EnumProperty(
+        name="Proxy Segments",
+        description="Choose how skeletal collision capsule endpoints are constructed",
+        items=_COLLISION_SEGMENT_MODE_ITEMS,
+        default="BONE_TAILS",
+    )  # type: ignore
+
+    upper_arm_collision: bpy.props.EnumProperty(
+        name="Upper Arm Collision",
+        description="Choose how much of the upper-arm capsule participates in collision tests",
+        items=_UPPER_ARM_COLLISION_ITEMS,
+        default="DISABLED",
     )  # type: ignore
 
     collision_adaptation: bpy.props.BoolProperty(
@@ -4494,6 +5691,7 @@ class StableGenApplyAnimationToRig(bpy.types.Operator):
         return True
 
     def invoke(self, context, event):
+        _initialize_collision_operator_settings(self, context)
         context.window_manager.fileselect_add(self)
         return {"RUNNING_MODAL"}
 
@@ -4514,7 +5712,20 @@ class StableGenApplyAnimationToRig(bpy.types.Operator):
                     layout.prop(self, "auto_match_clearance")
         if self.retarget_engine == "REST_SPACE":
             layout.prop(self, "limb_match_strength")
+            layout.prop(self, "match_hand_orientation")
+            if self.match_hand_orientation:
+                layout.prop(self, "hand_match_strength")
+                layout.prop(self, "hand_roll_mode")
+                if self.hand_roll_mode == "LIMITED":
+                    layout.prop(self, "hand_roll_limit")
+                elif self.hand_roll_mode == "TWIST_CHAIN":
+                    layout.label(
+                        text="Creates deform bones and redistributes forearm weights",
+                        icon="INFO",
+                    )
             layout.prop(self, "arm_correction_driver")
+            layout.prop(self, "collision_segment_mode")
+            layout.prop(self, "upper_arm_collision")
             layout.prop(self, "collision_adaptation")
             if self.collision_adaptation:
                 collision_box = layout.box()
@@ -4597,7 +5808,22 @@ class StableGenApplyAnimationToRig(bpy.types.Operator):
                     "Not enough source/target bone pairs were found. "
                     "Try analyzing the rig or using a different source animation."
                 )
+            target_armature[_HAND_MATCH_ENABLED_PROP] = (
+                self.retarget_engine == "REST_SPACE"
+                and self.match_hand_orientation
+            )
+            target_armature[_HAND_MATCH_STRENGTH_PROP] = (
+                self.hand_match_strength)
+            target_armature[_HAND_ROLL_MODE_PROP] = self.hand_roll_mode
+            target_armature[_HAND_ROLL_LIMIT_PROP] = self.hand_roll_limit
             collision_proxy = None
+            if self.retarget_engine == "REST_SPACE":
+                target_armature[_COLLISION_SEGMENT_MODE_PROP] = (
+                    self.collision_segment_mode)
+                target_armature[_UPPER_ARM_COLLISION_PROP] = (
+                    self.upper_arm_collision)
+                target_armature[_ARM_CORRECTION_DRIVER_PROP] = (
+                    self.arm_correction_driver)
             needs_reference_proxy = (
                 self.source_reference_mode == "START_FRAME"
                 and self.auto_match_reference
@@ -4607,7 +5833,10 @@ class StableGenApplyAnimationToRig(bpy.types.Operator):
                     self.retarget_engine == "REST_SPACE"
                     and (self.collision_adaptation or needs_reference_proxy)):
                 collision_proxy = _collision_proxy_for_armature(
-                    target_armature, target_profile)
+                    target_armature,
+                    target_profile,
+                    segment_mode=self.collision_segment_mode,
+                )
                 if collision_proxy is None:
                     print(
                         "[StableGen] WARNING: Could not build a skeletal collision proxy; "
@@ -4651,6 +5880,10 @@ class StableGenApplyAnimationToRig(bpy.types.Operator):
                     start,
                     self.source_reference_mode,
                     swap_target_sides=effective_swap,
+                    match_hand_orientation=self.match_hand_orientation,
+                    hand_match_strength=self.hand_match_strength,
+                    hand_roll_mode=self.hand_roll_mode,
+                    hand_roll_limit=self.hand_roll_limit,
                 )
                 reference_matches, mismatch_reason = _reference_provenance_matches(
                     target_reference_pose,
@@ -4670,6 +5903,11 @@ class StableGenApplyAnimationToRig(bpy.types.Operator):
                         clearance=self.auto_match_clearance,
                         collision_proxy=collision_proxy,
                         arm_correction_driver=self.arm_correction_driver,
+                        upper_arm_collision=self.upper_arm_collision,
+                        match_hand_orientation=self.match_hand_orientation,
+                        hand_match_strength=self.hand_match_strength,
+                        hand_roll_mode=self.hand_roll_mode,
+                        hand_roll_limit=self.hand_roll_limit,
                     )
                     target_reference_pose = _capture_reference_pose(
                         target_armature,
@@ -4757,6 +5995,11 @@ class StableGenApplyAnimationToRig(bpy.types.Operator):
                     collision_iterations=self.collision_iterations,
                     collision_max_deviation=self.collision_max_deviation,
                     arm_correction_driver=self.arm_correction_driver,
+                    upper_arm_collision=self.upper_arm_collision,
+                    match_hand_orientation=self.match_hand_orientation,
+                    hand_match_strength=self.hand_match_strength,
+                    hand_roll_mode=self.hand_roll_mode,
+                    hand_roll_limit=self.hand_roll_limit,
                 )
 
             context.scene.frame_set(start)

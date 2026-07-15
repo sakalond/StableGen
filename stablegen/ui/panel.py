@@ -279,12 +279,20 @@ class StableGenPanel(bpy.types.Panel):
             elif autorig_op:
                 action_row.operator("object.stablegen_autorig_selected_mesh", text="Cancel Auto-Rigging", icon="CANCEL")
                 progress_col = layout.column()
-                progress = getattr(autorig_op, '_progress', 0)
-                stage = getattr(autorig_op, '_stage', 'Auto-Rigging')
+                overall = getattr(autorig_op, '_overall_progress', 0)
+                overall_stage = getattr(
+                    autorig_op, '_overall_stage', 'Initializing Auto-Rigging')
                 progress_col.progress(
-                    text=f"{stage} ({progress:.0f}%)",
-                    factor=max(0.0, min(progress / 100.0, 1.0))
+                    text=f"{overall_stage} ({overall:.0f}%)",
+                    factor=max(0.0, min(overall / 100.0, 1.0))
                 )
+                phase = getattr(autorig_op, '_phase_progress', 0)
+                phase_stage = getattr(autorig_op, '_phase_stage', '')
+                if phase_stage:
+                    progress_col.progress(
+                        text=f"{phase_stage} ({phase:.0f}%)",
+                        factor=max(0.0, min(phase / 100.0, 1.0))
+                    )
 
             elif comfy_tex_op and getattr(scene, 'trellis2_pipeline_active', False):
                 # ── Phase 3: Texturing via ComfyUIGenerate ──
@@ -1003,6 +1011,18 @@ class StableGenPanel(bpy.types.Panel):
                         row.prop(scene, "trellis2_autorig_use_postprocess", text="Skin Postprocess", toggle=True)
                         row = content_box.row()
                         row.prop(scene, "trellis2_autorig_use_skeleton", text="Use Existing Skeleton", toggle=True)
+                        row.prop(
+                            scene,
+                            "trellis2_autorig_cleanup_cross_limb_weights",
+                            text="Clean Limb Weights",
+                            toggle=True,
+                        )
+                        row = content_box.row()
+                        row.prop(
+                            scene,
+                            "trellis2_autorig_garment_mode",
+                            text="Garment Handling",
+                        )
 
                         content_box.separator()
                         row = content_box.row(align=True)
@@ -2088,7 +2108,8 @@ class StableGenPanel(bpy.types.Panel):
         row.operator("object.stablegen_local_postprocess", text="Run Local Post-Processing", icon="MODIFIER")
 
         row = tools_box.row()
-        row.operator("object.stablegen_autorig_selected_mesh", text="Auto-Rig Selected Mesh", icon="ARMATURE_DATA")
+        row.operator_context = "INVOKE_DEFAULT"
+        row.operator("object.stablegen_autorig_selected_mesh", text="Auto-Rig Selected Character", icon="ARMATURE_DATA")
 
         # --- Debug Tools ---
         prefs = context.preferences.addons.get(_ADDON_PKG)

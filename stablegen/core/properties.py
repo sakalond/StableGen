@@ -1524,6 +1524,32 @@ def register_properties(update_model_list, ControlNetUnit, LoRAUnit,
         description="Enable SkinTokens voxel skin post-processing before export",
         default=False, update=update_parameters
     )
+    bpy.types.Scene.trellis2_autorig_cleanup_cross_limb_weights = bpy.props.BoolProperty(
+        name="Clean Limb Weights",
+        description=(
+            "After import, repair spatially implausible hand and foot weights "
+            "such as influences from the opposite limb, spine, pelvis, or legs"
+        ),
+        default=True, update=update_parameters
+    )
+    bpy.types.Scene.trellis2_autorig_garment_mode = bpy.props.EnumProperty(
+        name="Garment Handling",
+        description="Optional post-import weighting for long dresses and skirts",
+        items=[
+            ('NONE', "Original Weights", "Keep the generated garment weights"),
+            (
+                'STABILIZE',
+                "Stabilized Dress",
+                "Apply a smooth pelvis/thigh blend to detected long garment surfaces",
+            ),
+            (
+                'LEG_FOLLOW',
+                "Smooth Leg Follow",
+                "Smoothly drive detected long garments from the pelvis, thighs, and lower legs",
+            ),
+        ],
+        default='NONE', update=update_parameters
+    )
     bpy.types.Scene.trellis2_autorig_top_k = bpy.props.IntProperty(
         name="Top K", description="SkinTokens sampling top-k",
         default=5, min=1, max=200, update=update_parameters
@@ -1899,6 +1925,8 @@ def unregister_properties(load_handler, _sg_queue_load_handler):
         'trellis2_solidify',
         'trellis2_autorig_enabled', 'trellis2_autorig_use_transfer',
         'trellis2_autorig_use_skeleton', 'trellis2_autorig_use_postprocess',
+        'trellis2_autorig_cleanup_cross_limb_weights',
+        'trellis2_autorig_garment_mode',
         'trellis2_autorig_top_k', 'trellis2_autorig_top_p',
         'trellis2_autorig_temperature', 'trellis2_autorig_repetition_penalty',
         'trellis2_autorig_num_beams', 'trellis2_autorig_model_ckpt',

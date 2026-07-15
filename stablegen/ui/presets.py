@@ -167,6 +167,8 @@ GEN_PARAMETERS = [
     "trellis2_autorig_use_transfer",
     "trellis2_autorig_use_skeleton",
     "trellis2_autorig_use_postprocess",
+    "trellis2_autorig_cleanup_cross_limb_weights",
+    "trellis2_autorig_garment_mode",
     "trellis2_autorig_top_k",
     "trellis2_autorig_top_p",
     "trellis2_autorig_temperature",

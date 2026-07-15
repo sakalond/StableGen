@@ -1,6 +1,7 @@
 import os
 import json
 import email.utils
+import ntpath
 import posixpath
 import re
 import uuid
@@ -18,6 +19,26 @@ import numpy as np
 from PIL import Image
 
 _ADDON_PKG = __package__.rsplit('.', 1)[0]
+_SKINTOKENS_PROGRESS_EVENT = "stablegen_skintokens_progress"
+
+
+def _progress_percent(data):
+    """Return a clamped percentage from a ComfyUI progress payload."""
+    try:
+        value = float(data.get("value", 0.0))
+        maximum = float(data.get("max", 100.0))
+    except (TypeError, ValueError):
+        return None
+    if maximum <= 0:
+        return None
+    return max(0.0, min(100.0, value * 100.0 / maximum))
+
+
+def _message_node_matches(data, expected_node):
+    node = data.get("node")
+    if isinstance(node, (list, tuple)) and node:
+        node = node[0]
+    return str(node or "") == str(expected_node)
 
 
 class _Trellis2WorkflowMixin:
@@ -124,6 +145,201 @@ class _Trellis2WorkflowMixin:
         """Return True if server_address points to localhost."""
         host = server_address.split(':')[0].strip()
         return host in ('127.0.0.1', 'localhost', '0.0.0.0', '::1', '')
+
+    @staticmethod
+    def _join_remote_path(base_path, *parts):
+        path_module = (
+            ntpath
+            if re.match(r"^[A-Za-z]:[\\/]", base_path or "")
+            or "\\" in (base_path or "")
+            else posixpath
+        )
+        result = base_path
+        for part in parts:
+            for component in re.split(r"[\\/]", part or ""):
+                if component:
+                    result = path_module.join(result, component)
+        return path_module.normpath(result)
+
+    @staticmethod
+    def _comfyui_remote_upload_limit(server_address):
+        """Return the host's configured upload limit in bytes when discoverable."""
+        try:
+            stats_url = f"http://{server_address}/system_stats"
+            stats = json.loads(urllib.request.urlopen(
+                stats_url, timeout=get_timeout('api')).read())
+        except Exception:
+            return None
+        system = stats.get("system", {}) if isinstance(stats, dict) else {}
+        argv = system.get("argv", []) if isinstance(system, dict) else []
+        if not isinstance(argv, list):
+            return None
+        argv = [str(value) for value in argv]
+        limit_mb = None
+        for index, value in enumerate(argv):
+            if value == "--max-upload-size" and index + 1 < len(argv):
+                limit_mb = argv[index + 1]
+                break
+            prefix = "--max-upload-size="
+            if value.startswith(prefix):
+                limit_mb = value[len(prefix):]
+                break
+        if limit_mb is None:
+            # This is ComfyUI's command-line default when the option is absent.
+            limit_mb = 100.0
+        try:
+            return max(0, int(float(limit_mb) * 1024 * 1024))
+        except (TypeError, ValueError):
+            return None
+
+    @classmethod
+    def _comfyui_base_from_internal_folder_paths(cls, server_address):
+        """Infer the ComfyUI base directory from its registered model paths.
+
+        Recent ComfyUI builds expose ``/internal/folder_paths`` even when
+        ``/system_stats`` contains only a relative ``main.py`` argv entry and
+        omits the input/output roots.  The default model directories live below
+        ``<base>/models``.  Extra model paths may point elsewhere, so candidates
+        are scored across categories with each category's first (default) path
+        weighted most heavily.
+        """
+        try:
+            url = f"http://{server_address}/internal/folder_paths"
+            registered = json.loads(urllib.request.urlopen(
+                url, timeout=get_timeout('api')).read())
+        except Exception as exc:
+            print(
+                "[StableGen] Could not query ComfyUI internal folder paths: "
+                f"{exc}"
+            )
+            return None
+        if not isinstance(registered, dict):
+            return None
+
+        scores = {}
+        order = []
+        for values in registered.values():
+            if isinstance(values, str):
+                values = [values]
+            if not isinstance(values, (list, tuple)):
+                continue
+            category_candidates = set()
+            for index, value in enumerate(values):
+                if not isinstance(value, str):
+                    continue
+                match = re.match(
+                    r"^(.*)[\\/]models(?:[\\/].*)?$",
+                    value.strip(),
+                    flags=re.IGNORECASE,
+                )
+                if not match or not match.group(1):
+                    continue
+                candidate = ntpath.normpath(match.group(1)) if (
+                    re.match(r"^[A-Za-z]:[\\/]", value) or "\\" in value
+                ) else posixpath.normpath(match.group(1))
+                key = candidate.lower() if "\\" in candidate else candidate
+                if key in category_candidates:
+                    continue
+                category_candidates.add(key)
+                if key not in scores:
+                    scores[key] = [0, candidate]
+                    order.append(key)
+                scores[key][0] += 3 if index == 0 else 1
+
+        if not scores:
+            return None
+        best_key = max(order, key=lambda key: scores[key][0])
+        base_dir = scores[best_key][1]
+        print(
+            "[StableGen] Inferred ComfyUI base directory from registered "
+            f"model paths: {base_dir}"
+        )
+        return base_dir
+
+    @classmethod
+    def _comfyui_uploaded_file_path(
+            cls, server_address, upload_info):
+        """Resolve an uploaded input reference to an absolute host filesystem path."""
+        for key in ("path", "filepath", "full_path"):
+            value = upload_info.get(key)
+            if value and (ntpath.isabs(value) or posixpath.isabs(value)):
+                return value
+
+        try:
+            stats_url = f"http://{server_address}/system_stats"
+            stats = json.loads(urllib.request.urlopen(
+                stats_url, timeout=get_timeout('api')).read())
+        except Exception as exc:
+            print(f"[StableGen] Could not query ComfyUI input directory: {exc}")
+            return None
+
+        system = stats.get("system", {}) if isinstance(stats, dict) else {}
+        input_dir = None
+        for container in (stats, system):
+            if not isinstance(container, dict):
+                continue
+            for key in ("input_dir", "input_directory"):
+                if container.get(key):
+                    input_dir = container[key]
+                    break
+            if input_dir:
+                break
+
+        argv = system.get("argv", []) if isinstance(system, dict) else []
+        argv = [str(value) for value in argv] if isinstance(argv, list) else []
+
+        def argument_value(option):
+            for index, value in enumerate(argv):
+                if value == option and index + 1 < len(argv):
+                    return argv[index + 1]
+                prefix = option + "="
+                if value.startswith(prefix):
+                    return value[len(prefix):]
+            return None
+
+        base_dir = argument_value("--base-directory")
+        if not input_dir:
+            input_dir = argument_value("--input-directory")
+        if input_dir and not (ntpath.isabs(input_dir) or posixpath.isabs(input_dir)):
+            if base_dir:
+                input_dir = cls._join_remote_path(base_dir, input_dir)
+            elif argv and (ntpath.isabs(argv[0]) or posixpath.isabs(argv[0])):
+                script_dir = ntpath.dirname(argv[0]) if "\\" in argv[0] else posixpath.dirname(argv[0])
+                input_dir = cls._join_remote_path(script_dir, input_dir)
+        if not input_dir and base_dir:
+            input_dir = cls._join_remote_path(base_dir, "input")
+        if not input_dir:
+            output_dir = stats.get("output_dir") or system.get("output_dir")
+            if output_dir:
+                path_module = ntpath if "\\" in output_dir else posixpath
+                input_dir = cls._join_remote_path(
+                    path_module.dirname(output_dir), "input")
+        if not input_dir:
+            inferred_base = cls._comfyui_base_from_internal_folder_paths(
+                server_address)
+            if inferred_base:
+                input_dir = cls._join_remote_path(inferred_base, "input")
+        if not input_dir and argv and (ntpath.isabs(argv[0]) or posixpath.isabs(argv[0])):
+            path_module = ntpath if "\\" in argv[0] else posixpath
+            input_dir = cls._join_remote_path(
+                path_module.dirname(argv[0]), "input")
+        if not input_dir:
+            # ComfyUI normally starts with its base directory as the process
+            # working directory.  A relative reference is preferable to
+            # inventing an absolute host path and remains correct through
+            # localhost tunnels such as zrok/SSH.  Custom input-directory users
+            # are handled by the explicit metadata and argv branches above.
+            input_dir = "input"
+            print(
+                "[StableGen] ComfyUI did not expose an absolute input directory; "
+                "using a process-relative input path"
+            )
+
+        return cls._join_remote_path(
+            input_dir,
+            upload_info.get("subfolder", ""),
+            upload_info.get("name", ""),
+        )
 
     @staticmethod
     def _is_trellis2_mesh_output(value):
@@ -665,6 +881,26 @@ class _Trellis2WorkflowMixin:
         server_address = context.preferences.addons[_ADDON_PKG].preferences.server_address
         scene = context.scene
 
+        def _set_phase(phase, label, percent, detail=None):
+            if hasattr(self.operator, '_set_pipeline_phase'):
+                self.operator._set_pipeline_phase(phase, label, percent, detail)
+            else:
+                self.operator._progress = percent
+                self.operator._stage = detail or label
+
+        def _transfer_detail(action, completed, total, attempt):
+            completed_mb = completed / (1024 * 1024)
+            if total:
+                total_mb = total / (1024 * 1024)
+                percent = completed * 100.0 / total
+                detail = f"{action}: {completed_mb:.1f}/{total_mb:.1f} MiB"
+            else:
+                percent = 0.0
+                detail = f"{action}: {completed_mb:.1f} MiB"
+            if attempt > 1:
+                detail += f" (attempt {attempt})"
+            return percent, detail
+
         if not getattr(scene, 'skintokens_autorig_available', False):
             return {
                 "error": (
@@ -675,6 +911,69 @@ class _Trellis2WorkflowMixin:
         if not self._check_server_alive(server_address):
             return {"error": "ComfyUI server is not responding. Please restart it and try again."}
 
+        # Always upload standalone auto-rig inputs.  An address that looks local
+        # can still terminate on another computer through zrok, SSH forwarding,
+        # a reverse proxy, a container, or a VM.  In those cases passing the
+        # Blender-side absolute path makes SkinTokens look for a file that only
+        # exists on the client.  Uploading is also valid for a genuinely local
+        # ComfyUI instance and gives both cases the same deterministic behavior.
+        from .._generator_utils import (
+            _TransferCancelled,
+            download_file_with_resume,
+            upload_file_to_comfyui,
+        )
+
+        upload_limit = self._comfyui_remote_upload_limit(server_address)
+        source_size = os.path.getsize(input_glb_path)
+        if upload_limit and source_size > upload_limit:
+            source_mb = source_size / (1024 * 1024)
+            limit_mb = upload_limit / (1024 * 1024)
+            required_mb = ((int(source_mb) // 64) + 1) * 64
+            return {
+                "error": (
+                    f"The exported GLB is {source_mb:.2f} MB, exceeding the "
+                    f"ComfyUI upload limit of {limit_mb:.0f} MB. "
+                    "On the ComfyUI host, set --max-upload-size "
+                    f"{required_mb} or higher and restart ComfyUI."
+                )
+            }
+        _set_phase(1, "Source Upload", 0, "Starting upload")
+
+        def _upload_progress(completed, total, attempt):
+            percent, detail = _transfer_detail(
+                "Uploading source", completed, total, attempt)
+            _set_phase(1, "Source Upload", percent, detail)
+
+        upload_info = upload_file_to_comfyui(
+            server_address,
+            input_glb_path,
+            file_type="input",
+            subfolder="stablegen_autorig",
+            progress_cb=_upload_progress,
+            cancel_cb=lambda: getattr(self.operator, '_cancelled', False),
+            max_retries=4,
+        )
+        if not upload_info:
+            if getattr(self.operator, '_cancelled', False):
+                return {"error": "cancelled"}
+            return {
+                "error": (
+                    "Could not upload the exported GLB to ComfyUI. "
+                    "Check the ComfyUI upload-size limit and network connection."
+                )
+            }
+        comfyui_input_path = self._comfyui_uploaded_file_path(
+            server_address, upload_info)
+        if not comfyui_input_path:
+            return {
+                "error": (
+                    "The GLB was uploaded to ComfyUI, but StableGen could not "
+                    "discover the host input directory from /system_stats."
+                )
+            }
+        print(f"[StableGen] Auto-rig source uploaded to: {comfyui_input_path}")
+        _set_phase(1, "Source Upload", 100, "Upload complete")
+
         self._flush_comfyui_vram(server_address, label="Pre-auto-rigging")
 
         unique_prefix = f"stablegen_autorig_{uuid.uuid4().hex[:8]}"
@@ -682,7 +981,7 @@ class _Trellis2WorkflowMixin:
             "1": {
                 "class_type": "StableGenSkinTokensAutoRig",
                 "inputs": {
-                    "input_path": input_glb_path,
+                    "input_path": comfyui_input_path,
                     "output_prefix": unique_prefix,
                     "install_policy": "auto",
                     "use_transfer": bool(getattr(scene, 'trellis2_autorig_use_transfer', True)),
@@ -716,10 +1015,7 @@ class _Trellis2WorkflowMixin:
 
         try:
             prompt_id = self._queue_prompt(prompt, client_id, server_address)
-            if hasattr(self.operator, '_stage'):
-                self.operator._stage = "Auto-Rigging"
-            if hasattr(self.operator, '_progress'):
-                self.operator._progress = 5
+            _set_phase(2, "SkinTokens Rigging", 0, "Queued on ComfyUI")
 
             while True:
                 if _cancelled():
@@ -743,15 +1039,16 @@ class _Trellis2WorkflowMixin:
                     if data.get('prompt_id') != prompt_id:
                         continue
                     if data.get('node') is None:
-                        if hasattr(self.operator, '_progress'):
-                            self.operator._progress = 100
+                        _set_phase(
+                            2, "SkinTokens Rigging", 100,
+                            "Rig generation complete")
                         break
                     if data.get('node') == "1":
                         print("[StableGen] Executing node: Auto-Rigging")
-                        if hasattr(self.operator, '_stage'):
-                            self.operator._stage = "Auto-Rigging"
-                        if hasattr(self.operator, '_progress'):
-                            self.operator._progress = max(self.operator._progress, 10)
+                        _set_phase(
+                            2, "SkinTokens Rigging",
+                            max(self.operator._phase_progress, 1),
+                            "Starting SkinTokens")
 
                 elif message.get('type') == 'executed':
                     data = message.get('data', {})
@@ -759,6 +1056,36 @@ class _Trellis2WorkflowMixin:
                         refs = self._extract_trellis2_file_refs(data.get('output', {}))
                         if refs:
                             output_refs.extend(refs)
+
+                elif message.get('type') == _SKINTOKENS_PROGRESS_EVENT:
+                    data = message.get('data', {})
+                    if not _message_node_matches(data, "1"):
+                        continue
+                    if str(data.get('run_id') or '') != unique_prefix:
+                        continue
+                    percent = _progress_percent(data)
+                    stage = str(data.get('stage') or '').strip()
+                    detail = str(data.get('detail') or '').strip()
+                    if percent is not None:
+                        percent = max(self.operator._phase_progress, percent)
+                        _set_phase(
+                            2, "SkinTokens Rigging", percent,
+                            detail or stage or "Auto-Rigging")
+                    elif stage:
+                        _set_phase(
+                            2, "SkinTokens Rigging",
+                            self.operator._phase_progress, detail or stage)
+
+                elif message.get('type') == 'progress':
+                    data = message.get('data', {})
+                    if not _message_node_matches(data, "1"):
+                        continue
+                    percent = _progress_percent(data)
+                    if percent is not None:
+                        _set_phase(
+                            2, "SkinTokens Rigging",
+                            max(self.operator._phase_progress, percent),
+                            "Auto-Rigging")
 
                 elif message.get('type') == 'execution_error':
                     error_data = message.get('data', {})
@@ -786,12 +1113,16 @@ class _Trellis2WorkflowMixin:
                 print(f"[StableGen] SkinTokens history lookup failed: {hist_err}")
 
         for file_ref in output_refs:
+            if _cancelled():
+                return {"error": "cancelled"}
             path = file_ref.get('path') or ''
             if path and os.path.isfile(path):
                 try:
+                    _set_phase(3, "Result Download", 0, "Reading local result")
                     with open(path, 'rb') as handle:
                         data = handle.read()
                     if data:
+                        _set_phase(3, "Result Download", 100, "Result ready")
                         return data
                 except OSError as read_err:
                     print(f"[StableGen] SkinTokens direct file read failed: {read_err}")
@@ -800,9 +1131,24 @@ class _Trellis2WorkflowMixin:
             if not view_url:
                 continue
             try:
-                data = urllib.request.urlopen(view_url, timeout=get_timeout('transfer')).read()
+                _set_phase(3, "Result Download", 0, "Starting download")
+
+                def _download_progress(completed, total, attempt):
+                    percent, detail = _transfer_detail(
+                        "Downloading result", completed, total, attempt)
+                    _set_phase(3, "Result Download", percent, detail)
+
+                data = download_file_with_resume(
+                    view_url,
+                    progress_cb=_download_progress,
+                    cancel_cb=_cancelled,
+                    max_retries=6,
+                )
                 if data:
+                    _set_phase(3, "Result Download", 100, "Download complete")
                     return data
+            except _TransferCancelled:
+                return {"error": "cancelled"}
             except Exception as view_err:
                 print(f"[StableGen] SkinTokens HTTP download failed: {view_err}")
 
@@ -1232,6 +1578,40 @@ class _Trellis2WorkflowMixin:
                                         f"executed event: {self._describe_trellis2_file_ref(refs[0])}"
                                     )
 
+                    elif message['type'] == _SKINTOKENS_PROGRESS_EVENT:
+                        if not autorig_enabled:
+                            continue
+                        p_data = message.get('data', {})
+                        autorig_node_id = NODES.get('autorig')
+                        if not _message_node_matches(p_data, autorig_node_id):
+                            continue
+                        expected_run_id = f"{unique_prefix}_skintokens"
+                        if str(p_data.get('run_id') or '') != expected_run_id:
+                            continue
+
+                        autorig_phase = getattr(self.operator, '_autorig_phase', 0)
+                        if autorig_phase:
+                            if getattr(self.operator, '_current_phase', 0) != autorig_phase:
+                                self.operator._current_phase = autorig_phase
+                                self.operator._phase_progress = 0
+                            total_phases = getattr(
+                                self.operator, '_total_phases', autorig_phase)
+                            self.operator._overall_stage = (
+                                f"Phase {autorig_phase}/{total_phases}: Auto-Rigging"
+                            )
+
+                        percent = _progress_percent(p_data)
+                        if percent is not None:
+                            self.operator._phase_progress = max(
+                                self.operator._phase_progress, percent)
+                            self.operator._detail_progress = percent
+                        stage = str(p_data.get('stage') or 'Auto-Rigging').strip()
+                        detail = str(p_data.get('detail') or '').strip()
+                        self.operator._phase_stage = stage
+                        self.operator._detail_stage = detail or stage
+                        if hasattr(self.operator, '_update_overall'):
+                            self.operator._update_overall()
+
                     elif message['type'] == 'progress':
                         # Within-node progress (sampler steps).
                         # TRELLIS.2 nodes may emit separate runs of progress
@@ -1254,6 +1634,8 @@ class _Trellis2WorkflowMixin:
                             if autorig_enabled and _current_exec_node == 'autorig':
                                 autorig_phase = getattr(self.operator, '_autorig_phase', 0)
                                 if autorig_phase:
+                                    if getattr(self.operator, '_current_phase', 0) != autorig_phase:
+                                        self.operator._phase_progress = 0
                                     self.operator._current_phase = autorig_phase
                                     total_phases = getattr(self.operator, '_total_phases', autorig_phase)
                                     self.operator._overall_stage = (
@@ -1289,6 +1671,16 @@ class _Trellis2WorkflowMixin:
                                 continue
 
                         step_progress = (p_value / p_max) * 100 if p_max else 0
+
+                        if _current_exec_node == 'autorig':
+                            self.operator._phase_progress = max(
+                                self.operator._phase_progress, step_progress)
+                            self.operator._detail_progress = step_progress
+                            if not self.operator._detail_stage:
+                                self.operator._detail_stage = "Auto-Rigging"
+                            if hasattr(self.operator, '_update_overall'):
+                                self.operator._update_overall()
+                            continue
 
                         # Detect sub-phase transition
                         if p_value < _prev_p_value:
