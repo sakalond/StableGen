@@ -9,6 +9,8 @@ shader raycast(
     vector CameraUp = vector(0,1,0),   // Camera up vector in world space
     float AngleThreshold = 90.0,  // Maximum angle in degrees between ray and normal
     float Power = 4.0,            // Exponent for weight falloff (higher = sharper)
+    float AllowBackface = 0.0,    // Non-zero preserves legacy two-sided projection
+    float RayEpsilon = 0.001,     // Scene-scale occlusion tolerance
     output float Result = 0
 )
 {
@@ -50,11 +52,16 @@ shader raycast(
     if (trace(Origin, d))
     {
         getmessage("trace", "hitdist", Distance);
-        if ((Distance + 0.001) < threshold)
+        if ((Distance + RayEpsilon) < threshold)
             Result = 0;
         else {
             float dot_val = dot(d, normalize(SurfaceNormal));
-            float orthogonality = abs(clamp(dot_val, -1.0, 1.0));
+            float clamped_dot = clamp(dot_val, -1.0, 1.0);
+            // Direction is camera -> surface, so front-facing outward normals
+            // have a negative dot product.
+            float orthogonality = AllowBackface != 0.0
+                ? abs(clamped_dot)
+                : max(-clamped_dot, 0.0);
             float angle = acos(orthogonality) * 180.0 / M_PI;
             if (angle > AngleThreshold) {
                 Result = 0;

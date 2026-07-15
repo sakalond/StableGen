@@ -11,6 +11,33 @@ from mathutils import Vector
 _SG_BUFFER_UV_NAME = "_SG_ProjectionBuffer"
 
 
+def _camera_world_location(camera):
+    """Return camera position in world space (including parent transforms)."""
+    return camera.matrix_world.translation.copy()
+
+
+def _scene_ray_epsilon(context):
+    """Scale ray tolerances to the scene instead of assuming metre-sized assets."""
+    corners = []
+    for obj in context.view_layer.objects:
+        if obj.type != 'MESH' or obj.hide_get():
+            continue
+        corners.extend(obj.matrix_world @ Vector(corner) for corner in obj.bound_box)
+    if not corners:
+        return 1e-5
+    min_corner = Vector((
+        min(point.x for point in corners),
+        min(point.y for point in corners),
+        min(point.z for point in corners),
+    ))
+    max_corner = Vector((
+        max(point.x for point in corners),
+        max(point.y for point in corners),
+        max(point.z for point in corners),
+    ))
+    return max((max_corner - min_corner).length * 1e-5, 1e-7)
+
+
 def _copy_uv_to_attribute(obj, uv_layer_name, attr_name):
     """Copy UV data from a UV layer to a named FLOAT_VECTOR corner-domain attribute.
     Uses FLOAT_VECTOR (3-component) instead of FLOAT2 so the attribute does NOT
@@ -37,7 +64,15 @@ def _copy_uv_to_attribute(obj, uv_layer_name, attr_name):
     obj.data.update()
 
 
-def _bake_visibility_weights(context, objects, cameras, mat_id, stop_index=1000000):
+def _bake_visibility_weights(
+    context,
+    objects,
+    cameras,
+    mat_id,
+    stop_index=1000000,
+    angle_threshold=None,
+    power_exponent=None,
+):
     """Pre-compute per-vertex, per-camera visibility weights and store them
     as ``FLOAT`` ``POINT``-domain mesh attributes.
 
@@ -57,8 +92,12 @@ def _bake_visibility_weights(context, objects, cameras, mat_id, stop_index=10000
     from math import pow as fpow
 
     scene = context.scene
-    angle_threshold = scene.discard_factor        # degrees
-    power_exponent  = scene.weight_exponent
+    angle_threshold = (
+        scene.discard_factor if angle_threshold is None else angle_threshold
+    )
+    power_exponent = (
+        scene.weight_exponent if power_exponent is None else power_exponent
+    )
     feather_active  = scene.visibility_vignette
     feather_width   = scene.visibility_vignette_width if feather_active else 0.0
     feather_gamma   = scene.visibility_vignette_softness if feather_active else 1.0
@@ -67,7 +106,7 @@ def _bake_visibility_weights(context, objects, cameras, mat_id, stop_index=10000
     # Pre-compute camera data once -----------------------------------------------
     cam_data = []
     for camera in cameras:
-        cam_loc = camera.location.copy()
+        cam_loc = _camera_world_location(camera)
         quat    = camera.matrix_world.to_quaternion()
         cam_dir = quat @ Vector((0, 0, -1))
         cam_up  = quat @ Vector((0, 1, 0))
@@ -93,14 +132,17 @@ def _bake_visibility_weights(context, objects, cameras, mat_id, stop_index=10000
 
     # Build scene-wide BVH for occlusion (matches ShaderNodeRaycast behaviour,
     # which checks ALL visible scene geometry, not just the current object).
+    depsgraph = context.evaluated_depsgraph_get()
     scene_bm = bmesh.new()
     vert_offset = 0
     for scene_obj in context.view_layer.objects:
         if scene_obj.type != 'MESH' or scene_obj.hide_get():
             continue
         tmp = bmesh.new()
-        tmp.from_mesh(scene_obj.data)
-        tmp.transform(scene_obj.matrix_world)
+        evaluated_obj = scene_obj.evaluated_get(depsgraph)
+        evaluated_mesh = evaluated_obj.to_mesh()
+        tmp.from_mesh(evaluated_mesh)
+        tmp.transform(evaluated_obj.matrix_world)
         for v in tmp.verts:
             scene_bm.verts.new(v.co)
         scene_bm.verts.ensure_lookup_table()
@@ -112,6 +154,7 @@ def _bake_visibility_weights(context, objects, cameras, mat_id, stop_index=10000
                 pass  # skip degenerate / duplicate faces
         vert_offset += len(tmp.verts)
         tmp.free()
+        evaluated_obj.to_mesh_clear()
     scene_bm.normal_update()
     scene_tree = BVHTree.FromBMesh(scene_bm)
     scene_bm.free()
@@ -121,8 +164,21 @@ def _bake_visibility_weights(context, objects, cameras, mat_id, stop_index=10000
     n_cameras = len(cameras)
     for obj_idx, obj in enumerate(objects):
         bm = bmesh.new()
-        bm.from_mesh(obj.data)
-        bm.transform(obj.matrix_world)
+        evaluated_obj = obj.evaluated_get(depsgraph)
+        evaluated_mesh = evaluated_obj.to_mesh()
+        if len(evaluated_mesh.vertices) == len(obj.data.vertices):
+            source_mesh = evaluated_mesh
+            source_matrix = evaluated_obj.matrix_world
+        else:
+            print(
+                f"[StableGen] Warning: '{obj.name}' modifiers change vertex count; "
+                "visibility weights use the base mesh because POINT attributes "
+                "cannot be mapped safely to evaluated topology."
+            )
+            source_mesh = obj.data
+            source_matrix = obj.matrix_world
+        bm.from_mesh(source_mesh)
+        bm.transform(source_matrix)
         bm.normal_update()
 
         n_verts = len(bm.verts)
@@ -130,6 +186,7 @@ def _bake_visibility_weights(context, objects, cameras, mat_id, stop_index=10000
         positions_np = np.array([v.co[:] for v in bm.verts], dtype=np.float64)
         normals_np   = np.array([v.normal[:] for v in bm.verts], dtype=np.float64)
         bm.free()
+        evaluated_obj.to_mesh_clear()
 
         for cam_idx, camera in enumerate(cameras):
             print(f"[StableGen] Baking visibility: object {obj_idx+1}/{len(objects)}, "
@@ -170,7 +227,13 @@ def _bake_visibility_weights(context, objects, cameras, mat_id, stop_index=10000
             valid &= (np.abs(x_proj) < filmw) & (np.abs(y_proj) < filmh)
 
             # Angle threshold
-            dot_dn    = np.abs(np.einsum('ij,ij->i', direction, normals_np))
+            raw_dot = np.einsum('ij,ij->i', direction, normals_np)
+            if getattr(scene, 'sg_allow_backface_projection', False):
+                dot_dn = np.abs(raw_dot)
+            else:
+                # ``direction`` points camera -> surface, so a visible front
+                # face has a negative dot product with its outward normal.
+                dot_dn = np.maximum(-raw_dot, 0.0)
             dot_dn    = np.clip(dot_dn, 0.0, 1.0)
             angle_deg = np.degrees(np.arccos(dot_dn))
             valid &= angle_deg < angle_threshold
@@ -178,11 +241,12 @@ def _bake_visibility_weights(context, objects, cameras, mat_id, stop_index=10000
             # ── BVH raycast only for candidates that passed filters ───
             candidate_indices = np.nonzero(valid)[0]
             occluded = np.zeros(n_verts, dtype=bool)
+            ray_epsilon = _scene_ray_epsilon(context)
             for vi in candidate_indices:
                 d_mu = Vector(direction[vi])
                 hit_loc, _, _, hit_dist = scene_tree.ray_cast(
-                    cam_loc_mu, d_mu, float(dists[vi]) + 0.01)
-                if hit_loc is not None and dists[vi] > hit_dist + 0.001:
+                    cam_loc_mu, d_mu, float(dists[vi]) + ray_epsilon * 10.0)
+                if hit_loc is not None and dists[vi] > hit_dist + ray_epsilon:
                     occluded[vi] = True
 
             valid &= ~occluded
@@ -231,7 +295,7 @@ def _bake_visibility_weights(context, objects, cameras, mat_id, stop_index=10000
                             continue
                         d_off_mu = Vector(d_off / norm)
                         h_loc, _, _, h_dist = scene_tree.ray_cast(
-                            cam_loc_mu, d_off_mu, dist_v + 0.01)
+                            cam_loc_mu, d_off_mu, dist_v + ray_epsilon * 10.0)
                         depth_thr = getattr(scene, 'sg_silhouette_depth', 0.05)
                         if h_loc is not None and dist_v > h_dist + depth_thr:
                             is_edge = True
@@ -294,15 +358,16 @@ def create_native_raycast_visibility(nodes, links, camera, geometry, context, i,
     # --- Camera location (CombineXYZ) ---
     add_camera_loc = nodes.new("ShaderNodeCombineXYZ")
     add_camera_loc.location = (-600, 200 + 300 * i)
-    add_camera_loc.inputs[0].default_value = camera.location.x
-    add_camera_loc.inputs[1].default_value = camera.location.y
-    add_camera_loc.inputs[2].default_value = camera.location.z
+    camera_location = _camera_world_location(camera)
+    add_camera_loc.inputs[0].default_value = camera_location.x
+    add_camera_loc.inputs[1].default_value = camera_location.y
+    add_camera_loc.inputs[2].default_value = camera_location.z
 
     # --- Direction: Geometry.Position - CameraLoc ---
     subtract = nodes.new("ShaderNodeVectorMath")
     subtract.operation = 'SUBTRACT'
     subtract.location = (x_base, -300 + y_base)
-    subtract.inputs[1].default_value = camera.location
+    subtract.inputs[1].default_value = camera_location
 
     normalize_node = nodes.new("ShaderNodeVectorMath")
     normalize_node.operation = 'NORMALIZE'
@@ -486,14 +551,15 @@ def create_native_raycast_visibility(nodes, links, camera, geometry, context, i,
     threshold_plus = nodes.new("ShaderNodeMath")
     threshold_plus.operation = 'ADD'
     threshold_plus.location = (x_base + 100, y_base + 100)
-    threshold_plus.inputs[1].default_value = 0.01
+    ray_epsilon = _scene_ray_epsilon(context)
+    threshold_plus.inputs[1].default_value = ray_epsilon * 10.0
     links.new(length_node.outputs["Value"], threshold_plus.inputs[0])
     links.new(threshold_plus.outputs[0], raycast.inputs["Length"])
 
     hit_dist_plus = nodes.new("ShaderNodeMath")
     hit_dist_plus.operation = 'ADD'
     hit_dist_plus.location = (x_base + 400, y_base + 50)
-    hit_dist_plus.inputs[1].default_value = 0.001
+    hit_dist_plus.inputs[1].default_value = ray_epsilon
     links.new(raycast.outputs["Hit Distance"], hit_dist_plus.inputs[0])
 
     dist_check = nodes.new("ShaderNodeMath")
@@ -529,15 +595,28 @@ def create_native_raycast_visibility(nodes, links, camera, geometry, context, i,
     clamp_dot2.inputs[1].default_value = 1.0
     links.new(clamp_dot.outputs[0], clamp_dot2.inputs[0])
 
-    abs_dot = nodes.new("ShaderNodeMath")
-    abs_dot.operation = 'ABSOLUTE'
-    abs_dot.location = (x_base + 600, y_base - 150)
-    links.new(clamp_dot2.outputs[0], abs_dot.inputs[0])
+    facing_dot = nodes.new("ShaderNodeMath")
+    facing_dot.location = (x_base + 600, y_base - 150)
+    if getattr(context.scene, 'sg_allow_backface_projection', False):
+        facing_dot.operation = 'ABSOLUTE'
+        links.new(clamp_dot2.outputs[0], facing_dot.inputs[0])
+    else:
+        # camera->surface dot outward-normal is negative for a front face.
+        facing_dot.operation = 'MULTIPLY'
+        facing_dot.inputs[1].default_value = -1.0
+        links.new(clamp_dot2.outputs[0], facing_dot.inputs[0])
+
+        facing_clamp = nodes.new("ShaderNodeMath")
+        facing_clamp.operation = 'MAXIMUM'
+        facing_clamp.location = (x_base + 650, y_base - 200)
+        facing_clamp.inputs[1].default_value = 0.0
+        links.new(facing_dot.outputs[0], facing_clamp.inputs[0])
+        facing_dot = facing_clamp
 
     acos_node = nodes.new("ShaderNodeMath")
     acos_node.operation = 'ARCCOSINE'
     acos_node.location = (x_base + 700, y_base - 150)
-    links.new(abs_dot.outputs[0], acos_node.inputs[0])
+    links.new(facing_dot.outputs[0], acos_node.inputs[0])
 
     to_degrees = nodes.new("ShaderNodeMath")
     to_degrees.operation = 'MULTIPLY'
@@ -557,7 +636,7 @@ def create_native_raycast_visibility(nodes, links, camera, geometry, context, i,
     power_node.location = (x_base + 700, y_base - 250)
     power_node.inputs[1].default_value = context.scene.weight_exponent
     power_node.label = 'power_weight'
-    links.new(abs_dot.outputs[0], power_node.inputs[0])
+    links.new(facing_dot.outputs[0], power_node.inputs[0])
 
     # ========================================
     # COMBINE ALL: frustum_ok * occlusion_ok * angle_ok * weight
@@ -789,7 +868,7 @@ def _get_voronoi_placeholder(color=(1.0, 0.0, 1.0)):
     return img
 
 
-def project_image(context, to_project, mat_id, stop_index=1000000):
+def project_image(context, to_project, mat_id, stop_index=1000000, cameras=None):
     """     
     Projects an image onto all mesh objects using UV Project Modifier.     
     """
@@ -1034,6 +1113,32 @@ def project_image(context, to_project, mat_id, stop_index=1000000):
                 v_off = -200 * idx
                 all_w_outputs.append(_get_weight_output(weight_nodes[idx], v_off))
 
+            # Apply initial-view priority once, globally, before max
+            # normalization. The old recursive Map Range changed meaning as
+            # cameras were paired, so results depended on camera count/tree
+            # shape rather than only on view rank.
+            if context.scene.early_priority:
+                from .view_plan import initial_view_prior
+                ranked_outputs = []
+                for idx, weight_output in enumerate(all_w_outputs):
+                    prior = nodes_collection.new("ShaderNodeMath")
+                    prior.operation = 'MULTIPLY'
+                    prior.location = (x_offset - 1700, y_offset - 120 * idx)
+                    prior.label = f"InitialViewPrior-{idx}"
+                    desired_prior = initial_view_prior(
+                        idx, len(all_w_outputs), context.scene.early_priority_strength
+                    )
+                    prior["sg_desired_prior"] = desired_prior
+                    # This node sits before SharpW. Apply the inverse exponent
+                    # so the requested rank prior remains bounded after
+                    # sharpening (especially for Voronoi exponents near 1000).
+                    prior.inputs[1].default_value = desired_prior ** (
+                        1.0 / max(float(user_exponent), 1e-6)
+                    )
+                    links.new(weight_output, prior.inputs[0])
+                    ranked_outputs.append(prior.outputs[0])
+                all_w_outputs = ranked_outputs
+
             # ── Step 3: Find per-pixel maximum ────────────────────────
             max_node = nodes_collection.new("ShaderNodeMath")
             max_node.operation = 'MAXIMUM'
@@ -1077,20 +1182,104 @@ def project_image(context, to_project, mat_id, stop_index=1000000):
 
                 # sharp_w = pow(norm_w, user_exponent)
                 # (inputs are in [0, 1] → no underflow possible)
-                if user_exponent != 1.0:
-                    pw = nodes_collection.new("ShaderNodeMath")
-                    pw.operation = 'POWER'
-                    pw.location = (div.location[0] + 200,
-                                   div.location[1])
-                    pw.label = f"SharpW-{idx}"
-                    pw.inputs[1].default_value = user_exponent
-                    links.new(div.outputs[0], pw.inputs[0])
-                    powered_nodes.append(pw)
-                else:
-                    powered_nodes.append(div)
+                # Always keep an explicit sharpening node. This makes the
+                # post-generation reset deterministic even when the material
+                # was initially built with exponent 1.
+                pw = nodes_collection.new("ShaderNodeMath")
+                pw.operation = 'POWER'
+                pw.location = (div.location[0] + 200,
+                               div.location[1])
+                pw.label = f"SharpW-{idx}"
+                pw.inputs[1].default_value = user_exponent
+                links.new(div.outputs[0], pw.inputs[0])
+                powered_nodes.append(pw)
 
             # Replace weight_nodes with sharpened-normalised nodes
             weight_nodes = powered_nodes
+
+            if getattr(context.scene, 'sg_texel_ownership', False):
+                # Sequential hard ownership with hysteresis:
+                # replace only when new_confidence > owner + margin. An
+                # uncovered texel has owner confidence 0 and is accepted by
+                # any positive new confidence.
+                owner_color = shaders[0]
+                owner_weight = weight_nodes[0]
+                margin = max(
+                    0.0,
+                    float(getattr(context.scene, 'sg_texel_replacement_margin', 0.05)),
+                )
+                for idx in range(1, len(shaders)):
+                    margin_node = nodes_collection.new("ShaderNodeMath")
+                    margin_node.operation = 'ADD'
+                    margin_node.location = (x_offset - 200, y_offset - 180 * idx)
+                    margin_node.inputs[1].default_value = margin
+                    margin_node.label = f"OwnerMargin-{idx}"
+                    links.new(owner_weight.outputs[0], margin_node.inputs[0])
+
+                    replace = nodes_collection.new("ShaderNodeMath")
+                    replace.operation = 'GREATER_THAN'
+                    replace.location = (x_offset, y_offset - 180 * idx)
+                    replace.label = f"OwnerReplace-{idx}"
+                    links.new(weight_nodes[idx].outputs[0], replace.inputs[0])
+                    links.new(margin_node.outputs[0], replace.inputs[1])
+
+                    owner_empty = nodes_collection.new("ShaderNodeMath")
+                    owner_empty.operation = 'COMPARE'
+                    owner_empty.location = (x_offset, y_offset - 180 * idx - 70)
+                    owner_empty.inputs[1].default_value = 0.0
+                    owner_empty.inputs[2].default_value = 0.0
+                    owner_empty.label = f"OwnerEmpty-{idx}"
+                    links.new(owner_weight.outputs[0], owner_empty.inputs[0])
+
+                    replace_or_empty = nodes_collection.new("ShaderNodeMath")
+                    replace_or_empty.operation = 'MAXIMUM'
+                    replace_or_empty.location = (x_offset + 100, y_offset - 180 * idx)
+                    replace_or_empty.label = f"OwnerAccept-{idx}"
+                    links.new(replace.outputs[0], replace_or_empty.inputs[0])
+                    links.new(owner_empty.outputs[0], replace_or_empty.inputs[1])
+
+                    select_color = nodes_collection.new("ShaderNodeMixRGB")
+                    select_color.location = (x_offset + 200, y_offset - 180 * idx)
+                    select_color.label = f"TexelOwner-{idx}"
+                    links.new(replace_or_empty.outputs[0], select_color.inputs["Fac"])
+                    links.new(owner_color.outputs[0], select_color.inputs["Color1"])
+                    links.new(shaders[idx].outputs[0], select_color.inputs["Color2"])
+
+                    confidence_delta = nodes_collection.new("ShaderNodeMath")
+                    confidence_delta.operation = 'SUBTRACT'
+                    confidence_delta.location = (x_offset + 200, y_offset - 180 * idx - 90)
+                    links.new(weight_nodes[idx].outputs[0], confidence_delta.inputs[0])
+                    links.new(owner_weight.outputs[0], confidence_delta.inputs[1])
+                    selected_delta = nodes_collection.new("ShaderNodeMath")
+                    selected_delta.operation = 'MULTIPLY'
+                    selected_delta.location = (x_offset + 350, y_offset - 180 * idx - 90)
+                    links.new(confidence_delta.outputs[0], selected_delta.inputs[0])
+                    links.new(replace_or_empty.outputs[0], selected_delta.inputs[1])
+                    selected_confidence = nodes_collection.new("ShaderNodeMath")
+                    selected_confidence.operation = 'ADD'
+                    selected_confidence.location = (x_offset + 500, y_offset - 180 * idx - 90)
+                    selected_confidence.label = f"OwnerConfidence-{idx}"
+                    links.new(owner_weight.outputs[0], selected_confidence.inputs[0])
+                    links.new(selected_delta.outputs[0], selected_confidence.inputs[1])
+                    owner_color = select_color
+                    owner_weight = selected_confidence
+
+                final_mix = nodes_collection.new("ShaderNodeMixRGB")
+                final_mix.location = (x_offset + 450, y_offset)
+                final_mix.inputs["Color2"].default_value = (
+                    *context.scene.fallback_color, 1.0
+                )
+                links.new(owner_color.outputs[0], final_mix.inputs["Color1"])
+                if last_node:
+                    links.new(last_node.outputs[0], final_mix.inputs["Color2"])
+                uncovered = nodes_collection.new("ShaderNodeMath")
+                uncovered.operation = 'COMPARE'
+                uncovered.inputs[1].default_value = 0.0
+                uncovered.inputs[2].default_value = 0.0
+                uncovered.label = "OwnerUncovered"
+                links.new(owner_weight.outputs[0], uncovered.inputs[0])
+                links.new(uncovered.outputs[0], final_mix.inputs["Fac"])
+                return final_mix, owner_weight
 
         new_shaders = []
         new_weight_nodes = []
@@ -1101,7 +1290,7 @@ def project_image(context, to_project, mat_id, stop_index=1000000):
                 vert_offset = -200 * (i // 2)
                 sum_node = nodes_collection.new("ShaderNodeMath")
                 sum_node.operation = 'ADD'
-                sum_node.location = (x_offset - 800, y_offset + vert_offset) if context.scene.early_priority else (x_offset - 600, y_offset + vert_offset)
+                sum_node.location = (x_offset - 600, y_offset + vert_offset)
                 
                 def get_weight_output(w_item):
                     if isinstance(w_item, tuple):
@@ -1160,18 +1349,9 @@ def project_image(context, to_project, mat_id, stop_index=1000000):
                 # Compute mix factor: weight_A / (weight_A+weight_B)
                 div_node = nodes_collection.new("ShaderNodeMath")
                 div_node.operation = 'DIVIDE'
-                div_node.location = (x_offset - 600, y_offset + vert_offset) if context.scene.early_priority else (x_offset - 400, y_offset + vert_offset)
+                div_node.location = (x_offset - 400, y_offset + vert_offset)
                 links.new(w_out_2, div_node.inputs[0])
                 links.new(sum_node.outputs[0], div_node.inputs[1])
-
-                if context.scene.early_priority:
-                    # Add map range node
-                    map_range_node = nodes_collection.new("ShaderNodeMapRange")
-                    map_range_node.location = (x_offset - 400, y_offset + vert_offset)
-                    # to_min, to_max, from_max are set to 0.0 and 1.0 by default
-                    # set to prioritize earlier images
-                    map_range_node.inputs[1].default_value = context.scene.early_priority_strength
-                    links.new(div_node.outputs[0], map_range_node.inputs[0])
 
                 # Create a MixRGB node for color blending of the two inputs
                 mix_node = nodes_collection.new("ShaderNodeMixRGB")
@@ -1181,8 +1361,7 @@ def project_image(context, to_project, mat_id, stop_index=1000000):
                 links.new(shaders[i].outputs[0], mix_node.inputs["Color1"])
                 links.new(shaders[i+1].outputs[0], mix_node.inputs["Color2"])
                 # Use the computed mix factor
-                to_connect = div_node if not context.scene.early_priority else map_range_node
-                links.new(to_connect.outputs[0], mix_node.inputs["Fac"])
+                links.new(div_node.outputs[0], mix_node.inputs["Fac"])
 
                 new_shaders.append(mix_node)
                 # The new effective weight is the sum (stored in sum_node)
@@ -1194,8 +1373,13 @@ def project_image(context, to_project, mat_id, stop_index=1000000):
                 i += 1
         return build_mix_tree(new_shaders, new_weight_nodes, nodes_collection, links, last_node, level+1)
 
-    cameras = [obj for obj in context.scene.objects if obj.type == 'CAMERA']
-    cameras.sort(key=lambda x: x.name)
+    if cameras is None:
+        from .view_plan import order_cameras
+        cameras = order_cameras(
+            obj for obj in context.scene.objects if obj.type == 'CAMERA'
+        )
+    else:
+        cameras = list(cameras)
     
     # Force refresh of the UI
     for area in context.screen.areas:
@@ -1469,6 +1653,43 @@ def project_image(context, to_project, mat_id, stop_index=1000000):
             links.new(mask_tex.outputs[0], to_float.inputs[0])
             return to_float
 
+        def _create_qwen_write_mask_weight(cam_index, mat_id_inner):
+            """Sample the binary repair mask saved for a sequential Qwen view."""
+            mask_path = get_file_path(
+                context,
+                "inpaint",
+                subtype="visibility",
+                camera_id=cam_index,
+            )
+            if not os.path.exists(mask_path):
+                return None
+            mask_image = get_or_load_image(
+                mask_path,
+                force_reload=context.scene.overwrite_material,
+            )
+            if mask_image is None:
+                return None
+            mask_image.colorspace_settings.name = 'Non-Color'
+
+            mask_tex = nodes.new("ShaderNodeTexImage")
+            mask_tex.image = mask_image
+            mask_tex.extension = 'CLIP'
+            mask_tex.interpolation = 'Closest'
+            mask_tex.label = f"QwenWriteMask-{cam_index}-{mat_id_inner}"
+            mask_tex.location = (-500, -200 * cam_index - 300)
+
+            uv_node = uv_map_nodes[cam_index]
+            uv_out = "Vector" if uv_node.type == 'ATTRIBUTE' else "UV"
+            links.new(uv_node.outputs[uv_out], mask_tex.inputs["Vector"])
+
+            to_float = nodes.new("ShaderNodeMath")
+            to_float.operation = 'MULTIPLY'
+            to_float.inputs[1].default_value = 1.0
+            to_float.location = (-300, -200 * cam_index - 300)
+            to_float.label = f"QwenWriteWeight-{cam_index}-{mat_id_inner}"
+            links.new(mask_tex.outputs[0], to_float.inputs[0])
+            return to_float
+
         # Voronoi mode flag: keep natural weights for non-generated cameras
         voronoi_active = (context.scene.model_architecture in ('qwen_image_edit', 'flux2_klein')
                           and getattr(context.scene, 'qwen_voronoi_mode', False)
@@ -1608,7 +1829,7 @@ def project_image(context, to_project, mat_id, stop_index=1000000):
                 subtract = nodes.new("ShaderNodeVectorMath")
                 subtract.operation = 'SUBTRACT'
                 subtract.location = (-400, -300 + (-800) * i)
-                subtract.inputs[1].default_value = camera.location
+                subtract.inputs[1].default_value = _camera_world_location(camera)
                 subtract_nodes.append(subtract)
 
                 normalize = nodes.new("ShaderNodeVectorMath")
@@ -1627,10 +1848,18 @@ def project_image(context, to_project, mat_id, stop_index=1000000):
                     script_angle.script = raycast_osl_text
                 else:
                     script_angle.mode = 'EXTERNAL'
-                    script_angle.filepath = os.path.join(os.path.dirname(__file__), "raycast.osl")
+                    script_angle.filepath = os.path.join(
+                        os.path.dirname(os.path.dirname(__file__)), "raycast.osl"
+                    )
 
                 script_angle.inputs["AngleThreshold"].default_value = context.scene.discard_factor
                 script_angle.inputs["Power"].default_value = context.scene.weight_exponent
+                if "AllowBackface" in script_angle.inputs:
+                    script_angle.inputs["AllowBackface"].default_value = float(
+                        getattr(context.scene, 'sg_allow_backface_projection', False)
+                    )
+                if "RayEpsilon" in script_angle.inputs:
+                    script_angle.inputs["RayEpsilon"].default_value = _scene_ray_epsilon(context)
                 script_angle.label = f"Angle-{i}-{mat_id}"
 
                 scripts_to_connect = [script_angle]
@@ -1648,7 +1877,9 @@ def project_image(context, to_project, mat_id, stop_index=1000000):
                         script_feather.script = feather_osl_text
                     else:
                         script_feather.mode = 'EXTERNAL'
-                        script_feather.filepath = os.path.join(os.path.dirname(__file__), "feather.osl")
+                        script_feather.filepath = os.path.join(
+                            os.path.dirname(os.path.dirname(__file__)), "feather.osl"
+                        )
 
                     if context.scene.visibility_vignette: # Only set if feathering is active
                         script_feather.inputs["EdgeFeather"].default_value = context.scene.visibility_vignette_width
@@ -1725,9 +1956,10 @@ def project_image(context, to_project, mat_id, stop_index=1000000):
                 # Add combine XYZ node
                 add_camera_loc = nodes.new("ShaderNodeCombineXYZ")
                 add_camera_loc.location = (-600, 200 + 300 * i)
-                add_camera_loc.inputs[0].default_value = camera.location.x
-                add_camera_loc.inputs[1].default_value = camera.location.y
-                add_camera_loc.inputs[2].default_value = camera.location.z
+                camera_location = _camera_world_location(camera)
+                add_camera_loc.inputs[0].default_value = camera_location.x
+                add_camera_loc.inputs[1].default_value = camera_location.y
+                add_camera_loc.inputs[2].default_value = camera_location.z
                 add_camera_loc_nodes.append(add_camera_loc)
 
                 # Add length node
@@ -1735,6 +1967,28 @@ def project_image(context, to_project, mat_id, stop_index=1000000):
                 length.operation = 'LENGTH'
                 length.location = (-400, 200 * (i+1))
                 length_nodes.append(length)
+
+            use_qwen_write_mask = (
+                i > 0
+                and i <= stop_index
+                and context.scene.model_architecture == 'qwen_image_edit'
+                and context.scene.generation_method == 'sequential'
+                and context.scene.qwen_generation_method == 'generate'
+                and context.scene.qwen_context_render_mode in {'REPLACE_STYLE', 'ADDITIONAL'}
+                and getattr(context.scene, 'qwen_use_projection_write_masks', True)
+            )
+            if use_qwen_write_mask and script_nodes_outputs:
+                current_weight = script_nodes_outputs[-1]
+                if not isinstance(current_weight, tuple):
+                    write_weight = _create_qwen_write_mask_weight(i, mat_id)
+                    if write_weight is not None:
+                        masked_weight = nodes.new("ShaderNodeMath")
+                        masked_weight.operation = 'MULTIPLY'
+                        masked_weight.location = (0, (-800) * i + 100)
+                        masked_weight.label = f"QwenWriteMasked-{i}-{mat_id}"
+                        links.new(current_weight.outputs[0], masked_weight.inputs[0])
+                        links.new(write_weight.outputs[0], masked_weight.inputs[1])
+                        script_nodes_outputs[-1] = masked_weight
 
         # Build mix shader tree
         if mat.name in processed_materials and is_local_edit:
@@ -1810,7 +2064,7 @@ def get_or_create_osl_text(filename):
     Loads an OSL script into a Blender internal text block.
     This ensures the script is embedded in the .blend file (portable).
     """
-    filepath = os.path.join(os.path.dirname(__file__), filename)
+    filepath = os.path.join(os.path.dirname(os.path.dirname(__file__)), filename)
     if not os.path.exists(filepath):
         print(f"[StableGen] Error: OSL script not found at {filepath}")
         return None

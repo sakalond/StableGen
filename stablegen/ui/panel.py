@@ -1308,6 +1308,12 @@ class StableGenPanel(bpy.types.Panel):
                     row.prop(scene, "early_priority_strength", text="Priority Strength")
 
                 row = content_box.row()
+                row.prop(scene, "sg_texel_ownership", text="Per-Texel View Ownership", toggle=True, icon="UV")
+                if scene.sg_texel_ownership:
+                    row = content_box.row()
+                    row.prop(scene, "sg_texel_replacement_margin", text="Replacement Margin")
+
+                row = content_box.row()
                 row.prop(scene, "bake_visibility_weights", text="Bake Visibility (Transform-Stable)", toggle=True, icon="MESH_DATA")
 
                 row = content_box.row()
@@ -1318,6 +1324,9 @@ class StableGenPanel(bpy.types.Panel):
 
                 row = content_box.row()
                 row.prop(scene, "sg_silhouette_rays", text="Silhouette Rays")
+
+                row = content_box.row()
+                row.prop(scene, "sg_allow_backface_projection", text="Allow Backface Projection")
 
             # --- Output & Material Settings ---
             if _show_diffusion_sections:
@@ -1588,6 +1597,22 @@ class StableGenPanel(bpy.types.Panel):
 
                         dilation_row = context_box.row()
                         dilation_row.prop(scene, "qwen_context_fallback_dilation", text="Fallback Dilate (px)")
+
+                        protection_row = context_box.row()
+                        protection_row.prop(
+                            scene,
+                            "qwen_use_projection_write_masks",
+                            text="Protect Trusted Texture",
+                            toggle=True,
+                            icon="LOCKED",
+                        )
+                        if scene.qwen_use_projection_write_masks:
+                            tolerance_row = context_box.row()
+                            tolerance_row.prop(
+                                scene,
+                                "qwen_residual_fallback_tolerance",
+                                text="Residual Magenta Tol.",
+                            )
 
                         cleanup_row = context_box.row()
                         cleanup_row.prop(scene, "qwen_context_cleanup", text="Apply Cleanup", toggle=True, icon="BRUSH_DATA")

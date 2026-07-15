@@ -27,13 +27,19 @@ from ..util.workflow_templates import prompt_text, prompt_text_img2img, prompt_t
 from .rendering import export_emit_image, export_visibility, export_canny, bake_texture, prepare_baking, unwrap, export_render, export_viewport, render_edge_feather_mask, apply_uv_inpaint_texture
 from ..cameras.geometry import _SGCameraResolution, _get_camera_resolution
 from ..cameras.overlays import _sg_restore_square_display, _sg_remove_crop_overlay, _sg_ensure_crop_overlay, _sg_hide_label_overlay, _sg_restore_label_overlay
-from .projection import project_image, reinstate_compare_nodes
+from .projection import project_image, reinstate_compare_nodes, _bake_visibility_weights
 from ..utils import get_last_material_index, get_generation_dirs, get_file_path, get_dir_path, remove_empty_dirs, get_compositor_node_tree, configure_output_node_paths, get_eevee_engine_id, sg_modal_active
 from ..util.mirror_color import MirrorReproject, _get_viewport_ref_np, _apply_color_match_to_file
 from ..timeout_config import get_timeout
 from .._generator_utils import redraw_ui, setup_studio_lighting, _pbr_setup_studio_lights, upload_image_to_comfyui
 from .pbr import _PBRMixin
 from .gallery import _PreviewGalleryOverlay
+from .view_plan import ViewRecord, choose_aligned_resolution, order_cameras
+from .quality_masks import (
+    apply_binary_context_mask,
+    regularize_repair_mask,
+    reject_fallback_from_write_mask,
+)
 
 import websocket
 
@@ -346,6 +352,7 @@ class ComfyUIGenerate(_PBRMixin, bpy.types.Operator):
     _active_ws = None  # WebSocket reference for cancel-time close
     _threads_left = 0
     _cameras = None
+    _view_plan = None
     _selected_camera_ids = None
     _grid_width = 0
     _grid_height = 0
@@ -419,6 +426,63 @@ class ComfyUIGenerate(_PBRMixin, bpy.types.Operator):
             fallback = tuple(context.scene.qwen_guidance_fallback_color)
             background = tuple(context.scene.qwen_guidance_background_color)
         return fallback, background
+
+    def _apply_qwen_binary_context_mask(self, context, camera_id, fallback_color):
+        """Make the exported sequential mask authoritative for Qwen context."""
+        if not getattr(context.scene, "qwen_use_projection_write_masks", True):
+            return
+        if context.scene.qwen_context_render_mode not in {'REPLACE_STYLE', 'ADDITIONAL'}:
+            return
+
+        context_path = get_file_path(
+            context, "inpaint", subtype="render", camera_id=camera_id
+        )
+        mask_path = get_file_path(
+            context, "inpaint", subtype="visibility", camera_id=camera_id
+        )
+        context_image = cv2.imread(context_path, cv2.IMREAD_COLOR)
+        repair_mask = cv2.imread(mask_path, cv2.IMREAD_GRAYSCALE)
+        if context_image is None or repair_mask is None:
+            print(f"[StableGen] Binary Qwen context skipped; missing context or mask for camera {camera_id}")
+            return
+
+        repair_mask = regularize_repair_mask(
+            repair_mask,
+            threshold=127,
+            dilation=context.scene.qwen_context_fallback_dilation,
+        )
+        context_image = apply_binary_context_mask(
+            context_image, repair_mask, fallback_color
+        )
+        cv2.imwrite(context_path, context_image)
+        cv2.imwrite(mask_path, repair_mask)
+
+        # These files are generated immediately before their first upload, but
+        # invalidate defensively for regeneration/debug workflows.
+        if hasattr(self, '_uploaded_images_cache'):
+            self._uploaded_images_cache.pop(context_path, None)
+            self._uploaded_images_cache.pop(mask_path, None)
+
+    def _reject_qwen_fallback_writes(self, context, camera_id, image_path, fallback_color):
+        """Keep residual sentinel pixels out of the projection material."""
+        if not getattr(context.scene, "qwen_use_projection_write_masks", True):
+            return
+        if context.scene.qwen_context_render_mode not in {'REPLACE_STYLE', 'ADDITIONAL'}:
+            return
+        mask_path = get_file_path(
+            context, "inpaint", subtype="visibility", camera_id=camera_id
+        )
+        write_mask = cv2.imread(mask_path, cv2.IMREAD_GRAYSCALE)
+        generated = cv2.imread(image_path, cv2.IMREAD_COLOR)
+        if write_mask is None or generated is None:
+            return
+        write_mask = reject_fallback_from_write_mask(
+            write_mask,
+            generated,
+            fallback_color,
+            tolerance=getattr(context.scene, "qwen_residual_fallback_tolerance", 8),
+        )
+        cv2.imwrite(mask_path, write_mask)
 
     @classmethod
     def poll(cls, context):
@@ -515,12 +579,9 @@ class ComfyUIGenerate(_PBRMixin, bpy.types.Operator):
         lower_bound = int(target_px * 0.8)
 
         if context.scene.auto_rescale and ((total_pixels > upper_bound or total_pixels < lower_bound) or (resolution_x % align_step != 0 or resolution_y % align_step != 0)):
-            scale_factor = (target_px / total_pixels) ** 0.5
-            render.resolution_x = int(resolution_x * scale_factor)
-            render.resolution_y = int(resolution_y * scale_factor)
-            # Round down to nearest multiple of align_step
-            render.resolution_x -= render.resolution_x % align_step
-            render.resolution_y -= render.resolution_y % align_step
+            render.resolution_x, render.resolution_y = choose_aligned_resolution(
+                resolution_x, resolution_y, target_px, align_step
+            )
             self.report({'INFO'}, f"Resolution automatically rescaled to {render.resolution_x}x{render.resolution_y}.")
 
         elif total_pixels > upper_bound:
@@ -537,22 +598,10 @@ class ComfyUIGenerate(_PBRMixin, bpy.types.Operator):
             render.resolution_x = self._original_resolution_x
             render.resolution_y = self._original_resolution_y
             return {'CANCELLED'}
-        # Sort cameras by name
-        self._cameras.sort(key=lambda x: x.name)
-
-        # Apply custom generation order if enabled (non-destructive reorder)
+        order_names = []
         if context.scene.sg_use_custom_camera_order and len(context.scene.sg_camera_order) > 0:
             order_names = [item.name for item in context.scene.sg_camera_order]
-            cam_by_name = {cam.name: cam for cam in self._cameras}
-            ordered = []
-            for name in order_names:
-                if name in cam_by_name:
-                    ordered.append(cam_by_name.pop(name))
-            # Append any cameras not in the order list (newly added cameras)
-            for cam in self._cameras:
-                if cam.name in cam_by_name:
-                    ordered.append(cam)
-            self._cameras = ordered
+        self._cameras = order_cameras(self._cameras, order_names)
 
         # Hide crop and label overlays during generation
         _sg_remove_crop_overlay()
@@ -565,13 +614,35 @@ class ComfyUIGenerate(_PBRMixin, bpy.types.Operator):
                     crx, cry = int(cam["sg_res_x"]), int(cam["sg_res_y"])
                     c_total = crx * cry
                     if (c_total > upper_bound or c_total < lower_bound) or (crx % align_step != 0 or cry % align_step != 0):
-                        sf = (target_px / c_total) ** 0.5
-                        crx = int(crx * sf)
-                        cry = int(cry * sf)
-                        crx -= crx % align_step
-                        cry -= cry % align_step
+                        crx, cry = choose_aligned_resolution(
+                            crx, cry, target_px, align_step
+                        )
                         cam["sg_res_x"] = crx
                         cam["sg_res_y"] = cry
+
+        self._view_plan = []
+        for index, cam in enumerate(self._cameras):
+            if "sg_view_uuid" not in cam:
+                cam["sg_view_uuid"] = uuid.uuid4().hex
+            cam_res_x = int(cam.get("sg_res_x", render.resolution_x))
+            cam_res_y = int(cam.get("sg_res_y", render.resolution_y))
+            self._view_plan.append(ViewRecord(
+                view_id=str(cam["sg_view_uuid"]),
+                index=index,
+                name=cam.name,
+                camera=cam,
+                resolution_x=cam_res_x,
+                resolution_y=cam_res_y,
+            ))
+
+        revision_dir = get_generation_dirs(context)["revision"]
+        os.makedirs(revision_dir, exist_ok=True)
+        with open(os.path.join(revision_dir, "view_plan.json"), "w", encoding="utf-8") as manifest_file:
+            json.dump(
+                {"schema": 1, "views": [record.to_manifest() for record in self._view_plan]},
+                manifest_file,
+                indent=2,
+            )
         self._selected_camera_ids = [i for i, cam in enumerate(self._cameras) if cam in bpy.context.selected_objects] #TEST
         if len(self._selected_camera_ids) == 0:
             self._selected_camera_ids = list(range(len(self._cameras))) # All cameras selected if none are selected
@@ -862,16 +933,65 @@ class ComfyUIGenerate(_PBRMixin, bpy.types.Operator):
                             continue
                         
                         nodes = obj.active_material.node_tree.nodes
+                        has_normalized_sharpness = any(
+                            node.type == 'MATH'
+                            and node.operation == 'POWER'
+                            and node.label.startswith('SharpW-')
+                            for node in nodes
+                        )
                         for node in nodes:
-                            # OSL script nodes: update 'Power' input
-                            if node.type == 'SCRIPT':
-                                if 'Power' in node.inputs:
-                                    node.inputs['Power'].default_value = new_exponent
-                            # Native MATH POWER nodes (Blender 5.1+ native path)
-                            elif node.type == 'MATH' and node.operation == 'POWER' and node.label == 'power_weight':
+                            if (node.type == 'MATH'
+                                    and node.operation == 'POWER'
+                                    and node.label.startswith('SharpW-')):
                                 node.inputs[1].default_value = new_exponent
+                            elif node.type == 'SCRIPT' and 'Power' in node.inputs:
+                                # Normalized materials sharpen at SharpW; their
+                                # per-camera source must remain the base weight.
+                                node.inputs['Power'].default_value = (
+                                    1.0 if has_normalized_sharpness else new_exponent
+                                )
+                            elif (node.type == 'MATH'
+                                    and node.operation == 'POWER'
+                                    and node.label == 'power_weight'):
+                                node.inputs[1].default_value = (
+                                    1.0 if has_normalized_sharpness else new_exponent
+                                )
+                            elif (node.type == 'MATH'
+                                    and node.operation == 'MULTIPLY'
+                                    and node.label.startswith('InitialViewPrior-')
+                                    and "sg_desired_prior" in node):
+                                node.inputs[1].default_value = float(
+                                    node["sg_desired_prior"]
+                                ) ** (1.0 / max(float(new_exponent), 1e-6))
                     
                     print("[StableGen] Weight exponent reset complete.")
+
+                # Baked visibility stores the angle/exponent numerically in
+                # mesh attributes, so changing shader nodes alone cannot reset
+                # it. Recompute once using the final display settings.
+                reset_angle = (
+                    context.scene.discard_factor_after_generation
+                    if context.scene.discard_factor_generation_only
+                    else context.scene.discard_factor
+                )
+                reset_exponent = (
+                    context.scene.weight_exponent_after_generation
+                    if context.scene.weight_exponent_generation_only
+                    else context.scene.weight_exponent
+                )
+                if (context.scene.bake_visibility_weights
+                        and (context.scene.discard_factor_generation_only
+                             or context.scene.weight_exponent_generation_only)
+                        and self._cameras):
+                    print("[StableGen] Rebaking visibility weights for final display settings...")
+                    _bake_visibility_weights(
+                        context,
+                        self._to_texture,
+                        self._cameras,
+                        self._material_id,
+                        angle_threshold=reset_angle,
+                        power_exponent=reset_exponent,
+                    )
 
                 # If viewport rendering mode is 'Rendered' and mode is 'regenerate_selected', switch to 'Solid' and then back to 'Rendered' to refresh the viewport
                 if context.scene.generation_mode == 'regenerate_selected' and context.area.spaces.active.shading.type == 'RENDERED':
@@ -1151,7 +1271,10 @@ class ComfyUIGenerate(_PBRMixin, bpy.types.Operator):
                     def image_reproject_callback():
                         try:
                             redraw_ui(context)
-                            project_image(context, self._to_texture, self._material_id, stop_index=self._current_image)
+                            project_image(
+                                context, self._to_texture, self._material_id,
+                                stop_index=self._current_image, cameras=self._cameras,
+                            )
                         except Exception as e:
                             self._error = str(e)
                             traceback.print_exc()
@@ -1255,13 +1378,24 @@ class ComfyUIGenerate(_PBRMixin, bpy.types.Operator):
                                     _vis_cam = self._cameras[self._current_image - 1]
                                     _cur_cam = self._cameras[self._current_image] if self._current_image < len(self._cameras) else _vis_cam
                                     with _SGCameraResolution(context, _cur_cam):
-                                        export_visibility(context, self._to_texture, camera_visibility=_vis_cam) # Export mask for current view
+                                        export_visibility(
+                                            context,
+                                            self._to_texture,
+                                            camera_visibility=_vis_cam,
+                                            camera_render=_cur_cam,
+                                            camera_id=self._current_image,
+                                        ) # Export mask for current view
                                     _emit_cam = _cur_cam
+                                    context.scene.camera = _emit_cam
                                     with _SGCameraResolution(context, _emit_cam):
                                         if context.scene.model_architecture in ('qwen_image_edit', 'flux2_klein'): # export custom bg and fallback for Qwen/Klein image edit
                                             fallback_color, background_color = self._get_qwen_context_colors(context)
                                             export_emit_image(context, self._to_texture, camera_id=self._current_image, bg_color=background_color, fallback_color=fallback_color) # Export render for next view
-                                            self._dilate_qwen_context_fallback(context, self._current_image, fallback_color)
+                                            self._apply_qwen_binary_context_mask(
+                                                context,
+                                                self._current_image,
+                                                fallback_color,
+                                            )
                                         else:
                                             # Use a gray (neutral) background and fallback for other architectures
                                             export_emit_image(context, self._to_texture, camera_id=self._current_image, bg_color=(0.5, 0.5, 0.5), fallback_color=(0.5, 0.5, 0.5))
@@ -1321,6 +1455,17 @@ class ComfyUIGenerate(_PBRMixin, bpy.types.Operator):
                     with open(image_path, 'wb') as f:
                         f.write(image)
 
+                    if (context.scene.model_architecture == 'qwen_image_edit'
+                            and context.scene.generation_method == 'sequential'
+                            and self._current_image > 0):
+                        fallback_color, _ = self._get_qwen_context_colors(context)
+                        self._reject_qwen_fallback_writes(
+                            context,
+                            self._current_image,
+                            image_path,
+                            fallback_color,
+                        )
+
                     
                     # Use hack to re-generate the image using IPAdapter to match IPAdapter style
                     if camera_id == 0 and (context.scene.generation_method == 'sequential' or context.scene.generation_method == 'separate' or context.scene.generation_method in ('refine', 'local_edit'))\
@@ -1357,7 +1502,10 @@ class ComfyUIGenerate(_PBRMixin, bpy.types.Operator):
                         def image_project_callback():
                             try:
                                 redraw_ui(context)
-                                project_image(context, self._to_texture, self._material_id, stop_index=self._current_image)
+                                project_image(
+                                    context, self._to_texture, self._material_id,
+                                    stop_index=self._current_image, cameras=self._cameras,
+                                )
                             except Exception as e:
                                 self._error = str(e)
                                 traceback.print_exc()
@@ -1499,7 +1647,10 @@ class ComfyUIGenerate(_PBRMixin, bpy.types.Operator):
             self._stage = "Projecting Image"
             redraw_ui(context)
             if context.scene.generation_method != 'uv_inpaint':
-                project_image(context, self._to_texture, self._material_id)
+                project_image(
+                    context, self._to_texture, self._material_id,
+                    cameras=self._cameras,
+                )
             else:
                 # Apply the UV inpainted textures to each mesh
                 from .rendering import apply_uv_inpaint_texture

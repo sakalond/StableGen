@@ -12,6 +12,36 @@ import cv2
 _ADDON_PKG = __package__.rsplit('.', 1)[0]
 
 
+def _snapshot_material_state(obj):
+    """Capture exact slot order, active slot, and per-polygon assignments."""
+    return {
+        "materials": list(obj.data.materials),
+        "active_index": int(obj.active_material_index),
+        "polygon_indices": [polygon.material_index for polygon in obj.data.polygons],
+    }
+
+
+def _restore_material_state(obj, state):
+    """Restore a material snapshot without active-first slot reordering."""
+    obj.data.materials.clear()
+    for material in state["materials"]:
+        obj.data.materials.append(material)
+    if obj.data.materials:
+        obj.active_material_index = min(
+            state["active_index"], len(obj.data.materials) - 1
+        )
+    polygon_indices = state["polygon_indices"]
+    if len(polygon_indices) == len(obj.data.polygons):
+        max_index = max(len(obj.data.materials) - 1, 0)
+        for polygon, material_index in zip(obj.data.polygons, polygon_indices):
+            polygon.material_index = min(material_index, max_index)
+    else:
+        print(
+            f"[StableGen] Warning: polygon count changed while exporting '{obj.name}'; "
+            "material slots were restored but polygon indices could not be."
+        )
+
+
 def purge_orphans():
     """
     Purge unused datablocks (images, materials, node groups, etc).
@@ -613,7 +643,6 @@ def export_emit_image(context, to_export, camera_id=None, bg_color=(0.5, 0.5, 0.
 
         # Store original materials and create temporary ones
         original_materials = {}
-        original_active_material = {}
         temporary_materials = {}
 
         # Check if there is BSDF applied
@@ -622,8 +651,7 @@ def export_emit_image(context, to_export, camera_id=None, bg_color=(0.5, 0.5, 0.
 
         for obj in to_export:
             # Store original materials
-            original_materials[obj] = list(obj.data.materials)
-            original_active_material[obj] = obj.active_material
+            original_materials[obj] = _snapshot_material_state(obj)
 
             # Copy active material and switch to it
             mat = obj.active_material
@@ -829,14 +857,8 @@ def export_emit_image(context, to_export, camera_id=None, bg_color=(0.5, 0.5, 0.
         bpy.context.scene.view_settings.view_transform = 'Standard'
 
         # Restore original materials
-        for obj, materials in original_materials.items():
-            obj.data.materials.clear()
-            # First append the original active material
-            if original_active_material[obj]:
-                obj.data.materials.append(original_active_material[obj])
-            for mat in materials:
-                if mat != original_active_material[obj]:
-                    obj.data.materials.append(mat)
+        for obj, material_state in original_materials.items():
+            _restore_material_state(obj, material_state)
 
         # Clean up temporary materials
         for _, temp_mat in temporary_materials.items():
@@ -860,15 +882,15 @@ def export_render(context, camera_id=None, output_dir=None, filename=None):
 
     # Store original materials and create temporary ones
     original_materials = {}
-    original_active_material = {}
+    temporary_materials = []
     for obj in context.view_layer.objects:
         if obj.type == 'MESH':
             # Store original materials
-            original_materials[obj] = list(obj.data.materials)
-            original_active_material[obj] = obj.active_material
+            original_materials[obj] = _snapshot_material_state(obj)
 
             # Create temporary material
             temp_mat = bpy.data.materials.new(name="TempRenderMaterial")
+            temporary_materials.append(temp_mat)
             temp_mat.use_nodes = True # Even Workbench uses nodes for basic color
             nodes = temp_mat.node_tree.nodes
             links = temp_mat.node_tree.links
@@ -940,23 +962,16 @@ def export_render(context, camera_id=None, output_dir=None, filename=None):
     bpy.ops.render.render(write_still=True)
 
     # Restore original materials
-    for obj, materials in original_materials.items():
-        obj.data.materials.clear()
-        # First append the original active material
-        if original_active_material[obj]:
-            obj.data.materials.append(original_active_material[obj])
-        for mat in materials:
-            if mat != original_active_material[obj]:
-                obj.data.materials.append(mat)
+    for obj, material_state in original_materials.items():
+        _restore_material_state(obj, material_state)
 
     # Restore original render settings
     render_layer.use_pass_combined = original_combined
 
     # Clean up temporary materials
-    # Use a while loop to safely remove materials while iterating
-    temp_mats = [m for m in bpy.data.materials if m.name.startswith("TempRenderMaterial")]
-    for mat in temp_mats:
-        bpy.data.materials.remove(mat)
+    for mat in temporary_materials:
+        if mat.name in bpy.data.materials:
+            bpy.data.materials.remove(mat)
 
 
     # Restore original render settings
@@ -1179,7 +1194,8 @@ def expand_mask_to_blocks(mask_file_path, block_size=8):
         return None
 
 
-def export_visibility(context, to_export, obj=None, camera_visibility=None, prepare_only=False):
+def export_visibility(context, to_export, obj=None, camera_visibility=None,
+                      prepare_only=False, camera_render=None, camera_id=None):
     """     
     Exports the visibility of the mesh by temporarily altering the shading nodes.
     :param context: Blender context.
@@ -1193,8 +1209,14 @@ def export_visibility(context, to_export, obj=None, camera_visibility=None, prep
     """
     # Store original materials and create temporary ones
     original_materials = {}
-    original_active_material = {}
     temporary_materials = {}
+
+    def restore_prepared_materials():
+        for prepared_obj, material_state in original_materials.items():
+            _restore_material_state(prepared_obj, material_state)
+        for temp_mat in temporary_materials.values():
+            if temp_mat and temp_mat.name in bpy.data.materials:
+                bpy.data.materials.remove(temp_mat)
 
     def prepare_material(obj):
         mat = obj.active_material
@@ -1202,8 +1224,7 @@ def export_visibility(context, to_export, obj=None, camera_visibility=None, prep
             return False
 
         # Store original materials
-        original_materials[obj] = list(obj.data.materials)
-        original_active_material[obj] = obj.active_material  # Store original active material
+        original_materials[obj] = _snapshot_material_state(obj)
 
         # Store original active mat
 
@@ -1213,13 +1234,6 @@ def export_visibility(context, to_export, obj=None, camera_visibility=None, prep
             return False
         mat_copy = mat.copy()
 
-        # Clear materials and assign temp material
-        obj.data.materials.clear()
-        obj.data.materials.append(mat_copy)
-        
-        # Store temporary material for later deletion
-        temporary_materials[obj] = mat_copy
-        
         # Enable use of nodes
         mat_copy.use_nodes = True
         nodes = mat_copy.node_tree.nodes
@@ -1233,9 +1247,11 @@ def export_visibility(context, to_export, obj=None, camera_visibility=None, prep
                 break
 
         if not output:
+            bpy.data.materials.remove(mat_copy)
             return False
         
         if not output.inputs[0].links:
+            bpy.data.materials.remove(mat_copy)
             return False
         
         # Determine which input to used based on existence of BSDF node before the output
@@ -1244,12 +1260,19 @@ def export_visibility(context, to_export, obj=None, camera_visibility=None, prep
             if not principled.inputs[0].links:
                 # Principled BSDF exists but nothing is connected to its
                 # Base Color – this is not a projection material.
+                bpy.data.materials.remove(mat_copy)
                 return False
             color_mix = principled.inputs[0].links[0].from_node
             input = principled.inputs[0]
         else:
             color_mix = output.inputs[0].links[0].from_node
             input = output.inputs[0]
+
+        # Validation succeeded; only now replace the object's slots. This
+        # prevents an early return from leaving a complex mesh modified.
+        obj.data.materials.clear()
+        obj.data.materials.append(mat_copy)
+        temporary_materials[obj] = mat_copy
         # Add equal node between color mix and bsdf
         equal = nodes.new("ShaderNodeMath")
         
@@ -1405,9 +1428,11 @@ def export_visibility(context, to_export, obj=None, camera_visibility=None, prep
         # Prepare for all objects
         for obj in to_export:
             if not prepare_material(obj):
+                restore_prepared_materials()
                 return False
     else:
         if not prepare_material(obj):
+            restore_prepared_materials()
             return False
         
     if prepare_only:
@@ -1440,28 +1465,21 @@ def export_visibility(context, to_export, obj=None, camera_visibility=None, prep
             )
     else:
         # Make sure the camera is active and set to render
-        cameras = [obj for obj in context.scene.objects if obj.type == 'CAMERA']
-        cameras.sort(key=lambda x: x.name)
-        camera_visibility_index = [i for i, camera in enumerate(cameras) if camera == camera_visibility][0]
-        camera_render_index = (camera_visibility_index + 1) % len(cameras)
-        camera_render = cameras[camera_render_index]
+        if camera_render is None:
+            from .view_plan import order_cameras
+            cameras = order_cameras(
+                obj for obj in context.scene.objects if obj.type == 'CAMERA'
+            )
+            camera_visibility_index = cameras.index(camera_visibility)
+            camera_render_index = (camera_visibility_index + 1) % len(cameras)
+            camera_render = cameras[camera_render_index]
+        else:
+            camera_render_index = camera_id
         context.scene.camera = camera_render
         export_emit_image(context, to_export, camera_id=f"{camera_render_index}_visibility", bg_color=(1, 1, 1), view_transform='Raw', fallback_color=(1,1,1))
 
     # Restore original materials
-    for obj, materials in original_materials.items():
-        obj.data.materials.clear()
-        # First append the original active material
-        if original_active_material[obj]:
-            obj.data.materials.append(original_active_material[obj])
-        for mat in materials:
-            if mat != original_active_material[obj]:
-                obj.data.materials.append(mat)
-
-    # Clean up temporary materials
-    for _, temp_mat in temporary_materials.items():
-        if temp_mat and temp_mat.name in bpy.data.materials:
-            bpy.data.materials.remove(temp_mat)
+    restore_prepared_materials()
 
     return True
 

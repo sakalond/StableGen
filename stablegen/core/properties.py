@@ -782,6 +782,11 @@ def register_properties(update_model_list, ControlNetUnit, LoRAUnit,
                     "Prevents thin outlines of foreground geometry (e.g. hands) bleeding onto surfaces behind them.  0 = disabled",
         default=3, min=0, max=20, update=update_parameters,
     )
+    bpy.types.Scene.sg_allow_backface_projection = bpy.props.BoolProperty(
+        name="Allow Backface Projection",
+        description="Use legacy two-sided projection weights. Leave disabled for characters and closed meshes so a camera cannot write through back-facing surfaces",
+        default=False, update=update_parameters,
+    )
     bpy.types.Scene.sg_silhouette_depth = bpy.props.FloatProperty(
         name="Silhouette Depth",
         description="Minimum depth difference (Blender units) between the vertex and an offset ray hit to consider it a silhouette edge. Raise if too much is eroded, lower if outlines remain",
@@ -1130,6 +1135,16 @@ def register_properties(update_model_list, ControlNetUnit, LoRAUnit,
         description="Dilate fallback color regions in the context render before sending to Qwen.",
         default=1, min=0, max=64, update=update_parameters
     )
+    bpy.types.Scene.qwen_use_projection_write_masks = bpy.props.BoolProperty(
+        name="Protect Trusted Texture",
+        description="Use the binary sequential visibility mask both to build exact magenta context and to restrict which pixels a later Qwen view may project",
+        default=True, update=update_parameters
+    )
+    bpy.types.Scene.qwen_residual_fallback_tolerance = bpy.props.IntProperty(
+        name="Residual Fallback Tolerance",
+        description="RGB distance used only inside the known repair mask to reject magenta pixels left by Qwen",
+        default=8, min=0, max=64, update=update_parameters
+    )
     bpy.types.Scene.qwen_prompt_gray_background = bpy.props.BoolProperty(
         name="Gray Background Prompt",
         description="Include 'Replace the background with solid gray' in the default context-render prompt. Disable to let the model choose the background freely",
@@ -1212,14 +1227,24 @@ def register_properties(update_model_list, ControlNetUnit, LoRAUnit,
         default='standard', update=update_parameters
     )
     bpy.types.Scene.early_priority_strength = bpy.props.FloatProperty(
-        name="Prioritize Initial Views",
-        description="Strength of the priority applied to initial views. Higher values will make the earlier cameras more important than the later ones. Every view will be prioritized over the next one.\n    - Very high values may cause various artifacts.",
+        name="Priority Strength",
+        description="Strength of the bounded global camera-rank prior. At maximum strength the final view receives one quarter of the first view's prior before confidence normalization",
         default=0.5, min=0.0, max=1.0, update=update_parameters
     )
     bpy.types.Scene.early_priority = bpy.props.BoolProperty(
-        name="Priority Strength",
-        description="Enable blending priority for earlier cameras.\n    - This may prevent artifacts caused by later cameras overwriting earlier ones.\n    - You will have to place the important cameras first.",
+        name="Prioritize Initial Views",
+        description="Apply a predictable global rank prior so earlier cameras win close confidence decisions. Put detail-critical cameras first",
         default=False, update=update_parameters
+    )
+    bpy.types.Scene.sg_texel_ownership = bpy.props.BoolProperty(
+        name="Per-Texel View Ownership",
+        description="Select one camera per surface point and keep its detail until a later camera has meaningfully higher confidence. This creates harder camera boundaries than weighted blending",
+        default=False, update=update_parameters
+    )
+    bpy.types.Scene.sg_texel_replacement_margin = bpy.props.FloatProperty(
+        name="Ownership Replacement Margin",
+        description="Extra confidence a later camera needs before replacing the current per-texel owner",
+        default=0.05, min=0.0, max=1.0, update=update_parameters
     )
     bpy.types.Scene.texture_objects = bpy.props.EnumProperty(
         name="Objects to Texture", description="Select the objects to texture",
@@ -1828,6 +1853,8 @@ def unregister_properties(load_handler, _sg_queue_load_handler):
         'visibility_vignette', 'visibility_vignette_width', 'visibility_vignette_softness',
         'visibility_vignette_blur',
         'sg_silhouette_margin', 'sg_silhouette_depth', 'sg_silhouette_rays',
+        'sg_allow_backface_projection',
+        'sg_texel_ownership', 'sg_texel_replacement_margin',
         'refine_angle_ramp_active', 'refine_angle_ramp_pos_0', 'refine_angle_ramp_pos_1',
         'refine_feather_ramp_pos_0', 'refine_feather_ramp_pos_1',
         'refine_edge_feather_projection', 'refine_edge_feather_width', 'refine_edge_feather_softness',
@@ -1859,6 +1886,7 @@ def unregister_properties(load_handler, _sg_queue_load_handler):
         'qwen_guidance_fallback_color', 'qwen_guidance_background_color',
         'qwen_context_cleanup', 'qwen_context_cleanup_hue_tolerance',
         'qwen_context_cleanup_value_adjust', 'qwen_context_fallback_dilation',
+        'qwen_use_projection_write_masks', 'qwen_residual_fallback_tolerance',
         'qwen_prompt_gray_background',
     ]
     for prop in _simple_scene_props:

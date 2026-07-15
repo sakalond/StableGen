@@ -10,6 +10,7 @@ from datetime import datetime
 from ..util.workflow_templates import prompt_text_qwen_image_edit, prompt_text_flux2_klein
 from ..utils import get_generation_dirs
 from ..timeout_config import get_timeout
+from .graph_validation import validate_workflow_graph
 
 from io import BytesIO
 import numpy as np
@@ -546,6 +547,13 @@ class _TexturingWorkflowMixin:
 
         # --- Reference Latent chain (Qwen unzoom fix) ---
         self._build_qwen_reference_latent_chain(prompt, NODES)
+
+        graph_issues = validate_workflow_graph(
+            prompt, (NODES['pos_prompt'], NODES['neg_prompt'])
+        )
+        if graph_issues:
+            self.operator._error = "Invalid Qwen refine workflow: " + "; ".join(graph_issues)
+            return {"error": "invalid_workflow"}
         
         # --- Save and Execute ---
         self._save_prompt_to_file(prompt, revision_dir)
@@ -814,6 +822,13 @@ class _TexturingWorkflowMixin:
              }
         else:
             prompt[NODES['unet_loader']]['inputs']['unet_name'] = context.scene.model_name
+
+        graph_issues = validate_workflow_graph(
+            prompt, (NODES['pos_prompt'], NODES['neg_prompt'])
+        )
+        if graph_issues:
+            self.operator._error = "Invalid Qwen edit workflow: " + "; ".join(graph_issues)
+            return {"error": "invalid_workflow"}
 
         # --- Execute ---
         self._save_prompt_to_file(prompt, revision_dir)
