@@ -2,6 +2,7 @@
 
 import os
 import math
+from contextlib import contextmanager
 import bpy, bmesh  # pylint: disable=import-error
 import numpy as np
 import mathutils
@@ -40,6 +41,219 @@ def _restore_material_state(obj, state):
             f"[StableGen] Warning: polygon count changed while exporting '{obj.name}'; "
             "material slots were restored but polygon indices could not be."
         )
+
+
+class _RenderStateTransaction:
+    """Restore temporary render mutations even when an export raises."""
+
+    _PASS_NAMES = (
+        "use_pass_combined",
+        "use_pass_diffuse_color",
+        "use_pass_diffuse_direct",
+        "use_pass_diffuse_indirect",
+        "use_pass_ambient_occlusion",
+        "use_pass_shadow",
+        "use_pass_emit",
+        "use_pass_environment",
+        "use_pass_z",
+        "use_pass_normal",
+        "use_pass_object_index",
+        "use_pass_material_index",
+    )
+
+    def __init__(self, context, objects=()):
+        self.context = context
+        self.scene = context.scene
+        self.objects = [obj for obj in objects if obj and obj.type == 'MESH']
+
+    def __enter__(self):
+        scene = self.scene
+        render = scene.render
+        self.material_states = {
+            obj: _snapshot_material_state(obj) for obj in self.objects
+        }
+        self.object_pass_indices = {
+            obj: int(obj.pass_index) for obj in scene.objects
+            if hasattr(obj, 'pass_index')
+        }
+        self.material_pass_indices = {
+            material: int(material.pass_index) for material in bpy.data.materials
+            if hasattr(material, 'pass_index')
+        }
+        self.material_ptrs = {material.as_pointer() for material in bpy.data.materials}
+        self.world_ptrs = {world.as_pointer() for world in bpy.data.worlds}
+        self.hide_render_state = {
+            obj: bool(obj.hide_render) for obj in scene.objects
+        }
+        self.world = scene.world
+        self.world_state = None
+        if self.world:
+            backgrounds = []
+            if self.world.node_tree:
+                for node in self.world.node_tree.nodes:
+                    if node.type == 'BACKGROUND':
+                        backgrounds.append((
+                            node,
+                            tuple(node.inputs["Color"].default_value),
+                            node.inputs["Strength"].default_value,
+                        ))
+            self.world_state = (
+                self.world.use_nodes,
+                tuple(self.world.color),
+                backgrounds,
+            )
+        self.scene_state = {
+            "frame": scene.frame_current,
+            "camera": scene.camera,
+            "engine": render.engine,
+            "film_transparent": render.film_transparent,
+            "use_compositing": render.use_compositing,
+            "filepath": render.filepath,
+            "resolution_x": render.resolution_x,
+            "resolution_y": render.resolution_y,
+            "resolution_percentage": render.resolution_percentage,
+            "image_file_format": render.image_settings.file_format,
+            "scene_use_nodes": scene.use_nodes,
+            "display_device": scene.display_settings.display_device,
+            "view_transform": scene.view_settings.view_transform,
+            "look": scene.view_settings.look,
+            "exposure": scene.view_settings.exposure,
+            "gamma": scene.view_settings.gamma,
+            "cycles_samples": getattr(scene.cycles, "samples", None),
+            "cycles_device": getattr(scene.cycles, "device", None),
+            "cycles_shading_system": getattr(scene.cycles, "shading_system", None),
+            "cycles_use_osl": getattr(scene.cycles, "use_osl", None),
+            "material_override": getattr(self.context.view_layer, "material_override", None),
+            "shading_light": scene.display.shading.light,
+            "shading_color_type": scene.display.shading.color_type,
+        }
+        self.pass_state = {
+            name: getattr(self.context.view_layer, name)
+            for name in self._PASS_NAMES
+            if hasattr(self.context.view_layer, name)
+        }
+        node_tree = (
+            getattr(scene, "compositing_node_group", None)
+            if hasattr(scene, "compositing_node_group")
+            else getattr(scene, "node_tree", None)
+        )
+        self.compositor_tree = node_tree
+        self.compositor_ptrs = (
+            {node.as_pointer() for node in node_tree.nodes} if node_tree else set()
+        )
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        scene = self.scene
+        state = self.scene_state
+        restored_meshes = set()
+        for obj, material_state in self.material_states.items():
+            if obj.name in bpy.data.objects:
+                mesh_pointer = obj.data.as_pointer()
+                if mesh_pointer not in restored_meshes:
+                    _restore_material_state(obj, material_state)
+                    restored_meshes.add(mesh_pointer)
+        # Clearing slots on shared mesh data clamps every user's active index;
+        # restore per-object active slots only after all shared data is final.
+        for obj, material_state in self.material_states.items():
+            if obj.name in bpy.data.objects and obj.data.materials:
+                obj.active_material_index = min(
+                    material_state["active_index"], len(obj.data.materials) - 1
+                )
+
+        for obj, hidden in self.hide_render_state.items():
+            if obj.name in bpy.data.objects:
+                obj.hide_render = hidden
+        for obj, pass_index in self.object_pass_indices.items():
+            if obj.name in bpy.data.objects:
+                obj.pass_index = pass_index
+        for material, pass_index in self.material_pass_indices.items():
+            if material.name in bpy.data.materials:
+                material.pass_index = pass_index
+
+        compositor_tree = (
+            getattr(scene, "compositing_node_group", None)
+            if hasattr(scene, "compositing_node_group")
+            else getattr(scene, "node_tree", None)
+        )
+        if compositor_tree:
+            for node in list(compositor_tree.nodes):
+                if node.as_pointer() not in self.compositor_ptrs:
+                    compositor_tree.nodes.remove(node)
+
+        scene.world = self.world
+        if self.world and self.world_state:
+            use_nodes, color, backgrounds = self.world_state
+            self.world.use_nodes = use_nodes
+            self.world.color = color
+            for node, bg_color, strength in backgrounds:
+                if node.id_data:
+                    node.inputs["Color"].default_value = bg_color
+                    node.inputs["Strength"].default_value = strength
+
+        scene.camera = state["camera"]
+        scene.render.engine = state["engine"]
+        scene.render.film_transparent = state["film_transparent"]
+        scene.render.use_compositing = state["use_compositing"]
+        scene.render.filepath = state["filepath"]
+        scene.render.resolution_x = state["resolution_x"]
+        scene.render.resolution_y = state["resolution_y"]
+        scene.render.resolution_percentage = state["resolution_percentage"]
+        scene.render.image_settings.file_format = state["image_file_format"]
+        scene.use_nodes = state["scene_use_nodes"]
+        scene.display_settings.display_device = state["display_device"]
+        scene.view_settings.view_transform = state["view_transform"]
+        scene.view_settings.look = state["look"]
+        scene.view_settings.exposure = state["exposure"]
+        scene.view_settings.gamma = state["gamma"]
+        if state["cycles_samples"] is not None:
+            scene.cycles.samples = state["cycles_samples"]
+        if state["cycles_device"] is not None:
+            scene.cycles.device = state["cycles_device"]
+        if state["cycles_shading_system"] is not None:
+            scene.cycles.shading_system = state["cycles_shading_system"]
+        if state["cycles_use_osl"] is not None:
+            scene.cycles.use_osl = state["cycles_use_osl"]
+        if hasattr(self.context.view_layer, "material_override"):
+            self.context.view_layer.material_override = state["material_override"]
+        scene.display.shading.light = state["shading_light"]
+        scene.display.shading.color_type = state["shading_color_type"]
+        for name, value in self.pass_state.items():
+            setattr(self.context.view_layer, name, value)
+        scene.frame_set(state["frame"])
+
+        for material in list(bpy.data.materials):
+            if material.as_pointer() not in self.material_ptrs and material.users == 0:
+                bpy.data.materials.remove(material)
+        for world in list(bpy.data.worlds):
+            if world.as_pointer() not in self.world_ptrs and world.users == 0:
+                bpy.data.worlds.remove(world)
+        return False
+
+
+@contextmanager
+def _temporary_render_copies(context, objects):
+    """Yield isolated mesh copies without touching production material slots."""
+    originals = [obj for obj in objects if obj and obj.type == 'MESH']
+    copies = []
+    mapping = {}
+    try:
+        for original in originals:
+            duplicate = original.copy()
+            duplicate.data = original.data.copy()
+            duplicate.name = f"_SG_RenderCopy_{original.name}"
+            context.scene.collection.objects.link(duplicate)
+            original.hide_render = True
+            duplicate.hide_render = False
+            copies.append(duplicate)
+            mapping[original] = duplicate
+        yield copies, mapping
+    finally:
+        for duplicate in copies:
+            mesh = duplicate.data
+            bpy.data.objects.remove(duplicate, do_unlink=True)
+            if mesh and mesh.users == 0:
+                bpy.data.meshes.remove(mesh)
 
 
 def purge_orphans():
@@ -160,7 +374,7 @@ def create_edge_feathered_mask(mask_path, feather_width=30):
     return output_path
 
 
-def render_edge_feather_mask(context, to_export, camera, camera_index, feather_width=30, softness=1.0):
+def _render_edge_feather_mask_impl(context, to_export, camera, camera_index, feather_width=30, softness=1.0):
     """Render a geometry silhouette from *camera* and apply distance-transform
     edge feathering.
 
@@ -204,25 +418,15 @@ def render_edge_feather_mask(context, to_export, camera, camera_index, feather_w
     context.scene.camera = camera
 
     # ── Replace target-object materials with white Emission ─────────────────
-    saved_materials = {}
-    saved_active_materials = {}
-    temp_materials = []
-    for obj in to_export:
-        saved_materials[obj] = list(obj.data.materials)
-        saved_active_materials[obj] = obj.active_material
-
-        mat = bpy.data.materials.new(name="_SG_EdgeFeather_Temp")
-        mat.use_nodes = True
-        mat.node_tree.nodes.clear()
-        emission = mat.node_tree.nodes.new("ShaderNodeEmission")
-        emission.inputs["Color"].default_value = (1.0, 1.0, 1.0, 1.0)
-        emission.inputs["Strength"].default_value = 1.0
-        out_node = mat.node_tree.nodes.new("ShaderNodeOutputMaterial")
-        mat.node_tree.links.new(emission.outputs[0], out_node.inputs["Surface"])
-
-        obj.data.materials.clear()
-        obj.data.materials.append(mat)
-        temp_materials.append(mat)
+    mat = bpy.data.materials.new(name="_SG_EdgeFeather_Temp")
+    mat.use_nodes = True
+    mat.node_tree.nodes.clear()
+    emission = mat.node_tree.nodes.new("ShaderNodeEmission")
+    emission.inputs["Color"].default_value = (1.0, 1.0, 1.0, 1.0)
+    emission.inputs["Strength"].default_value = 1.0
+    out_node = mat.node_tree.nodes.new("ShaderNodeOutputMaterial")
+    mat.node_tree.links.new(emission.outputs[0], out_node.inputs["Surface"])
+    context.view_layer.material_override = mat
 
     # ── Hide non-target mesh objects ────────────────────────────────────────
     hidden_restore = {}
@@ -262,8 +466,6 @@ def render_edge_feather_mask(context, to_export, camera, camera_index, feather_w
     node_tree = get_compositor_node_tree(context.scene)
     comp_nodes = node_tree.nodes
     comp_links = node_tree.links
-    comp_nodes.clear()
-
     render_layers = comp_nodes.new('CompositorNodeRLayers')
     try:
         mix_node = comp_nodes.new('CompositorNodeMixRGB')
@@ -288,18 +490,6 @@ def render_edge_feather_mask(context, to_export, camera, camera_index, feather_w
     # ── Determine actual output path ────────────────────────────────────────
     frame_suffix = "0001" if bpy.app.version < (5, 0, 0) else ""
     raw_path = os.path.join(output_dir, f"{raw_file}{frame_suffix}.png")
-
-    # ── Restore materials ───────────────────────────────────────────────────
-    for obj, mats in saved_materials.items():
-        obj.data.materials.clear()
-        if saved_active_materials[obj]:
-            obj.data.materials.append(saved_active_materials[obj])
-        for m in mats:
-            if m != saved_active_materials[obj]:
-                obj.data.materials.append(m)
-    for mat in temp_materials:
-        if mat and mat.name in bpy.data.materials:
-            bpy.data.materials.remove(mat)
 
     # ── Restore non-target visibility ───────────────────────────────────────
     for obj, was_hidden in hidden_restore.items():
@@ -365,6 +555,19 @@ def render_edge_feather_mask(context, to_export, camera, camera_index, feather_w
 
     print(f"[StableGen] Edge-feather mask saved: {ef_path} (width={feather_width}px, softness={softness:.2f})")
     return ef_path
+
+
+def render_edge_feather_mask(context, to_export, camera, camera_index, feather_width=30, softness=1.0):
+    all_meshes = [obj for obj in context.scene.objects if obj.type == 'MESH']
+    with _RenderStateTransaction(context, all_meshes):
+        return _render_edge_feather_mask_impl(
+            context,
+            to_export,
+            camera,
+            camera_index,
+            feather_width=feather_width,
+            softness=softness,
+        )
 
 
 def apply_uv_inpaint_texture(context, obj, baked_image_path):
@@ -630,7 +833,7 @@ def flatten_projection_material_for_refine(context, obj, baked_image_path):
 
     print(f"[StableGen] Flattened ProjectionMaterial for '{obj.name}' to baked texture '{os.path.basename(baked_image_path)}'")
 
-def export_emit_image(context, to_export, camera_id=None, bg_color=(0.5, 0.5, 0.5), view_transform='Standard', fallback_color=(0,0,0)):
+def _export_emit_image_impl(context, to_export, camera_id=None, bg_color=(0.5, 0.5, 0.5), view_transform='Standard', fallback_color=(0,0,0)):
         """
         Exports a emit-only render of the scene from a camera's perspective.
         :param context: Blender context.
@@ -638,9 +841,6 @@ def export_emit_image(context, to_export, camera_id=None, bg_color=(0.5, 0.5, 0.
         :return: None
         """
         print("[StableGen] Exporting emit render")
-        # Set animation frame to 1
-        bpy.context.scene.frame_set(1)
-
         # Store original materials and create temporary ones
         original_materials = {}
         temporary_materials = {}
@@ -790,9 +990,6 @@ def export_emit_image(context, to_export, camera_id=None, bg_color=(0.5, 0.5, 0.
         nodes = node_tree.nodes
         links = node_tree.links
 
-        # Clear existing nodes
-        nodes.clear()
-
         # Create nodes
         render_layers = nodes.new('CompositorNodeRLayers')
         try:
@@ -868,7 +1065,20 @@ def export_emit_image(context, to_export, camera_id=None, bg_color=(0.5, 0.5, 0.
         print(f"[StableGen] Emmision render saved to: {os.path.join(output_dir, output_file)}.png")
 
 
-def export_render(context, camera_id=None, output_dir=None, filename=None):
+def export_emit_image(context, to_export, camera_id=None, bg_color=(0.5, 0.5, 0.5), view_transform='Standard', fallback_color=(0,0,0)):
+    with _RenderStateTransaction(context, to_export):
+        with _temporary_render_copies(context, to_export) as (copies, _mapping):
+            return _export_emit_image_impl(
+                context,
+                copies,
+                camera_id=camera_id,
+                bg_color=bg_color,
+                view_transform=view_transform,
+                fallback_color=fallback_color,
+            )
+
+
+def _export_render_impl(context, camera_id=None, output_dir=None, filename=None):
     """
     Renders the scene from a camera's perspective using Workbench.
     Creates temporary materials for consistent rendering.
@@ -879,39 +1089,6 @@ def export_render(context, camera_id=None, output_dir=None, filename=None):
     :return: None
     """
     print("[StableGen] Exporting render using Workbench")
-
-    # Store original materials and create temporary ones
-    original_materials = {}
-    temporary_materials = []
-    for obj in context.view_layer.objects:
-        if obj.type == 'MESH':
-            # Store original materials
-            original_materials[obj] = _snapshot_material_state(obj)
-
-            # Create temporary material
-            temp_mat = bpy.data.materials.new(name="TempRenderMaterial")
-            temporary_materials.append(temp_mat)
-            temp_mat.use_nodes = True # Even Workbench uses nodes for basic color
-            nodes = temp_mat.node_tree.nodes
-            links = temp_mat.node_tree.links
-
-            # Clear default nodes
-            for node in nodes:
-                nodes.remove(node)
-
-            # Create basic material output and diffuse BSDF (Workbench respects Base Color)
-            mat_output = nodes.new('ShaderNodeOutputMaterial')
-            diffuse = nodes.new('ShaderNodeBsdfDiffuse') # Simple diffuse color
-            diffuse.inputs['Color'].default_value = (0.8, 0.8, 0.8, 1.0) # Default grey
-            diffuse.inputs['Roughness'].default_value = 0.5
-            links.new(diffuse.outputs['BSDF'], mat_output.inputs['Surface'])
-
-            # Clear materials and assign temp material
-            obj.data.materials.clear()
-            obj.data.materials.append(temp_mat)
-
-    # Set animation frame to 1
-    context.scene.frame_set(1)
 
     # Setup output path
     if output_dir is None:
@@ -951,8 +1128,6 @@ def export_render(context, camera_id=None, output_dir=None, filename=None):
     node_tree = get_compositor_node_tree(context.scene)
     nodes = node_tree.nodes
     links = node_tree.links
-    nodes.clear()
-
     render_layers = nodes.new('CompositorNodeRLayers')
     output_node = nodes.new('CompositorNodeOutputFile')
     configure_output_node_paths(output_node, output_dir, output_file)
@@ -961,18 +1136,8 @@ def export_render(context, camera_id=None, output_dir=None, filename=None):
     # Render
     bpy.ops.render.render(write_still=True)
 
-    # Restore original materials
-    for obj, material_state in original_materials.items():
-        _restore_material_state(obj, material_state)
-
     # Restore original render settings
     render_layer.use_pass_combined = original_combined
-
-    # Clean up temporary materials
-    for mat in temporary_materials:
-        if mat.name in bpy.data.materials:
-            bpy.data.materials.remove(mat)
-
 
     # Restore original render settings
     if context.scene.render.engine != original_engine:
@@ -984,10 +1149,15 @@ def export_render(context, camera_id=None, output_dir=None, filename=None):
     context.scene.render.use_compositing = original_use_compositing
 
 
-    print(f"[StableGen] Render saved to: {os.path.join(output_dir, output_file)}0001.png") # Blender adds frame number
+def export_render(context, camera_id=None, output_dir=None, filename=None):
+    objects = [obj for obj in context.view_layer.objects if obj.type == 'MESH']
+    with _RenderStateTransaction(context, objects):
+        return _export_render_impl(
+            context, camera_id=camera_id, output_dir=output_dir, filename=filename
+        )
 
 
-def export_viewport(context, camera_id=None, output_dir=None, filename=None):
+def _export_viewport_impl(context, camera_id=None, output_dir=None, filename=None):
     """
     Renders the scene using viewport OpenGL render to include overlays.
     :param context: Blender context.
@@ -1082,6 +1252,15 @@ def export_viewport(context, camera_id=None, output_dir=None, filename=None):
     context.scene.render.image_settings.file_format = original_image_settings
 
     print(f"[StableGen] Viewport render saved to: {os.path.join(output_dir, output_file)}.png")
+
+
+def export_viewport(context, camera_id=None, output_dir=None, filename=None):
+    """Viewport export with full scene-state restoration on every exit path."""
+    objects = [obj for obj in context.view_layer.objects if obj.type == 'MESH']
+    with _RenderStateTransaction(context, objects):
+        return _export_viewport_impl(
+            context, camera_id=camera_id, output_dir=output_dir, filename=filename
+        )
 
 def export_canny(context, camera_id=None, low_threshold=0, high_threshold=80):
     """
@@ -1194,8 +1373,8 @@ def expand_mask_to_blocks(mask_file_path, block_size=8):
         return None
 
 
-def export_visibility(context, to_export, obj=None, camera_visibility=None,
-                      prepare_only=False, camera_render=None, camera_id=None):
+def _export_visibility_impl(context, to_export, obj=None, camera_visibility=None,
+                            prepare_only=False, camera_render=None, camera_id=None):
     """     
     Exports the visibility of the mesh by temporarily altering the shading nodes.
     :param context: Blender context.
@@ -1253,6 +1432,40 @@ def export_visibility(context, to_export, obj=None, camera_visibility=None,
         if not output.inputs[0].links:
             bpy.data.materials.remove(mat_copy)
             return False
+
+        # Confidence-owned sequential materials expose the original source
+        # quality explicitly.  Build repair = visible surface & ~trusted from
+        # that socket instead of reverse-engineering RGB or summed blend
+        # weights.  The copied material is used only by this render.
+        owner_quality = next(
+            (node for node in nodes if node.label == 'SGOwnerQuality'), None
+        )
+        if owner_quality is not None:
+            trusted = nodes.new("ShaderNodeMath")
+            trusted.operation = 'GREATER_THAN'
+            trusted.inputs[1].default_value = float(getattr(
+                context.scene, 'qwen_trust_threshold', 0.7
+            )) - 1e-7
+            trusted.label = "SGTrustedContext"
+            links.new(owner_quality.outputs[0], trusted.inputs[0])
+
+            repair = nodes.new("ShaderNodeMath")
+            repair.operation = 'SUBTRACT'
+            repair.inputs[0].default_value = 1.0
+            repair.label = "SGRepairMask"
+            links.new(trusted.outputs[0], repair.inputs[1])
+
+            repair_color = nodes.new("ShaderNodeMixRGB")
+            repair_color.inputs["Color1"].default_value = (0, 0, 0, 1)
+            repair_color.inputs["Color2"].default_value = (1, 1, 1, 1)
+            repair_color.label = "SGRepairMaskColor"
+            links.new(repair.outputs[0], repair_color.inputs["Fac"])
+            links.new(repair_color.outputs[0], output.inputs[0])
+
+            obj.data.materials.clear()
+            obj.data.materials.append(mat_copy)
+            temporary_materials[obj] = mat_copy
+            return True
         
         # Determine which input to used based on existence of BSDF node before the output
         if output.inputs[0].links and output.inputs[0].links[0].from_node.type == 'BSDF_PRINCIPLED':
@@ -1476,12 +1689,31 @@ def export_visibility(context, to_export, obj=None, camera_visibility=None,
         else:
             camera_render_index = camera_id
         context.scene.camera = camera_render
-        export_emit_image(context, to_export, camera_id=f"{camera_render_index}_visibility", bg_color=(1, 1, 1), view_transform='Raw', fallback_color=(1,1,1))
+        _export_emit_image_impl(context, to_export, camera_id=f"{camera_render_index}_visibility", bg_color=(1, 1, 1), view_transform='Raw', fallback_color=(1,1,1))
 
     # Restore original materials
     restore_prepared_materials()
 
     return True
+
+
+def export_visibility(context, to_export, obj=None, camera_visibility=None,
+                      prepare_only=False, camera_render=None, camera_id=None):
+    objects = [obj] if obj is not None else list(to_export or ())
+    if prepare_only:
+        return _export_visibility_impl(
+            context, to_export, obj=obj, camera_visibility=camera_visibility,
+            prepare_only=True, camera_render=camera_render, camera_id=camera_id,
+        )
+    with _RenderStateTransaction(context, objects):
+        with _temporary_render_copies(context, objects) as (copies, mapping):
+            mapped_obj = mapping.get(obj) if obj is not None else None
+            return _export_visibility_impl(
+                context, copies, obj=mapped_obj,
+                camera_visibility=camera_visibility,
+                prepare_only=False, camera_render=camera_render,
+                camera_id=camera_id,
+            )
 
 
 # =========================================================

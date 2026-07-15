@@ -829,7 +829,159 @@ class SG_OT_DebugRestoreMaterial(bpy.types.Operator):
 
 
 # ═════════════════════════════════════════════════════════════════════════
-# 9. Debug Make Solid
+# 9. Live Ownership / Confidence Diagnostics
+# ═════════════════════════════════════════════════════════════════════════
+
+class SG_OT_DebugOwnershipDiagnostic(bpy.types.Operator):
+    """Visualize values from the actual projection ownership graph.
+
+    The material is copied before its output is replaced, so the diagnostic
+    cannot alter the production graph. Undo restores the original slots.
+    """
+    bl_idname = "stablegen.debug_ownership_diagnostic"
+    bl_label = "Ownership Diagnostic"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    mode: bpy.props.EnumProperty(
+        name="Diagnostic",
+        items=[
+            ('OWNER', "Owner Camera", "Hue identifies the selected source camera"),
+            ('QUALITY', "Owner Quality", "Resolved acquisition quality of the owner"),
+            ('ACQUISITION', "Camera Quality", "Raw acquisition quality for the active camera"),
+            ('TRUSTED', "Trusted Context", "White where owner quality reaches the trust threshold"),
+            ('REPAIR', "Repair Mask", "White where the current view must regenerate context"),
+            ('WRITE', "Write Mask", "Authoritative generated-pixel write mask for the active camera"),
+            ('GUARD', "Depth/Part Guard", "Rear-surface rejection mask for the active camera"),
+            ('FALLBACK', "Fallback Only", "White where no trusted owner exists"),
+        ],
+        default='QUALITY',
+    )  # type: ignore
+
+    @classmethod
+    def poll(cls, context):
+        return _common_poll(cls, context)
+
+    def invoke(self, context, event):
+        return context.window_manager.invoke_props_dialog(self)
+
+    @staticmethod
+    def _find_node(nodes, exact=None, prefix=None):
+        for node in nodes:
+            label = getattr(node, "label", "")
+            if exact is not None and label == exact:
+                return node
+            if prefix is not None and label.startswith(prefix):
+                return node
+        return None
+
+    def execute(self, context):
+        meshes = _get_target_meshes(context)
+        cameras = _get_cameras(context)
+        _cam, camera_index = _get_active_camera(context)
+        material_copies = {}
+        visualized = 0
+
+        for obj in meshes:
+            for slot in obj.material_slots:
+                source_mat = slot.material
+                if not source_mat or not source_mat.use_nodes:
+                    continue
+                key = source_mat.as_pointer()
+                mat = material_copies.get(key)
+                if mat is None:
+                    mat = source_mat.copy()
+                    mat.name = f"SG_Debug_Diagnostic_{source_mat.name}"
+                    material_copies[key] = mat
+                    nodes = mat.node_tree.nodes
+                    links = mat.node_tree.links
+
+                    owner_quality = self._find_node(nodes, exact="SGOwnerQuality")
+                    if self.mode == 'OWNER':
+                        source = self._find_node(nodes, exact="SGOwnerCamera")
+                    elif self.mode == 'QUALITY':
+                        source = owner_quality
+                    elif self.mode == 'ACQUISITION':
+                        source = self._find_node(
+                            nodes, prefix=f"AcquisitionQuality-{camera_index}-"
+                        )
+                    elif self.mode in {'TRUSTED', 'REPAIR'}:
+                        source = owner_quality
+                    elif self.mode == 'WRITE':
+                        source = self._find_node(
+                            nodes, prefix=f"SequentialWriteWeight-{camera_index}-"
+                        )
+                    elif self.mode == 'GUARD':
+                        source = self._find_node(
+                            nodes, prefix=f"ProjectionGuardWeight-{camera_index}-"
+                        )
+                    else:
+                        source = self._find_node(nodes, exact="OwnerUncovered")
+
+                    if source is None or not source.outputs:
+                        bpy.data.materials.remove(mat)
+                        material_copies[key] = None
+                        continue
+
+                    value_socket = source.outputs[0]
+                    if self.mode in {'TRUSTED', 'REPAIR'}:
+                        compare = nodes.new("ShaderNodeMath")
+                        compare.operation = 'GREATER_THAN'
+                        compare.label = "SGDebugTrusted"
+                        compare.inputs[1].default_value = getattr(
+                            context.scene, 'qwen_trust_threshold', 0.55
+                        )
+                        links.new(value_socket, compare.inputs[0])
+                        value_socket = compare.outputs[0]
+                        if self.mode == 'REPAIR':
+                            invert = nodes.new("ShaderNodeMath")
+                            invert.operation = 'SUBTRACT'
+                            invert.inputs[0].default_value = 1.0
+                            links.new(value_socket, invert.inputs[1])
+                            value_socket = invert.outputs[0]
+
+                    ramp = nodes.new("ShaderNodeValToRGB")
+                    ramp.label = f"SGDebug-{self.mode}"
+                    if self.mode == 'OWNER':
+                        normalize = nodes.new("ShaderNodeMath")
+                        normalize.operation = 'DIVIDE'
+                        normalize.inputs[1].default_value = max(len(cameras) - 1, 1)
+                        links.new(value_socket, normalize.inputs[0])
+                        value_socket = normalize.outputs[0]
+                        ramp.color_ramp.elements[0].color = (1.0, 0.0, 0.0, 1.0)
+                        ramp.color_ramp.elements[1].color = (0.0, 0.2, 1.0, 1.0)
+                        middle = ramp.color_ramp.elements.new(0.5)
+                        middle.color = (0.0, 1.0, 0.1, 1.0)
+                    else:
+                        ramp.color_ramp.elements[0].color = (0.0, 0.0, 0.0, 1.0)
+                        ramp.color_ramp.elements[1].color = (1.0, 1.0, 1.0, 1.0)
+                    links.new(value_socket, ramp.inputs['Fac'])
+
+                    emission = nodes.new("ShaderNodeEmission")
+                    emission.label = "SGDebugEmission"
+                    links.new(ramp.outputs['Color'], emission.inputs['Color'])
+                    output = next(
+                        (n for n in nodes if n.type == 'OUTPUT_MATERIAL' and n.is_active_output),
+                        None,
+                    )
+                    if output is None:
+                        output = nodes.new("ShaderNodeOutputMaterial")
+                    for link in list(output.inputs['Surface'].links):
+                        links.remove(link)
+                    links.new(emission.outputs[0], output.inputs['Surface'])
+
+                if mat is not None:
+                    slot.material = mat
+                    visualized += 1
+
+        if not visualized:
+            self.report({'WARNING'}, "The selected diagnostic is not present in these projection materials")
+            return {'CANCELLED'}
+        self.report({'INFO'}, f"Applied {self.mode.lower()} diagnostic to {visualized} material slot(s)")
+        return {'FINISHED'}
+
+
+# ═════════════════════════════════════════════════════════════════════════
+# 10. Debug Make Solid
 # ═════════════════════════════════════════════════════════════════════════
 
 class SG_OT_DebugMakeSolid(bpy.types.Operator):
@@ -1087,5 +1239,6 @@ debug_classes = [
     SG_OT_DebugFeatherPreview,
     SG_OT_DebugUVSeamViz,
     SG_OT_DebugRestoreMaterial,
+    SG_OT_DebugOwnershipDiagnostic,
     SG_OT_DebugMakeSolid,
 ]

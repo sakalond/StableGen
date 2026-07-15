@@ -10,13 +10,22 @@ from datetime import datetime
 from ..util.workflow_templates import prompt_text_qwen_image_edit, prompt_text_flux2_klein
 from ..utils import get_generation_dirs
 from ..timeout_config import get_timeout
-from .graph_validation import validate_workflow_graph
+from .graph_validation import validate_workflow_graph, qwen_style_semantic_slot, sdxl_final_mask_reference
 
 from io import BytesIO
 import numpy as np
 from PIL import Image
 
 _ADDON_PKG = __package__.rsplit('.', 1)[0]
+
+
+def _immutable_view_prompt(operator):
+    """Return the prompt frozen into the canonical generation view plan."""
+    index = getattr(operator, '_current_image', -1)
+    plan = getattr(operator, '_view_plan', ()) or ()
+    if 0 <= index < len(plan):
+        return plan[index].prompt or ""
+    return ""
 
 
 def _texturing_prompt(scene):
@@ -54,25 +63,33 @@ def _generation_prompt(scene):
 
 
 class _TexturingWorkflowMixin:
+    def _queue_prompt(self, prompt, client_id, server_address):
+        """Validate every dynamically edited texturing graph at submission."""
+        issues = validate_workflow_graph(prompt)
+        if issues:
+            message = "Invalid texturing workflow: " + "; ".join(issues)
+            self.operator._error = message
+            raise ValueError(message)
+        return super()._queue_prompt(prompt, client_id, server_address)
+
     """Texturing workflow methods for WorkflowManager."""
 
     def _crop_and_vignette(
         self,
         img_bytes,
-        border_px: int = 8,
+        border_px: int = 0,
         feather: float = 0.15,
         gamma: float = 0.7,
     ):
         """
-        Crop a constant border from the image and apply an *alpha* vignette
-        that fades the image out toward the edges.
+        Apply an alpha vignette without changing image registration.
 
         IMPORTANT:
           - RGB is NOT darkened here, only alpha is shaped.
           - This assumes the shader uses alpha to blend with the underlying
             surface (e.g. Mix using alpha as Fac).
 
-        border_px : how many pixels to remove on each side.
+        border_px : deprecated and ignored; sequential outputs stay full-size.
         feather   : fraction of min(width, height) that is used as the feather band.
         gamma     : exponent applied to the feather mask (1.0 = linear).
         """
@@ -89,19 +106,8 @@ class _TexturingWorkflowMixin:
                   f"({len(img_bytes)} bytes): {e}  — returning raw bytes.")
             return img_bytes
 
-        w, h = img.size
-        if w <= 2 * border_px or h <= 2 * border_px:
-            # Too small to crop; just return as-is
-            out_buf = BytesIO()
-            img.save(out_buf, format="PNG")
-            return out_buf.getvalue()
-
-        # --- Crop hard Comfy border first ---
-        left   = border_px
-        top    = border_px
-        right  = w - border_px
-        bottom = h - border_px
-        img = img.crop((left, top, right, bottom))
+        # Never crop here. The old fixed eight-pixel crop changed camera/image
+        # registration and the projection transform was not updated.
         w, h = img.size
 
         # Convert to numpy for mask math
@@ -548,6 +554,27 @@ class _TexturingWorkflowMixin:
         # --- Reference Latent chain (Qwen unzoom fix) ---
         self._build_qwen_reference_latent_chain(prompt, NODES)
 
+        prompt[NODES['sampler']]['inputs']['seed'] = context.scene.seed
+        prompt[NODES['sampler']]['inputs']['steps'] = context.scene.steps
+        prompt[NODES['sampler']]['inputs']['cfg'] = context.scene.cfg
+        prompt[NODES['sampler']]['inputs']['sampler_name'] = context.scene.sampler
+        prompt[NODES['sampler']]['inputs']['scheduler'] = context.scene.scheduler
+        prompt[NODES['sampler']]['inputs']['denoise'] = 1.0
+
+        if is_nunchaku:
+            prompt[NODES['unet_loader']] = {
+                "inputs": {
+                    "model_name": context.scene.model_name,
+                    "cpu_offload": "auto",
+                    "num_blocks_on_gpu": 1,
+                    "use_pin_memory": "enable",
+                },
+                "class_type": "NunchakuQwenImageDiTLoader",
+                "_meta": {"title": "Nunchaku Qwen-Image DiT Loader"},
+            }
+        else:
+            prompt[NODES['unet_loader']]['inputs']['unet_name'] = context.scene.model_name
+
         graph_issues = validate_workflow_graph(
             prompt, (NODES['pos_prompt'], NODES['neg_prompt'])
         )
@@ -632,12 +659,9 @@ class _TexturingWorkflowMixin:
         remove_context = False
 
         # --- Camera Prompt Injection ---
-        if context.scene.use_camera_prompts and self.operator._cameras and self.operator._current_image < len(self.operator._cameras):
-            current_camera_name = self.operator._cameras[self.operator._current_image].name
-            # Find the prompt in the collection
-            prompt_item = next((item for item in context.scene.camera_prompts if item.name == current_camera_name), None)
-            if prompt_item and prompt_item.prompt:
-                view_desc = prompt_item.prompt
+        if context.scene.use_camera_prompts:
+            view_desc = _immutable_view_prompt(self.operator)
+            if view_desc:
                 # Prepend the view description
                 user_prompt = f"{view_desc}, {user_prompt}"
 
@@ -718,7 +742,7 @@ class _TexturingWorkflowMixin:
                     prompt[NODES['pos_prompt']]['inputs']['prompt'] = pos_prompt_text
 
         # Case 2: Sequential generation (after first image)
-        elif not is_initial_image:
+        if style_image_info is None and not is_initial_image:
             if context_mode == 'REPLACE_STYLE':
                 # The context render becomes the style image
                 style_image_info = context_render_info
@@ -792,8 +816,9 @@ class _TexturingWorkflowMixin:
                 }
                 # Point text-encode image2 at the scaled version so both
                 # VL processing and the reference latent chain see ~1 MP.
-                prompt[NODES['pos_prompt']]['inputs']['image2'] = [scale_node_key, 0]
-                prompt[NODES['neg_prompt']]['inputs']['image2'] = [scale_node_key, 0]
+                style_slot = qwen_style_semantic_slot(context_mode, is_initial_image)
+                prompt[NODES['pos_prompt']]['inputs'][style_slot] = [scale_node_key, 0]
+                prompt[NODES['neg_prompt']]['inputs'][style_slot] = [scale_node_key, 0]
 
         # --- Reference Latent chain (Qwen unzoom fix) ---
         self._build_qwen_reference_latent_chain(prompt, NODES)
@@ -926,14 +951,10 @@ class _TexturingWorkflowMixin:
         # --- Base user prompt + camera injection ---
         user_prompt = _texturing_prompt(context.scene)
         camera_suffix = ""
-        if (context.scene.use_camera_prompts
-                and self.operator._cameras
-                and self.operator._current_image < len(self.operator._cameras)):
-            cam_name = self.operator._cameras[self.operator._current_image].name
-            prompt_item = next(
-                (p for p in context.scene.camera_prompts if p.name == cam_name), None)
-            if prompt_item and prompt_item.prompt:
-                camera_suffix = f", {prompt_item.prompt}"
+        if context.scene.use_camera_prompts:
+            view_desc = _immutable_view_prompt(self.operator)
+            if view_desc:
+                camera_suffix = f", {view_desc}"
 
         # ─── Collect reference images ────────────────────────────────
         ref_images = []
@@ -1929,12 +1950,9 @@ class _TexturingWorkflowMixin:
         
         base_prompt_text = _texturing_prompt(context.scene)
         # Camera Prompt Injection
-        if context.scene.use_camera_prompts and context.scene.generation_method in ['separate', 'sequential', 'refine', 'local_edit'] and self.operator._cameras and self.operator._current_image < len(self.operator._cameras):
-            current_camera_name = self.operator._cameras[self.operator._current_image].name
-            # Find the prompt in the collection
-            prompt_item = next((item for item in context.scene.camera_prompts if item.name == current_camera_name), None)
-            if prompt_item and prompt_item.prompt:
-                view_desc = prompt_item.prompt
+        if context.scene.use_camera_prompts and context.scene.generation_method in ['separate', 'sequential', 'refine', 'local_edit']:
+            view_desc = _immutable_view_prompt(self.operator)
+            if view_desc:
                 # Prepend the view description
                 base_prompt_text = f"{view_desc}, {base_prompt_text}"
         
@@ -2328,12 +2346,9 @@ class _TexturingWorkflowMixin:
         
         base_prompt_text = _texturing_prompt(context.scene)
         # Camera Prompt Injection
-        if context.scene.use_camera_prompts and context.scene.generation_method in ['separate', 'sequential', 'refine', 'local_edit'] and self.operator._cameras and self.operator._current_image < len(self.operator._cameras):
-            current_camera_name = self.operator._cameras[self.operator._current_image].name
-            # Find the prompt in the collection
-            prompt_item = next((item for item in context.scene.camera_prompts if item.name == current_camera_name), None)
-            if prompt_item and prompt_item.prompt:
-                view_desc = prompt_item.prompt
+        if context.scene.use_camera_prompts and context.scene.generation_method in ['separate', 'sequential', 'refine', 'local_edit']:
+            view_desc = _immutable_view_prompt(self.operator)
+            if view_desc:
                 # Prepend the view description
                 base_prompt_text = f"{view_desc}, {base_prompt_text}"
         
@@ -2429,10 +2444,10 @@ class _TexturingWorkflowMixin:
             prompt[NODES['mask_image']]["inputs"]["image"] = mask_info['name']
             prompt[NODES['input_image']]["inputs"]["image"] = render_info['name']
             
-            # Configure mask blur settings
-            if not context.scene.blur_mask:
-                prompt[NODES['inpaint_conditioning']]["inputs"]["mask"] = [NODES['grow_mask'], 0]  # Direct connection
-                prompt[NODES['vae_encode_inpaint']]["inputs"]["mask"] = [NODES['grow_mask'], 0]   # Direct connection
+            # One authoritative processed mask drives every inpaint consumer.
+            final_mask = sdxl_final_mask_reference(context.scene.blur_mask, NODES)
+            prompt[NODES['inpaint_conditioning']]["inputs"]["mask"] = final_mask
+            prompt[NODES['vae_encode_inpaint']]["inputs"]["mask"] = final_mask
             
             # Set blur parameters
             prompt[NODES['blur']]["inputs"]["sigma"] = context.scene.blur_mask_sigma
@@ -2565,12 +2580,9 @@ class _TexturingWorkflowMixin:
         
         base_prompt_text = _texturing_prompt(context.scene)
         # Camera Prompt Injection
-        if context.scene.use_camera_prompts and context.scene.generation_method in ['separate', 'sequential', 'refine', 'local_edit'] and self.operator._cameras and self.operator._current_image < len(self.operator._cameras):
-            current_camera_name = self.operator._cameras[self.operator._current_image].name
-            # Find the prompt in the collection
-            prompt_item = next((item for item in context.scene.camera_prompts if item.name == current_camera_name), None)
-            if prompt_item and prompt_item.prompt:
-                view_desc = prompt_item.prompt
+        if context.scene.use_camera_prompts and context.scene.generation_method in ['separate', 'sequential', 'refine', 'local_edit']:
+            view_desc = _immutable_view_prompt(self.operator)
+            if view_desc:
                 # Prepend the view description
                 base_prompt_text = f"{view_desc}, {base_prompt_text}"
         
@@ -2771,12 +2783,9 @@ class _TexturingWorkflowMixin:
         
         base_prompt_text = _texturing_prompt(context.scene)
         # Camera Prompt Injection
-        if context.scene.use_camera_prompts and context.scene.generation_method in ['separate', 'sequential', 'refine', 'local_edit', 'grid'] and self.operator._cameras and self.operator._current_image < len(self.operator._cameras):
-            current_camera_name = self.operator._cameras[self.operator._current_image].name
-            # Find the prompt in the collection
-            prompt_item = next((item for item in context.scene.camera_prompts if item.name == current_camera_name), None)
-            if prompt_item and prompt_item.prompt:
-                view_desc = prompt_item.prompt
+        if context.scene.use_camera_prompts and context.scene.generation_method in ['separate', 'sequential', 'refine', 'local_edit', 'grid']:
+            view_desc = _immutable_view_prompt(self.operator)
+            if view_desc:
                 # Prepend the view description
                 base_prompt_text = f"{view_desc}, {base_prompt_text}"
         

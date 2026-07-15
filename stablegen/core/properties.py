@@ -789,8 +789,8 @@ def register_properties(update_model_list, ControlNetUnit, LoRAUnit,
     )
     bpy.types.Scene.sg_silhouette_depth = bpy.props.FloatProperty(
         name="Silhouette Depth",
-        description="Minimum depth difference (Blender units) between the vertex and an offset ray hit to consider it a silhouette edge. Raise if too much is eroded, lower if outlines remain",
-        default=0.05, min=0.001, max=1.0, step=1, precision=3, update=update_parameters,
+        description="Minimum depth discontinuity as a fraction of model scale; pixel footprint is also considered so protection behaves consistently on tiny and huge characters",
+        default=0.01, min=0.0001, max=0.25, step=1, precision=4, update=update_parameters,
     )
     bpy.types.Scene.sg_silhouette_rays = bpy.props.EnumProperty(
         name="Silhouette Rays",
@@ -1135,6 +1135,36 @@ def register_properties(update_model_list, ControlNetUnit, LoRAUnit,
         description="Dilate fallback color regions in the context render before sending to Qwen.",
         default=1, min=0, max=64, update=update_parameters
     )
+    bpy.types.Scene.qwen_trust_threshold = bpy.props.FloatProperty(
+        name="Trusted Source Threshold",
+        description="Minimum original source-camera acquisition quality required before RGB is protected in later Qwen context views",
+        default=0.70, min=0.0, max=1.0, update=update_parameters,
+    )
+    bpy.types.Scene.qwen_mask_min_island_area = bpy.props.IntProperty(
+        name="Minimum Trusted Island",
+        description="Trusted islands smaller than this pixel area become repair; 0 disables",
+        default=16, min=0, max=65536, update=update_parameters,
+    )
+    bpy.types.Scene.qwen_mask_min_hole_area = bpy.props.IntProperty(
+        name="Minimum Repair Hole",
+        description="Repair holes smaller than this pixel area are filled back to trusted; 0 disables",
+        default=8, min=0, max=65536, update=update_parameters,
+    )
+    bpy.types.Scene.qwen_mask_min_strip_width = bpy.props.IntProperty(
+        name="Minimum Context Strip",
+        description="Remove thin stretched trusted strips narrower than this many pixels",
+        default=2, min=0, max=64, update=update_parameters,
+    )
+    bpy.types.Scene.qwen_mask_uncertainty_dilation = bpy.props.IntProperty(
+        name="Repair Uncertainty Dilation",
+        description="Expand repair into uncertain boundary pixels while respecting object and material labels",
+        default=1, min=0, max=64, update=update_parameters,
+    )
+    bpy.types.Scene.qwen_mask_keep_largest_components = bpy.props.IntProperty(
+        name="Keep Largest Repair Components",
+        description="Keep only this many largest repair components for extremely fragmented masks; 0 keeps all",
+        default=0, min=0, max=64, update=update_parameters,
+    )
     bpy.types.Scene.qwen_use_projection_write_masks = bpy.props.BoolProperty(
         name="Protect Trusted Texture",
         description="Use the binary sequential visibility mask both to build exact magenta context and to restrict which pixels a later Qwen view may project",
@@ -1228,12 +1258,12 @@ def register_properties(update_model_list, ControlNetUnit, LoRAUnit,
     )
     bpy.types.Scene.early_priority_strength = bpy.props.FloatProperty(
         name="Priority Strength",
-        description="Strength of the bounded global camera-rank prior. At maximum strength the final view receives one quarter of the first view's prior before confidence normalization",
+        description="Extra replacement resistance applied only to reliable early-view owners; it never promotes grazing coverage to trusted",
         default=0.5, min=0.0, max=1.0, update=update_parameters
     )
     bpy.types.Scene.early_priority = bpy.props.BoolProperty(
         name="Prioritize Initial Views",
-        description="Apply a predictable global rank prior so earlier cameras win close confidence decisions. Put detail-critical cameras first",
+        description="Anchor already-reliable early-view detail by raising its replacement margin. Poorly observed side texels remain untrusted and replaceable",
         default=False, update=update_parameters
     )
     bpy.types.Scene.sg_texel_ownership = bpy.props.BoolProperty(
@@ -1245,6 +1275,57 @@ def register_properties(update_model_list, ControlNetUnit, LoRAUnit,
         name="Ownership Replacement Margin",
         description="Extra confidence a later camera needs before replacing the current per-texel owner",
         default=0.05, min=0.0, max=1.0, update=update_parameters
+    )
+    bpy.types.Scene.sg_allow_trusted_replacement = bpy.props.BoolProperty(
+        name="Allow Trusted Quality Upgrades",
+        description="Permit a later camera to replace trusted detail only when its source quality exceeds the owner by the replacement margin",
+        default=False, update=update_parameters,
+    )
+    bpy.types.Scene.sg_ownership_blend_mode = bpy.props.EnumProperty(
+        name="Ownership Detail Fusion",
+        description="Choose how camera detail is fused after confidence resolution",
+        items=[
+            ('OWNER', "Single Detail Owner", "Keep high-frequency detail from one owner; blend only low-frequency seam colour"),
+            ('HARD', "Hard Owner", "Keep one owner with no seam colour matching"),
+            ('LEGACY', "Legacy Weighted Blend", "Use the previous weighted camera averaging behavior"),
+        ],
+        default='OWNER', update=update_parameters,
+    )
+    bpy.types.Scene.sg_ownership_seam_width = bpy.props.FloatProperty(
+        name="Ownership Seam Width",
+        description="Quality-distance band where only low-frequency colour is blended between detail owners",
+        default=0.08, min=0.0, max=0.5, update=update_parameters,
+    )
+    bpy.types.Scene.sg_ownership_lowpass_sigma = bpy.props.FloatProperty(
+        name="Ownership Low-Pass Radius",
+        description="Image-space Gaussian radius used for seam colour matching; high-frequency detail remains owned by one camera",
+        default=8.0, min=0.1, max=64.0, update=update_parameters,
+    )
+    bpy.types.Scene.sg_auto_view_sequence = bpy.props.BoolProperty(
+        name="Overlap-Aware View Sequence",
+        description="Order non-custom camera plans through nearby bridge views to reduce angular jumps and context discontinuities",
+        default=False, update=update_parameters,
+    )
+    bpy.types.Scene.sg_anchor_camera = bpy.props.StringProperty(
+        name="Anchor Camera",
+        description="Camera name used as the first view by overlap-aware sequencing; empty uses the active scene camera",
+        default="", update=update_parameters,
+    )
+    bpy.types.Scene.sg_texturing_frame = bpy.props.IntProperty(
+        name="Texturing Frame",
+        description="Explicit frame used consistently for evaluated character geometry, visibility, projection, and baking",
+        default=1, update=update_parameters,
+    )
+    bpy.types.Scene.sg_freeze_ownership_after_generation = bpy.props.BoolProperty(
+        name="Freeze Ownership to UV Texture",
+        description="Bake resolved camera ownership to UV textures after generation so pose, camera, and scene visibility changes cannot alter the final texture",
+        default=False, update=update_parameters,
+    )
+    bpy.types.Scene.sg_material_discard_factor = bpy.props.FloatProperty(
+        name="Material Discard Angle", default=90.0, options={'HIDDEN'}
+    )
+    bpy.types.Scene.sg_material_weight_exponent = bpy.props.FloatProperty(
+        name="Material Weight Exponent", default=1.0, options={'HIDDEN'}
     )
     bpy.types.Scene.texture_objects = bpy.props.EnumProperty(
         name="Objects to Texture", description="Select the objects to texture",
@@ -1855,6 +1936,11 @@ def unregister_properties(load_handler, _sg_queue_load_handler):
         'sg_silhouette_margin', 'sg_silhouette_depth', 'sg_silhouette_rays',
         'sg_allow_backface_projection',
         'sg_texel_ownership', 'sg_texel_replacement_margin',
+        'sg_allow_trusted_replacement', 'sg_ownership_blend_mode',
+        'sg_ownership_seam_width', 'sg_ownership_lowpass_sigma',
+        'sg_auto_view_sequence', 'sg_anchor_camera', 'sg_texturing_frame',
+        'sg_freeze_ownership_after_generation', 'sg_material_discard_factor',
+        'sg_material_weight_exponent',
         'refine_angle_ramp_active', 'refine_angle_ramp_pos_0', 'refine_angle_ramp_pos_1',
         'refine_feather_ramp_pos_0', 'refine_feather_ramp_pos_1',
         'refine_edge_feather_projection', 'refine_edge_feather_width', 'refine_edge_feather_softness',
@@ -1887,6 +1973,10 @@ def unregister_properties(load_handler, _sg_queue_load_handler):
         'qwen_context_cleanup', 'qwen_context_cleanup_hue_tolerance',
         'qwen_context_cleanup_value_adjust', 'qwen_context_fallback_dilation',
         'qwen_use_projection_write_masks', 'qwen_residual_fallback_tolerance',
+        'qwen_trust_threshold', 'qwen_mask_min_island_area',
+        'qwen_mask_min_hole_area', 'qwen_mask_min_strip_width',
+        'qwen_mask_uncertainty_dilation',
+        'qwen_mask_keep_largest_components',
         'qwen_prompt_gray_background',
     ]
     for prop in _simple_scene_props:

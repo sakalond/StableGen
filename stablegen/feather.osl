@@ -2,6 +2,8 @@ shader raycast_feather(
     vector Direction = N,    // Ray direction in world space
     float CameraAspect = 1.77778, // width/height ratio (e.g., 16:9)
     float CameraFOV = 1.0,        // horizontal FOV in radians
+    float CameraShiftX = 0.0,
+    float CameraShiftY = 0.0,
     vector CameraDir = vector(0,0,-1), // Camera look direction in world space
     vector CameraUp = vector(0,1,0),   // Camera up vector in world space
     float EdgeFeather = 0.0,      // Fraction of radius used for feather (0 = off)
@@ -35,6 +37,8 @@ shader raycast_feather(
     // Project the ray direction onto the film plane.
     float x_proj = cam_x / -cam_z;
     float y_proj = cam_y / -cam_z;
+    x_proj -= 2.0 * CameraShiftX * filmw;
+    y_proj -= 2.0 * CameraShiftY * filmh;
     
     // If the projected point falls outside the film bounds, exit.
     if (abs(x_proj) > filmw || abs(y_proj) > filmh) {

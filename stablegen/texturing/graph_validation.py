@@ -59,3 +59,16 @@ def validate_workflow_graph(prompt: Mapping, semantic_node_ids=()) -> list[str]:
                     f"semantic image slots differ between text encoders and node {node_id}"
                 )
     return issues
+
+
+def qwen_style_semantic_slot(context_mode: str, is_initial_image: bool) -> str:
+    """Return the Qwen text-encoder slot occupied by the style reference."""
+    if context_mode == "ADDITIONAL" and not is_initial_image:
+        return "image3"
+    return "image2"
+
+
+def sdxl_final_mask_reference(blur_mask: bool, nodes: Mapping) -> list:
+    """Return the one processed mask consumed by all SDXL inpaint nodes."""
+    node_id = nodes['image_to_mask'] if blur_mask else nodes['grow_mask']
+    return [node_id, 0]

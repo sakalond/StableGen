@@ -9,7 +9,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 import math
 import re
-from typing import Any, Iterable, Sequence
+from types import MappingProxyType
+from typing import Any, Iterable, Mapping, Sequence
 
 
 _NATURAL_PARTS = re.compile(r"(\d+)")
@@ -34,6 +35,29 @@ def order_cameras(cameras: Iterable[Any], custom_names: Sequence[str] = ()) -> l
             ordered.append(by_name[name])
             seen.add(name)
     ordered.extend(camera for camera in natural if camera.name not in seen)
+    return ordered
+
+
+def order_cameras_from_manifest(cameras: Iterable[Any], manifest: Mapping) -> list[Any]:
+    """Restore persisted UUID ordering for regeneration/project-only runs."""
+    cameras = list(cameras)
+    by_id = {
+        str(camera.get("sg_view_uuid")): camera
+        for camera in cameras
+        if camera.get("sg_view_uuid")
+    }
+    ordered = []
+    seen = set()
+    for record in manifest.get("views", []):
+        camera = by_id.get(str(record.get("view_id", "")))
+        if camera is not None and camera not in seen:
+            ordered.append(camera)
+            seen.add(camera)
+    ordered.extend(
+        camera
+        for camera in sorted(cameras, key=lambda item: natural_name_key(item.name))
+        if camera not in seen
+    )
     return ordered
 
 
@@ -113,29 +137,51 @@ class ViewRecord:
     camera: Any
     resolution_x: int
     resolution_y: int
+    prompt: str = ""
+    file_identifiers: Mapping[str, str] | None = None
+    matrix_world: tuple[tuple[float, ...], ...] | None = None
+    intrinsics: Mapping[str, Any] | None = None
+
+    def __post_init__(self):
+        object.__setattr__(
+            self,
+            "file_identifiers",
+            MappingProxyType(dict(self.file_identifiers or {})),
+        )
+        object.__setattr__(
+            self,
+            "intrinsics",
+            MappingProxyType(dict(self.intrinsics or {})),
+        )
 
     def to_manifest(self) -> dict[str, Any]:
         camera_data = getattr(self.camera, "data", None)
-        matrix = getattr(self.camera, "matrix_world", None)
-        matrix_rows = None
-        if matrix is not None:
+        matrix_rows = self.matrix_world
+        if matrix_rows is None:
+            matrix = getattr(self.camera, "matrix_world", None)
             try:
-                matrix_rows = [[float(value) for value in row] for row in matrix]
+                matrix_rows = tuple(
+                    tuple(float(value) for value in row) for row in matrix
+                ) if matrix is not None else None
             except (TypeError, ValueError):
                 matrix_rows = None
+        intrinsics = dict(self.intrinsics or {})
         return {
             "schema": 1,
             "view_id": self.view_id,
             "index": self.index,
             "name": self.name,
             "resolution": [self.resolution_x, self.resolution_y],
-            "matrix_world": matrix_rows,
+            "prompt": self.prompt,
+            "files": dict(self.file_identifiers or {}),
+            "matrix_world": [list(row) for row in matrix_rows] if matrix_rows else None,
             "camera": {
-                "type": getattr(camera_data, "type", None),
-                "lens": getattr(camera_data, "lens", None),
-                "sensor_width": getattr(camera_data, "sensor_width", None),
-                "sensor_height": getattr(camera_data, "sensor_height", None),
-                "shift_x": getattr(camera_data, "shift_x", None),
-                "shift_y": getattr(camera_data, "shift_y", None),
+                "type": intrinsics.get("type", getattr(camera_data, "type", None)),
+                "lens": intrinsics.get("lens", getattr(camera_data, "lens", None)),
+                "sensor_width": intrinsics.get("sensor_width", getattr(camera_data, "sensor_width", None)),
+                "sensor_height": intrinsics.get("sensor_height", getattr(camera_data, "sensor_height", None)),
+                "shift_x": intrinsics.get("shift_x", getattr(camera_data, "shift_x", None)),
+                "shift_y": intrinsics.get("shift_y", getattr(camera_data, "shift_y", None)),
+                "ortho_scale": intrinsics.get("ortho_scale", getattr(camera_data, "ortho_scale", None)),
             },
         }

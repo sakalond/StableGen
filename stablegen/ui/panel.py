@@ -1309,9 +1309,38 @@ class StableGenPanel(bpy.types.Panel):
 
                 row = content_box.row()
                 row.prop(scene, "sg_texel_ownership", text="Per-Texel View Ownership", toggle=True, icon="UV")
-                if scene.sg_texel_ownership:
+                ownership_active = (
+                    scene.sg_texel_ownership
+                    or (scene.model_architecture == 'qwen_image_edit'
+                        and scene.generation_method == 'sequential'
+                        and scene.qwen_use_projection_write_masks)
+                )
+                if ownership_active:
+                    if not scene.sg_texel_ownership:
+                        row = content_box.row()
+                        row.label(text="Enabled automatically for protected Qwen sequential projection", icon="INFO")
                     row = content_box.row()
                     row.prop(scene, "sg_texel_replacement_margin", text="Replacement Margin")
+                    row = content_box.row()
+                    row.prop(scene, "sg_allow_trusted_replacement", text="Allow Trusted Quality Upgrades", toggle=True)
+                    row = content_box.row()
+                    row.prop(scene, "sg_ownership_blend_mode", text="Detail Fusion")
+                    if scene.sg_ownership_blend_mode == 'OWNER':
+                        row = content_box.row()
+                        row.prop(scene, "sg_ownership_seam_width", text="Seam Width")
+                        row = content_box.row()
+                        row.prop(scene, "sg_ownership_lowpass_sigma", text="Low-Pass Radius")
+                    row = content_box.row()
+                    row.prop(scene, "sg_freeze_ownership_after_generation", text="Freeze Ownership to UV", toggle=True)
+
+                row = content_box.row()
+                row.prop(scene, "sg_auto_view_sequence", text="Overlap-Aware View Sequence", toggle=True)
+                if scene.sg_auto_view_sequence:
+                    row = content_box.row()
+                    row.prop(scene, "sg_anchor_camera", text="Anchor Camera")
+
+                row = content_box.row()
+                row.prop(scene, "sg_texturing_frame", text="Texturing Frame")
 
                 row = content_box.row()
                 row.prop(scene, "bake_visibility_weights", text="Bake Visibility (Transform-Stable)", toggle=True, icon="MESH_DATA")
@@ -1595,9 +1624,6 @@ class StableGenPanel(bpy.types.Panel):
                             row = colors_box.row()
                             row.prop(scene, "qwen_guidance_fallback_color", text="Fallback")
 
-                        dilation_row = context_box.row()
-                        dilation_row.prop(scene, "qwen_context_fallback_dilation", text="Fallback Dilate (px)")
-
                         protection_row = context_box.row()
                         protection_row.prop(
                             scene,
@@ -1607,20 +1633,23 @@ class StableGenPanel(bpy.types.Panel):
                             icon="LOCKED",
                         )
                         if scene.qwen_use_projection_write_masks:
+                            threshold_row = context_box.row()
+                            threshold_row.prop(
+                                scene, "qwen_trust_threshold", text="Trusted Quality"
+                            )
                             tolerance_row = context_box.row()
                             tolerance_row.prop(
                                 scene,
                                 "qwen_residual_fallback_tolerance",
                                 text="Residual Magenta Tol.",
                             )
-
-                        cleanup_row = context_box.row()
-                        cleanup_row.prop(scene, "qwen_context_cleanup", text="Apply Cleanup", toggle=True, icon="BRUSH_DATA")
-                        if scene.qwen_context_cleanup:
-                            row = context_box.row()
-                            row.prop(scene, "qwen_context_cleanup_hue_tolerance", text="Hue Tol (°)")
-                            row = context_box.row()
-                            row.prop(scene, "qwen_context_cleanup_value_adjust", text="Value Adjust")
+                            regularize_box = context_box.box()
+                            regularize_box.label(text="Binary Boundary Regularization")
+                            regularize_box.prop(scene, "qwen_mask_min_island_area", text="Min Trusted Island")
+                            regularize_box.prop(scene, "qwen_mask_min_hole_area", text="Min Repair Hole")
+                            regularize_box.prop(scene, "qwen_mask_min_strip_width", text="Min Context Strip")
+                            regularize_box.prop(scene, "qwen_mask_uncertainty_dilation", text="Uncertainty Dilate")
+                            regularize_box.prop(scene, "qwen_mask_keep_largest_components", text="Largest Components")
 
                 elif scene.model_architecture == 'sdxl' or scene.model_architecture == 'flux1':
                     # IPAdapter Parameters
@@ -2173,6 +2202,9 @@ class StableGenPanel(bpy.types.Panel):
             if width_mode == 'narrow':
                 row = debug_box.row()
             op2 = row.operator("stablegen.debug_feather_preview", text="Feather Preview", icon="MOD_SMOOTH")
+
+            row = debug_box.row()
+            row.operator("stablegen.debug_ownership_diagnostic", text="Ownership Diagnostics", icon="SHADING_RENDERED")
 
             row = debug_box.row()
             row.operator("stablegen.debug_make_solid", text="Debug Make Solid", icon="MOD_REMESH")
