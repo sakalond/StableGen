@@ -14,6 +14,7 @@ import bpy
 import os
 import colorsys
 import numpy as np
+from contextlib import contextmanager
 from mathutils import Vector
 
 from .texturing.projection import (
@@ -189,6 +190,42 @@ def _restore_cameras(hidden):
                 col.objects.link(cam)
 
 
+@contextmanager
+def _debug_projection_build_state(scene):
+    """Build diagnostics with the finished material's display controls.
+
+    Sequential generation may use a restrictive angle and then reset only the
+    material nodes for final display.  Rebuilding a debug material from the
+    generation configuration made the new 70-degree graph look substantially
+    sharper than the actual 90-degree final graph (and than legacy diagnostics,
+    which mutated the scene value itself).  Preserve the generation settings,
+    use the recorded material state when a completed run exists, and restore
+    everything after the diagnostic graph is built.
+    """
+    original = {
+        "overwrite_material": scene.overwrite_material,
+        "generation_method": scene.generation_method,
+        "generation_mode": scene.generation_mode,
+        "discard_factor": scene.discard_factor,
+        "weight_exponent": scene.weight_exponent,
+    }
+    if getattr(scene, "output_timestamp", ""):
+        scene.discard_factor = getattr(
+            scene, "sg_material_discard_factor", scene.discard_factor
+        )
+        scene.weight_exponent = getattr(
+            scene, "sg_material_weight_exponent", scene.weight_exponent
+        )
+    scene.overwrite_material = True
+    scene.generation_method = 'separate'
+    scene.generation_mode = 'standard'
+    try:
+        yield
+    finally:
+        for name, value in original.items():
+            setattr(scene, name, value)
+
+
 # ═════════════════════════════════════════════════════════════════════════
 # 1. Draw Solid Colors  (calls the real project_image)
 # ═════════════════════════════════════════════════════════════════════════
@@ -223,29 +260,66 @@ class SG_OT_DebugSolidColors(bpy.types.Operator):
             rx, ry = _get_camera_resolution(cam, context.scene)
             _save_solid_image(path, rx, ry, (*colors[i], 1.0))
 
-        # Override scene settings so project_image() performs a full
-        # fresh build: UV projections + new material tree.  Without this,
-        # sequential mode skips UV projections and enters the
-        # "update-existing" branch which produces a blank material.
-        orig_overwrite   = context.scene.overwrite_material
-        orig_gen_method  = context.scene.generation_method
-        orig_gen_mode    = context.scene.generation_mode
-        context.scene.overwrite_material  = True
-        context.scene.generation_method   = 'separate'
-        context.scene.generation_mode     = 'standard'
-        try:
-            project_image(context, meshes, mat_id)
-        finally:
-            context.scene.overwrite_material  = orig_overwrite
-            context.scene.generation_method   = orig_gen_method
-            context.scene.generation_mode     = orig_gen_mode
+        # Replay the real sequential material lifecycle.  A one-shot
+        # ``separate`` build cannot detect failures in the incremental path
+        # (for example, a later camera image loading while its stop gate stays
+        # closed).  stop_index=0 creates the UV projections/material; every
+        # later call patches or rebuilds it exactly as generation does.
+        with _debug_projection_build_state(context.scene):
+            context.scene.generation_method = 'sequential'
+            for stop_index in range(n_cams):
+                project_image(
+                    context,
+                    meshes,
+                    mat_id,
+                    stop_index=stop_index,
+                    cameras=cameras,
+                )
+
+        validation_errors = []
+        inspected_materials = set()
+        for obj in meshes:
+            mat = obj.active_material
+            if mat is None or mat.as_pointer() in inspected_materials:
+                continue
+            inspected_materials.add(mat.as_pointer())
+            nodes = mat.node_tree.nodes
+            for i in range(n_cams):
+                image_node = next(
+                    (node for node in nodes
+                     if node.type == 'TEX_IMAGE' and node.label == f"{i}-{mat_id}"),
+                    None,
+                )
+                expected_path = os.path.normcase(os.path.abspath(get_file_path(
+                    context, "generated", camera_id=i, material_id=mat_id
+                )))
+                actual_path = (
+                    os.path.normcase(os.path.abspath(bpy.path.abspath(image_node.image.filepath)))
+                    if image_node is not None and image_node.image is not None else ""
+                )
+                if actual_path != expected_path:
+                    validation_errors.append(
+                        f"camera {i}: expected {os.path.basename(expected_path)}, "
+                        f"got {os.path.basename(actual_path) or 'no image'}"
+                    )
+                if any(node.label == f"StopGate-{i}-{mat_id}" for node in nodes):
+                    validation_errors.append(f"camera {i}: sequential stop gate is still closed")
+
+        if validation_errors:
+            details = "; ".join(validation_errors[:4])
+            print(f"[StableGen] Solid-color sequential validation FAILED: {details}")
+            self.report({'ERROR'}, f"Sequential projection validation failed: {details}")
+            return {'CANCELLED'}
 
         # Rename materials for easy identification / cleanup
         for obj in meshes:
             if obj.active_material:
                 obj.active_material.name = "SG_Debug_SolidColors"
 
-        self.report({'INFO'}, f"Solid-colour projection applied ({n_cams} cameras)")
+        self.report(
+            {'INFO'},
+            f"Solid-colour sequential projection validated ({n_cams} cameras)",
+        )
         return {'FINISHED'}
 
 
@@ -286,18 +360,8 @@ class SG_OT_DebugGridPattern(bpy.types.Operator):
             rx, ry = _get_camera_resolution(cam, context.scene)
             _save_grid_image(path, rx, ry, colors[i], self.grid_size)
 
-        orig_overwrite   = context.scene.overwrite_material
-        orig_gen_method  = context.scene.generation_method
-        orig_gen_mode    = context.scene.generation_mode
-        context.scene.overwrite_material  = True
-        context.scene.generation_method   = 'separate'
-        context.scene.generation_mode     = 'standard'
-        try:
+        with _debug_projection_build_state(context.scene):
             project_image(context, meshes, mat_id)
-        finally:
-            context.scene.overwrite_material  = orig_overwrite
-            context.scene.generation_method   = orig_gen_method
-            context.scene.generation_mode     = orig_gen_mode
 
         for obj in meshes:
             if obj.active_material:
@@ -348,18 +412,8 @@ class SG_OT_DebugVisibilityMaterial(bpy.types.Operator):
                 rx, ry = _get_camera_resolution(cam, context.scene)
                 _save_solid_image(path, rx, ry, (*colors[i], 1.0))
 
-            orig_overwrite  = context.scene.overwrite_material
-            orig_gen_method = context.scene.generation_method
-            orig_gen_mode   = context.scene.generation_mode
-            context.scene.overwrite_material = True
-            context.scene.generation_method  = 'separate'
-            context.scene.generation_mode    = 'standard'
-            try:
+            with _debug_projection_build_state(context.scene):
                 project_image(context, meshes, mat_id)
-            finally:
-                context.scene.overwrite_material = orig_overwrite
-                context.scene.generation_method  = orig_gen_method
-                context.scene.generation_mode    = orig_gen_mode
 
             # Transform projection material into visibility mask
             result = export_visibility(context, meshes, prepare_only=True)

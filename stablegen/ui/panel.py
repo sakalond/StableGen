@@ -7,6 +7,7 @@ import math
 from ..utils import sg_modal_active
 from ..core import get_addon_prefs
 from .presets import PRESETS, GEN_PARAMETERS
+from ..feature_flags import all_rework_features_disabled
 from . import queue as _queue_mod
 
 _ADDON_PKG = __package__.rsplit('.', 1)[0]
@@ -1309,16 +1310,7 @@ class StableGenPanel(bpy.types.Panel):
 
                 row = content_box.row()
                 row.prop(scene, "sg_texel_ownership", text="Per-Texel View Ownership", toggle=True, icon="UV")
-                ownership_active = (
-                    scene.sg_texel_ownership
-                    or (scene.model_architecture == 'qwen_image_edit'
-                        and scene.generation_method == 'sequential'
-                        and scene.qwen_use_projection_write_masks)
-                )
-                if ownership_active:
-                    if not scene.sg_texel_ownership:
-                        row = content_box.row()
-                        row.label(text="Enabled automatically for protected Qwen sequential projection", icon="INFO")
+                if scene.sg_texel_ownership:
                     row = content_box.row()
                     row.prop(scene, "sg_texel_replacement_margin", text="Replacement Margin")
                     row = content_box.row()
@@ -1356,6 +1348,35 @@ class StableGenPanel(bpy.types.Panel):
 
                 row = content_box.row()
                 row.prop(scene, "sg_allow_backface_projection", text="Allow Backface Projection")
+
+                experiments = content_box.box()
+                experiments.label(text="Texturing Rework Experiments (all opt-in)", icon="EXPERIMENTAL")
+                status = experiments.row(align=True)
+                if all_rework_features_disabled(scene):
+                    status.label(text="Legacy baseline active", icon="CHECKMARK")
+                else:
+                    status.alert = True
+                    status.label(text="One or more experiments active", icon="INFO")
+                status.operator(
+                    "stablegen.reset_texturing_experiments",
+                    text="Disable All",
+                    icon="LOOP_BACK",
+                )
+                experiments.prop(scene, "sg_rework_camera_plan", text="Canonical Camera Plan", toggle=True)
+                experiments.prop(scene, "sg_rework_aligned_resolution", text="Improved Aligned Resolution", toggle=True)
+                experiments.prop(scene, "sg_rework_full_resolution_scale", text="Force 100% Guide Resolution", toggle=True)
+                experiments.prop(scene, "sg_rework_acquisition_quality", text="Acquisition Quality Weighting", toggle=True)
+                experiments.prop(scene, "sg_rework_initial_view_priority", text="Confidence-Aware Initial View Priority", toggle=True)
+                experiments.prop(scene, "sg_rework_projection_guard", text="Depth/Part Projection Guard", toggle=True)
+                experiments.prop(scene, "sg_rework_projection_rebuild", text="Rebuild Sequential Projection Graph", toggle=True)
+                experiments.prop(scene, "sg_rework_projection_geometry", text="Projection Geometry Corrections", toggle=True)
+                experiments.prop(scene, "sg_rework_consistent_frame", text="Consistent Texturing Frame", toggle=True)
+                experiments.prop(scene, "sg_rework_reset_controls", text="Corrected Angle/Exponent Reset", toggle=True)
+                experiments.prop(scene, "sg_rework_sdxl_registration", text="Corrected SDXL Mask Registration", toggle=True)
+                experiments.prop(scene, "sg_rework_safe_render_state", text="Transactional Render State", toggle=True)
+                experiments.prop(scene, "sg_rework_workflow_validation", text="Workflow Graph Validation", toggle=True)
+                experiments.prop(scene, "sg_rework_qwen_workflow", text="Corrected Qwen Workflow Routing", toggle=True)
+                experiments.prop(scene, "sg_rework_final_display", text="Continuous Final Display Rebuild", toggle=True)
 
             # --- Output & Material Settings ---
             if _show_diffusion_sections:
@@ -1624,32 +1645,65 @@ class StableGenPanel(bpy.types.Panel):
                             row = colors_box.row()
                             row.prop(scene, "qwen_guidance_fallback_color", text="Fallback")
 
-                        protection_row = context_box.row()
-                        protection_row.prop(
+                        context_box.prop(
                             scene,
-                            "qwen_use_projection_write_masks",
-                            text="Protect Trusted Texture",
+                            "qwen_use_confidence_context",
+                            text="Confidence-Gated Context",
                             toggle=True,
-                            icon="LOCKED",
+                            icon="MOD_MASK",
                         )
-                        if scene.qwen_use_projection_write_masks:
+                        if scene.qwen_use_confidence_context:
                             threshold_row = context_box.row()
                             threshold_row.prop(
                                 scene, "qwen_trust_threshold", text="Trusted Quality"
                             )
-                            tolerance_row = context_box.row()
-                            tolerance_row.prop(
+                            context_box.prop(
+                                scene,
+                                "qwen_regularize_context_mask",
+                                text="Regularize Context Boundary",
+                                toggle=True,
+                            )
+                            if scene.qwen_regularize_context_mask:
+                                regularize_box = context_box.box()
+                                regularize_box.label(text="Binary Boundary Regularization")
+                                regularize_box.prop(scene, "qwen_mask_min_island_area", text="Min Trusted Island")
+                                regularize_box.prop(scene, "qwen_mask_min_hole_area", text="Min Repair Hole")
+                                regularize_box.prop(scene, "qwen_mask_min_strip_width", text="Min Context Strip")
+                                regularize_box.prop(scene, "qwen_mask_uncertainty_dilation", text="Uncertainty Dilate")
+                                regularize_box.prop(scene, "qwen_mask_keep_largest_components", text="Largest Components")
+                        else:
+                            dilation_row = context_box.row()
+                            dilation_row.prop(scene, "qwen_context_fallback_dilation", text="Legacy Fallback Dilate (px)")
+                            cleanup_row = context_box.row()
+                            cleanup_row.prop(scene, "qwen_context_cleanup", text="Legacy Cleanup", toggle=True, icon="BRUSH_DATA")
+                            if scene.qwen_context_cleanup:
+                                row = context_box.row()
+                                row.prop(scene, "qwen_context_cleanup_hue_tolerance", text="Hue Tol (°)")
+                                row = context_box.row()
+                                row.prop(scene, "qwen_context_cleanup_value_adjust", text="Value Adjust")
+
+                        protection_row = context_box.row()
+                        protection_row.prop(
+                            scene,
+                            "qwen_use_projection_write_masks",
+                            text="Restrict Projection to Write Mask",
+                            toggle=True,
+                            icon="LOCKED",
+                        )
+                        residual_row = context_box.row()
+                        residual_row.prop(
+                            scene,
+                            "qwen_reject_residual_fallback",
+                            text="Reject Residual Magenta",
+                            toggle=True,
+                        )
+                        if scene.qwen_reject_residual_fallback:
+                            row = context_box.row()
+                            row.prop(
                                 scene,
                                 "qwen_residual_fallback_tolerance",
                                 text="Residual Magenta Tol.",
                             )
-                            regularize_box = context_box.box()
-                            regularize_box.label(text="Binary Boundary Regularization")
-                            regularize_box.prop(scene, "qwen_mask_min_island_area", text="Min Trusted Island")
-                            regularize_box.prop(scene, "qwen_mask_min_hole_area", text="Min Repair Hole")
-                            regularize_box.prop(scene, "qwen_mask_min_strip_width", text="Min Context Strip")
-                            regularize_box.prop(scene, "qwen_mask_uncertainty_dilation", text="Uncertainty Dilate")
-                            regularize_box.prop(scene, "qwen_mask_keep_largest_components", text="Largest Components")
 
                 elif scene.model_architecture == 'sdxl' or scene.model_architecture == 'flux1':
                     # IPAdapter Parameters

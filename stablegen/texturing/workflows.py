@@ -25,6 +25,16 @@ def _immutable_view_prompt(operator):
     plan = getattr(operator, '_view_plan', ()) or ()
     if 0 <= index < len(plan):
         return plan[index].prompt or ""
+    # Legacy camera-prompt lookup when the canonical-plan experiment is off.
+    cameras = getattr(operator, '_cameras', ()) or ()
+    if 0 <= index < len(cameras):
+        camera_name = cameras[index].name
+        item = next(
+            (entry for entry in bpy.context.scene.camera_prompts
+             if entry.name == camera_name),
+            None,
+        )
+        return item.prompt if item and item.prompt else ""
     return ""
 
 
@@ -65,11 +75,12 @@ def _generation_prompt(scene):
 class _TexturingWorkflowMixin:
     def _queue_prompt(self, prompt, client_id, server_address):
         """Validate every dynamically edited texturing graph at submission."""
-        issues = validate_workflow_graph(prompt)
-        if issues:
-            message = "Invalid texturing workflow: " + "; ".join(issues)
-            self.operator._error = message
-            raise ValueError(message)
+        if getattr(bpy.context.scene, 'sg_rework_workflow_validation', False):
+            issues = validate_workflow_graph(prompt)
+            if issues:
+                message = "Invalid texturing workflow: " + "; ".join(issues)
+                self.operator._error = message
+                raise ValueError(message)
         return super()._queue_prompt(prompt, client_id, server_address)
 
     """Texturing workflow methods for WorkflowManager."""
@@ -106,8 +117,20 @@ class _TexturingWorkflowMixin:
                   f"({len(img_bytes)} bytes): {e}  — returning raw bytes.")
             return img_bytes
 
-        # Never crop here. The old fixed eight-pixel crop changed camera/image
-        # registration and the projection transform was not updated.
+        if not getattr(bpy.context.scene, 'sg_rework_sdxl_registration', False):
+            # Rigging-branch behavior used a fixed eight-pixel crop regardless
+            # of the call-site default.
+            legacy_border = 8
+            width, height = img.size
+            if width > 2 * legacy_border and height > 2 * legacy_border:
+                img = img.crop((
+                    legacy_border,
+                    legacy_border,
+                    width - legacy_border,
+                    height - legacy_border,
+                ))
+        # Corrected mode never crops because projection registration is not
+        # adjusted for a changed image extent.
         w, h = img.size
 
         # Convert to numpy for mask math
@@ -554,30 +577,31 @@ class _TexturingWorkflowMixin:
         # --- Reference Latent chain (Qwen unzoom fix) ---
         self._build_qwen_reference_latent_chain(prompt, NODES)
 
-        prompt[NODES['sampler']]['inputs']['seed'] = context.scene.seed
-        prompt[NODES['sampler']]['inputs']['steps'] = context.scene.steps
-        prompt[NODES['sampler']]['inputs']['cfg'] = context.scene.cfg
-        prompt[NODES['sampler']]['inputs']['sampler_name'] = context.scene.sampler
-        prompt[NODES['sampler']]['inputs']['scheduler'] = context.scene.scheduler
-        prompt[NODES['sampler']]['inputs']['denoise'] = 1.0
+        if getattr(context.scene, 'sg_rework_qwen_workflow', False):
+            prompt[NODES['sampler']]['inputs']['seed'] = context.scene.seed
+            prompt[NODES['sampler']]['inputs']['steps'] = context.scene.steps
+            prompt[NODES['sampler']]['inputs']['cfg'] = context.scene.cfg
+            prompt[NODES['sampler']]['inputs']['sampler_name'] = context.scene.sampler
+            prompt[NODES['sampler']]['inputs']['scheduler'] = context.scene.scheduler
+            prompt[NODES['sampler']]['inputs']['denoise'] = 1.0
 
-        if is_nunchaku:
-            prompt[NODES['unet_loader']] = {
-                "inputs": {
-                    "model_name": context.scene.model_name,
-                    "cpu_offload": "auto",
-                    "num_blocks_on_gpu": 1,
-                    "use_pin_memory": "enable",
-                },
-                "class_type": "NunchakuQwenImageDiTLoader",
-                "_meta": {"title": "Nunchaku Qwen-Image DiT Loader"},
-            }
-        else:
-            prompt[NODES['unet_loader']]['inputs']['unet_name'] = context.scene.model_name
+            if is_nunchaku:
+                prompt[NODES['unet_loader']] = {
+                    "inputs": {
+                        "model_name": context.scene.model_name,
+                        "cpu_offload": "auto",
+                        "num_blocks_on_gpu": 1,
+                        "use_pin_memory": "enable",
+                    },
+                    "class_type": "NunchakuQwenImageDiTLoader",
+                    "_meta": {"title": "Nunchaku Qwen-Image DiT Loader"},
+                }
+            else:
+                prompt[NODES['unet_loader']]['inputs']['unet_name'] = context.scene.model_name
 
-        graph_issues = validate_workflow_graph(
+        graph_issues = (validate_workflow_graph(
             prompt, (NODES['pos_prompt'], NODES['neg_prompt'])
-        )
+        ) if getattr(context.scene, 'sg_rework_workflow_validation', False) else [])
         if graph_issues:
             self.operator._error = "Invalid Qwen refine workflow: " + "; ".join(graph_issues)
             return {"error": "invalid_workflow"}
@@ -724,7 +748,11 @@ class _TexturingWorkflowMixin:
                 prompt[NODES['pos_prompt']]['inputs']['prompt'] = pos_prompt_text
 
         # Case 1b: TRELLIS.2 input image as style (when no external style configured)
-        elif getattr(context.scene, 'architecture_mode', '') == 'trellis2' and getattr(context.scene, 'qwen_use_trellis2_style', False):
+        trellis_style_branch = (
+            getattr(context.scene, 'architecture_mode', '') == 'trellis2'
+            and getattr(context.scene, 'qwen_use_trellis2_style', False)
+        )
+        if not use_external_this_frame and trellis_style_branch:
             use_t2_this_frame = True
             if not is_initial_image and getattr(context.scene, 'qwen_trellis2_style_initial_only', False):
                 # Initial-only mode: fall back to sequential style for subsequent frames
@@ -741,8 +769,19 @@ class _TexturingWorkflowMixin:
                         pos_prompt_text = self._get_qwen_default_prompts(context, is_initial_image).format(main_prompt=user_prompt)
                     prompt[NODES['pos_prompt']]['inputs']['prompt'] = pos_prompt_text
 
-        # Case 2: Sequential generation (after first image)
-        if style_image_info is None and not is_initial_image:
+        # Case 2: Sequential generation (after first image). The rigging
+        # branch used an ``elif`` after the TRELLIS branch, so an enabled
+        # initial-only TRELLIS style did not fall through on later views.
+        # Preserve that quirk unless the corrected routing experiment is on.
+        if getattr(context.scene, 'sg_rework_qwen_workflow', False):
+            use_sequential_style = style_image_info is None and not is_initial_image
+        else:
+            use_sequential_style = (
+                not use_external_this_frame
+                and not trellis_style_branch
+                and not is_initial_image
+            )
+        if use_sequential_style:
             if context_mode == 'REPLACE_STYLE':
                 # The context render becomes the style image
                 style_image_info = context_render_info
@@ -816,7 +855,11 @@ class _TexturingWorkflowMixin:
                 }
                 # Point text-encode image2 at the scaled version so both
                 # VL processing and the reference latent chain see ~1 MP.
-                style_slot = qwen_style_semantic_slot(context_mode, is_initial_image)
+                style_slot = (
+                    qwen_style_semantic_slot(context_mode, is_initial_image)
+                    if getattr(context.scene, 'sg_rework_qwen_workflow', False)
+                    else 'image2'
+                )
                 prompt[NODES['pos_prompt']]['inputs'][style_slot] = [scale_node_key, 0]
                 prompt[NODES['neg_prompt']]['inputs'][style_slot] = [scale_node_key, 0]
 
@@ -848,9 +891,9 @@ class _TexturingWorkflowMixin:
         else:
             prompt[NODES['unet_loader']]['inputs']['unet_name'] = context.scene.model_name
 
-        graph_issues = validate_workflow_graph(
+        graph_issues = (validate_workflow_graph(
             prompt, (NODES['pos_prompt'], NODES['neg_prompt'])
-        )
+        ) if getattr(context.scene, 'sg_rework_workflow_validation', False) else [])
         if graph_issues:
             self.operator._error = "Invalid Qwen edit workflow: " + "; ".join(graph_issues)
             return {"error": "invalid_workflow"}
@@ -2444,10 +2487,16 @@ class _TexturingWorkflowMixin:
             prompt[NODES['mask_image']]["inputs"]["image"] = mask_info['name']
             prompt[NODES['input_image']]["inputs"]["image"] = render_info['name']
             
-            # One authoritative processed mask drives every inpaint consumer.
-            final_mask = sdxl_final_mask_reference(context.scene.blur_mask, NODES)
-            prompt[NODES['inpaint_conditioning']]["inputs"]["mask"] = final_mask
-            prompt[NODES['vae_encode_inpaint']]["inputs"]["mask"] = final_mask
+            if getattr(context.scene, 'sg_rework_sdxl_registration', False):
+                # One authoritative processed mask drives every inpaint consumer.
+                final_mask = sdxl_final_mask_reference(context.scene.blur_mask, NODES)
+                prompt[NODES['inpaint_conditioning']]["inputs"]["mask"] = final_mask
+                prompt[NODES['vae_encode_inpaint']]["inputs"]["mask"] = final_mask
+            elif not context.scene.blur_mask:
+                # Exact pre-rework graph mutation. With blur enabled, retain
+                # the template's original mask links.
+                prompt[NODES['inpaint_conditioning']]["inputs"]["mask"] = [NODES['grow_mask'], 0]
+                prompt[NODES['vae_encode_inpaint']]["inputs"]["mask"] = [NODES['grow_mask'], 0]
             
             # Set blur parameters
             prompt[NODES['blur']]["inputs"]["sigma"] = context.scene.blur_mask_sigma

@@ -10,7 +10,7 @@ import bpy  # pylint: disable=import-error
 # -- UI / Operator classes ------------------------------------------------
 from .ui.presets import (
     ApplyPreset, SavePreset, DeletePreset,
-    ResetQwenPrompt, SwitchToMeshGeneration,
+    ResetQwenPrompt, ResetTexturingExperiments, SwitchToMeshGeneration,
 )
 from .ui.panel import StableGenPanel, StableGenPrintPanel
 from .ui.queue import (
@@ -170,6 +170,7 @@ classes = [
     SavePreset,
     DeletePreset,
     ResetQwenPrompt,
+    ResetTexturingExperiments,
     SwitchToMeshGeneration,
     # Queue operators
     SG_UL_SceneQueueList,

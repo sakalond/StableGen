@@ -19,6 +19,7 @@ from .callbacks import (
     update_print_dithered,
 )
 from . import ADDON_PKG
+from ..feature_flags import TEXTURING_REWORK_DEFAULTS
 
 
 # ── Helper(s) used by properties ───────────────────────────────────────────
@@ -785,12 +786,92 @@ def register_properties(update_model_list, ControlNetUnit, LoRAUnit,
     bpy.types.Scene.sg_allow_backface_projection = bpy.props.BoolProperty(
         name="Allow Backface Projection",
         description="Use legacy two-sided projection weights. Leave disabled for characters and closed meshes so a camera cannot write through back-facing surfaces",
-        default=False, update=update_parameters,
+        default=TEXTURING_REWORK_DEFAULTS["sg_allow_backface_projection"], update=update_parameters,
+    )
+
+    # Texturing pipeline rework feature gates.  These deliberately default to
+    # False so a newly opened scene follows the rigging-branch projection and
+    # sequential-context behavior.  Each gate controls one independently
+    # testable behavior instead of enabling the rework as an inseparable set.
+    bpy.types.Scene.sg_rework_camera_plan = bpy.props.BoolProperty(
+        name="Canonical Camera Plan",
+        description="Snapshot camera order, transforms, intrinsics, prompts, and per-camera resolutions for the whole run",
+        default=TEXTURING_REWORK_DEFAULTS["sg_rework_camera_plan"], update=update_parameters,
+    )
+    bpy.types.Scene.sg_rework_aligned_resolution = bpy.props.BoolProperty(
+        name="Improved Aligned Resolution",
+        description="Use the new joint aspect/megapixel/alignment resolution search instead of legacy proportional rounding",
+        default=TEXTURING_REWORK_DEFAULTS["sg_rework_aligned_resolution"], update=update_parameters,
+    )
+    bpy.types.Scene.sg_rework_full_resolution_scale = bpy.props.BoolProperty(
+        name="Force 100% Guide Resolution",
+        description="Temporarily force Blender resolution percentage to 100 so guides and Qwen inputs match the configured pixel dimensions",
+        default=TEXTURING_REWORK_DEFAULTS["sg_rework_full_resolution_scale"], update=update_parameters,
+    )
+    bpy.types.Scene.sg_rework_safe_render_state = bpy.props.BoolProperty(
+        name="Transactional Render State",
+        description="Snapshot and restore render, compositor, material-slot, and scene state around pipeline renders",
+        default=TEXTURING_REWORK_DEFAULTS["sg_rework_safe_render_state"], update=update_parameters,
+    )
+    bpy.types.Scene.sg_rework_reset_controls = bpy.props.BoolProperty(
+        name="Corrected Angle/Exponent Reset",
+        description="Reset normalized projection weights and baked visibility consistently on completion, cancellation, and errors",
+        default=TEXTURING_REWORK_DEFAULTS["sg_rework_reset_controls"], update=update_parameters,
+    )
+    bpy.types.Scene.sg_rework_sdxl_registration = bpy.props.BoolProperty(
+        name="Corrected SDXL Mask Registration",
+        description="Use the corrected uncropped SDXL sequential mask and projection-alpha registration path",
+        default=TEXTURING_REWORK_DEFAULTS["sg_rework_sdxl_registration"], update=update_parameters,
+    )
+    bpy.types.Scene.sg_rework_acquisition_quality = bpy.props.BoolProperty(
+        name="Acquisition Quality Weighting",
+        description="Weight views using projected density and source-camera acquisition quality in addition to legacy visibility/frontality",
+        default=TEXTURING_REWORK_DEFAULTS["sg_rework_acquisition_quality"], update=update_parameters,
+    )
+    bpy.types.Scene.sg_rework_initial_view_priority = bpy.props.BoolProperty(
+        name="Confidence-Aware Initial View Priority",
+        description="Use early-view priority only as trusted-owner replacement resistance instead of the legacy recursive blend bias",
+        default=TEXTURING_REWORK_DEFAULTS["sg_rework_initial_view_priority"], update=update_parameters,
+    )
+    bpy.types.Scene.sg_rework_projection_guard = bpy.props.BoolProperty(
+        name="Depth/Part Projection Guard",
+        description="Reject projection near depth, object-ID, and material-ID discontinuities to reduce foreground silhouettes on rear surfaces",
+        default=TEXTURING_REWORK_DEFAULTS["sg_rework_projection_guard"], update=update_parameters,
+    )
+    bpy.types.Scene.sg_rework_projection_rebuild = bpy.props.BoolProperty(
+        name="Rebuild Sequential Projection Graph",
+        description="Rebuild the complete projection material after each generated view instead of using the legacy patch-in-place update",
+        default=TEXTURING_REWORK_DEFAULTS["sg_rework_projection_rebuild"], update=update_parameters,
+    )
+    bpy.types.Scene.sg_rework_projection_geometry = bpy.props.BoolProperty(
+        name="Projection Geometry Corrections",
+        description="Use signed facing, parented camera transforms, camera shift, orthographic support, evaluated meshes, and scale-aware ray tolerances",
+        default=TEXTURING_REWORK_DEFAULTS["sg_rework_projection_geometry"], update=update_parameters,
+    )
+    bpy.types.Scene.sg_rework_consistent_frame = bpy.props.BoolProperty(
+        name="Consistent Texturing Frame",
+        description="Evaluate guides, visibility, projection, and baking at the explicit Texturing Frame",
+        default=TEXTURING_REWORK_DEFAULTS["sg_rework_consistent_frame"], update=update_parameters,
+    )
+    bpy.types.Scene.sg_rework_workflow_validation = bpy.props.BoolProperty(
+        name="Workflow Graph Validation",
+        description="Validate generated Qwen/SDXL workflow graphs and semantic image slots before submission",
+        default=TEXTURING_REWORK_DEFAULTS["sg_rework_workflow_validation"], update=update_parameters,
+    )
+    bpy.types.Scene.sg_rework_qwen_workflow = bpy.props.BoolProperty(
+        name="Corrected Qwen Workflow Routing",
+        description="Use corrected Qwen style-slot routing, TRELLIS initial-only fallback, and refine sampler/model configuration",
+        default=TEXTURING_REWORK_DEFAULTS["sg_rework_qwen_workflow"], update=update_parameters,
+    )
+    bpy.types.Scene.sg_rework_final_display = bpy.props.BoolProperty(
+        name="Continuous Final Display Rebuild",
+        description="After sequential generation, rebuild the final material without generation-only binary Qwen write masks so it matches Reproject",
+        default=TEXTURING_REWORK_DEFAULTS["sg_rework_final_display"], update=update_parameters,
     )
     bpy.types.Scene.sg_silhouette_depth = bpy.props.FloatProperty(
         name="Silhouette Depth",
-        description="Minimum depth discontinuity as a fraction of model scale; pixel footprint is also considered so protection behaves consistently on tiny and huge characters",
-        default=0.01, min=0.0001, max=0.25, step=1, precision=4, update=update_parameters,
+        description="Legacy Blender-unit depth threshold unless Projection Geometry Corrections is enabled, where it is interpreted relative to model scale",
+        default=0.05, min=0.001, max=1.0, step=1, precision=3, update=update_parameters,
     )
     bpy.types.Scene.sg_silhouette_rays = bpy.props.EnumProperty(
         name="Silhouette Rays",
@@ -1135,6 +1216,16 @@ def register_properties(update_model_list, ControlNetUnit, LoRAUnit,
         description="Dilate fallback color regions in the context render before sending to Qwen.",
         default=1, min=0, max=64, update=update_parameters
     )
+    bpy.types.Scene.qwen_use_confidence_context = bpy.props.BoolProperty(
+        name="Confidence-Gated Context",
+        description="Replace legacy RGB/magenta discovery with an explicit binary trusted-versus-repair context mask",
+        default=TEXTURING_REWORK_DEFAULTS["qwen_use_confidence_context"], update=update_parameters,
+    )
+    bpy.types.Scene.qwen_regularize_context_mask = bpy.props.BoolProperty(
+        name="Regularize Context Boundary",
+        description="Apply island, hole, strip, dilation, and part-aware cleanup to the explicit binary Qwen repair mask",
+        default=TEXTURING_REWORK_DEFAULTS["qwen_regularize_context_mask"], update=update_parameters,
+    )
     bpy.types.Scene.qwen_trust_threshold = bpy.props.FloatProperty(
         name="Trusted Source Threshold",
         description="Minimum original source-camera acquisition quality required before RGB is protected in later Qwen context views",
@@ -1167,8 +1258,13 @@ def register_properties(update_model_list, ControlNetUnit, LoRAUnit,
     )
     bpy.types.Scene.qwen_use_projection_write_masks = bpy.props.BoolProperty(
         name="Protect Trusted Texture",
-        description="Use the binary sequential visibility mask both to build exact magenta context and to restrict which pixels a later Qwen view may project",
-        default=True, update=update_parameters
+        description="Restrict each later Qwen camera's projection contribution to its binary editable/write mask",
+        default=TEXTURING_REWORK_DEFAULTS["qwen_use_projection_write_masks"], update=update_parameters
+    )
+    bpy.types.Scene.qwen_reject_residual_fallback = bpy.props.BoolProperty(
+        name="Reject Residual Magenta",
+        description="Remove residual fallback-color pixels from a Qwen camera's explicit projection write mask",
+        default=TEXTURING_REWORK_DEFAULTS["qwen_reject_residual_fallback"], update=update_parameters,
     )
     bpy.types.Scene.qwen_residual_fallback_tolerance = bpy.props.IntProperty(
         name="Residual Fallback Tolerance",
@@ -1935,6 +2031,15 @@ def unregister_properties(load_handler, _sg_queue_load_handler):
         'visibility_vignette_blur',
         'sg_silhouette_margin', 'sg_silhouette_depth', 'sg_silhouette_rays',
         'sg_allow_backface_projection',
+        'sg_rework_camera_plan', 'sg_rework_aligned_resolution',
+        'sg_rework_full_resolution_scale',
+        'sg_rework_safe_render_state', 'sg_rework_reset_controls',
+        'sg_rework_sdxl_registration', 'sg_rework_acquisition_quality',
+        'sg_rework_initial_view_priority',
+        'sg_rework_projection_guard', 'sg_rework_projection_rebuild',
+        'sg_rework_projection_geometry',
+        'sg_rework_consistent_frame', 'sg_rework_workflow_validation',
+        'sg_rework_qwen_workflow', 'sg_rework_final_display',
         'sg_texel_ownership', 'sg_texel_replacement_margin',
         'sg_allow_trusted_replacement', 'sg_ownership_blend_mode',
         'sg_ownership_seam_width', 'sg_ownership_lowpass_sigma',
@@ -1972,7 +2077,9 @@ def unregister_properties(load_handler, _sg_queue_load_handler):
         'qwen_guidance_fallback_color', 'qwen_guidance_background_color',
         'qwen_context_cleanup', 'qwen_context_cleanup_hue_tolerance',
         'qwen_context_cleanup_value_adjust', 'qwen_context_fallback_dilation',
+        'qwen_use_confidence_context', 'qwen_regularize_context_mask',
         'qwen_use_projection_write_masks', 'qwen_residual_fallback_tolerance',
+        'qwen_reject_residual_fallback',
         'qwen_trust_threshold', 'qwen_mask_min_island_area',
         'qwen_mask_min_hole_area', 'qwen_mask_min_strip_width',
         'qwen_mask_uncertainty_dilation',

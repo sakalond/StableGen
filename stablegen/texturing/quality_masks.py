@@ -261,6 +261,7 @@ def build_depth_part_rejection_mask(
     *,
     margin=3,
     depth_threshold=3,
+    return_diagnostics=False,
 ):
     """Build a per-pixel projection guard around depth/part silhouettes.
 
@@ -273,9 +274,21 @@ def build_depth_part_rejection_mask(
     if depth.ndim == 3:
         depth = cv2.cvtColor(depth, cv2.COLOR_BGR2GRAY)
     depth = depth.astype(np.uint8)
+    margin = max(0, int(margin))
+    if margin == 0:
+        guard = np.full(depth.shape, 255, dtype=np.uint8)
+        diagnostics = {
+            "mode": "disabled",
+            "fallback_triggered": False,
+            "id_guard_allowed_foreground_percent": 100.0,
+            "allowed_foreground_percent": 100.0,
+        }
+        return (guard, diagnostics) if return_diagnostics else guard
     kernel3 = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
     depth_range = cv2.dilate(depth, kernel3) - cv2.erode(depth, kernel3)
-    edge = depth_range > max(0, int(depth_threshold))
+    depth_edge = depth_range > max(0, int(depth_threshold))
+    edge = depth_edge.copy()
+    used_part_ids = False
 
     for ids in (object_ids, material_ids):
         if ids is None:
@@ -287,13 +300,49 @@ def build_depth_part_rejection_mask(
                 ids, (depth.shape[1], depth.shape[0]), interpolation=cv2.INTER_NEAREST
             )
         edge |= cv2.dilate(ids, kernel3) != cv2.erode(ids, kernel3)
+        used_part_ids = True
 
-    edge_u8 = np.where(edge, 255, 0).astype(np.uint8)
-    margin = max(0, int(margin))
-    if margin:
-        size = margin * 2 + 1
-        edge_u8 = cv2.dilate(
-            edge_u8,
-            cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (size, size)),
+    def _guard_from_edges(edges):
+        edge_u8 = np.where(edges, 255, 0).astype(np.uint8)
+        if margin:
+            size = margin * 2 + 1
+            edge_u8 = cv2.dilate(
+                edge_u8,
+                cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (size, size)),
+            )
+        return np.where(edge_u8 > 0, 0, 255).astype(np.uint8)
+
+    guard = _guard_from_edges(edge)
+
+    # Categorical render passes must be noise-free, but older outputs and
+    # third-party render settings can contain one-LSB dither. Treating that as
+    # real object/material boundaries expands rejection across virtually the
+    # whole character. If part IDs would leave less than 10% of foreground
+    # writable, retain the depth-discontinuity protection and discard the
+    # contaminated ID contribution instead of blacking out the texture.
+    foreground = depth > 1
+    diagnostics = {
+        "mode": "depth_part" if used_part_ids else "depth_only",
+        "fallback_triggered": False,
+        "id_guard_allowed_foreground_percent": None,
+        "allowed_foreground_percent": None,
+    }
+    if used_part_ids and np.any(foreground):
+        allowed_fraction = float(np.count_nonzero((guard > 0) & foreground)) / float(
+            np.count_nonzero(foreground)
         )
-    return np.where(edge_u8 > 0, 0, 255).astype(np.uint8)
+        diagnostics["id_guard_allowed_foreground_percent"] = allowed_fraction * 100.0
+        if allowed_fraction < 0.10:
+            guard = _guard_from_edges(depth_edge)
+            diagnostics["mode"] = "depth_only_fallback"
+            diagnostics["fallback_triggered"] = True
+
+    if np.any(foreground):
+        diagnostics["allowed_foreground_percent"] = (
+            float(np.count_nonzero((guard > 0) & foreground))
+            * 100.0 / float(np.count_nonzero(foreground))
+        )
+
+    if return_diagnostics:
+        return guard, diagnostics
+    return guard

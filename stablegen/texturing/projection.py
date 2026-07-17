@@ -13,7 +13,11 @@ _SG_BUFFER_UV_NAME = "_SG_ProjectionBuffer"
 
 def _is_projection_mesh(obj):
     """Consistent render/visibility filter for production geometry."""
-    if obj.type != 'MESH' or obj.hide_get() or obj.hide_render:
+    if obj.type != 'MESH' or obj.hide_get():
+        return False
+    if not getattr(bpy.context.scene, 'sg_rework_projection_geometry', False):
+        return True
+    if obj.hide_render:
         return False
     if obj.get("sg_rig_helper", False) or obj.get("sg_exclude_texturing", False):
         return False
@@ -78,11 +82,17 @@ def _ensure_lowpass_texture(image_path, sigma=8.0):
 
 def _camera_world_location(camera):
     """Return camera position in world space (including parent transforms)."""
-    return camera.matrix_world.translation.copy()
+    if getattr(bpy.context.scene, 'sg_rework_projection_geometry', False):
+        return camera.matrix_world.translation.copy()
+    return camera.location.copy()
 
 
 def _scene_ray_epsilon(context):
     """Scale ray tolerances to the scene instead of assuming metre-sized assets."""
+    if not getattr(context.scene, 'sg_rework_projection_geometry', False):
+        # The legacy native graph used +0.01 ray length and +0.001 hit
+        # tolerance; callers multiply this base by ten for ray length.
+        return 0.001
     corners = []
     for obj in context.view_layer.objects:
         if not _is_projection_mesh(obj):
@@ -185,7 +195,11 @@ def _bake_visibility_weights(
         filmw  = tan(fov / 2)
         aspect = cam_res_x / cam_res_y
         filmh  = filmw / aspect
-        camera_type = camera.data.type
+        camera_type = (
+            camera.data.type
+            if getattr(scene, 'sg_rework_projection_geometry', False)
+            else 'PERSP'
+        )
         ortho_half_h = max(float(camera.data.ortho_scale) * 0.5, 1e-8)
         ortho_half_w = ortho_half_h * aspect
 
@@ -194,24 +208,32 @@ def _bake_visibility_weights(
             np.array(cam_dir, dtype=np.float64),
             np.array(cam_right, dtype=np.float64),
             np.array(cam_up_vec, dtype=np.float64),
-            filmw, filmh, float(camera.data.shift_x), float(camera.data.shift_y),
+            filmw, filmh,
+            float(camera.data.shift_x) if getattr(scene, 'sg_rework_projection_geometry', False) else 0.0,
+            float(camera.data.shift_y) if getattr(scene, 'sg_rework_projection_geometry', False) else 0.0,
             cam_loc,  # keep mathutils Vector for BVH calls
             camera_type, ortho_half_w, ortho_half_h,
         ))
 
     # Build scene-wide BVH for occlusion (matches ShaderNodeRaycast behaviour,
     # which checks ALL visible scene geometry, not just the current object).
-    depsgraph = context.evaluated_depsgraph_get()
+    use_corrected_geometry = getattr(scene, 'sg_rework_projection_geometry', False)
+    depsgraph = context.evaluated_depsgraph_get() if use_corrected_geometry else None
     scene_bm = bmesh.new()
     vert_offset = 0
     for scene_obj in context.view_layer.objects:
         if not _is_projection_mesh(scene_obj):
             continue
         tmp = bmesh.new()
-        evaluated_obj = scene_obj.evaluated_get(depsgraph)
-        evaluated_mesh = evaluated_obj.to_mesh()
-        tmp.from_mesh(evaluated_mesh)
-        tmp.transform(evaluated_obj.matrix_world)
+        evaluated_obj = None
+        if use_corrected_geometry:
+            evaluated_obj = scene_obj.evaluated_get(depsgraph)
+            evaluated_mesh = evaluated_obj.to_mesh()
+            tmp.from_mesh(evaluated_mesh)
+            tmp.transform(evaluated_obj.matrix_world)
+        else:
+            tmp.from_mesh(scene_obj.data)
+            tmp.transform(scene_obj.matrix_world)
         for v in tmp.verts:
             scene_bm.verts.new(v.co)
         scene_bm.verts.ensure_lookup_table()
@@ -223,7 +245,8 @@ def _bake_visibility_weights(
                 pass  # skip degenerate / duplicate faces
         vert_offset += len(tmp.verts)
         tmp.free()
-        evaluated_obj.to_mesh_clear()
+        if evaluated_obj is not None:
+            evaluated_obj.to_mesh_clear()
     scene_bm.normal_update()
     scene_tree = BVHTree.FromBMesh(scene_bm)
     scene_bm.free()
@@ -233,17 +256,22 @@ def _bake_visibility_weights(
     n_cameras = len(cameras)
     for obj_idx, obj in enumerate(objects):
         bm = bmesh.new()
-        evaluated_obj = obj.evaluated_get(depsgraph)
-        evaluated_mesh = evaluated_obj.to_mesh()
-        if len(evaluated_mesh.vertices) == len(obj.data.vertices):
-            source_mesh = evaluated_mesh
-            source_matrix = evaluated_obj.matrix_world
+        evaluated_obj = None
+        if use_corrected_geometry:
+            evaluated_obj = obj.evaluated_get(depsgraph)
+            evaluated_mesh = evaluated_obj.to_mesh()
+            if len(evaluated_mesh.vertices) == len(obj.data.vertices):
+                source_mesh = evaluated_mesh
+                source_matrix = evaluated_obj.matrix_world
+            else:
+                print(
+                    f"[StableGen] Warning: '{obj.name}' modifiers change vertex count; "
+                    "visibility weights use the base mesh because POINT attributes "
+                    "cannot be mapped safely to evaluated topology."
+                )
+                source_mesh = obj.data
+                source_matrix = obj.matrix_world
         else:
-            print(
-                f"[StableGen] Warning: '{obj.name}' modifiers change vertex count; "
-                "visibility weights use the base mesh because POINT attributes "
-                "cannot be mapped safely to evaluated topology."
-            )
             source_mesh = obj.data
             source_matrix = obj.matrix_world
         bm.from_mesh(source_mesh)
@@ -255,7 +283,8 @@ def _bake_visibility_weights(
         positions_np = np.array([v.co[:] for v in bm.verts], dtype=np.float64)
         normals_np   = np.array([v.normal[:] for v in bm.verts], dtype=np.float64)
         bm.free()
-        evaluated_obj.to_mesh_clear()
+        if evaluated_obj is not None:
+            evaluated_obj.to_mesh_clear()
 
         for cam_idx, camera in enumerate(cameras):
             print(f"[StableGen] Baking visibility: object {obj_idx+1}/{len(objects)}, "
@@ -335,7 +364,9 @@ def _bake_visibility_weights(
                         positions_np[vi] - cam_dir_np * (dists[vi] + ray_epsilon * 10.0)
                     )
                 hit_loc, _, _, hit_dist = scene_tree.ray_cast(
-                    ray_origin, d_mu, float(dists[vi]) + ray_epsilon * 20.0)
+                    ray_origin, d_mu, float(dists[vi]) + ray_epsilon * (
+                        20.0 if getattr(scene, 'sg_rework_projection_geometry', False) else 10.0
+                    ))
                 if hit_loc is not None and dists[vi] > hit_dist + ray_epsilon:
                     occluded[vi] = True
 
@@ -395,22 +426,27 @@ def _bake_visibility_weights(
                                 + offset_world
                             )
                         h_loc, _, _, h_dist = scene_tree.ray_cast(
-                            offset_origin, d_off_mu, dist_v + ray_epsilon * 20.0)
-                        scene_scale = _scene_projection_scale(context)
-                        relative_depth = getattr(scene, 'sg_silhouette_depth', 0.01)
-                        if camera_type == 'ORTHO':
-                            pixel_footprint = (
-                                (2.0 * ortho_half_w) / max(cam_res_x_n, 1)
-                                * max(silhouette_margin_px, 1)
+                            offset_origin, d_off_mu, dist_v + ray_epsilon * (
+                                20.0 if getattr(scene, 'sg_rework_projection_geometry', False) else 10.0
+                            ))
+                        if getattr(scene, 'sg_rework_projection_geometry', False):
+                            scene_scale = _scene_projection_scale(context)
+                            relative_depth = getattr(scene, 'sg_silhouette_depth', 0.05)
+                            if camera_type == 'ORTHO':
+                                pixel_footprint = (
+                                    (2.0 * ortho_half_w) / max(cam_res_x_n, 1)
+                                    * max(silhouette_margin_px, 1)
+                                )
+                            else:
+                                pixel_footprint = (
+                                    dist_v * rad_per_px * max(silhouette_margin_px, 1)
+                                )
+                            depth_thr = max(
+                                scene_scale * relative_depth,
+                                pixel_footprint * 0.5,
                             )
                         else:
-                            pixel_footprint = (
-                                dist_v * rad_per_px * max(silhouette_margin_px, 1)
-                            )
-                        depth_thr = max(
-                            scene_scale * relative_depth,
-                            pixel_footprint * 0.5,
-                        )
+                            depth_thr = getattr(scene, 'sg_silhouette_depth', 0.05)
                         if h_loc is not None and dist_v > h_dist + depth_thr:
                             is_edge = True
                             break
@@ -646,7 +682,10 @@ def create_native_raycast_visibility(nodes, links, camera, geometry, context, i,
 
     shift_x_amount = nodes.new("ShaderNodeMath")
     shift_x_amount.operation = 'MULTIPLY'
-    shift_x_amount.inputs[1].default_value = 2.0 * float(camera.data.shift_x)
+    shift_x_amount.inputs[1].default_value = (
+        2.0 * float(camera.data.shift_x)
+        if getattr(context.scene, 'sg_rework_projection_geometry', False) else 0.0
+    )
     links.new(filmw.outputs[0], shift_x_amount.inputs[0])
     centered_x = nodes.new("ShaderNodeMath")
     centered_x.operation = 'SUBTRACT'
@@ -655,7 +694,10 @@ def create_native_raycast_visibility(nodes, links, camera, geometry, context, i,
 
     shift_y_amount = nodes.new("ShaderNodeMath")
     shift_y_amount.operation = 'MULTIPLY'
-    shift_y_amount.inputs[1].default_value = 2.0 * float(camera.data.shift_y)
+    shift_y_amount.inputs[1].default_value = (
+        2.0 * float(camera.data.shift_y)
+        if getattr(context.scene, 'sg_rework_projection_geometry', False) else 0.0
+    )
     links.new(filmh.outputs[0], shift_y_amount.inputs[0])
     centered_y = nodes.new("ShaderNodeMath")
     centered_y.operation = 'SUBTRACT'
@@ -935,7 +977,10 @@ def create_native_feather(nodes, links, normalize_node, camera_fov_node, camera_
 
     shift_x_amount = nodes.new("ShaderNodeMath")
     shift_x_amount.operation = 'MULTIPLY'
-    shift_x_amount.inputs[1].default_value = 2.0 * float(camera.data.shift_x)
+    shift_x_amount.inputs[1].default_value = (
+        2.0 * float(camera.data.shift_x)
+        if getattr(context.scene, 'sg_rework_projection_geometry', False) else 0.0
+    )
     links.new(filmw.outputs[0], shift_x_amount.inputs[0])
     centered_x = nodes.new("ShaderNodeMath")
     centered_x.operation = 'SUBTRACT'
@@ -944,7 +989,10 @@ def create_native_feather(nodes, links, normalize_node, camera_fov_node, camera_
 
     shift_y_amount = nodes.new("ShaderNodeMath")
     shift_y_amount.operation = 'MULTIPLY'
-    shift_y_amount.inputs[1].default_value = 2.0 * float(camera.data.shift_y)
+    shift_y_amount.inputs[1].default_value = (
+        2.0 * float(camera.data.shift_y)
+        if getattr(context.scene, 'sg_rework_projection_geometry', False) else 0.0
+    )
     links.new(filmh.outputs[0], shift_y_amount.inputs[0])
     centered_y = nodes.new("ShaderNodeMath")
     centered_y.operation = 'SUBTRACT'
@@ -1411,13 +1459,15 @@ def project_image(
             # Replace weight_nodes with sharpened-normalised nodes
             weight_nodes = powered_nodes
 
-            use_confidence_ownership = (
+            # Binary Qwen write masks and per-texel ownership solve different
+            # problems. Write masks prevent a later generated view from writing
+            # protected context; ownership selects exactly one camera for
+            # high-frequency detail and therefore creates harder territories.
+            # Keep ownership genuinely opt-in so disabling the UI toggle
+            # restores continuous weighted blending without disabling Qwen's
+            # protection masks.
+            use_confidence_ownership = bool(
                 getattr(context.scene, 'sg_texel_ownership', False)
-                or (
-                    context.scene.model_architecture == 'qwen_image_edit'
-                    and context.scene.generation_method == 'sequential'
-                    and getattr(context.scene, 'qwen_use_projection_write_masks', True)
-                )
             )
             legacy_blend = getattr(
                 context.scene, 'sg_ownership_blend_mode', 'OWNER'
@@ -1442,7 +1492,9 @@ def project_image(
                 ))
                 priority_strength = (
                     float(getattr(context.scene, 'early_priority_strength', 0.5))
-                    if getattr(context.scene, 'early_priority', False) else 0.0
+                    if (getattr(context.scene, 'early_priority', False)
+                        and getattr(context.scene, 'sg_rework_initial_view_priority', False))
+                    else 0.0
                 )
 
                 owner_camera = nodes_collection.new("ShaderNodeValue")
@@ -1664,7 +1716,14 @@ def project_image(
                 vert_offset = -200 * (i // 2)
                 sum_node = nodes_collection.new("ShaderNodeMath")
                 sum_node.operation = 'ADD'
-                sum_node.location = (x_offset - 600, y_offset + vert_offset)
+                legacy_priority = (
+                    context.scene.early_priority
+                    and not getattr(context.scene, 'sg_rework_initial_view_priority', False)
+                )
+                sum_node.location = (
+                    (x_offset - 800, y_offset + vert_offset)
+                    if legacy_priority else (x_offset - 600, y_offset + vert_offset)
+                )
                 
                 def get_weight_output(w_item):
                     if isinstance(w_item, tuple):
@@ -1723,9 +1782,18 @@ def project_image(
                 # Compute mix factor: weight_A / (weight_A+weight_B)
                 div_node = nodes_collection.new("ShaderNodeMath")
                 div_node.operation = 'DIVIDE'
-                div_node.location = (x_offset - 400, y_offset + vert_offset)
+                div_node.location = (
+                    (x_offset - 600, y_offset + vert_offset)
+                    if legacy_priority else (x_offset - 400, y_offset + vert_offset)
+                )
                 links.new(w_out_2, div_node.inputs[0])
                 links.new(sum_node.outputs[0], div_node.inputs[1])
+
+                if legacy_priority:
+                    map_range_node = nodes_collection.new("ShaderNodeMapRange")
+                    map_range_node.location = (x_offset - 400, y_offset + vert_offset)
+                    map_range_node.inputs[1].default_value = context.scene.early_priority_strength
+                    links.new(div_node.outputs[0], map_range_node.inputs[0])
 
                 # Create a MixRGB node for color blending of the two inputs
                 mix_node = nodes_collection.new("ShaderNodeMixRGB")
@@ -1735,7 +1803,8 @@ def project_image(
                 links.new(shaders[i].outputs[0], mix_node.inputs["Color1"])
                 links.new(shaders[i+1].outputs[0], mix_node.inputs["Color2"])
                 # Use the computed mix factor
-                links.new(div_node.outputs[0], mix_node.inputs["Fac"])
+                to_connect = map_range_node if legacy_priority else div_node
+                links.new(to_connect.outputs[0], mix_node.inputs["Fac"])
 
                 new_shaders.append(mix_node)
                 # The new effective weight is the sum (stored in sum_node)
@@ -1844,7 +1913,8 @@ def project_image(
     # ── Optional: bake per-vertex visibility weights ──────────────────
     use_baked_weights = (
         getattr(context.scene, 'bake_visibility_weights', False)
-        or any(camera.data.type == 'ORTHO' for camera in cameras)
+        or (getattr(context.scene, 'sg_rework_projection_geometry', False)
+            and any(camera.data.type == 'ORTHO' for camera in cameras))
     )
     if use_baked_weights:
         # Always compute weights for ALL cameras (ignore stop_index).
@@ -1930,11 +2000,80 @@ def project_image(
             original_uv_map = obj.data.uv_layers[1]
 
 
-        if not is_local_edit:
-            # Rebuild deterministically at every sequential step. Later views
-            # acquire write masks, projection guards, low-pass companions, and
-            # ownership confidence only after generation; patching the old
-            # graph left those inputs stale and could launder poor context.
+        rework_requires_rebuild = any((
+            getattr(context.scene, 'sg_rework_projection_rebuild', False),
+            getattr(context.scene, 'sg_rework_projection_guard', False),
+            getattr(context.scene, 'sg_texel_ownership', False),
+            getattr(context.scene, 'qwen_use_projection_write_masks', False),
+            getattr(context.scene, 'sg_rework_sdxl_registration', False),
+        ))
+        legacy_incremental_update = (
+            ((context.scene.generation_method == 'sequential' and stop_index > 0)
+             or context.scene.generation_mode == 'regenerate_selected')
+            and not rework_requires_rebuild
+        )
+
+        if legacy_incremental_update:
+            # Exact rigging-branch behavior: patch the newly generated image
+            # into the existing graph and remove that view's stop-index gate.
+            script_node = None
+            for node in nodes:
+                if ((node.type == 'SCRIPT'
+                     or (node.type == 'MATH' and node.operation == 'MULTIPLY'))
+                        and (node.label == f"Angle-{stop_index}-{mat_id}"
+                             or node.label == f"{stop_index}-{mat_id}")):
+                    script_node = node
+                    break
+            # New feature nodes may sit between Angle and the temporary gate.
+            # Identify the gate explicitly and reconnect its actual input source;
+            # retaining the old direct-child search keeps old saved graphs valid.
+            stop_gate = next(
+                (node for node in nodes
+                 if node.label == f"StopGate-{stop_index}-{mat_id}"),
+                None,
+            )
+            if stop_gate is None and script_node:
+                stop_gate = next(
+                    (link.to_node for link in script_node.outputs[0].links
+                     if link.to_node.type == 'MATH'
+                     and link.to_node.operation == 'LESS_THAN'),
+                    None,
+                )
+            if stop_gate is not None:
+                gate_source = (
+                    stop_gate.inputs[0].links[0].from_socket
+                    if stop_gate.inputs[0].links else None
+                )
+                gate_destinations = [
+                    link.to_socket for link in stop_gate.outputs[0].links
+                ]
+                nodes.remove(stop_gate)
+                if gate_source is not None:
+                    for output_socket in gate_destinations:
+                        links.new(gate_source, output_socket)
+            for node in nodes:
+                if node.type == 'TEX_IMAGE' and node.label == f"{stop_index}-{mat_id}":
+                    image_path = get_file_path(
+                        context, "generated", camera_id=stop_index, material_id=mat_id
+                    )
+                    if ((context.scene.generation_method in ('sequential', 'separate'))
+                            and context.scene.sequential_ipadapter
+                            and context.scene.sequential_ipadapter_regenerate
+                            and not context.scene.use_ipadapter
+                            and stop_index == 0
+                            and context.scene.sequential_ipadapter_mode == 'first'):
+                        image_path = image_path.replace(".png", "_ipadapter.png")
+                    image = get_or_load_image(
+                        image_path,
+                        force_reload=context.scene.overwrite_material,
+                    )
+                    if image:
+                        node.image = image
+                    break
+            continue
+        elif not is_local_edit:
+            # Rebuild mode is required for per-view assets that only exist
+            # after generation (write masks, guards, and ownership inputs).
             # Clear existing nodes
             for node in nodes:
                 nodes.remove(node)
@@ -2051,6 +2190,8 @@ def project_image(
 
         def _create_projection_guard_weight(cam_index, mat_id_inner):
             """Sample per-pixel depth/object/material silhouette rejection."""
+            if not getattr(context.scene, 'sg_rework_projection_guard', False):
+                return None
             guard_path = os.path.join(
                 get_dir_path(context, "inpaint")["visibility"],
                 f"projection_guard{cam_index}.png",
@@ -2109,7 +2250,8 @@ def project_image(
             tex_image_nodes.append(tex_image)
 
             lowpass_node = tex_image
-            if (getattr(context.scene, 'sg_ownership_blend_mode', 'OWNER') == 'OWNER'
+            if (getattr(context.scene, 'sg_texel_ownership', False)
+                    and getattr(context.scene, 'sg_ownership_blend_mode', 'OWNER') == 'OWNER'
                     and i <= stop_index and tex_image.image is not None):
                 source_path = bpy.path.abspath(tex_image.image.filepath)
                 lowpass_path = _ensure_lowpass_texture(
@@ -2172,6 +2314,7 @@ def project_image(
                 if i > stop_index and not voronoi_active:
                     less_than = nodes.new("ShaderNodeMath")
                     less_than.operation = 'LESS_THAN'
+                    less_than.label = f"StopGate-{i}-{mat_id}"
                     less_than.location = (-100, (-800) * i)
                     less_than.inputs[1].default_value = -1
                     links.new(passthrough.outputs[0], less_than.inputs[0])
@@ -2217,7 +2360,8 @@ def project_image(
                         final_weight_node = (angle_weight, feather_weight)
                 else:
                     final_weight_node = angle_weight
-                    if (context.scene.generation_method == 'sequential'
+                    if (getattr(context.scene, 'sg_rework_acquisition_quality', False)
+                            and context.scene.generation_method == 'sequential'
                             and context.scene.visibility_vignette):
                         frame_weight = create_native_feather(
                             nodes, links, normalize_node, camera_fov_node,
@@ -2236,6 +2380,7 @@ def project_image(
                 if i > stop_index and not voronoi_active:
                     less_than = nodes.new("ShaderNodeMath")
                     less_than.operation = 'LESS_THAN'
+                    less_than.label = f"StopGate-{i}-{mat_id}"
                     less_than.location = (-200, (-800) * i)
                     less_than.inputs[1].default_value = -1
                     source_node = final_weight_node[0] if isinstance(final_weight_node, tuple) else final_weight_node
@@ -2290,9 +2435,15 @@ def project_image(
                 if "RayEpsilon" in script_angle.inputs:
                     script_angle.inputs["RayEpsilon"].default_value = _scene_ray_epsilon(context)
                 if "CameraShiftX" in script_angle.inputs:
-                    script_angle.inputs["CameraShiftX"].default_value = camera.data.shift_x
+                    script_angle.inputs["CameraShiftX"].default_value = (
+                        camera.data.shift_x
+                        if getattr(context.scene, 'sg_rework_projection_geometry', False) else 0.0
+                    )
                 if "CameraShiftY" in script_angle.inputs:
-                    script_angle.inputs["CameraShiftY"].default_value = camera.data.shift_y
+                    script_angle.inputs["CameraShiftY"].default_value = (
+                        camera.data.shift_y
+                        if getattr(context.scene, 'sg_rework_projection_geometry', False) else 0.0
+                    )
                 script_angle.label = f"Angle-{i}-{mat_id}"
 
                 scripts_to_connect = [script_angle]
@@ -2331,9 +2482,15 @@ def project_image(
                         script_feather.inputs["EdgeGamma"].default_value = 1.0
                     script_feather.label = f"Feather-{i}-{mat_id}"
                     if "CameraShiftX" in script_feather.inputs:
-                        script_feather.inputs["CameraShiftX"].default_value = camera.data.shift_x
+                        script_feather.inputs["CameraShiftX"].default_value = (
+                            camera.data.shift_x
+                            if getattr(context.scene, 'sg_rework_projection_geometry', False) else 0.0
+                        )
                     if "CameraShiftY" in script_feather.inputs:
-                        script_feather.inputs["CameraShiftY"].default_value = camera.data.shift_y
+                        script_feather.inputs["CameraShiftY"].default_value = (
+                            camera.data.shift_y
+                            if getattr(context.scene, 'sg_rework_projection_geometry', False) else 0.0
+                        )
                     scripts_to_connect.append(script_feather)
 
                     # Optionally add edge-feather mask as third multiplier
@@ -2345,13 +2502,15 @@ def project_image(
                             final_weight_node = (script_angle, script_feather)
                     elif is_local_edit_mode:
                         final_weight_node = (script_angle, script_feather)
-                    else:
+                    elif getattr(context.scene, 'sg_rework_acquisition_quality', False):
                         frame_quality = nodes.new("ShaderNodeMath")
                         frame_quality.operation = 'MULTIPLY'
                         frame_quality.label = f"FrameEdgeQuality-{i}-{mat_id}"
                         links.new(script_angle.outputs[0], frame_quality.inputs[0])
                         links.new(script_feather.outputs[0], frame_quality.inputs[1])
                         final_weight_node = frame_quality
+                    else:
+                        final_weight_node = script_angle
                 else:
                     # Just use Angle script output directly
                     final_weight_node = script_angle
@@ -2362,6 +2521,7 @@ def project_image(
                     # Connect a temporary less than node to the script node
                     less_than = nodes.new("ShaderNodeMath")
                     less_than.operation = 'LESS_THAN'
+                    less_than.label = f"StopGate-{i}-{mat_id}"
                     less_than.location = (-200, (-800) * i)
                     less_than.inputs[1].default_value = -1
                     
@@ -2423,7 +2583,8 @@ def project_image(
 
             # Add projected pixel density to live native/OSL paths.  Baked
             # acquisition attributes already contain this term.
-            if (not use_baked_weights and script_nodes_outputs
+            if (getattr(context.scene, 'sg_rework_acquisition_quality', False)
+                    and not use_baked_weights and script_nodes_outputs
                     and not isinstance(script_nodes_outputs[-1], tuple)
                     and length_nodes[-1] is not None):
                 cam_res_x, cam_res_y = _get_camera_resolution(camera, context.scene)
@@ -2460,9 +2621,11 @@ def project_image(
                 and context.scene.generation_method == 'sequential'
                 and context.scene.qwen_generation_method == 'generate'
                 and context.scene.qwen_context_render_mode in {'REPLACE_STYLE', 'ADDITIONAL'}
-                and getattr(context.scene, 'qwen_use_projection_write_masks', True)
+                and getattr(context.scene, 'qwen_use_projection_write_masks', False)
             )
             use_sdxl_write_mask = (
+                getattr(context.scene, 'sg_rework_sdxl_registration', False)
+                and
                 i > 0
                 and i <= stop_index
                 and context.scene.model_architecture == 'sdxl'
@@ -2495,11 +2658,27 @@ def project_image(
             if script_nodes_outputs and not isinstance(script_nodes_outputs[-1], tuple):
                 guard_weight = _create_projection_guard_weight(i, mat_id)
                 if guard_weight is not None:
+                    # A projection guard marks depth/object/material boundaries
+                    # as unsafe for ownership, but it must not delete the last
+                    # available coverage. Complex character meshes can have
+                    # dense ID boundaries around hair, facial parts, fingers,
+                    # clothing openings, and adjacent mesh pieces. If every
+                    # camera is hard-zeroed at the same surface point, the
+                    # ownership graph falls through to the material's black
+                    # fallback. Keep a tiny, untrusted confidence floor: safe
+                    # views still beat it overwhelmingly, while the best weak
+                    # source fills a texel only when no guarded source exists.
+                    guard_floor = nodes.new("ShaderNodeMath")
+                    guard_floor.operation = 'MAXIMUM'
+                    guard_floor.inputs[1].default_value = 0.001
+                    guard_floor.label = f"ProjectionGuardFloor-{i}-{mat_id}"
+                    links.new(guard_weight.outputs[0], guard_floor.inputs[0])
+
                     guarded = nodes.new("ShaderNodeMath")
                     guarded.operation = 'MULTIPLY'
                     guarded.label = f"DepthPartGuarded-{i}-{mat_id}"
                     links.new(script_nodes_outputs[-1].outputs[0], guarded.inputs[0])
-                    links.new(guard_weight.outputs[0], guarded.inputs[1])
+                    links.new(guard_floor.outputs[0], guarded.inputs[1])
                     script_nodes_outputs[-1] = guarded
 
         # Build mix shader tree

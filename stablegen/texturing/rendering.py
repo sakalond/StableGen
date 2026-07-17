@@ -13,6 +13,54 @@ import cv2
 _ADDON_PKG = __package__.rsplit('.', 1)[0]
 
 
+@contextmanager
+def _legacy_render_dither(scene):
+    """Use Blender's legacy output dithering without mutating the scene."""
+    original = scene.render.dither_intensity
+    scene.render.dither_intensity = 1.0
+    try:
+        yield
+    finally:
+        scene.render.dither_intensity = original
+
+
+def _prepare_compositor_render(scene, node_tree):
+    """Isolate one render from stale compositor File Output nodes.
+
+    The legacy path cleared the compositor before every export. Transactional
+    mode preserves the user's graph instead, so its existing output nodes are
+    muted for the render and all nodes created by the export are removed by
+    ``_finish_compositor_render``.
+    """
+    nodes = node_tree.nodes
+    if not getattr(scene, 'sg_rework_safe_render_state', False):
+        nodes.clear()
+        return None
+    state = {
+        "pointers": {node.as_pointer() for node in nodes},
+        "muted_outputs": [],
+    }
+    for node in nodes:
+        if node.bl_idname == 'CompositorNodeOutputFile' and hasattr(node, 'mute'):
+            state["muted_outputs"].append((node, bool(node.mute)))
+            node.mute = True
+    return state
+
+
+def _finish_compositor_render(node_tree, state):
+    if state is None:
+        return
+    for node in list(node_tree.nodes):
+        if node.as_pointer() not in state["pointers"]:
+            node_tree.nodes.remove(node)
+    for node, was_muted in state["muted_outputs"]:
+        try:
+            if node.id_data is not None:
+                node.mute = was_muted
+        except ReferenceError:
+            pass
+
+
 def _snapshot_material_state(obj):
     """Capture exact slot order, active slot, and per-polygon assignments."""
     return {
@@ -112,6 +160,7 @@ class _RenderStateTransaction:
             "resolution_x": render.resolution_x,
             "resolution_y": render.resolution_y,
             "resolution_percentage": render.resolution_percentage,
+            "dither_intensity": render.dither_intensity,
             "image_file_format": render.image_settings.file_format,
             "scene_use_nodes": scene.use_nodes,
             "display_device": scene.display_settings.display_device,
@@ -199,6 +248,7 @@ class _RenderStateTransaction:
         scene.render.resolution_x = state["resolution_x"]
         scene.render.resolution_y = state["resolution_y"]
         scene.render.resolution_percentage = state["resolution_percentage"]
+        scene.render.dither_intensity = state["dither_intensity"]
         scene.render.image_settings.file_format = state["image_file_format"]
         scene.use_nodes = state["scene_use_nodes"]
         scene.display_settings.display_device = state["display_device"]
@@ -466,6 +516,7 @@ def _render_edge_feather_mask_impl(context, to_export, camera, camera_index, fea
     node_tree = get_compositor_node_tree(context.scene)
     comp_nodes = node_tree.nodes
     comp_links = node_tree.links
+    compositor_state = _prepare_compositor_render(context.scene, node_tree)
     render_layers = comp_nodes.new('CompositorNodeRLayers')
     try:
         mix_node = comp_nodes.new('CompositorNodeMixRGB')
@@ -485,7 +536,10 @@ def _render_edge_feather_mask_impl(context, to_export, camera, camera_index, fea
     comp_links.new(mix_node.outputs[0], output_node.inputs[0])
 
     # ── Render ──────────────────────────────────────────────────────────────
-    bpy.ops.render.render(write_still=True)
+    try:
+        bpy.ops.render.render(write_still=True)
+    finally:
+        _finish_compositor_render(node_tree, compositor_state)
 
     # ── Determine actual output path ────────────────────────────────────────
     frame_suffix = "0001" if bpy.app.version < (5, 0, 0) else ""
@@ -558,6 +612,11 @@ def _render_edge_feather_mask_impl(context, to_export, camera, camera_index, fea
 
 
 def render_edge_feather_mask(context, to_export, camera, camera_index, feather_width=30, softness=1.0):
+    if not getattr(context.scene, 'sg_rework_safe_render_state', False):
+        return _render_edge_feather_mask_impl(
+            context, to_export, camera, camera_index,
+            feather_width=feather_width, softness=softness,
+        )
     all_meshes = [obj for obj in context.scene.objects if obj.type == 'MESH']
     with _RenderStateTransaction(context, all_meshes):
         return _render_edge_feather_mask_impl(
@@ -841,6 +900,8 @@ def _export_emit_image_impl(context, to_export, camera_id=None, bg_color=(0.5, 0
         :return: None
         """
         print("[StableGen] Exporting emit render")
+        if not getattr(context.scene, 'sg_rework_consistent_frame', False):
+            context.scene.frame_set(1)
         # Store original materials and create temporary ones
         original_materials = {}
         temporary_materials = {}
@@ -989,6 +1050,7 @@ def _export_emit_image_impl(context, to_export, camera_id=None, bg_color=(0.5, 0
         node_tree = get_compositor_node_tree(context.scene)
         nodes = node_tree.nodes
         links = node_tree.links
+        compositor_state = _prepare_compositor_render(context.scene, node_tree)
 
         # Create nodes
         render_layers = nodes.new('CompositorNodeRLayers')
@@ -1012,7 +1074,10 @@ def _export_emit_image_impl(context, to_export, camera_id=None, bg_color=(0.5, 0
         links.new(mix_node.outputs[0], output_node.inputs[0])
 
         # Render
-        bpy.ops.render.render(write_still=True)
+        try:
+            bpy.ops.render.render(write_still=True)
+        finally:
+            _finish_compositor_render(node_tree, compositor_state)
 
         # Post-processing for visibility masks
         if "visibility" in str(camera_id):
@@ -1066,6 +1131,12 @@ def _export_emit_image_impl(context, to_export, camera_id=None, bg_color=(0.5, 0
 
 
 def export_emit_image(context, to_export, camera_id=None, bg_color=(0.5, 0.5, 0.5), view_transform='Standard', fallback_color=(0,0,0)):
+    if not getattr(context.scene, 'sg_rework_safe_render_state', False):
+        with _legacy_render_dither(context.scene):
+            return _export_emit_image_impl(
+                context, to_export, camera_id=camera_id, bg_color=bg_color,
+                view_transform=view_transform, fallback_color=fallback_color,
+            )
     with _RenderStateTransaction(context, to_export):
         with _temporary_render_copies(context, to_export) as (copies, _mapping):
             return _export_emit_image_impl(
@@ -1089,6 +1160,9 @@ def _export_render_impl(context, camera_id=None, output_dir=None, filename=None)
     :return: None
     """
     print("[StableGen] Exporting render using Workbench")
+
+    if not getattr(context.scene, 'sg_rework_consistent_frame', False):
+        context.scene.frame_set(1)
 
     # Setup output path
     if output_dir is None:
@@ -1128,13 +1202,17 @@ def _export_render_impl(context, camera_id=None, output_dir=None, filename=None)
     node_tree = get_compositor_node_tree(context.scene)
     nodes = node_tree.nodes
     links = node_tree.links
+    compositor_state = _prepare_compositor_render(context.scene, node_tree)
     render_layers = nodes.new('CompositorNodeRLayers')
     output_node = nodes.new('CompositorNodeOutputFile')
     configure_output_node_paths(output_node, output_dir, output_file)
     links.new(render_layers.outputs['Image'], output_node.inputs[0])
 
     # Render
-    bpy.ops.render.render(write_still=True)
+    try:
+        bpy.ops.render.render(write_still=True)
+    finally:
+        _finish_compositor_render(node_tree, compositor_state)
 
     # Restore original render settings
     render_layer.use_pass_combined = original_combined
@@ -1150,6 +1228,11 @@ def _export_render_impl(context, camera_id=None, output_dir=None, filename=None)
 
 
 def export_render(context, camera_id=None, output_dir=None, filename=None):
+    if not getattr(context.scene, 'sg_rework_safe_render_state', False):
+        with _legacy_render_dither(context.scene):
+            return _export_render_impl(
+                context, camera_id=camera_id, output_dir=output_dir, filename=filename
+            )
     objects = [obj for obj in context.view_layer.objects if obj.type == 'MESH']
     with _RenderStateTransaction(context, objects):
         return _export_render_impl(
@@ -1256,6 +1339,11 @@ def _export_viewport_impl(context, camera_id=None, output_dir=None, filename=Non
 
 def export_viewport(context, camera_id=None, output_dir=None, filename=None):
     """Viewport export with full scene-state restoration on every exit path."""
+    if not getattr(context.scene, 'sg_rework_safe_render_state', False):
+        with _legacy_render_dither(context.scene):
+            return _export_viewport_impl(
+                context, camera_id=camera_id, output_dir=output_dir, filename=filename
+            )
     objects = [obj for obj in context.view_layer.objects if obj.type == 'MESH']
     with _RenderStateTransaction(context, objects):
         return _export_viewport_impl(
@@ -1705,6 +1793,12 @@ def export_visibility(context, to_export, obj=None, camera_visibility=None,
             context, to_export, obj=obj, camera_visibility=camera_visibility,
             prepare_only=True, camera_render=camera_render, camera_id=camera_id,
         )
+    if not getattr(context.scene, 'sg_rework_safe_render_state', False):
+        with _legacy_render_dither(context.scene):
+            return _export_visibility_impl(
+                context, to_export, obj=obj, camera_visibility=camera_visibility,
+                prepare_only=False, camera_render=camera_render, camera_id=camera_id,
+            )
     with _RenderStateTransaction(context, objects):
         with _temporary_render_copies(context, objects) as (copies, mapping):
             mapped_obj = mapping.get(obj) if obj is not None else None
