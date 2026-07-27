@@ -9,6 +9,12 @@ from mathutils import Vector
 
 
 _SG_BUFFER_UV_NAME = "_SG_ProjectionBuffer"
+_OSL_RESOURCE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+
+def _osl_resource_path(filename):
+    """Return the installed path for an OSL resource in the add-on root."""
+    return os.path.join(_OSL_RESOURCE_DIR, filename)
 
 
 def _copy_uv_to_attribute(obj, uv_layer_name, attr_name):
@@ -1627,7 +1633,7 @@ def project_image(context, to_project, mat_id, stop_index=1000000):
                     script_angle.script = raycast_osl_text
                 else:
                     script_angle.mode = 'EXTERNAL'
-                    script_angle.filepath = os.path.join(os.path.dirname(__file__), "raycast.osl")
+                    script_angle.filepath = _osl_resource_path("raycast.osl")
 
                 script_angle.inputs["AngleThreshold"].default_value = context.scene.discard_factor
                 script_angle.inputs["Power"].default_value = context.scene.weight_exponent
@@ -1648,7 +1654,7 @@ def project_image(context, to_project, mat_id, stop_index=1000000):
                         script_feather.script = feather_osl_text
                     else:
                         script_feather.mode = 'EXTERNAL'
-                        script_feather.filepath = os.path.join(os.path.dirname(__file__), "feather.osl")
+                        script_feather.filepath = _osl_resource_path("feather.osl")
 
                     if context.scene.visibility_vignette: # Only set if feathering is active
                         script_feather.inputs["EdgeFeather"].default_value = context.scene.visibility_vignette_width
@@ -1810,7 +1816,7 @@ def get_or_create_osl_text(filename):
     Loads an OSL script into a Blender internal text block.
     This ensures the script is embedded in the .blend file (portable).
     """
-    filepath = os.path.join(os.path.dirname(__file__), filename)
+    filepath = _osl_resource_path(filename)
     if not os.path.exists(filepath):
         print(f"[StableGen] Error: OSL script not found at {filepath}")
         return None
