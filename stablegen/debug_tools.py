@@ -14,6 +14,7 @@ import bpy
 import os
 import colorsys
 import numpy as np
+import sys
 from contextlib import contextmanager
 from mathutils import Vector
 
@@ -27,6 +28,11 @@ from .texturing.projection import (
 from .texturing.rendering import export_visibility
 from .cameras.geometry import _get_camera_resolution
 from .utils import get_file_path, get_generation_dirs, ensure_dirs_exist, sg_modal_active
+from .mesh_gen.rig_display import (
+    convert_armature_bones_to_fortune,
+    fortune_conversion_risks,
+    selected_armatures_for_display,
+)
 
 
 # ─── Shared helpers ──────────────────────────────────────────────────────
@@ -59,9 +65,348 @@ def _common_poll(cls, context):
     return True
 
 
+class SG_OT_DebugForceGenerationIdle(bpy.types.Operator):
+    """Clear stale in-process texturing state after an interrupted operation."""
+
+    bl_idname = "stablegen.debug_force_generation_idle"
+    bl_label = "Force Generation Idle"
+    bl_description = (
+        "Force StableGen's saved generation state back to Idle and close any "
+        "stale generation WebSocket; use only when no generation is actually running"
+    )
+    bl_options = {'REGISTER'}
+
+    @classmethod
+    def poll(cls, context):
+        # The button itself is debug-gated. Keep the recovery operator callable
+        # through Search/Python even when a stale file also lost its UI state.
+        return context.scene is not None
+
+    def execute(self, context):
+        # Avoid importing generator.py here: debug_tools is imported by the
+        # add-on registration graph before the generator operator. If it is
+        # already loaded, also clear its process-local sentinels.
+        generator_modules = [
+            module
+            for name, module in tuple(sys.modules.items())
+            if name.endswith(".texturing.generator")
+        ]
+        closed_socket = False
+        for module in generator_modules:
+            generator = getattr(module, "ComfyUIGenerate", None)
+            if generator is None:
+                continue
+            websocket = getattr(generator, "_active_ws", None)
+            if websocket is not None:
+                try:
+                    websocket.close()
+                    closed_socket = True
+                except Exception:
+                    pass
+            generator._active_ws = None
+            generator._is_running = False
+
+        context.scene.generation_status = 'idle'
+        context.scene.generation_progress = 0.0
+        if hasattr(context.scene, "sg_last_gen_error"):
+            context.scene.sg_last_gen_error = False
+
+        message = "Forced StableGen generation state to Idle"
+        if closed_socket:
+            message += " and closed the stale WebSocket"
+        self.report({'WARNING'}, message)
+        return {'FINISHED'}
+
+
 def _saturated_colors(n):
     """Return *n* maximally-saturated, evenly-spaced RGB tuples."""
     return [colorsys.hsv_to_rgb(i / max(n, 1), 1.0, 1.0) for i in range(n)]
+
+
+_SKIN_WEIGHT_COLOR_ATTRIBUTE = "SG_SkinWeights"
+_SKIN_WEIGHT_PREVIOUS_ATTRIBUTE = "sg_skin_debug_previous_color_attribute"
+
+
+def _mesh_armature_for_skin_debug(obj):
+    """Return the armature that owns *obj*'s deform groups, if available."""
+    if obj.parent and obj.parent.type == 'ARMATURE':
+        return obj.parent
+    for modifier in obj.modifiers:
+        if (
+            modifier.type == 'ARMATURE'
+            and modifier.object
+            and modifier.object.type == 'ARMATURE'
+        ):
+            return modifier.object
+    return None
+
+
+def _get_skinning_target_meshes(context):
+    """Resolve meshes for the skin-weight diagnostic without requiring cameras.
+
+    Selected meshes take priority. If an armature is selected, all scene meshes
+    driven by it are used. With no useful selection, all rigged scene meshes are
+    considered. This matches the common post-auto-rig workflow where the
+    imported armature, rather than every individual garment mesh, is selected.
+    """
+    selected_meshes = [
+        obj for obj in context.selected_objects
+        if obj.type == 'MESH' and obj.vertex_groups
+    ]
+    if selected_meshes:
+        return selected_meshes
+
+    selected_armatures = {
+        obj for obj in context.selected_objects if obj.type == 'ARMATURE'
+    }
+    if context.active_object and context.active_object.type == 'ARMATURE':
+        selected_armatures.add(context.active_object)
+
+    candidates = [
+        obj for obj in context.scene.objects
+        if obj.type == 'MESH' and obj.vertex_groups
+    ]
+    if selected_armatures:
+        return [
+            obj for obj in candidates
+            if _mesh_armature_for_skin_debug(obj) in selected_armatures
+        ]
+    return [obj for obj in candidates if _mesh_armature_for_skin_debug(obj)]
+
+
+def _skinning_debug_poll(context):
+    prefs = context.preferences.addons.get(__package__)
+    if not prefs or not prefs.preferences.enable_debug:
+        return False
+    if sg_modal_active(context):
+        return False
+    return bool(_get_skinning_target_meshes(context))
+
+
+def _active_skinning_bone_name(context):
+    """Resolve the bone/group whose individual influence should be displayed."""
+    active_pose_bone = getattr(context, "active_pose_bone", None)
+    if active_pose_bone is not None:
+        return active_pose_bone.name
+    active_edit_bone = getattr(context, "active_bone", None)
+    if active_edit_bone is not None:
+        return active_edit_bone.name
+
+    active_object = context.active_object
+    if active_object and active_object.type == 'ARMATURE':
+        active_bone = active_object.data.bones.active
+        if active_bone is not None:
+            return active_bone.name
+    if active_object and active_object.type == 'MESH':
+        active_group = active_object.vertex_groups.active
+        if active_group is not None:
+            return active_group.name
+
+    for obj in context.selected_objects:
+        if obj.type == 'ARMATURE' and obj.data.bones.active is not None:
+            return obj.data.bones.active.name
+        if obj.type == 'MESH' and obj.vertex_groups.active is not None:
+            return obj.vertex_groups.active.name
+    return None
+
+
+def _stable_skinning_palette(names):
+    """Return stable, visually separated sRGB colors for bone/group names."""
+    golden_ratio = 0.618033988749895
+    colors = []
+    for index, _name in enumerate(names):
+        hue = (0.03 + index * golden_ratio) % 1.0
+        saturation = 0.78 + 0.10 * (index % 3)
+        value = 1.0
+        colors.append(colorsys.hsv_to_rgb(hue, saturation, value))
+    return np.asarray(colors, dtype=np.float32)
+
+
+def _skinning_palette_for_object(obj):
+    """Return (bone names, colors, vertex-group-index -> palette-index)."""
+    armature = _mesh_armature_for_skin_debug(obj)
+    if armature:
+        names = [bone.name for bone in armature.data.bones if bone.use_deform]
+    else:
+        # Useful for imported/debug meshes whose Armature modifier was removed.
+        # StableGen marker groups are not skin influences and are excluded.
+        names = sorted(
+            group.name for group in obj.vertex_groups
+            if not group.name.startswith("SG_")
+        )
+    palette = _stable_skinning_palette(names)
+    group_to_palette = {}
+    for palette_index, name in enumerate(names):
+        group = obj.vertex_groups.get(name)
+        if group is not None:
+            group_to_palette[group.index] = palette_index
+    return names, palette, group_to_palette
+
+
+def _max_weight_heat_color(value):
+    """Blue -> cyan -> yellow -> red diagnostic ramp for [0, 1]."""
+    value = float(np.clip(value, 0.0, 1.0))
+    positions = np.asarray((0.0, 0.33, 0.66, 1.0), dtype=np.float32)
+    colors = np.asarray(
+        ((0.05, 0.05, 0.45), (0.0, 0.9, 1.0),
+         (1.0, 0.95, 0.0), (1.0, 0.0, 0.0)),
+        dtype=np.float32,
+    )
+    return np.asarray([
+        np.interp(value, positions, colors[:, channel])
+        for channel in range(3)
+    ], dtype=np.float32)
+
+
+def _influence_heat_color(value):
+    """SkinTokens-like pale-blue -> cyan -> green -> yellow -> red ramp."""
+    value = float(np.clip(value, 0.0, 1.0))
+    positions = np.asarray((0.0, 0.2, 0.45, 0.7, 1.0), dtype=np.float32)
+    colors = np.asarray(
+        ((0.34, 0.56, 0.78), (0.05, 0.82, 0.95),
+         (0.10, 0.82, 0.36), (1.0, 0.88, 0.0), (0.92, 0.05, 0.02)),
+        dtype=np.float32,
+    )
+    return np.asarray([
+        np.interp(value, positions, colors[:, channel])
+        for channel in range(3)
+    ], dtype=np.float32)
+
+
+def _skinning_colors_for_object(obj, mode='BLENDED', bone_name=None):
+    """Evaluate the current vertex groups into a SkinTokens-style color map.
+
+    ``ACTIVE_BONE`` matches the SkinTokens paper view: a blue-to-red heatmap of
+    one selected bone's influence over the complete mesh. ``BLENDED`` displays
+    the normalized weighted blend of per-bone colors, ``DOMINANT`` shows hard
+    ownership, and ``MAX_WEIGHT`` visualizes assignment certainty.
+    """
+    names, palette, group_to_palette = _skinning_palette_for_object(obj)
+    colors = np.zeros((len(obj.data.vertices), 4), dtype=np.float32)
+    colors[:, 3] = 1.0
+    unweighted = 0
+
+    if mode == 'ACTIVE_BONE':
+        colors[:, :3] = _influence_heat_color(0.0)
+        group = obj.vertex_groups.get(bone_name) if bone_name else None
+        if group is not None:
+            for vertex in obj.data.vertices:
+                weight = next(
+                    (
+                        float(item.weight) for item in vertex.groups
+                        if item.group == group.index
+                    ),
+                    0.0,
+                )
+                colors[vertex.index, :3] = _influence_heat_color(weight)
+        return colors, {
+            "bone_count": len(names),
+            "mapped_group_count": int(group is not None),
+            "vertex_count": len(obj.data.vertices),
+            "unweighted_count": 0,
+            "selected_bone": bone_name,
+        }
+
+    for vertex in obj.data.vertices:
+        influences = [
+            (float(item.weight), group_to_palette[item.group])
+            for item in vertex.groups
+            if item.group in group_to_palette and item.weight > 1e-8
+        ]
+        total = sum(weight for weight, _palette_index in influences)
+        if total <= 1e-8:
+            unweighted += 1
+            continue
+
+        if mode == 'DOMINANT':
+            _weight, palette_index = max(influences, key=lambda item: item[0])
+            colors[vertex.index, :3] = palette[palette_index]
+        elif mode == 'MAX_WEIGHT':
+            strongest = max(weight for weight, _palette_index in influences)
+            colors[vertex.index, :3] = _max_weight_heat_color(strongest / total)
+        else:
+            blended = np.zeros(3, dtype=np.float32)
+            for weight, palette_index in influences:
+                blended += palette[palette_index] * weight
+            colors[vertex.index, :3] = blended / total
+
+    return colors, {
+        "bone_count": len(names),
+        "mapped_group_count": len(group_to_palette),
+        "vertex_count": len(obj.data.vertices),
+        "unweighted_count": unweighted,
+    }
+
+
+def _apply_skinning_weight_colors(obj, mode='BLENDED', bone_name=None):
+    """Write the diagnostic POINT color attribute and return its statistics."""
+    mesh = obj.data
+    current = mesh.color_attributes.get(_SKIN_WEIGHT_COLOR_ATTRIBUTE)
+    if current is None:
+        previous = mesh.color_attributes.active_color
+        mesh[_SKIN_WEIGHT_PREVIOUS_ATTRIBUTE] = (
+            previous.name if previous is not None else ""
+        )
+    elif current.domain != 'POINT' or current.data_type != 'FLOAT_COLOR':
+        mesh.color_attributes.remove(current)
+        current = None
+
+    if current is None:
+        current = mesh.color_attributes.new(
+            name=_SKIN_WEIGHT_COLOR_ATTRIBUTE,
+            type='FLOAT_COLOR',
+            domain='POINT',
+        )
+
+    colors, stats = _skinning_colors_for_object(
+        obj, mode=mode, bone_name=bone_name)
+    try:
+        current.data.foreach_set("color_srgb", colors.ravel())
+    except (AttributeError, TypeError):
+        # Blender 3.x exposes only the scene-linear color accessor.
+        current.data.foreach_set("color", colors.ravel())
+    mesh.color_attributes.active_color = current
+    mesh.update()
+    return stats
+
+
+def _clear_skinning_weight_colors(obj):
+    """Remove only StableGen's diagnostic attribute and restore color focus."""
+    mesh = obj.data
+    attribute = mesh.color_attributes.get(_SKIN_WEIGHT_COLOR_ATTRIBUTE)
+    if attribute is not None:
+        mesh.color_attributes.remove(attribute)
+    previous_name = mesh.get(_SKIN_WEIGHT_PREVIOUS_ATTRIBUTE, "")
+    previous = mesh.color_attributes.get(previous_name) if previous_name else None
+    if previous is not None:
+        mesh.color_attributes.active_color = previous
+    if _SKIN_WEIGHT_PREVIOUS_ATTRIBUTE in mesh:
+        del mesh[_SKIN_WEIGHT_PREVIOUS_ATTRIBUTE]
+    mesh.update()
+    return attribute is not None
+
+
+def _set_skinning_debug_viewport(context, enabled):
+    """Select vertex-color solid shading without touching object materials."""
+    screen = getattr(context, "screen", None)
+    if screen is None:
+        return
+    for area in screen.areas:
+        if area.type != 'VIEW_3D':
+            continue
+        for space in area.spaces:
+            if space.type != 'VIEW_3D':
+                continue
+            shading = space.shading
+            shading.type = 'SOLID'
+            if enabled:
+                shading.color_type = 'VERTEX'
+                try:
+                    shading.light = 'FLAT'
+                except (AttributeError, TypeError):
+                    pass
+            elif shading.color_type == 'VERTEX':
+                shading.color_type = 'MATERIAL'
 
 
 def _save_solid_image(path, width, height, color_rgba):
@@ -850,7 +1195,271 @@ class SG_OT_DebugUVSeamViz(bpy.types.Operator):
 
 
 # ═════════════════════════════════════════════════════════════════════════
-# 8. Restore Original Material
+# 8. Skinning Weight Colors
+# ═════════════════════════════════════════════════════════════════════════
+
+class SG_OT_DebugConvertFortuneRig(bpy.types.Operator):
+    """Reorient an existing generated rig using Fortune joint directions."""
+
+    bl_idname = "stablegen.debug_convert_fortune_rig"
+    bl_label = "Convert Existing Rig to Fortune"
+    bl_description = (
+        "Rebuild an existing SkinTokens rig's rest-pose bone directions so "
+        "tails point toward child joints; weights and joint heads are preserved"
+    )
+    bl_options = {'REGISTER', 'UNDO'}
+
+    force_unsafe: bpy.props.BoolProperty(
+        name="Convert Animated/Posed Rig Anyway",
+        description=(
+            "Rest-axis conversion may change existing animations, constraints, "
+            "drivers, or the current pose"
+        ),
+        default=False,
+    )  # type: ignore
+
+    _risks = None
+
+    @classmethod
+    def poll(cls, context):
+        if sg_modal_active(context):
+            cls.poll_message_set("Another StableGen operation is in progress")
+            return False
+        if not selected_armatures_for_display(context):
+            cls.poll_message_set("Select a rigged mesh or armature")
+            return False
+        return True
+
+    def invoke(self, context, _event):
+        armatures = selected_armatures_for_display(context)
+        self._risks = {
+            armature.name: fortune_conversion_risks(armature)
+            for armature in armatures
+            if fortune_conversion_risks(armature)
+        }
+        if self._risks:
+            return context.window_manager.invoke_props_dialog(self, width=560)
+        return self.execute(context)
+
+    def draw(self, _context):
+        layout = self.layout
+        layout.label(
+            text="This rewrites rest-pose bone axes and is safe by default only for unanimated rigs.",
+            icon='ERROR',
+        )
+        for armature_name, risks in (self._risks or {}).items():
+            layout.label(text=f"{armature_name}: {', '.join(risks)}")
+        layout.prop(self, "force_unsafe")
+
+    def execute(self, context):
+        armatures = selected_armatures_for_display(context)
+        blocked = {
+            armature.name: fortune_conversion_risks(armature)
+            for armature in armatures
+            if fortune_conversion_risks(armature)
+        }
+        if blocked and not self.force_unsafe:
+            details = "; ".join(
+                f"{name}: {', '.join(risks)}"
+                for name, risks in blocked.items()
+            )
+            self.report(
+                {'ERROR'},
+                "Conversion cancelled. Enable the confirmation checkbox to "
+                f"override: {details}",
+            )
+            return {'CANCELLED'}
+
+        total = 0
+        for armature in armatures:
+            stats = convert_armature_bones_to_fortune(armature)
+            total += stats["changed"]
+            print(
+                "[StableGen Debug] Fortune-converted "
+                f"{armature.name}: {stats}"
+            )
+        self.report(
+            {'INFO'},
+            f"Converted {len(armatures)} rig(s), reoriented {total} bones",
+        )
+        return {'FINISHED'}
+
+class SG_OT_DebugSkinningWeights(bpy.types.Operator):
+    """Color rigged meshes from their actual deform vertex-group weights.
+
+    The default view matches the SkinTokens comparison: the selected bone's
+    individual influence is shown from blue (zero) to red (one). Alternative
+    modes expose blended per-bone colors, dominant ownership, and assignment
+    confidence. Materials and weights are left untouched; only a named mesh
+    color attribute and viewport shading mode are changed.
+    """
+    bl_idname = "stablegen.debug_skinning_weights"
+    bl_label = "Skinning Weight Colors"
+    bl_description = (
+        "Visualize generated skin weights, defaulting to a selected-bone "
+        "blue-to-red influence heatmap"
+    )
+    bl_options = {'REGISTER', 'UNDO'}
+
+    mode: bpy.props.EnumProperty(
+        name="Display",
+        items=[
+            (
+                'ACTIVE_BONE',
+                "Selected Bone Heatmap",
+                "SkinTokens paper-style view: blue is zero influence and red "
+                "is full influence for the active bone or vertex group",
+            ),
+            (
+                'BLENDED',
+                "Blended Bone Colors",
+                "SkinTokens-style map: blend stable per-bone colors using "
+                "the normalized skin weights",
+            ),
+            (
+                'DOMINANT',
+                "Dominant Bone",
+                "Show only the strongest deform bone on every vertex",
+            ),
+            (
+                'MAX_WEIGHT',
+                "Maximum Weight",
+                "Heatmap the strongest normalized influence: blue is weak "
+                "and red is fully assigned",
+            ),
+        ],
+        default='ACTIVE_BONE',
+    )  # type: ignore
+
+    @classmethod
+    def poll(cls, context):
+        return _skinning_debug_poll(context)
+
+    def execute(self, context):
+        meshes = _get_skinning_target_meshes(context)
+        bone_name = (
+            _active_skinning_bone_name(context)
+            if self.mode == 'ACTIVE_BONE' else None
+        )
+        if self.mode == 'ACTIVE_BONE' and not bone_name:
+            self.report(
+                {'ERROR'},
+                "Select a pose/edit bone or make a deform vertex group active",
+            )
+            return {'CANCELLED'}
+        processed_data = set()
+        totals = {
+            "meshes": 0,
+            "vertices": 0,
+            "groups": 0,
+            "unweighted": 0,
+        }
+        skipped = []
+
+        for obj in meshes:
+            data_pointer = obj.data.as_pointer()
+            if data_pointer in processed_data:
+                skipped.append(obj.name)
+                continue
+            processed_data.add(data_pointer)
+
+            stats = _apply_skinning_weight_colors(
+                obj, mode=self.mode, bone_name=bone_name)
+            if (
+                self.mode != 'ACTIVE_BONE'
+                and not stats["mapped_group_count"]
+            ):
+                _clear_skinning_weight_colors(obj)
+                skipped.append(obj.name)
+                continue
+            totals["meshes"] += 1
+            totals["vertices"] += stats["vertex_count"]
+            totals["groups"] += stats["mapped_group_count"]
+            totals["unweighted"] += stats["unweighted_count"]
+
+        if not totals["meshes"] or (
+            self.mode == 'ACTIVE_BONE' and not totals["groups"]
+        ):
+            for obj in meshes:
+                _clear_skinning_weight_colors(obj)
+            self.report(
+                {'ERROR'},
+                (
+                    f"No vertex group named '{bone_name}' was found on the target meshes"
+                    if self.mode == 'ACTIVE_BONE'
+                    else "No deform-bone vertex groups were found on the target meshes"
+                ),
+            )
+            return {'CANCELLED'}
+
+        _set_skinning_debug_viewport(context, True)
+        print(
+            "[StableGen Debug] Skinning colors: "
+            f"{totals['meshes']} mesh(es), {totals['vertices']} vertices, "
+            f"{totals['groups']} mapped deform groups, "
+            f"{totals['unweighted']} unweighted vertices, mode={self.mode}, "
+            f"bone={bone_name or 'all'}."
+        )
+        if skipped:
+            print(
+                "[StableGen Debug] Skinning color targets skipped: "
+                + ", ".join(skipped)
+            )
+        self.report(
+            {'INFO'},
+            (
+                f"Skinning heatmap for {bone_name} applied to "
+                f"{totals['meshes']} mesh(es)"
+                if self.mode == 'ACTIVE_BONE'
+                else f"Skinning colors applied to {totals['meshes']} mesh(es); "
+                f"{totals['unweighted']} unweighted vertices shown black"
+            ),
+        )
+        return {'FINISHED'}
+
+
+class SG_OT_DebugClearSkinningWeights(bpy.types.Operator):
+    """Remove StableGen skin-weight colors without changing materials/weights."""
+    bl_idname = "stablegen.debug_clear_skinning_weights"
+    bl_label = "Clear Skinning Weight Colors"
+    bl_description = "Remove the StableGen skin-weight color attribute"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    @classmethod
+    def poll(cls, context):
+        prefs = context.preferences.addons.get(__package__)
+        if not prefs or not prefs.preferences.enable_debug:
+            return False
+        if sg_modal_active(context):
+            return False
+        return any(
+            obj.type == 'MESH'
+            and obj.data.color_attributes.get(_SKIN_WEIGHT_COLOR_ATTRIBUTE)
+            for obj in context.scene.objects
+        )
+
+    def execute(self, context):
+        selected = [obj for obj in context.selected_objects if obj.type == 'MESH']
+        meshes = selected or [
+            obj for obj in context.scene.objects
+            if obj.type == 'MESH'
+            and obj.data.color_attributes.get(_SKIN_WEIGHT_COLOR_ATTRIBUTE)
+        ]
+        processed_data = set()
+        removed = 0
+        for obj in meshes:
+            data_pointer = obj.data.as_pointer()
+            if data_pointer in processed_data:
+                continue
+            processed_data.add(data_pointer)
+            removed += int(_clear_skinning_weight_colors(obj))
+        _set_skinning_debug_viewport(context, False)
+        self.report({'INFO'}, f"Cleared skinning colors from {removed} mesh(es)")
+        return {'FINISHED'}
+
+
+# ═════════════════════════════════════════════════════════════════════════
+# 9. Restore Original Material
 # ═════════════════════════════════════════════════════════════════════════
 
 class SG_OT_DebugRestoreMaterial(bpy.types.Operator):
@@ -883,7 +1492,7 @@ class SG_OT_DebugRestoreMaterial(bpy.types.Operator):
 
 
 # ═════════════════════════════════════════════════════════════════════════
-# 9. Live Ownership / Confidence Diagnostics
+# 10. Live Ownership / Confidence Diagnostics
 # ═════════════════════════════════════════════════════════════════════════
 
 class SG_OT_DebugOwnershipDiagnostic(bpy.types.Operator):
@@ -1035,7 +1644,7 @@ class SG_OT_DebugOwnershipDiagnostic(bpy.types.Operator):
 
 
 # ═════════════════════════════════════════════════════════════════════════
-# 10. Debug Make Solid
+# 11. Debug Make Solid
 # ═════════════════════════════════════════════════════════════════════════
 
 class SG_OT_DebugMakeSolid(bpy.types.Operator):
@@ -1285,6 +1894,7 @@ class SG_OT_DebugMakeSolid(bpy.types.Operator):
 # ─── Registration list ───────────────────────────────────────────────────
 
 debug_classes = [
+    SG_OT_DebugForceGenerationIdle,
     SG_OT_DebugSolidColors,
     SG_OT_DebugGridPattern,
     SG_OT_DebugVisibilityMaterial,
@@ -1292,6 +1902,9 @@ debug_classes = [
     SG_OT_DebugPerCameraWeight,
     SG_OT_DebugFeatherPreview,
     SG_OT_DebugUVSeamViz,
+    SG_OT_DebugConvertFortuneRig,
+    SG_OT_DebugSkinningWeights,
+    SG_OT_DebugClearSkinningWeights,
     SG_OT_DebugRestoreMaterial,
     SG_OT_DebugOwnershipDiagnostic,
     SG_OT_DebugMakeSolid,

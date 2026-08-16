@@ -2004,6 +2004,7 @@ def project_image(
             getattr(context.scene, 'sg_rework_projection_rebuild', False),
             getattr(context.scene, 'sg_rework_projection_guard', False),
             getattr(context.scene, 'sg_texel_ownership', False),
+            getattr(context.scene, 'qwen_use_confidence_context', False),
             getattr(context.scene, 'qwen_use_projection_write_masks', False),
             getattr(context.scene, 'sg_rework_sdxl_registration', False),
         ))
@@ -2106,6 +2107,7 @@ def project_image(
         normalize_nodes = []
         script_nodes = []
         script_nodes_outputs = []
+        confidence_quality_nodes = []
         add_camera_loc_nodes = []
         length_nodes = []
         camera_fov_nodes = []
@@ -2151,7 +2153,12 @@ def project_image(
             links.new(mask_tex.outputs[0], to_float.inputs[0])
             return to_float
 
-        def _create_write_mask_weight(cam_index, mat_id_inner, binary=False):
+        def _create_write_mask_weight(
+            cam_index,
+            mat_id_inner,
+            binary=False,
+            label_prefix="SequentialWrite",
+        ):
             """Sample the authoritative per-view sequential write mask."""
             mask_path = get_file_path(
                 context,
@@ -2173,7 +2180,7 @@ def project_image(
             mask_tex.image = mask_image
             mask_tex.extension = 'CLIP'
             mask_tex.interpolation = 'Closest' if binary else 'Linear'
-            mask_tex.label = f"SequentialWriteMask-{cam_index}-{mat_id_inner}"
+            mask_tex.label = f"{label_prefix}Mask-{cam_index}-{mat_id_inner}"
             mask_tex.location = (-500, -200 * cam_index - 300)
 
             uv_node = uv_map_nodes[cam_index]
@@ -2184,7 +2191,7 @@ def project_image(
             to_float.operation = 'MULTIPLY'
             to_float.inputs[1].default_value = 1.0
             to_float.location = (-300, -200 * cam_index - 300)
-            to_float.label = f"SequentialWriteWeight-{cam_index}-{mat_id_inner}"
+            to_float.label = f"{label_prefix}Weight-{cam_index}-{mat_id_inner}"
             links.new(mask_tex.outputs[0], to_float.inputs[0])
             return to_float
 
@@ -2223,6 +2230,14 @@ def project_image(
         voronoi_active = (context.scene.model_architecture in ('qwen_image_edit', 'flux2_klein')
                           and getattr(context.scene, 'qwen_voronoi_mode', False)
                           and context.scene.generation_method == 'sequential')
+        confidence_context_active = (
+            getattr(context.scene, 'qwen_use_confidence_context', False)
+            and context.scene.model_architecture == 'qwen_image_edit'
+            and context.scene.generation_method == 'sequential'
+            and context.scene.qwen_generation_method == 'generate'
+            and context.scene.qwen_context_render_mode
+            in {'REPLACE_STYLE', 'ADDITIONAL'}
+        )
 
         for i, camera in enumerate(cameras):
             # Add image texture node
@@ -2623,6 +2638,7 @@ def project_image(
                 and context.scene.qwen_context_render_mode in {'REPLACE_STYLE', 'ADDITIONAL'}
                 and getattr(context.scene, 'qwen_use_projection_write_masks', False)
             )
+            qwen_write_weight = None
             use_sdxl_write_mask = (
                 getattr(context.scene, 'sg_rework_sdxl_registration', False)
                 and
@@ -2637,6 +2653,8 @@ def project_image(
                     write_weight = _create_write_mask_weight(
                         i, mat_id, binary=use_qwen_write_mask
                     )
+                    if use_qwen_write_mask:
+                        qwen_write_weight = write_weight
                     if write_weight is not None:
                         masked_weight = nodes.new("ShaderNodeMath")
                         masked_weight.operation = 'MULTIPLY'
@@ -2680,6 +2698,79 @@ def project_image(
                     links.new(script_nodes_outputs[-1].outputs[0], guarded.inputs[0])
                     links.new(guard_floor.outputs[0], guarded.inputs[1])
                     script_nodes_outputs[-1] = guarded
+
+            # Confidence is deliberately independent from colour ownership.
+            # Preserve the unnormalised source-camera quality before the mix
+            # tree turns it into relative colour weights. Later Qwen cameras
+            # may acquire confidence only inside the binary repair/write mask;
+            # protected RGB copied through a full-frame edit cannot be
+            # laundered into high-quality coverage.
+            if (confidence_context_active and script_nodes_outputs
+                    and not isinstance(script_nodes_outputs[-1], tuple)):
+                confidence_quality = script_nodes_outputs[-1]
+                if i > stop_index:
+                    # Voronoi generation intentionally leaves future camera
+                    # placeholders active for colour segmentation. They are
+                    # not acquired observations and must never contribute to
+                    # source confidence.
+                    confidence_quality = nodes.new("ShaderNodeValue")
+                    confidence_quality.outputs[0].default_value = 0.0
+                    confidence_quality.label = f"ConfidenceFuture-{i}-{mat_id}"
+                elif i > 0 and qwen_write_weight is None:
+                    confidence_write = _create_write_mask_weight(
+                        i,
+                        mat_id,
+                        binary=True,
+                        label_prefix="ConfidenceWrite",
+                    )
+                    if confidence_write is None:
+                        print(
+                            "[StableGen] WARNING: confidence write mask "
+                            f"missing for camera {i}; refusing to upgrade "
+                            "source confidence for that view."
+                        )
+                        confidence_quality = nodes.new("ShaderNodeValue")
+                        confidence_quality.outputs[0].default_value = 0.0
+                        confidence_quality.label = (
+                            f"ConfidenceWriteMissing-{i}-{mat_id}"
+                        )
+                    else:
+                        accepted_quality = nodes.new("ShaderNodeMath")
+                        accepted_quality.operation = 'MULTIPLY'
+                        accepted_quality.label = (
+                            f"ConfidenceAccepted-{i}-{mat_id}"
+                        )
+                        links.new(
+                            confidence_quality.outputs[0],
+                            accepted_quality.inputs[0],
+                        )
+                        links.new(
+                            confidence_write.outputs[0],
+                            accepted_quality.inputs[1],
+                        )
+                        confidence_quality = accepted_quality
+                confidence_quality_nodes.append(confidence_quality)
+
+        # Expose a confidence-only max chain for context rendering.  This
+        # node never selects or mixes RGB, so disabling texel ownership keeps
+        # the continuous weighted material while still providing a genuine
+        # best-source trust signal to Qwen.
+        if confidence_context_active and confidence_quality_nodes:
+            best_quality = nodes.new("ShaderNodeMath")
+            best_quality.operation = 'MULTIPLY'
+            best_quality.inputs[1].default_value = 1.0
+            links.new(
+                confidence_quality_nodes[0].outputs[0],
+                best_quality.inputs[0],
+            )
+            for index, quality_node in enumerate(confidence_quality_nodes[1:], 1):
+                next_best = nodes.new("ShaderNodeMath")
+                next_best.operation = 'MAXIMUM'
+                next_best.label = f"SGBestSourceQualityStep-{index}"
+                links.new(best_quality.outputs[0], next_best.inputs[0])
+                links.new(quality_node.outputs[0], next_best.inputs[1])
+                best_quality = next_best
+            best_quality.label = "SGBestSourceQuality"
 
         # Build mix shader tree
         if mat.name in processed_materials and is_local_edit:

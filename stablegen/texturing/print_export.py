@@ -1971,8 +1971,10 @@ def _collect_face_visibility(mesh):
     return face_vis
 
 
-def _make_solid_mesh_object(obj, fill_gaps=True, visible_faces=None, keep_largest_island=False,
-                            face_visibility=None):
+def _make_solid_mesh_object(
+        obj, fill_gaps=True, visible_faces=None, keep_largest_island=False,
+        face_visibility=None, *, use_evaluated_mesh=True, raycast_count=None,
+        weld_distance=0.0001, robust_fill=False, smooth_caps=False):
     import bmesh
     from mathutils.bvhtree import BVHTree
     import numpy as np
@@ -1982,13 +1984,29 @@ def _make_solid_mesh_object(obj, fill_gaps=True, visible_faces=None, keep_larges
     import time
 
     t_start = time.perf_counter()
-    temp, eval_obj = _get_triangulated_mesh(obj, apply_transforms=False)
+    if use_evaluated_mesh:
+        temp, eval_obj = _get_triangulated_mesh(
+            obj, apply_transforms=False
+        )
+    else:
+        # General post-processing must operate on the base/rest mesh. Using
+        # evaluated_get().to_mesh() here would bake the current armature pose
+        # and leave the Armature modifier attached, causing double deformation.
+        temp = obj.data.copy()
+        eval_obj = None
+        temp.calc_loop_triangles()
     try:
         bm = bmesh.new()
         bm.from_mesh(temp)
         
-        # Weld overlapping/duplicate vertices to resolve topological disconnects on boundaries
-        bmesh.ops.remove_doubles(bm, verts=bm.verts, dist=0.0001)
+        # The 3D-print export historically welds coincident evaluated geometry.
+        # General post-processing must not globally weld detached character
+        # shells (clothing/body, armor panels, eyes, etc.), because doing so
+        # creates branching boundaries and overlapping caps.
+        if weld_distance and weld_distance > 0.0:
+            bmesh.ops.remove_doubles(
+                bm, verts=bm.verts, dist=float(weld_distance)
+            )
         
         bm.faces.ensure_lookup_table()
         bm.edges.ensure_lookup_table()
@@ -2041,16 +2059,23 @@ def _make_solid_mesh_object(obj, fill_gaps=True, visible_faces=None, keep_larges
             z_bottom = zmin
             
             # Precompute cylinder angle offsets (ordered by proximity to 0.0)
-            raycast_count = 12
-            if hasattr(bpy, "context") and bpy.context and hasattr(bpy.context, "scene") and bpy.context.scene:
-                raycast_count = getattr(bpy.context.scene, "stablegen_print_raycast_count", 12)
+            effective_raycast_count = raycast_count
+            if effective_raycast_count is None:
+                effective_raycast_count = 12
+                if hasattr(bpy, "context") and bpy.context and hasattr(bpy.context, "scene") and bpy.context.scene:
+                    effective_raycast_count = getattr(
+                        bpy.context.scene,
+                        "stablegen_print_raycast_count",
+                        12,
+                    )
+            effective_raycast_count = max(4, int(effective_raycast_count))
             
             angle_offsets = [0.0]
-            step = 2.0 * math.pi / raycast_count
+            step = 2.0 * math.pi / effective_raycast_count
             i = 1
-            while len(angle_offsets) < raycast_count:
+            while len(angle_offsets) < effective_raycast_count:
                 angle_offsets.append(i * step)
-                if len(angle_offsets) < raycast_count:
+                if len(angle_offsets) < effective_raycast_count:
                     angle_offsets.append(-i * step)
                 i += 1
 
@@ -2153,101 +2178,232 @@ def _make_solid_mesh_object(obj, fill_gaps=True, visible_faces=None, keep_larges
 
         if fill_gaps:
             t0 = time.perf_counter()
-            visible_centers = {tuple(round(c, 4) for c in f.calc_center_median()) for f in bm.faces}
-            
-            # 2. Identify all boundary edges after deletion
             boundary_edges = [e for e in bm.edges if e.is_boundary]
             print(f"[StableGen Make Solid] Identified {len(boundary_edges)} boundary edges in {time.perf_counter() - t0:.4f}s")
-            
-            # 3. Walk and trace all boundary edge loops to create new cap faces directly (incredibly fast)
+
+            # Mark newly created faces explicitly. Centroid comparison is not
+            # reliable on dense meshes because unrelated small triangles can
+            # quantize to the same rounded center.
+            cap_layer = bm.faces.layers.int.get("_SG_SolidCap")
+            if cap_layer is None:
+                cap_layer = bm.faces.layers.int.new("_SG_SolidCap")
+            source_faces = set(bm.faces)
+
             t0 = time.perf_counter()
             new_faces = []
-            
-            # Map each boundary edge to its desired directed transition (v -> u)
-            # to ensure that the cap face traverses the edge in the opposite direction 
-            # of the adjacent face (achieving a consistent winding order and correct outward normal).
-            directed_transitions = []
-            for e in boundary_edges:
-                f = e.link_faces[0]
-                target_loop = None
-                for l in f.loops:
-                    if l.edge == e:
-                        target_loop = l
-                        break
-                if target_loop:
-                    u = target_loop.vert
-                    v = target_loop.link_loop_next.vert
-                    directed_transitions.append((v, u, e))
-                    
-            # Group directed transitions by their start vertex
-            from collections import defaultdict
-            vert_to_transitions = defaultdict(list)
-            for trans in directed_transitions:
-                v_start, v_end, e = trans
-                vert_to_transitions[v_start].append(trans)
-                
-            directed_edges_set = set(directed_transitions)
-            while directed_edges_set:
-                start_trans = directed_edges_set.pop()
-                v_start, v_next, e = start_trans
-                
-                loop_verts = [v_start]
-                visited_verts_set = {v_start}
-                v_curr = v_next
-                
-                while True:
-                    # Cycle detection: split complex/bowtie networks into separate simple faces
-                    if v_curr in visited_verts_set:
-                        idx = loop_verts.index(v_curr)
-                        cycle = loop_verts[idx:]
-                        if len(cycle) >= 3:
-                            try:
-                                nf = bm.faces.new(cycle)
-                                new_faces.append(nf)
-                            except Exception:
-                                pass
-                        # Remove the completed cycle from the active walk path
-                        loop_verts = loop_verts[:idx]
-                        visited_verts_set = set(loop_verts)
-                        
-                    loop_verts.append(v_curr)
-                    visited_verts_set.add(v_curr)
-                    
-                    next_trans = None
-                    for trans in vert_to_transitions[v_curr]:
-                        if trans in directed_edges_set:
-                            next_trans = trans
+
+            if robust_fill and boundary_edges:
+                # Fill each genuine boundary cycle independently. The legacy
+                # arbitrary transition walk can cross between touching loops
+                # and create overlapping faces. A branching component is
+                # rejected rather than silently damaging the source object.
+                remaining = set(boundary_edges)
+                boundary_set = set(boundary_edges)
+                components = []
+                while remaining:
+                    seed = remaining.pop()
+                    component = {seed}
+                    stack = [seed]
+                    while stack:
+                        edge = stack.pop()
+                        for vert in edge.verts:
+                            for linked in vert.link_edges:
+                                if linked in remaining and linked in boundary_set:
+                                    remaining.remove(linked)
+                                    component.add(linked)
+                                    stack.append(linked)
+                    components.append(component)
+
+                for component in components:
+                    component_vertices = {
+                        vert for edge in component for vert in edge.verts
+                    }
+                    branching = [
+                        vert for vert in component_vertices
+                        if sum(
+                            edge in component for edge in vert.link_edges
+                        ) != 2
+                    ]
+                    if branching:
+                        raise RuntimeError(
+                            "cannot safely cap a branching boundary "
+                            f"({len(component)} edges, "
+                            f"{len(branching)} branching vertices)"
+                        )
+                    fill_result = bmesh.ops.triangle_fill(
+                        bm,
+                        edges=list(component),
+                        use_beauty=True,
+                        use_dissolve=False,
+                    )
+                    component_faces = [
+                        geom for geom in fill_result.get("geom", ())
+                        if isinstance(geom, bmesh.types.BMFace)
+                        and geom not in source_faces
+                    ]
+                    if not component_faces:
+                        raise RuntimeError(
+                            "failed to create a cap for a valid boundary loop"
+                        )
+                    new_faces.extend(component_faces)
+            else:
+                # Preserve the historical 3D-print fill behavior. The general
+                # post-processing operator uses the validated triangle-fill
+                # path above.
+                directed_transitions = []
+                for edge in boundary_edges:
+                    face = edge.link_faces[0]
+                    target_loop = next(
+                        (loop for loop in face.loops if loop.edge == edge),
+                        None,
+                    )
+                    if target_loop:
+                        directed_transitions.append((
+                            target_loop.link_loop_next.vert,
+                            target_loop.vert,
+                            edge,
+                        ))
+
+                from collections import defaultdict
+                vert_to_transitions = defaultdict(list)
+                for transition in directed_transitions:
+                    vert_to_transitions[transition[0]].append(transition)
+
+                directed_edges_set = set(directed_transitions)
+                while directed_edges_set:
+                    start_trans = directed_edges_set.pop()
+                    loop_verts = [start_trans[0]]
+                    visited_verts_set = {start_trans[0]}
+                    vert_current = start_trans[1]
+
+                    while True:
+                        if vert_current in visited_verts_set:
+                            index = loop_verts.index(vert_current)
+                            cycle = loop_verts[index:]
+                            if len(cycle) >= 3:
+                                try:
+                                    new_faces.append(bm.faces.new(cycle))
+                                except Exception:
+                                    pass
+                            loop_verts = loop_verts[:index]
+                            visited_verts_set = set(loop_verts)
+
+                        loop_verts.append(vert_current)
+                        visited_verts_set.add(vert_current)
+                        next_trans = next(
+                            (
+                                transition
+                                for transition in vert_to_transitions[
+                                    vert_current
+                                ]
+                                if transition in directed_edges_set
+                            ),
+                            None,
+                        )
+                        if next_trans is None:
+                            if len(loop_verts) >= 3:
+                                try:
+                                    new_faces.append(
+                                        bm.faces.new(loop_verts)
+                                    )
+                                except Exception:
+                                    pass
                             break
-                    if next_trans is None:
-                        # Close the remaining walk path if valid
-                        if len(loop_verts) >= 3:
-                            try:
-                                nf = bm.faces.new(loop_verts)
-                                new_faces.append(nf)
-                            except Exception:
-                                pass
-                        break
-                        
-                    directed_edges_set.remove(next_trans)
-                    v_curr = next_trans[1]
-            print(f"[StableGen Make Solid] Traced and created {len(new_faces)} cap faces in {time.perf_counter() - t0:.4f}s")
-                    
-            # 5. Triangulate the newly created cap faces using beauty settings
+                        directed_edges_set.remove(next_trans)
+                        vert_current = next_trans[1]
+
+            print(f"[StableGen Make Solid] Created {len(new_faces)} cap faces in {time.perf_counter() - t0:.4f}s")
+
+            # Use a temporary sentinel so triangulation can be identified
+            # without depending on BMesh face identity surviving the operation.
+            for face in new_faces:
+                face[cap_layer] = 2
+
             t0 = time.perf_counter()
-            if new_faces:
+            if new_faces and not robust_fill:
                 try:
-                    bmesh.ops.triangulate(bm, faces=new_faces, quad_method='BEAUTY', ngon_method='BEAUTY')
-                except Exception as e:
-                    print(f"[StableGen Make Solid] Warning: BMesh triangulation failed: {e}")
-            print(f"[StableGen Make Solid] Triangulated new faces in {time.perf_counter() - t0:.4f}s")
-                    
-            # 6. Find new faces and transfer nearest colors
+                    bmesh.ops.triangulate(
+                        bm,
+                        faces=new_faces,
+                        quad_method='BEAUTY',
+                        ngon_method='BEAUTY',
+                    )
+                except Exception as error:
+                    print(
+                        "[StableGen Make Solid] Warning: "
+                        f"BMesh triangulation failed: {error}"
+                    )
+            final_new_faces = [
+                face for face in bm.faces if face[cap_layer] == 2
+            ]
+            for face in final_new_faces:
+                face[cap_layer] = 1
+            print(f"[StableGen Make Solid] Finalized {len(final_new_faces)} cap triangles in {time.perf_counter() - t0:.4f}s")
+
+            # Inherit the surrounding face material instead of accepting
+            # BMesh's default material slot 0. Direct boundary-edge votes are
+            # preferred; vertex adjacency covers interior fill triangles.
+            for cap_face in final_new_faces:
+                material_votes = {}
+                for edge in cap_face.edges:
+                    for adjacent in edge.link_faces:
+                        if adjacent in source_faces and adjacent.is_valid:
+                            material = adjacent.material_index
+                            material_votes[material] = (
+                                material_votes.get(material, 0.0)
+                                + max(edge.calc_length(), 1.0e-8) * 4.0
+                            )
+                if not material_votes:
+                    for vert in cap_face.verts:
+                        for adjacent in vert.link_faces:
+                            if adjacent in source_faces and adjacent.is_valid:
+                                material = adjacent.material_index
+                                material_votes[material] = (
+                                    material_votes.get(material, 0.0) + 1.0
+                                )
+                if material_votes:
+                    cap_face.material_index = max(
+                        material_votes,
+                        key=material_votes.get,
+                    )
+                cap_face.smooth = bool(smooth_caps)
+
             t0 = time.perf_counter()
-            final_new_faces = []
-            for f in bm.faces:
-                center_key = tuple(round(c, 4) for c in f.calc_center_median())
-                if center_key not in visible_centers:
-                    final_new_faces.append(f)
+
+            # New cap loops otherwise receive zero/default custom-data values.
+            # Copy UV, color, and generic corner attributes from the nearest
+            # surviving loop on the same boundary vertex. This keeps existing
+            # ProjectionUV attributes usable when solidifying after texturing.
+            new_face_set = set(final_new_faces)
+            layer_kinds = (
+                "uv", "color", "float_color", "float",
+                "float_vector", "int", "string",
+            )
+            for nf in final_new_faces:
+                for dst_loop in nf.loops:
+                    src_loop = next(
+                        (
+                            loop for loop in dst_loop.vert.link_loops
+                            if loop.face not in new_face_set
+                        ),
+                        None,
+                    )
+                    if src_loop is None:
+                        continue
+                    for kind in layer_kinds:
+                        layers = getattr(bm.loops.layers, kind, None)
+                        if layers is None:
+                            continue
+                        for layer in layers.values():
+                            try:
+                                if kind == "uv":
+                                    dst_loop[layer].uv = src_loop[layer].uv
+                                else:
+                                    dst_loop[layer] = src_loop[layer]
+                            except (AttributeError, TypeError, ValueError):
+                                # Not every Blender version exposes every
+                                # generic layer through an assignable BMesh API.
+                                pass
                     
             if color_lay and final_new_faces:
                 valid_face_info = [info for info in face_info if info[2] in visible_faces]
@@ -2276,6 +2432,26 @@ def _make_solid_mesh_object(obj, fill_gaps=True, visible_faces=None, keep_larges
         bm.to_mesh(solid_mesh)
         bm.free()
 
+        # BMesh exposes face booleans through its integer custom-data layer.
+        # Convert the internal 0/1 marker to a proper mesh Boolean attribute so
+        # Geometry Nodes, shaders, diagnostics, and future post-processing can
+        # consume it without guessing the storage convention.
+        cap_attribute = solid_mesh.attributes.get("_SG_SolidCap")
+        if (
+            cap_attribute is not None
+            and cap_attribute.data_type != 'BOOLEAN'
+        ):
+            cap_values = [
+                bool(item.value) for item in cap_attribute.data
+            ]
+            solid_mesh.attributes.remove(cap_attribute)
+            cap_attribute = solid_mesh.attributes.new(
+                name="_SG_SolidCap",
+                type='BOOLEAN',
+                domain='FACE',
+            )
+            cap_attribute.data.foreach_set("value", cap_values)
+
         if vis_centers is not None:
             import numpy as np
             n_faces = len(solid_mesh.polygons)
@@ -2292,7 +2468,10 @@ def _make_solid_mesh_object(obj, fill_gaps=True, visible_faces=None, keep_larges
         print(f"[StableGen Make Solid] Total execution time: {time.perf_counter() - t_start:.4f}s")
         return solid_mesh
     finally:
-        eval_obj.to_mesh_clear()
+        if eval_obj is not None:
+            eval_obj.to_mesh_clear()
+        elif temp and temp.name in bpy.data.meshes:
+            bpy.data.meshes.remove(temp)
 
 
 def _extract_mesh_data(obj, apply_transforms, palette_rgbs, image):
@@ -3503,4 +3682,3 @@ class Export3MFCancel(bpy.types.Operator):
         else:
             self.report({'WARNING'}, "No active 3MF export operator found.")
         return {'FINISHED'}
-

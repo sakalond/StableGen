@@ -10,6 +10,7 @@ import email.utils
 from datetime import datetime, timezone, timedelta
 
 from .timeout_config import get_timeout
+from .prompt_archive import archive_prompt
 
 from io import BytesIO
 import numpy as np
@@ -172,11 +173,35 @@ class _WorkflowBase:
         return False
 
 
-    def _save_prompt_to_file(self, prompt, output_dir):
-        """Saves the prompt to a file for debugging."""
+    def _save_prompt_to_file(
+        self,
+        prompt,
+        output_dir,
+        *,
+        workflow="workflow",
+        camera_id=None,
+    ):
+        """Save the latest graph and a non-overwriting per-view debug copy."""
         try:
-            with open(os.path.join(output_dir, "prompt.json"), 'w') as f:
-                json.dump(prompt, f, indent=2)  # Added indent for better readability
+            operator = getattr(self, "operator", None)
+            view_index = getattr(operator, "_current_image", None)
+            camera_name = None
+
+            cameras = getattr(operator, "_cameras", ()) or ()
+            camera_lookup_index = camera_id
+            if camera_lookup_index is None:
+                camera_lookup_index = view_index
+            if isinstance(camera_lookup_index, int) and 0 <= camera_lookup_index < len(cameras):
+                camera_name = getattr(cameras[camera_lookup_index], "name", None)
+
+            _, archive_path = archive_prompt(
+                prompt,
+                output_dir,
+                workflow=workflow,
+                view_index=view_index if isinstance(view_index, int) else None,
+                camera_name=camera_name,
+            )
+            print(f"[StableGen] Saved workflow archive: {archive_path}")
         except Exception as e:
             print(f"[StableGen] Failed to save prompt to file: {str(e)}")
 

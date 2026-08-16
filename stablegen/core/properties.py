@@ -611,7 +611,7 @@ def register_properties(update_model_list, ControlNetUnit, LoRAUnit,
             ('waiting', 'Waiting for cancel', ''),
             ('error', 'Error', '')
         ],
-        default='idle', update=update_parameters
+        default='idle', update=update_parameters, options={'SKIP_SAVE'}
     )
     bpy.types.Scene.sg_last_gen_error = bpy.props.BoolProperty(
         name="Last Generation Error",
@@ -620,7 +620,8 @@ def register_properties(update_model_list, ControlNetUnit, LoRAUnit,
     )
     bpy.types.Scene.generation_progress = bpy.props.FloatProperty(
         name="Generation Progress", description="Current progress of image generation",
-        default=0.0, min=0.0, max=100.0, update=update_parameters
+        default=0.0, min=0.0, max=100.0, update=update_parameters,
+        options={'SKIP_SAVE'},
     )
 
     # ── Material / blending ────────────────────────────────────────────
@@ -862,6 +863,16 @@ def register_properties(update_model_list, ControlNetUnit, LoRAUnit,
         name="Corrected Qwen Workflow Routing",
         description="Use corrected Qwen style-slot routing, TRELLIS initial-only fallback, and refine sampler/model configuration",
         default=TEXTURING_REWORK_DEFAULTS["sg_rework_qwen_workflow"], update=update_parameters,
+    )
+    bpy.types.Scene.qwen_global_style_vlm_only = bpy.props.BoolProperty(
+        name="Global Style Reference: VLM Only",
+        description="In Qwen Additional Context mode, keep Image 3 available for visual-language style analysis but exclude it from full-resolution ReferenceLatent conditioning so it competes less with the spatial RGB context",
+        default=TEXTURING_REWORK_DEFAULTS["qwen_global_style_vlm_only"], update=update_parameters,
+    )
+    bpy.types.Scene.qwen_latent_locked_context = bpy.props.BoolProperty(
+        name="Latent-Locked Context Inpainting",
+        description="For later sequential Qwen views, initialize the sampler from the RGB context render and use the exported visibility repair mask as a latent noise mask. White/repair pixels denoise; black/trusted pixels are restored after every sampling step",
+        default=TEXTURING_REWORK_DEFAULTS["qwen_latent_locked_context"], update=update_parameters,
     )
     bpy.types.Scene.sg_rework_final_display = bpy.props.BoolProperty(
         name="Continuous Final Display Rebuild",
@@ -1218,7 +1229,7 @@ def register_properties(update_model_list, ControlNetUnit, LoRAUnit,
     )
     bpy.types.Scene.qwen_use_confidence_context = bpy.props.BoolProperty(
         name="Confidence-Gated Context",
-        description="Replace legacy RGB/magenta discovery with an explicit binary trusted-versus-repair context mask",
+        description="Build an ownership-independent best-source quality field and replace low-quality context with an explicit binary repair mask. Continuous RGB projection blending is preserved",
         default=TEXTURING_REWORK_DEFAULTS["qwen_use_confidence_context"], update=update_parameters,
     )
     bpy.types.Scene.qwen_regularize_context_mask = bpy.props.BoolProperty(
@@ -1752,6 +1763,43 @@ def register_properties(update_model_list, ControlNetUnit, LoRAUnit,
         ],
         default='NONE', update=update_parameters
     )
+    bpy.types.Scene.trellis2_autorig_bone_display_type = bpy.props.EnumProperty(
+        name="Bone Display",
+        description="Viewport shape used for newly imported SkinTokens bones",
+        items=[
+            ('OCTAHEDRAL', "Octahedral (Mixamo-like)", "Classic tapered Blender/Mixamo-style bones"),
+            ('STICK', "Stick / Joint Circles", "Thin bone lines with circular joint markers"),
+            ('BBONE', "B-Bone", "Box-like bendy-bone display"),
+            ('ENVELOPE', "Envelope", "Display bone deformation envelopes"),
+            ('WIRE', "Wire", "Wireframe bone display"),
+            ('IMPORTED', "Imported", "Keep the display and custom shapes from the imported GLB"),
+        ],
+        default='OCTAHEDRAL', update=update_parameters,
+    )
+    bpy.types.Scene.trellis2_autorig_bone_heuristic = bpy.props.EnumProperty(
+        name="Bone Direction",
+        description=(
+            "How Blender constructs bone axes when importing a SkinTokens glTF rig"
+        ),
+        items=[
+            (
+                'FORTUNE',
+                "Fortune / Child-Directed",
+                "Point one-child bones at their child joints; recommended default",
+            ),
+            (
+                'BLENDER',
+                "Blender / Legacy Round-Trip",
+                "Preserve original glTF local joint axes and legacy joint markers",
+            ),
+            (
+                'TEMPERANCE',
+                "Temperance / Nearest Axis",
+                "Use the local axis nearest the child direction",
+            ),
+        ],
+        default='FORTUNE', update=update_parameters,
+    )
     bpy.types.Scene.trellis2_autorig_top_k = bpy.props.IntProperty(
         name="Top K", description="SkinTokens sampling top-k",
         default=5, min=1, max=200, update=update_parameters
@@ -2039,7 +2087,9 @@ def unregister_properties(load_handler, _sg_queue_load_handler):
         'sg_rework_projection_guard', 'sg_rework_projection_rebuild',
         'sg_rework_projection_geometry',
         'sg_rework_consistent_frame', 'sg_rework_workflow_validation',
-        'sg_rework_qwen_workflow', 'sg_rework_final_display',
+        'sg_rework_qwen_workflow', 'qwen_global_style_vlm_only',
+        'qwen_latent_locked_context',
+        'sg_rework_final_display',
         'sg_texel_ownership', 'sg_texel_replacement_margin',
         'sg_allow_trusted_replacement', 'sg_ownership_blend_mode',
         'sg_ownership_seam_width', 'sg_ownership_lowpass_sigma',
@@ -2151,7 +2201,8 @@ def unregister_properties(load_handler, _sg_queue_load_handler):
         'trellis2_autorig_enabled', 'trellis2_autorig_use_transfer',
         'trellis2_autorig_use_skeleton', 'trellis2_autorig_use_postprocess',
         'trellis2_autorig_cleanup_cross_limb_weights',
-        'trellis2_autorig_garment_mode',
+        'trellis2_autorig_garment_mode', 'trellis2_autorig_bone_display_type',
+        'trellis2_autorig_bone_heuristic',
         'trellis2_autorig_top_k', 'trellis2_autorig_top_p',
         'trellis2_autorig_temperature', 'trellis2_autorig_repetition_penalty',
         'trellis2_autorig_num_beams', 'trellis2_autorig_model_ckpt',

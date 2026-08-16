@@ -68,6 +68,122 @@ def qwen_style_semantic_slot(context_mode: str, is_initial_image: bool) -> str:
     return "image2"
 
 
+def qwen_reference_latent_slots(
+    context_mode: str,
+    is_initial_image: bool,
+    global_style_vlm_only: bool,
+) -> tuple[str, ...]:
+    """Return Qwen image slots that should receive spatial reference latents.
+
+    Image 3 remains connected to ``TextEncodeQwenImageEditPlus`` when the
+    VLM-only experiment is active; omitting it here removes only its manual
+    full-resolution ReferenceLatent conditioning.
+    """
+    slots = ["image1", "image2", "image3"]
+    if (
+        global_style_vlm_only
+        and context_mode == "ADDITIONAL"
+        and not is_initial_image
+    ):
+        slots.remove("image3")
+    return tuple(slots)
+
+
+def attach_qwen_latent_lock(
+    prompt: dict,
+    *,
+    sampler_node_id: str,
+    vae_node_id: str,
+    context_image_name: str,
+    repair_mask_name: str,
+    start_node_id: int = 650,
+) -> dict[str, str]:
+    """Attach sampler-level Qwen context inpainting to ``prompt``.
+
+    The context render is VAE-encoded as the sampler's starting latent.  The
+    exported sequential visibility image uses StableGen's repair convention:
+    white pixels may denoise and black pixels remain locked.  ComfyUI's generic
+    noise-mask sampler restores the protected source latent after every step.
+
+    Dedicated loader/encode nodes are intentional.  Qwen's semantic image
+    slots are dynamically reordered between Replace Style and Additional
+    modes; keeping the latent-lock path separate prevents semantic slot changes
+    from silently changing which image is protected.
+    """
+    sampler_node_id = str(sampler_node_id)
+    vae_node_id = str(vae_node_id)
+    if sampler_node_id not in prompt:
+        raise ValueError(f"Qwen latent lock sampler node {sampler_node_id} is missing")
+    if vae_node_id not in prompt:
+        raise ValueError(f"Qwen latent lock VAE node {vae_node_id} is missing")
+    if not context_image_name:
+        raise ValueError("Qwen latent lock requires a context image")
+    if not repair_mask_name:
+        raise ValueError("Qwen latent lock requires a repair mask")
+
+    next_id = int(start_node_id)
+
+    def allocate() -> str:
+        nonlocal next_id
+        while str(next_id) in prompt:
+            next_id += 1
+        node_id = str(next_id)
+        next_id += 1
+        return node_id
+
+    context_loader = allocate()
+    context_encode = allocate()
+    mask_loader = allocate()
+    image_to_mask = allocate()
+    set_noise_mask = allocate()
+
+    prompt[context_loader] = {
+        "inputs": {"image": context_image_name},
+        "class_type": "LoadImage",
+        "_meta": {"title": "Qwen Latent Lock - Context"},
+    }
+    prompt[context_encode] = {
+        "inputs": {
+            "pixels": [context_loader, 0],
+            "vae": [vae_node_id, 0],
+        },
+        "class_type": "VAEEncode",
+        "_meta": {"title": "Qwen Latent Lock - Encode Context"},
+    }
+    prompt[mask_loader] = {
+        "inputs": {"image": repair_mask_name},
+        "class_type": "LoadImage",
+        "_meta": {"title": "Qwen Latent Lock - Repair Mask"},
+    }
+    prompt[image_to_mask] = {
+        "inputs": {
+            "image": [mask_loader, 0],
+            "channel": "red",
+        },
+        "class_type": "ImageToMask",
+        "_meta": {"title": "Qwen Latent Lock - Image to Mask"},
+    }
+    prompt[set_noise_mask] = {
+        "inputs": {
+            "samples": [context_encode, 0],
+            "mask": [image_to_mask, 0],
+        },
+        "class_type": "SetLatentNoiseMask",
+        "_meta": {"title": "Qwen Latent Lock - Set Noise Mask"},
+    }
+    prompt[sampler_node_id].setdefault("inputs", {})["latent_image"] = [
+        set_noise_mask,
+        0,
+    ]
+    return {
+        "context_loader": context_loader,
+        "context_encode": context_encode,
+        "mask_loader": mask_loader,
+        "image_to_mask": image_to_mask,
+        "set_noise_mask": set_noise_mask,
+    }
+
+
 def sdxl_final_mask_reference(blur_mask: bool, nodes: Mapping) -> list:
     """Return the one processed mask consumed by all SDXL inpaint nodes."""
     node_id = nodes['image_to_mask'] if blur_mask else nodes['grow_mask']

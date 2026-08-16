@@ -23,6 +23,7 @@ from .texturing.rendering import (
 )
 from .texturing.orbit_export import ExportOrbitGIF
 from .texturing.game_export import ExportForGameEngine
+from .texturing.solidify import StableGenMakeSolid
 from .animation import (
     StableGenCharacterizeRig, StableGenApplyRigPosePreset,
     StableGenSetRetargetReferencePose,
@@ -53,7 +54,8 @@ from .texturing.generator import (
     ComfyUIGenerate, Reproject, Regenerate, MirrorReproject,
 )
 from .mesh_gen.trellis2 import (
-    Trellis2Generate, StableGenAutoRigSelectedMesh, StableGenLocalPostProcess,
+    Trellis2Generate, StableGenApplyBoneDisplay,
+    StableGenAutoRigSelectedMesh, StableGenLocalPostProcess,
 )
 from .mesh_gen.batch import (
     TRELLIS2_OT_BatchSelectFolder, TRELLIS2_OT_BatchGenerate,
@@ -118,6 +120,7 @@ classes = [
     Regenerate,
     MirrorReproject,
     Trellis2Generate,
+    StableGenApplyBoneDisplay,
     StableGenAutoRigSelectedMesh,
     StableGenLocalPostProcess,
     TRELLIS2_OT_BatchSelectFolder,
@@ -135,6 +138,7 @@ classes = [
     SwitchMaterial,
     ExportOrbitGIF,
     ExportForGameEngine,
+    StableGenMakeSolid,
     StableGenCharacterizeRig,
     StableGenApplyRigPosePreset,
     StableGenSetRetargetReferencePose,

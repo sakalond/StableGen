@@ -10,7 +10,13 @@ from datetime import datetime
 from ..util.workflow_templates import prompt_text_qwen_image_edit, prompt_text_flux2_klein
 from ..utils import get_generation_dirs
 from ..timeout_config import get_timeout
-from .graph_validation import validate_workflow_graph, qwen_style_semantic_slot, sdxl_final_mask_reference
+from .graph_validation import (
+    validate_workflow_graph,
+    qwen_style_semantic_slot,
+    qwen_reference_latent_slots,
+    attach_qwen_latent_lock,
+    sdxl_final_mask_reference,
+)
 
 from io import BytesIO
 import numpy as np
@@ -186,7 +192,13 @@ class _TexturingWorkflowMixin:
         img_out.save(out_buf, format="PNG")
         return out_buf.getvalue()
 
-    def _build_qwen_reference_latent_chain(self, prompt, NODES, start_node_id=700):
+    def _build_qwen_reference_latent_chain(
+        self,
+        prompt,
+        NODES,
+        start_node_id=700,
+        latent_slots=("image1", "image2", "image3"),
+    ):
         """
         Build VAEEncode + ReferenceLatent chain for the Qwen unzoom fix.
 
@@ -195,11 +207,13 @@ class _TexturingWorkflowMixin:
         a 1 MP rescale).  We replicate the reference-latent injection
         manually so the latents match the actual output resolution.
 
-        For each active image (image1 / image2 / image3) still present in
-        the positive text-encode node, a VAEEncode node is created and a
-        ReferenceLatent node is chained onto both positive and negative
-        conditioning.  The KSampler inputs are then updated to point at
-        the tail of the chain.
+        For each selected, active image still present in the positive
+        text-encode node, a VAEEncode node is created and a ReferenceLatent
+        node is chained onto both positive and negative conditioning. The
+        KSampler inputs are then updated to point at the tail of the chain.
+        A slot omitted from ``latent_slots`` remains available to the Qwen
+        visual-language encoder but exerts no full-resolution reference-latent
+        pressure.
 
         When ``qwen_timestep_zero_ref`` is enabled on the scene, a
         FluxKontextMultiReferenceLatentMethod node is appended with
@@ -216,8 +230,8 @@ class _TexturingWorkflowMixin:
         active_refs = []
         pos_inputs = prompt[pos_node]['inputs']
         for key in ('image1', 'image2', 'image3'):
-            if key in pos_inputs:
-                active_refs.append(pos_inputs[key])
+            if key in pos_inputs and key in latent_slots:
+                active_refs.append((key, pos_inputs[key]))
 
         if not active_refs:
             return
@@ -230,7 +244,7 @@ class _TexturingWorkflowMixin:
         pos_cond_ref = [pos_node, 0]
         neg_cond_ref = [neg_node, 0]
 
-        for i, img_ref in enumerate(active_refs):
+        for i, (slot, img_ref) in enumerate(active_refs):
             # --- VAEEncode for this image ---
             # For image1 we can reuse the existing node 8 which already
             # encodes the same image (also used as KSampler latent_image).
@@ -245,7 +259,7 @@ class _TexturingWorkflowMixin:
                         "vae": vae_ref
                     },
                     "class_type": "VAEEncode",
-                    "_meta": {"title": f"VAE Encode (Ref {i + 1})"}
+                    "_meta": {"title": f"VAE Encode ({slot})"}
                 }
                 vae_enc_ref = [vae_enc_id, 0]
 
@@ -258,7 +272,7 @@ class _TexturingWorkflowMixin:
                     "latent": vae_enc_ref
                 },
                 "class_type": "ReferenceLatent",
-                "_meta": {"title": f"Reference Latent Pos {i + 1}"}
+                "_meta": {"title": f"Reference Latent Pos ({slot})"}
             }
             pos_cond_ref = [ref_pos_id, 0]
 
@@ -271,7 +285,7 @@ class _TexturingWorkflowMixin:
                     "latent": vae_enc_ref
                 },
                 "class_type": "ReferenceLatent",
-                "_meta": {"title": f"Reference Latent Neg {i + 1}"}
+                "_meta": {"title": f"Reference Latent Neg ({slot})"}
             }
             neg_cond_ref = [ref_neg_id, 0]
 
@@ -607,7 +621,9 @@ class _TexturingWorkflowMixin:
             return {"error": "invalid_workflow"}
         
         # --- Save and Execute ---
-        self._save_prompt_to_file(prompt, revision_dir)
+        self._save_prompt_to_file(
+            prompt, revision_dir, workflow="qwen_refine", camera_id=camera_id
+        )
         
         ws = self._connect_to_websocket(server_address, client_id)
         if ws is None:
@@ -635,6 +651,7 @@ class _TexturingWorkflowMixin:
 
         NODES = {
             'sampler': "1",
+            'vae_loader': "4",
             'save_image': "5",
             'model_sampler': "6", # ModelSamplingAuraFlow
             'cfg_norm': "7", # CFGNorm
@@ -864,7 +881,72 @@ class _TexturingWorkflowMixin:
                 prompt[NODES['neg_prompt']]['inputs'][style_slot] = [scale_node_key, 0]
 
         # --- Reference Latent chain (Qwen unzoom fix) ---
-        self._build_qwen_reference_latent_chain(prompt, NODES)
+        latent_slots = qwen_reference_latent_slots(
+            context_mode,
+            is_initial_image,
+            getattr(context.scene, 'qwen_global_style_vlm_only', False),
+        )
+        if 'image3' not in latent_slots and 'image3' in prompt[NODES['pos_prompt']]['inputs']:
+            print(
+                "[StableGen] Qwen Image 3 global style is VLM-only; "
+                "skipping its ReferenceLatent"
+            )
+        self._build_qwen_reference_latent_chain(
+            prompt,
+            NODES,
+            latent_slots=latent_slots,
+        )
+
+        # --- Sampler-level latent-locked context inpainting ---
+        # Unlike the RGB/magenta conditioning alone, this makes the exported
+        # visibility repair mask authoritative inside the sampler.  It is
+        # available only for later sequential views that actually have a
+        # context render; the initial view keeps the legacy depth-start latent.
+        latent_lock_enabled = bool(getattr(
+            context.scene, 'qwen_latent_locked_context', False
+        ))
+        latent_lock_active = (
+            latent_lock_enabled
+            and not is_initial_image
+            and context_mode in {'REPLACE_STYLE', 'ADDITIONAL'}
+            and context_render_info is not None
+        )
+        if latent_lock_active:
+            repair_mask_info = self.operator._get_uploaded_image_info(
+                context,
+                "inpaint",
+                subtype="visibility",
+                camera_id=camera_id,
+            )
+            if not repair_mask_info:
+                self.operator._error = (
+                    "Qwen latent-locked context is enabled, but the sequential "
+                    f"repair mask for camera {camera_id} is missing."
+                )
+                return {"error": "conn_failed"}
+            attach_qwen_latent_lock(
+                prompt,
+                sampler_node_id=NODES['sampler'],
+                vae_node_id=NODES['vae_loader'],
+                context_image_name=context_render_info['name'],
+                repair_mask_name=repair_mask_info['name'],
+            )
+            print(
+                "[StableGen] Qwen latent-locked context active for camera "
+                f"{camera_id}: trusted pixels are sampler-locked; repair "
+                "pixels denoise."
+            )
+        elif latent_lock_enabled and is_initial_image:
+            print(
+                "[StableGen] Qwen latent-locked context enabled; initial view "
+                "has no prior context and uses the normal sampler latent."
+            )
+        elif latent_lock_enabled:
+            print(
+                "[StableGen] Qwen latent-locked context enabled but inactive: "
+                "use a later sequential view with Replace Style or Additional "
+                "context."
+            )
 
         # --- Configure Sampler ---
         prompt[NODES['sampler']]['inputs']['seed'] = context.scene.seed
@@ -899,7 +981,9 @@ class _TexturingWorkflowMixin:
             return {"error": "invalid_workflow"}
 
         # --- Execute ---
-        self._save_prompt_to_file(prompt, revision_dir)
+        self._save_prompt_to_file(
+            prompt, revision_dir, workflow="qwen_edit", camera_id=camera_id
+        )
         ws = self._connect_to_websocket(server_address, client_id)
         if ws is None:
             return {"error": "conn_failed"}
@@ -1135,7 +1219,9 @@ class _TexturingWorkflowMixin:
         self._build_flux2_reference_chain(prompt, NODES, ref_images)
 
         # --- Execute ---
-        self._save_prompt_to_file(prompt, revision_dir)
+        self._save_prompt_to_file(
+            prompt, revision_dir, workflow="flux2_klein", camera_id=camera_id
+        )
         ws = self._connect_to_websocket(server_address, client_id)
         if ws is None:
             return {"error": "conn_failed"}
@@ -1189,7 +1275,7 @@ class _TexturingWorkflowMixin:
         prompt = self._build_controlnet_chain(prompt, context, controlnet_info, NODES)
         
         # Save prompt for debugging (in revision dir)
-        self._save_prompt_to_file(prompt, revision_dir)
+        self._save_prompt_to_file(prompt, revision_dir, workflow="sdxl_generate")
 
         # Execute generation and get results
         ws = self._connect_to_websocket(server_address, client_id)
@@ -2308,8 +2394,7 @@ class _TexturingWorkflowMixin:
                 prompt[NODES['sampler']]["inputs"]["negative"] = [NODES['neg_prompt'], 0]
         
         # Save prompt for debugging
-        with open(os.path.join(output_dir, "prompt.json"), 'w') as f:
-            json.dump(prompt, f)
+        self._save_prompt_to_file(prompt, output_dir, workflow="sdxl_refine")
         
         # Execute generation and get results
         ws = self._connect_to_websocket(server_address, client_id)
@@ -2754,7 +2839,7 @@ class _TexturingWorkflowMixin:
         # Note: No negative prompt is connected.
 
         # Save prompt for debugging.
-        self._save_prompt_to_file(prompt,  revision_dir)
+        self._save_prompt_to_file(prompt, revision_dir, workflow="flux_generate")
 
         # Execute generation via websocket.
         # Execute generation and get results
@@ -2953,7 +3038,7 @@ class _TexturingWorkflowMixin:
                     prompt[NODES['flux_lora_image']]["inputs"]["image"] = controlnet_info["depth"]['name']
         
         # Save prompt for debugging
-        self._save_prompt_to_file(prompt, revision_dir)
+        self._save_prompt_to_file(prompt, revision_dir, workflow="flux_refine")
         
         # Execute generation and get results
         ws = self._connect_to_websocket(server_address, client_id)

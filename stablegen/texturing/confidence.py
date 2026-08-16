@@ -65,6 +65,26 @@ def acquisition_quality(
     return np.clip(result, 0.0, 1.0)
 
 
+def best_source_quality(qualities, write_masks=None):
+    """Return the best legitimately acquired source quality per sample.
+
+    Colour fusion is intentionally absent from this policy.  A camera may
+    improve confidence only where it was permitted to write; copied/protected
+    context therefore cannot inherit the new camera's geometric quality.
+    """
+    q = np.asarray(qualities, dtype=np.float32)
+    if q.ndim < 1 or q.shape[0] == 0:
+        raise ValueError("qualities must contain a non-empty camera axis")
+    if write_masks is None:
+        writes = np.ones_like(q, dtype=bool)
+    else:
+        writes = np.asarray(write_masks) > 0
+        if writes.shape != q.shape:
+            raise ValueError("write_masks must match qualities")
+    accepted = np.where(writes, np.clip(q, 0.0, 1.0), 0.0)
+    return np.max(accepted, axis=0)
+
+
 def resolve_ownership(
     qualities,
     write_masks=None,

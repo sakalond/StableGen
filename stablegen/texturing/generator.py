@@ -48,6 +48,12 @@ from .quality_masks import (
     build_depth_part_rejection_mask,
 )
 from .confidence import camera_direction_from_matrix, overlap_aware_order
+from .pose_lock import (
+    TexturingPoseLock,
+    ensure_texturing_frame,
+    restore_active_texturing_frame,
+    set_active_texturing_frame,
+)
 from ..feature_flags import TEXTURING_REWORK_DEFAULTS
 
 import websocket
@@ -410,8 +416,38 @@ class ComfyUIGenerate(_PBRMixin, bpy.types.Operator):
         self._pbr_cam = 0
         self._pbr_cam_total = 1
         self._wait_event = threading.Event()
+        self._texturing_pose_lock = None
+        self._active_texturing_frame_previous = None
         from ..workflows import WorkflowManager
         self.workflow_manager = WorkflowManager(self)
+
+    def _begin_texturing_pose_lock(self, context, meshes):
+        """Freeze an animated target rig at the pose visible when Generate ran."""
+        self._texturing_pose_lock = TexturingPoseLock(context, meshes)
+        if not self._texturing_pose_lock.freeze():
+            return False
+        self._original_texturing_frame = self._texturing_pose_lock.frame
+        self._active_texturing_frame_previous = set_active_texturing_frame(
+            context.scene, self._original_texturing_frame
+        )
+        print(
+            "[StableGen] Locked animated character pose at frame "
+            f"{self._original_texturing_frame} for texturing"
+        )
+        return True
+
+    def _restore_texturing_pose(self, context):
+        """Idempotently restore the target rig and run-scoped frame marker."""
+        pose_lock = getattr(self, "_texturing_pose_lock", None)
+        if pose_lock is not None:
+            pose_lock.restore()
+            self._texturing_pose_lock = None
+        previous = getattr(self, "_active_texturing_frame_previous", None)
+        if previous is not None:
+            restore_active_texturing_frame(context.scene, previous)
+            self._active_texturing_frame_previous = None
+        elif hasattr(self, '_original_texturing_frame'):
+            context.scene.frame_set(self._original_texturing_frame)
 
     def _run_on_main_thread(self, func):
         """Execute *func* on Blender's main thread via a timer callback and
@@ -851,7 +887,24 @@ class ComfyUIGenerate(_PBRMixin, bpy.types.Operator):
                         ordered.append(camera)
                 self._cameras = ordered
 
-        if getattr(context.scene, 'sg_rework_consistent_frame', False):
+        # An Action is reevaluated by every later frame_set(), including the
+        # legacy exporters which select frame 1.  Capture and freeze the exact
+        # visible pose before any of those calls can move an animated target.
+        if context.scene.texture_objects == 'selected':
+            pose_lock_targets = [
+                obj for obj in bpy.context.selected_objects
+                if obj.type == 'MESH'
+            ]
+        else:
+            pose_lock_targets = [
+                obj for obj in bpy.context.view_layer.objects
+                if obj.type == 'MESH' and not obj.hide_get()
+            ]
+        pose_locked = self._begin_texturing_pose_lock(
+            context, pose_lock_targets
+        )
+        if (not pose_locked
+                and getattr(context.scene, 'sg_rework_consistent_frame', False)):
             self._original_texturing_frame = context.scene.frame_current
             context.scene.frame_set(int(getattr(context.scene, 'sg_texturing_frame', 1)))
 
@@ -995,8 +1048,7 @@ class ComfyUIGenerate(_PBRMixin, bpy.types.Operator):
             render.resolution_percentage = self._original_resolution_percentage
             render.resolution_x = self._original_resolution_x
             render.resolution_y = self._original_resolution_y
-            if hasattr(self, '_original_texturing_frame'):
-                context.scene.frame_set(self._original_texturing_frame)
+            self._restore_texturing_pose(context)
             return {'CANCELLED'}
         
         # If there are curves within the scene, warn the user
@@ -1021,8 +1073,7 @@ class ComfyUIGenerate(_PBRMixin, bpy.types.Operator):
                 render.resolution_percentage = self._original_resolution_percentage
                 render.resolution_x = self._original_resolution_x
                 render.resolution_y = self._original_resolution_y
-                if hasattr(self, '_original_texturing_frame'):
-                    context.scene.frame_set(self._original_texturing_frame)
+                self._restore_texturing_pose(context)
                 return {'CANCELLED'}
         else: # all
             self._to_texture = [obj for obj in bpy.context.view_layer.objects if obj.type == 'MESH' and not obj.hide_get()]
@@ -1045,8 +1096,7 @@ class ComfyUIGenerate(_PBRMixin, bpy.types.Operator):
                 render.resolution_percentage = self._original_resolution_percentage
                 render.resolution_x = self._original_resolution_x
                 render.resolution_y = self._original_resolution_y
-                if hasattr(self, '_original_texturing_frame'):
-                    context.scene.frame_set(self._original_texturing_frame)
+                self._restore_texturing_pose(context)
                 return {'CANCELLED'}
 
         if not context.scene.overwrite_material or self._material_id == -1 or (context.scene.generation_method == 'local_edit' or (context.scene.model_architecture.startswith('qwen') and context.scene.qwen_generation_method == 'local_edit')):
@@ -1080,6 +1130,7 @@ class ComfyUIGenerate(_PBRMixin, bpy.types.Operator):
                 # Start the prompt collection process with the first object
                 if not self._object_prompts:  # Only if prompts haven't been collected
                     self.current_object_name = self._to_texture[0].name
+                    self._restore_texturing_pose(context)
                     return context.window_manager.invoke_props_dialog(self, width=400)
                 
             # Continue with normal execution if all prompts are collected
@@ -1121,6 +1172,7 @@ class ComfyUIGenerate(_PBRMixin, bpy.types.Operator):
                     render.resolution_percentage = self._original_resolution_percentage
                     render.resolution_x = self._original_resolution_x
                     render.resolution_y = self._original_resolution_y
+                    self._restore_texturing_pose(context)
                     return {'CANCELLED'}
                     
                 # Export visibility masks for each object
@@ -1232,8 +1284,7 @@ class ComfyUIGenerate(_PBRMixin, bpy.types.Operator):
                     if not self._error:
                         self._error = f"Failed to restore projection state: {reset_error}"
                 finally:
-                    if hasattr(self, '_original_texturing_frame'):
-                        context.scene.frame_set(self._original_texturing_frame)
+                    self._restore_texturing_pose(context)
                 if self._error:
                     if self._error == "'25'" or self._error == "'111'" or self._error == "'5'":
                         # Probably canceled by user, quietly return
@@ -1507,9 +1558,7 @@ class ComfyUIGenerate(_PBRMixin, bpy.types.Operator):
                 context.scene.camera = camera
                 return camera
             return None
-        texturing_frame = int(getattr(context.scene, 'sg_texturing_frame', 1))
-        if context.scene.frame_current != texturing_frame:
-            context.scene.frame_set(texturing_frame)
+        ensure_texturing_frame(context.scene, force_configured=True)
         record = self._view_plan[index]
         camera = record.camera
         if record.matrix_world:
@@ -2262,7 +2311,9 @@ class ComfyUIGenerate(_PBRMixin, bpy.types.Operator):
         original_use_compositing = bpy.context.scene.render.use_compositing
         original_filepath = bpy.context.scene.render.filepath
 
-        bpy.context.scene.frame_set(1)
+        ensure_texturing_frame(
+            bpy.context.scene, honor_consistent=False
+        )
 
         output_dir = get_dir_path(context, "controlnet")["depth"]
         output_file = f"depth_map{camera_id}" if camera_id is not None else "depth_map"
@@ -2330,8 +2381,7 @@ class ComfyUIGenerate(_PBRMixin, bpy.types.Operator):
         :return: None     
         """
         print("[StableGen] Exporting depth map")
-        if not getattr(context.scene, 'sg_rework_consistent_frame', False):
-            context.scene.frame_set(1)
+        ensure_texturing_frame(context.scene)
         # Save original settings to restore later.
         original_engine = bpy.context.scene.render.engine
         original_view_transform = bpy.context.scene.view_settings.view_transform
@@ -2584,8 +2634,7 @@ class ComfyUIGenerate(_PBRMixin, bpy.types.Operator):
     def _export_normal_impl(self, context, camera_id=None):
         """Render the evaluated normal pass without mutating production state."""
         print("[StableGen] Exporting normal map")
-        if not getattr(context.scene, 'sg_rework_consistent_frame', False):
-            context.scene.frame_set(1)
+        ensure_texturing_frame(context.scene)
         output_dir = get_dir_path(context, "controlnet")["normal"]
         output_file = f"normal_map{camera_id}" if camera_id is not None else "normal_map"
 

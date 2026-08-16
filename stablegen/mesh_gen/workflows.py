@@ -1389,7 +1389,7 @@ class _Trellis2WorkflowMixin:
         # Save prompt for debugging
         revision_dir = get_generation_dirs(context).get("revision", "")
         if revision_dir:
-            self._save_prompt_to_file(prompt, revision_dir)
+            self._save_prompt_to_file(prompt, revision_dir, workflow="trellis2")
 
         # --- Two-phase VRAM management for textured path ---
         # NOTE: Two-phase execution (shape first, flush, then texture) was

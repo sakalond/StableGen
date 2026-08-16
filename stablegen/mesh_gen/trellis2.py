@@ -19,6 +19,13 @@ from ..utils import get_generation_dirs, sg_modal_active
 from ..timeout_config import get_timeout
 from .._generator_utils import setup_studio_lighting, redraw_ui, upload_image_to_comfyui
 from ..texturing.gallery import _PreviewGalleryOverlay
+from .rig_display import (
+    apply_autorig_bone_display,
+    autorig_gltf_import_kwargs,
+    configure_gltf_not_exported_visibility,
+    record_autorig_bone_heuristic,
+    selected_armatures_for_display,
+)
 
 _ADDON_PKG = __package__.rsplit('.', 1)[0]
 _GARMENT_STABILIZED_GROUP = "SG_GarmentStabilized"
@@ -1231,43 +1238,15 @@ class Trellis2Generate(bpy.types.Operator):
             print(f"[TRELLIS2] Cleared custom split normals on {cleared} imported mesh object(s)")
 
     @staticmethod
-    def _disable_not_exported_render_helpers():
-        """Disable glTF control/helper geometry for render and bake."""
-        disabled_objects = 0
-        disabled_collections = 0
-
-        def iter_collection_objects(collection):
-            seen = set()
-
-            def visit(col):
-                for obj in col.objects:
-                    if obj.name in seen:
-                        continue
-                    seen.add(obj.name)
-                    yield obj
-                for child in col.children:
-                    yield from visit(child)
-
-            yield from visit(collection)
-
-        for collection in bpy.data.collections:
-            if "not_exported" not in collection.name.lower():
-                continue
-
-            if not collection.hide_render:
-                collection.hide_render = True
-                disabled_collections += 1
-
-            for obj in iter_collection_objects(collection):
-                if not obj.hide_render:
-                    obj.hide_render = True
-                    disabled_objects += 1
-
-        if disabled_objects or disabled_collections:
+    def _configure_not_exported_helpers():
+        """Expose glTF helper visibility through eye/render collection icons."""
+        stats = configure_gltf_not_exported_visibility(bpy.context)
+        if stats["collections"]:
             print(
-                "[TRELLIS2] Disabled render visibility for "
-                f"{disabled_objects} glTF not_exported helper object(s) "
-                f"across {disabled_collections} collection(s)."
+                "[TRELLIS2] Hid glTF not_exported helpers through "
+                f"{stats['layer_collections']} view-layer eye toggle(s) and "
+                f"{stats['collections']} collection render toggle(s); cleared "
+                f"{stats['object_flags_cleared']} buried object flag(s)."
             )
 
     @classmethod
@@ -1548,15 +1527,37 @@ class Trellis2Generate(bpy.types.Operator):
 
             print(f"[TRELLIS2] Saved GLB to: {glb_path} ({len(self._glb_data)} bytes)")
 
-            # Import GLB into Blender
-            bpy.ops.import_scene.gltf(filepath=glb_path)
             autorig_enabled = getattr(self, '_autorig_enabled', False)
+            autorig_bone_heuristic = getattr(
+                context.scene,
+                'trellis2_autorig_bone_heuristic',
+                'FORTUNE',
+            )
+            # Import rigged SkinTokens joints with child-directed bone tails.
+            # Plain TRELLIS GLBs have no armature, so retain Blender's normal
+            # import defaults for those files.
+            if autorig_enabled:
+                bpy.ops.import_scene.gltf(**autorig_gltf_import_kwargs(
+                    glb_path, autorig_bone_heuristic))
+            else:
+                bpy.ops.import_scene.gltf(filepath=glb_path)
 
             # --- Clean hierarchy, unparent meshes, and remove GLTF/GLB structural empties ---
             imported_objects = [obj for obj in context.selected_objects]
             for obj in imported_objects:
                 obj["sg_generated"] = True
-            self._disable_not_exported_render_helpers()
+            if autorig_enabled:
+                record_autorig_bone_heuristic(
+                    imported_objects, autorig_bone_heuristic)
+                apply_autorig_bone_display(
+                    imported_objects,
+                    getattr(
+                        context.scene,
+                        'trellis2_autorig_bone_display_type',
+                        'OCTAHEDRAL',
+                    ),
+                )
+            self._configure_not_exported_helpers()
             mesh_objects = [obj for obj in imported_objects if obj.type == 'MESH']
             empty_objects = [obj for obj in imported_objects if obj.type == 'EMPTY']
 
@@ -2190,6 +2191,39 @@ class Trellis2Generate(bpy.types.Operator):
             traceback.print_exc()
 
 
+class StableGenApplyBoneDisplay(bpy.types.Operator):
+    """Apply the configured bone presentation to selected generated rigs."""
+
+    bl_idname = "stablegen.apply_autorig_bone_display"
+    bl_label = "Apply Bone Display"
+    bl_description = (
+        "Apply the selected SkinTokens bone display style to the selected "
+        "armature or the armature driving the selected mesh"
+    )
+    bl_options = {'REGISTER', 'UNDO'}
+
+    @classmethod
+    def poll(cls, context):
+        if sg_modal_active(context):
+            return False
+        armatures = selected_armatures_for_display(context)
+        if not armatures:
+            cls.poll_message_set("Select an armature or a rigged mesh")
+            return False
+        return True
+
+    def execute(self, context):
+        armatures = selected_armatures_for_display(context)
+        display_type = getattr(
+            context.scene, 'trellis2_autorig_bone_display_type', 'OCTAHEDRAL')
+        count = apply_autorig_bone_display(armatures, display_type)
+        self.report(
+            {'INFO'},
+            f"Applied {display_type.title()} bone display to {count} armature(s)",
+        )
+        return {'FINISHED'}
+
+
 class StableGenAutoRigSelectedMesh(bpy.types.Operator):
     """Run SkinTokens auto-rigging on the selected character mesh objects."""
 
@@ -2254,6 +2288,47 @@ class StableGenAutoRigSelectedMesh(bpy.types.Operator):
         ),
         default='NONE',
     )  # type: ignore
+    bone_display_type: bpy.props.EnumProperty(
+        name="Bone Display",
+        description="Viewport shape used for the imported SkinTokens bones",
+        items=(
+            ('OCTAHEDRAL', "Octahedral (Mixamo-like)", "Classic tapered Blender/Mixamo-style bones"),
+            ('STICK', "Stick / Joint Circles", "Thin bone lines with circular joint markers"),
+            ('BBONE', "B-Bone", "Box-like bendy-bone display"),
+            ('ENVELOPE', "Envelope", "Display bone deformation envelopes"),
+            ('WIRE', "Wire", "Wireframe bone display"),
+            ('IMPORTED', "Imported", "Keep the display and custom shapes from the imported GLB"),
+        ),
+        default='OCTAHEDRAL',
+    )  # type: ignore
+    bone_heuristic: bpy.props.EnumProperty(
+        name="Bone Direction",
+        description=(
+            "How Blender constructs display/deform bone axes from SkinTokens "
+            "glTF joint transforms"
+        ),
+        items=(
+            (
+                'FORTUNE',
+                "Fortune / Child-Directed",
+                "Point one-child bones at their child joints; best-looking default, "
+                "but non-uniform joint scaling can be less accurate",
+            ),
+            (
+                'BLENDER',
+                "Blender / Legacy Round-Trip",
+                "Preserve glTF local joint axes and imported joint-marker shapes; "
+                "best for glTF round trips",
+            ),
+            (
+                'TEMPERANCE',
+                "Temperance / Nearest Axis",
+                "Point toward the closest local axis; safer for non-uniform scaling "
+                "but less anatomically aligned than Fortune",
+            ),
+        ),
+        default='FORTUNE',
+    )  # type: ignore
     top_k: bpy.props.IntProperty(
         name="Top K",
         description="SkinTokens sampling top-k",
@@ -2313,6 +2388,16 @@ class StableGenAutoRigSelectedMesh(bpy.types.Operator):
             True,
         ),
         ("garment_mode", "trellis2_autorig_garment_mode", "NONE"),
+        (
+            "bone_display_type",
+            "trellis2_autorig_bone_display_type",
+            "OCTAHEDRAL",
+        ),
+        (
+            "bone_heuristic",
+            "trellis2_autorig_bone_heuristic",
+            "FORTUNE",
+        ),
         ("top_k", "trellis2_autorig_top_k", 5),
         ("top_p", "trellis2_autorig_top_p", 0.95),
         ("temperature", "trellis2_autorig_temperature", 1.0),
@@ -2394,6 +2479,8 @@ class StableGenAutoRigSelectedMesh(bpy.types.Operator):
         behavior_box.prop(self, "use_postprocess")
         behavior_box.prop(self, "cleanup_cross_limb_weights")
         behavior_box.prop(self, "garment_mode")
+        behavior_box.prop(self, "bone_heuristic")
+        behavior_box.prop(self, "bone_display_type")
         behavior_box.prop(self, "hide_source")
         if self.hide_source:
             behavior_box.label(
@@ -2873,13 +2960,22 @@ class StableGenAutoRigSelectedMesh(bpy.types.Operator):
             with open(output_path, 'wb') as handle:
                 handle.write(self._rigged_data)
 
-            bpy.ops.import_scene.gltf(filepath=output_path)
+            bpy.ops.import_scene.gltf(**autorig_gltf_import_kwargs(
+                output_path, getattr(self, 'bone_heuristic', 'FORTUNE')))
             self._set_pipeline_phase(4, "Blender Import", 45, "Preparing imported rig")
             imported_objects = list(context.selected_objects)
             for obj in imported_objects:
                 obj["sg_generated"] = True
+            record_autorig_bone_heuristic(
+                imported_objects,
+                getattr(self, 'bone_heuristic', 'FORTUNE'),
+            )
+            apply_autorig_bone_display(
+                imported_objects,
+                getattr(self, 'bone_display_type', 'OCTAHEDRAL'),
+            )
 
-            Trellis2Generate._disable_not_exported_render_helpers()
+            Trellis2Generate._configure_not_exported_helpers()
             mesh_objects = [obj for obj in imported_objects if obj.type == 'MESH']
             if mesh_objects:
                 Trellis2Generate._clear_imported_custom_normals(mesh_objects)

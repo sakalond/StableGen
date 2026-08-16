@@ -976,6 +976,35 @@ class StableGenPanel(bpy.types.Panel):
                                  icon="MOD_WIREFRAME")
 
                     row = content_box.row(align=True)
+                    row.prop(
+                        scene,
+                        "trellis2_autorig_bone_heuristic",
+                        text="Bone Direction",
+                    )
+
+                    row = content_box.row(align=True)
+                    row.prop(
+                        scene,
+                        "trellis2_autorig_bone_display_type",
+                        text="Bone Display",
+                    )
+                    row.operator(
+                        "stablegen.apply_autorig_bone_display",
+                        text="Apply",
+                        icon="CHECKMARK",
+                    )
+                    if (
+                        scene.trellis2_autorig_bone_heuristic == 'BLENDER'
+                        and scene.trellis2_autorig_bone_display_type != 'IMPORTED'
+                    ):
+                        warning = content_box.row()
+                        warning.alert = True
+                        warning.label(
+                            text="Legacy axes: use Imported display for original joint markers",
+                            icon="INFO",
+                        )
+
+                    row = content_box.row(align=True)
                     row.operator_context = "INVOKE_DEFAULT"
                     op = row.operator("stablegen.apply_rig_pose_preset",
                                       text="Rest",
@@ -1376,6 +1405,31 @@ class StableGenPanel(bpy.types.Panel):
                 experiments.prop(scene, "sg_rework_safe_render_state", text="Transactional Render State", toggle=True)
                 experiments.prop(scene, "sg_rework_workflow_validation", text="Workflow Graph Validation", toggle=True)
                 experiments.prop(scene, "sg_rework_qwen_workflow", text="Corrected Qwen Workflow Routing", toggle=True)
+                row = experiments.row()
+                row.enabled = bool(
+                    scene.model_architecture.startswith('qwen')
+                    and scene.qwen_generation_method == 'generate'
+                    and scene.qwen_context_render_mode == 'ADDITIONAL'
+                )
+                row.prop(
+                    scene,
+                    "qwen_global_style_vlm_only",
+                    text="Global Style Reference: VLM Only (Qwen Additional)",
+                    toggle=True,
+                )
+                row = experiments.row()
+                row.enabled = bool(
+                    scene.model_architecture.startswith('qwen')
+                    and scene.qwen_generation_method == 'generate'
+                    and scene.generation_method == 'sequential'
+                    and scene.qwen_context_render_mode in {'REPLACE_STYLE', 'ADDITIONAL'}
+                )
+                row.prop(
+                    scene,
+                    "qwen_latent_locked_context",
+                    text="Latent-Locked Context Inpainting (Qwen Sequential)",
+                    toggle=True,
+                )
                 experiments.prop(scene, "sg_rework_final_display", text="Continuous Final Display Rebuild", toggle=True)
 
             # --- Output & Material Settings ---
@@ -2216,6 +2270,9 @@ class StableGenPanel(bpy.types.Panel):
         row.operator("object.stablegen_local_postprocess", text="Run Local Post-Processing", icon="MODIFIER")
 
         row = tools_box.row()
+        row.operator("object.stablegen_make_solid", text="Make Solid", icon="MOD_REMESH")
+        if width_mode == 'narrow':
+            row = tools_box.row()
         row.operator_context = "INVOKE_DEFAULT"
         row.operator("object.stablegen_autorig_selected_mesh", text="Auto-Rig Selected Character", icon="ARMATURE_DATA")
 
@@ -2261,7 +2318,35 @@ class StableGenPanel(bpy.types.Panel):
             row.operator("stablegen.debug_ownership_diagnostic", text="Ownership Diagnostics", icon="SHADING_RENDERED")
 
             row = debug_box.row()
+            row.operator(
+                "stablegen.debug_skinning_weights",
+                text="Skinning Weight Colors",
+                icon="GROUP_VERTEX",
+            )
+            if width_mode == 'narrow':
+                row = debug_box.row()
+            row.operator(
+                "stablegen.debug_clear_skinning_weights",
+                text="Clear Skin Colors",
+                icon="X",
+            )
+
+            row = debug_box.row()
+            row.operator(
+                "stablegen.debug_convert_fortune_rig",
+                text="Convert Existing Rig to Fortune",
+                icon="ARMATURE_DATA",
+            )
+
+            row = debug_box.row()
             row.operator("stablegen.debug_make_solid", text="Debug Make Solid", icon="MOD_REMESH")
+
+            row = debug_box.row()
+            row.operator(
+                "stablegen.debug_force_generation_idle",
+                text="Force Generation Idle",
+                icon="CANCEL",
+            )
 
         # --- Narrow panel hint ---
         if width_mode == 'narrow':

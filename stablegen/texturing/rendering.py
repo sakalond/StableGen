@@ -7,6 +7,8 @@ import bpy, bmesh  # pylint: disable=import-error
 import numpy as np
 import mathutils
 from ..utils import get_file_path, get_dir_path, get_compositor_node_tree, configure_output_node_paths, get_eevee_engine_id, sg_modal_active, remove_empty_dirs
+from ..mesh_gen.rig_display import configure_gltf_not_exported_visibility
+from .pose_lock import ensure_texturing_frame
 from PIL import Image
 import cv2
 
@@ -900,8 +902,7 @@ def _export_emit_image_impl(context, to_export, camera_id=None, bg_color=(0.5, 0
         :return: None
         """
         print("[StableGen] Exporting emit render")
-        if not getattr(context.scene, 'sg_rework_consistent_frame', False):
-            context.scene.frame_set(1)
+        ensure_texturing_frame(context.scene)
         # Store original materials and create temporary ones
         original_materials = {}
         temporary_materials = {}
@@ -1161,8 +1162,7 @@ def _export_render_impl(context, camera_id=None, output_dir=None, filename=None)
     """
     print("[StableGen] Exporting render using Workbench")
 
-    if not getattr(context.scene, 'sg_rework_consistent_frame', False):
-        context.scene.frame_set(1)
+    ensure_texturing_frame(context.scene)
 
     # Setup output path
     if output_dir is None:
@@ -1521,21 +1521,26 @@ def _export_visibility_impl(context, to_export, obj=None, camera_visibility=None
             bpy.data.materials.remove(mat_copy)
             return False
 
-        # Confidence-owned sequential materials expose the original source
-        # quality explicitly.  Build repair = visible surface & ~trusted from
-        # that socket instead of reverse-engineering RGB or summed blend
-        # weights.  The copied material is used only by this render.
-        owner_quality = next(
-            (node for node in nodes if node.label == 'SGOwnerQuality'), None
+        # Reworked sequential materials expose source acquisition quality
+        # independently from RGB fusion. Prefer that max-quality signal; old
+        # ownership graphs remain supported as a compatibility fallback.
+        source_quality = next(
+            (node for node in nodes if node.label == 'SGBestSourceQuality'),
+            None,
         )
-        if owner_quality is not None:
+        if source_quality is None:
+            source_quality = next(
+                (node for node in nodes if node.label == 'SGOwnerQuality'),
+                None,
+            )
+        if source_quality is not None:
             trusted = nodes.new("ShaderNodeMath")
             trusted.operation = 'GREATER_THAN'
             trusted.inputs[1].default_value = float(getattr(
                 context.scene, 'qwen_trust_threshold', 0.7
             )) - 1e-7
             trusted.label = "SGTrustedContext"
-            links.new(owner_quality.outputs[0], trusted.inputs[0])
+            links.new(source_quality.outputs[0], trusted.inputs[0])
 
             repair = nodes.new("ShaderNodeMath")
             repair.operation = 'SUBTRACT'
@@ -2085,48 +2090,16 @@ def _is_gltf_not_exported_helper(obj):
     return False
 
 
-def _iter_collection_objects_recursive(collection):
-    seen = set()
-
-    def visit(col):
-        for obj in col.objects:
-            if obj.name in seen:
-                continue
-            seen.add(obj.name)
-            yield obj
-        for child in col.children:
-            yield from visit(child)
-
-    yield from visit(collection)
-
-
-def _disable_not_exported_render_helpers(context=None):
-    """Prevent glTF helper/control geometry from occluding texture bakes."""
-    disabled_objects = 0
-    disabled_collections = 0
-
-    for collection in bpy.data.collections:
-        if "not_exported" not in collection.name.lower():
-            continue
-
-        if not collection.hide_render:
-            collection.hide_render = True
-            disabled_collections += 1
-
-        for obj in _iter_collection_objects_recursive(collection):
-            if not obj.hide_render:
-                obj.hide_render = True
-                disabled_objects += 1
-
-    if disabled_objects or disabled_collections:
+def _configure_not_exported_helpers(context=None):
+    """Keep glTF helpers out of bakes using visible collection controls."""
+    stats = configure_gltf_not_exported_visibility(context or bpy.context)
+    if stats["collections"]:
         print(
-            "[StableGen] Disabled render visibility for "
-            f"{disabled_objects} glTF not_exported helper object(s) "
-            f"across {disabled_collections} collection(s)."
+            "[StableGen] Hid glTF not_exported helpers through "
+            f"{stats['layer_collections']} view-layer eye toggle(s) and "
+            f"{stats['collections']} collection render toggle(s); cleared "
+            f"{stats['object_flags_cleared']} buried object flag(s)."
         )
-
-    if context:
-        context.view_layer.update()
 
 
 def _object_visible_in_view_layer(obj):
@@ -2283,7 +2256,7 @@ def bake_texture(context, obj, texture_resolution, suffix = "", view_transform =
         :param obj: Blender object.         
         :return: True if successful, False otherwise. 
         """
-        _disable_not_exported_render_helpers(context)
+        _configure_not_exported_helpers(context)
         if _is_gltf_not_exported_helper(obj) or _is_bone_custom_shape_object(obj):
             print(f"[StableGen] Skipping helper mesh during bake: {obj.name}")
             return False
@@ -2577,7 +2550,7 @@ def bake_pbr_channel(context, obj, channel_name, texture_resolution, output_dir)
     if not obj.data.materials or not obj.active_material:
         return None
 
-    _disable_not_exported_render_helpers(context)
+    _configure_not_exported_helpers(context)
     if _is_gltf_not_exported_helper(obj) or _is_bone_custom_shape_object(obj):
         print(f"[StableGen] Skipping helper mesh during PBR bake: {obj.name}")
         return None
@@ -2585,131 +2558,128 @@ def bake_pbr_channel(context, obj, channel_name, texture_resolution, output_dir)
     # ── Save state ─────────────────────────────────────────────────
     orig_vt = context.scene.view_settings.view_transform
     orig_render = obj.hide_render
+    original_material_state = _snapshot_material_state(obj)
+    original_active_uv = (
+        obj.data.uv_layers.active.name
+        if obj.data.uv_layers.active else None
+    )
     context.scene.view_settings.view_transform = 'Standard'
     obj.hide_render = False
     source_uv_name = _first_source_uv_name(obj)
     _set_bake_uv_active(obj)
 
     # ── Copy material onto the object ──────────────────────────────
-    original_materials = list(obj.data.materials)
-    original_active = obj.active_material
-    mat_copy = original_active.copy()
-    obj.data.materials.clear()
-    obj.data.materials.append(mat_copy)
-    mat_copy.use_nodes = True
-    nodes = mat_copy.node_tree.nodes
-    links = mat_copy.node_tree.links
+    mat_copy = None
+    try:
+        mat_copy = obj.active_material.copy()
+        obj.data.materials.clear()
+        obj.data.materials.append(mat_copy)
+        mat_copy.use_nodes = True
+        nodes = mat_copy.node_tree.nodes
+        links = mat_copy.node_tree.links
 
-    # ── Find source socket in the copy ─────────────────────────────
-    sources = _find_pbr_bake_sources(mat_copy)
-    source_socket = sources.get(channel_name)
-    if source_socket is None:
-        _restore_materials(obj, original_materials, original_active)
-        bpy.data.materials.remove(mat_copy)
-        context.scene.view_settings.view_transform = orig_vt
-        obj.hide_render = orig_render
-        return None
+        # ── Find source socket in the copy ─────────────────────────
+        sources = _find_pbr_bake_sources(mat_copy)
+        source_socket = sources.get(channel_name)
+        if source_socket is None:
+            return None
 
-    # ── Find Output node ───────────────────────────────────────────
-    output_node = None
-    for n in nodes:
-        if n.type == 'OUTPUT_MATERIAL':
-            output_node = n
-            break
-    if not output_node:
-        _restore_materials(obj, original_materials, original_active)
-        bpy.data.materials.remove(mat_copy)
-        context.scene.view_settings.view_transform = orig_vt
-        obj.hide_render = orig_render
-        return None
-
-    # ── Rewire material for baking ───────────────────────────────
-    # Normal channel: use Cycles' built-in NORMAL bake which automatically
-    # converts to tangent space — game-engine / glTF compatible regardless
-    # of the original normal mode (world, bump, tangent).
-    # All other channels: rewire source → Emission → Output for EMIT bake.
-    bake_type = 'EMIT'
-    if channel_name == 'normal':
-        # Keep the Principled BSDF wired to the Output with the Normal
-        # input connected.  Cycles NORMAL bake evaluates the shader's
-        # final shading normal and converts it to tangent space for us.
-        bake_type = 'NORMAL'
-        # Ensure the normal influence is at full strength for baking
-        principled = None
-        for n in nodes:
-            if n.type == 'BSDF_PRINCIPLED':
-                principled = n
+        # ── Find Output node ───────────────────────────────────────
+        output_node = None
+        for node in nodes:
+            if node.type == 'OUTPUT_MATERIAL':
+                output_node = node
                 break
-        if principled and principled.inputs.get("Normal") and principled.inputs["Normal"].links:
-            nmap_node = principled.inputs["Normal"].links[0].from_node
-            if nmap_node.type == 'NORMAL_MAP':
-                nmap_node.inputs["Strength"].default_value = 1.0
-    else:
-        for link in list(output_node.inputs["Surface"].links):
-            links.remove(link)
+        if not output_node:
+            return None
 
-        emit_node = nodes.new("ShaderNodeEmission")
-        emit_node.location = (output_node.location[0] - 200,
-                              output_node.location[1])
-        links.new(source_socket, emit_node.inputs["Color"])
-        links.new(emit_node.outputs["Emission"],
-                  output_node.inputs["Surface"])
-
-    # ── Bake target image ──────────────────────────────────────────
-    suffix = _PBR_CHANNEL_SUFFIXES.get(channel_name, channel_name)
-    img_name = f"{obj.name}_{suffix}"
-    bake_img = bpy.data.images.new(name=img_name,
-                                   width=texture_resolution,
-                                   height=texture_resolution)
-
-    # Non-color channels (roughness, metallic, normal, height, AO) must be
-    # stored in linear / Non-Color so the round-trip is lossless:
-    #   Cycles linear → raw 8-bit → PNG → load as Non-Color → linear.
-    # Without this, the default sRGB image applies gamma encoding on write,
-    # but add_baked_material() loads them as Non-Color (no decode) →
-    # values are gamma-shifted (e.g. roughness 0.22 → 0.50).
-    if channel_name not in ('base_color', 'emission'):
-        bake_img.colorspace_settings.name = 'Non-Color'
-
-    tex_node = nodes.new("ShaderNodeTexImage")
-    tex_node.image = bake_img
-    nodes.active = tex_node
-
-    # ── Select object + non-projection UV ──────────────────────────
-    op_context = _activate_mesh_for_object_ops(obj)
-    _pin_unlinked_image_textures_to_uv(
-        nodes, links, source_uv_name, exclude_nodes={tex_node})
-    _set_bake_uv_active(obj)
-
-    # ── Bake ─────────────────────────────────────────────────────
-    # Ensure OBJECT mode — bake fails silently in EDIT mode
-    with bpy.context.temp_override(**op_context):
-        if bpy.context.mode != 'OBJECT':
-            bpy.ops.object.mode_set(mode='OBJECT')
-        if bake_type == 'NORMAL':
-            bpy.ops.object.bake(type='NORMAL',
-                                normal_space='TANGENT',
-                                width=texture_resolution,
-                                height=texture_resolution)
+        # ── Rewire material for baking ─────────────────────────────
+        # Normal channel uses Cycles' tangent-space NORMAL bake. All other
+        # channels route their source through Emission for an exact value bake.
+        bake_type = 'EMIT'
+        if channel_name == 'normal':
+            bake_type = 'NORMAL'
+            principled = next(
+                (node for node in nodes if node.type == 'BSDF_PRINCIPLED'),
+                None,
+            )
+            if (principled and principled.inputs.get("Normal")
+                    and principled.inputs["Normal"].links):
+                nmap_node = principled.inputs["Normal"].links[0].from_node
+                if nmap_node.type == 'NORMAL_MAP':
+                    nmap_node.inputs["Strength"].default_value = 1.0
         else:
-            bpy.ops.object.bake(type='EMIT',
-                                width=texture_resolution,
-                                height=texture_resolution)
+            for link in list(output_node.inputs["Surface"].links):
+                links.remove(link)
 
-    # ── Save ───────────────────────────────────────────────────────
-    os.makedirs(output_dir, exist_ok=True)
-    out_path = os.path.join(output_dir, f"{obj.name}_{suffix}.png")
-    bake_img.filepath_raw = out_path
-    bake_img.file_format = 'PNG'
-    bake_img.save()
-    print(f"[StableGen]     Saved PBR channel: {out_path}")
+            emit_node = nodes.new("ShaderNodeEmission")
+            emit_node.location = (
+                output_node.location[0] - 200,
+                output_node.location[1],
+            )
+            links.new(source_socket, emit_node.inputs["Color"])
+            links.new(
+                emit_node.outputs["Emission"],
+                output_node.inputs["Surface"],
+            )
 
-    # ── Cleanup ────────────────────────────────────────────────────
-    _restore_materials(obj, original_materials, original_active)
-    bpy.data.materials.remove(mat_copy)
-    context.scene.view_settings.view_transform = orig_vt
-    obj.hide_render = orig_render
-    return out_path
+        # ── Bake target image ──────────────────────────────────────
+        suffix = _PBR_CHANNEL_SUFFIXES.get(channel_name, channel_name)
+        img_name = f"{obj.name}_{suffix}"
+        bake_img = bpy.data.images.new(
+            name=img_name,
+            width=texture_resolution,
+            height=texture_resolution,
+        )
+        if channel_name not in ('base_color', 'emission'):
+            bake_img.colorspace_settings.name = 'Non-Color'
+
+        tex_node = nodes.new("ShaderNodeTexImage")
+        tex_node.image = bake_img
+        nodes.active = tex_node
+
+        # ── Select object + non-projection UV ──────────────────────
+        op_context = _activate_mesh_for_object_ops(obj)
+        _pin_unlinked_image_textures_to_uv(
+            nodes, links, source_uv_name, exclude_nodes={tex_node})
+        _set_bake_uv_active(obj)
+
+        # ── Bake ───────────────────────────────────────────────────
+        with bpy.context.temp_override(**op_context):
+            if bpy.context.mode != 'OBJECT':
+                bpy.ops.object.mode_set(mode='OBJECT')
+            if bake_type == 'NORMAL':
+                bpy.ops.object.bake(
+                    type='NORMAL',
+                    normal_space='TANGENT',
+                    width=texture_resolution,
+                    height=texture_resolution,
+                )
+            else:
+                bpy.ops.object.bake(
+                    type='EMIT',
+                    width=texture_resolution,
+                    height=texture_resolution,
+                )
+
+        # ── Save ───────────────────────────────────────────────────
+        os.makedirs(output_dir, exist_ok=True)
+        out_path = os.path.join(output_dir, f"{obj.name}_{suffix}.png")
+        bake_img.filepath_raw = out_path
+        bake_img.file_format = 'PNG'
+        bake_img.save()
+        print(f"[StableGen]     Saved PBR channel: {out_path}")
+        return out_path
+    finally:
+        # This must run for missing channels, missing outputs, failed Cycles
+        # bakes, failed image saves, and successful bakes alike.
+        _restore_material_state(obj, original_material_state)
+        if mat_copy and mat_copy.name in bpy.data.materials:
+            bpy.data.materials.remove(mat_copy)
+        if original_active_uv and obj.data.uv_layers.get(original_active_uv):
+            obj.data.uv_layers.active = obj.data.uv_layers[original_active_uv]
+        context.scene.view_settings.view_transform = orig_vt
+        obj.hide_render = orig_render
 
 
 def _flip_normal_green(filepath):
@@ -2942,7 +2912,7 @@ class BakeTextures(bpy.types.Operator):
         :return: {'RUNNING_MODAL'}     
         """
 
-        _disable_not_exported_render_helpers(context)
+        _configure_not_exported_helpers(context)
         self._objects, skipped = _texture_bake_targets(self._objects)
         if skipped:
             names = ", ".join(obj.name for obj in skipped[:5])

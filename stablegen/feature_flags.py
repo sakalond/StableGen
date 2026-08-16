@@ -17,6 +17,8 @@ TEXTURING_REWORK_DEFAULTS = {
     "sg_rework_consistent_frame": False,
     "sg_rework_workflow_validation": False,
     "sg_rework_qwen_workflow": False,
+    "qwen_global_style_vlm_only": False,
+    "qwen_latent_locked_context": False,
     "sg_rework_final_display": False,
     "qwen_use_confidence_context": False,
     "qwen_regularize_context_mask": False,

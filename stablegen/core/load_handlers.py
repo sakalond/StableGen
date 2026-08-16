@@ -25,6 +25,17 @@ def load_handler(dummy):
 
     scene = bpy.context.scene
 
+    # Modal operators and worker sockets cannot survive loading a .blend.
+    # Older files may nevertheless contain the serialized transient value
+    # "running" or "waiting", which leaves the Generate button permanently
+    # stuck after reopening. Runtime status is SKIP_SAVE now, but normalize
+    # legacy files as well.
+    for loaded_scene in bpy.data.scenes:
+        if getattr(loaded_scene, "generation_status", 'idle') != 'idle':
+            loaded_scene.generation_status = 'idle'
+        if hasattr(loaded_scene, "generation_progress"):
+            loaded_scene.generation_progress = 0.0
+
     # Pre-populate multi-color printing palette
     try:
         prepopulate_palette(scene)
