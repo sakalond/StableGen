@@ -1,6 +1,6 @@
-"""Batch DAE import + texture generation pipeline.
+"""Batch model import + texture generation pipeline.
 
-Imports each .dae file, auto-places cameras, generates textures using
+Imports each DAE or GLB file, auto-places cameras, generates textures using
 the current scene settings, bakes, and exports to GLB — all without
 user intervention.  Follows the same timer-based state-machine pattern
 as :pymod:`mesh_gen.batch`.
@@ -10,6 +10,11 @@ import os
 import bpy  # pylint: disable=import-error
 
 from ..utils import sg_modal_active
+from .batch_manifest import (
+    discover_model_files,
+    filename_contains_model_stem,
+    load_batch_manifest,
+)
 
 # Reference image filenames (checked in order)
 _REF_NAMES = ('ref.png', 'ref.jpg', 'ref.jpeg')
@@ -19,7 +24,7 @@ _IMAGE_EXTS = {'.png', '.jpg', '.jpeg', '.webp', '.bmp', '.tiff'}
 _batch_state = {
     'active': False,
     'cancelled': False,
-    'files': [],          # list of (abs_path, rel_path)
+    'files': [],          # validated model-entry dictionaries
     'index': -1,
     'total': 0,
     'top_dir': '',        # root directory (for fallback ref image)
@@ -58,22 +63,26 @@ def _sync_wm():
 
 # ── Reference image resolution ──────────────────────────────────────────────
 
-def _find_ref_image(dae_path, top_dir, ref_dir=''):
+def _find_ref_image(model_path, top_dir, ref_dir='', explicit_ref=''):
     """Return the path to a reference image for this model, or ''.
 
     Search order:
-    1. Separate reference directory (*ref_dir*): find an image file whose
-       name contains the building number (stem of the .dae filename) in the
-       matching subdirectory.
-    2. Same subdirectory as the .dae file: look for ref.png / ref.jpg / ref.jpeg.
-    3. Top-level model directory fallback: same ref names at *top_dir*.
+    An explicit manifest reference always wins. Otherwise, search a separate
+    reference tree using a token-safe model-stem match, then ``ref.*``
+    fallbacks beside the model and in the configured roots.
     """
-    dae_stem = os.path.splitext(os.path.basename(dae_path))[0]
-    dae_dir = os.path.dirname(dae_path)
+    if explicit_ref:
+        if os.path.isfile(explicit_ref):
+            return explicit_ref
+        print(f"[BatchTex] Explicit reference is missing: {explicit_ref}")
+        return ''
+
+    model_stem = os.path.splitext(os.path.basename(model_path))[0]
+    model_dir = os.path.dirname(model_path)
 
     # 1. Separate reference image directory (building-specific match)
     if ref_dir and os.path.isdir(ref_dir):
-        rel = os.path.relpath(dae_dir, top_dir)
+        rel = os.path.relpath(model_dir, top_dir)
         # Try the full relative path first, then progressively shorter
         # suffixes (e.g. "3D_modely/Úzká" → "Úzká") so the ref dir
         # doesn't need to replicate the exact model-tree prefix.
@@ -86,20 +95,21 @@ def _find_ref_image(dae_path, top_dir, ref_dir=''):
                 continue
             for name in sorted(os.listdir(search_dir)):
                 ext = os.path.splitext(name)[1].lower()
-                if ext in _IMAGE_EXTS and dae_stem in name:
+                if (ext in _IMAGE_EXTS and
+                        filename_contains_model_stem(name, model_stem)):
                     return os.path.join(search_dir, name)
     elif ref_dir:
         print(f"[BatchTex] ref_dir={ref_dir!r} isdir={os.path.isdir(ref_dir)}")
 
     # 2. Same directory as the .dae file (subdir-level fallback)
     for name in _REF_NAMES:
-        candidate = os.path.join(dae_dir, name)
+        candidate = os.path.join(model_dir, name)
         if os.path.isfile(candidate):
             return candidate
 
     # 3. Separate ref dir — subdirectory fallback ref image
     if ref_dir and os.path.isdir(ref_dir):
-        rel = os.path.relpath(dae_dir, top_dir)
+        rel = os.path.relpath(model_dir, top_dir)
         parts = rel.replace('\\', '/').split('/')
         candidates = [os.path.join(*parts[i:]) for i in range(len(parts))]
         candidates.append('.')
@@ -122,10 +132,121 @@ def _find_ref_image(dae_path, top_dir, ref_dir=''):
 
 # ── Phase handlers ──────────────────────────────────────────────────────────
 
+def _center_meshes_at_origin(objects):
+    """Center mesh bounds in XY and place the lowest point on Z=0."""
+    import mathutils  # pylint: disable=import-error
+
+    corners = []
+    for obj in objects:
+        corners.extend(obj.matrix_world @ mathutils.Vector(corner)
+                       for corner in obj.bound_box)
+    if not corners:
+        return
+    center_x = (min(point.x for point in corners) +
+                max(point.x for point in corners)) / 2.0
+    center_y = (min(point.y for point in corners) +
+                max(point.y for point in corners)) / 2.0
+    bottom_z = min(point.z for point in corners)
+    for obj in objects:
+        obj.location.x -= center_x
+        obj.location.y -= center_y
+        obj.location.z -= bottom_z
+
+
+def _scale_meshes(objects, target_size):
+    """Uniformly scale meshes so their largest world-space extent matches."""
+    if target_size <= 0:
+        return
+    import mathutils  # pylint: disable=import-error
+
+    corners = []
+    for obj in objects:
+        corners.extend(obj.matrix_world @ mathutils.Vector(corner)
+                       for corner in obj.bound_box)
+    if not corners:
+        return
+    extent = max(
+        max(point.x for point in corners) - min(point.x for point in corners),
+        max(point.y for point in corners) - min(point.y for point in corners),
+        max(point.z for point in corners) - min(point.z for point in corners),
+    )
+    if extent < 1e-6:
+        return
+    factor = target_size / extent
+    for obj in objects:
+        obj.scale *= factor
+
+
+def _import_glb(filepath, settings):
+    """Import an already-simplified GLB and prepare it for retexturing.
+
+    Libuše GLBs are output from the project's simplification pipeline. Heavy
+    DAE cleanup (interior removal, fan repair, remeshing) would alter that
+    verified geometry, so GLB preparation is deliberately light: remove
+    non-mesh scene nodes, strip the old baked material, join meshes, normalize
+    placement, and apply scale.
+    """
+    result = bpy.ops.import_scene.gltf(filepath=filepath)
+    if 'FINISHED' not in result:
+        raise RuntimeError("Blender GLB importer did not finish")
+
+    context = bpy.context
+    meshes = [obj for obj in context.scene.objects if obj.type == 'MESH']
+    if not meshes:
+        raise RuntimeError("GLB contains no mesh objects")
+
+    # Detach meshes while preserving world transforms, then remove imported
+    # empties, cameras, and lights so they cannot influence camera setup.
+    for obj in meshes:
+        world_matrix = obj.matrix_world.copy()
+        obj.parent = None
+        obj.matrix_world = world_matrix
+    for obj in list(context.scene.objects):
+        if obj.type != 'MESH':
+            bpy.data.objects.remove(obj, do_unlink=True)
+
+    # Apply the imported scene graph before joining separate mesh nodes.
+    bpy.ops.object.select_all(action='DESELECT')
+    for obj in meshes:
+        obj.select_set(True)
+    context.view_layer.objects.active = meshes[0]
+    bpy.ops.object.transform_apply(location=False, rotation=False, scale=True)
+
+    if len(meshes) > 1:
+        bpy.ops.object.join()
+        meshes = [context.view_layer.objects.active]
+
+    from . import cleanup
+    if settings.get('strip_materials', True):
+        cleanup.strip_materials_and_apply_clean(meshes[0])
+
+    if settings.get('center_origin', True):
+        _center_meshes_at_origin(meshes)
+    _scale_meshes(meshes, settings.get('auto_scale', 0.0))
+
+    bpy.ops.object.select_all(action='DESELECT')
+    for obj in meshes:
+        obj.select_set(True)
+    context.view_layer.objects.active = meshes[0]
+    bpy.ops.object.transform_apply(location=False, rotation=False, scale=True)
+
+    shading = settings.get('shading_mode', 'FLAT')
+    if shading == 'SMOOTH':
+        bpy.ops.object.shade_smooth()
+    elif shading == 'AUTO':
+        cleanup.auto_smooth_shading(meshes[0])
+    else:
+        bpy.ops.object.shade_flat()
+
+    vertices = sum(len(obj.data.vertices) for obj in meshes)
+    faces = sum(len(obj.data.polygons) for obj in meshes)
+    print(f"[BatchTex] GLB import complete: {vertices} verts, {faces} faces")
+
+
 def _do_import():
-    """Import the current DAE file.  Returns True on success."""
+    """Import the current DAE or GLB file. Returns True on success."""
     state = _batch_state
-    filepath = state['files'][state['index']][0]
+    filepath = state['files'][state['index']]['model_path']
     settings = state['settings']
 
     # Clear scene
@@ -133,22 +254,30 @@ def _do_import():
     bpy.ops.object.delete(use_global=False)
 
     try:
-        bpy.ops.stablegen.import_dae(
-            filepath=filepath,
-            merge_threshold=settings.get('merge_threshold', 0.001),
-            remove_interior=settings.get('remove_interior', True),
-            remove_ground=settings.get('remove_ground', True),
-            strip_materials=settings.get('strip_materials', True),
-            topology_method=settings.get('topology_method', 'FIX_FANS'),
-            edge_ratio=settings.get('edge_ratio', 2.5),
-            equalize_iterations=settings.get('equalize_iterations', 4),
-            voxel_size=settings.get('voxel_size', 0.0),
-            auto_scale=settings.get('auto_scale', 0.0),
-            shading_mode=settings.get('shading_mode', 'FLAT'),
-            center_origin=settings.get('center_origin', True),
-            join_meshes=True,
-            triangulate=settings.get('triangulate', True),
-        )
+        extension = os.path.splitext(filepath)[1].lower()
+        if extension == '.dae':
+            result = bpy.ops.stablegen.import_dae(
+                filepath=filepath,
+                merge_threshold=settings.get('merge_threshold', 0.001),
+                remove_interior=settings.get('remove_interior', True),
+                remove_ground=settings.get('remove_ground', True),
+                strip_materials=settings.get('strip_materials', True),
+                topology_method=settings.get('topology_method', 'FIX_FANS'),
+                edge_ratio=settings.get('edge_ratio', 2.5),
+                equalize_iterations=settings.get('equalize_iterations', 4),
+                voxel_size=settings.get('voxel_size', 0.0),
+                auto_scale=settings.get('auto_scale', 0.0),
+                shading_mode=settings.get('shading_mode', 'FLAT'),
+                center_origin=settings.get('center_origin', True),
+                join_meshes=True,
+                triangulate=settings.get('triangulate', True),
+            )
+            if 'FINISHED' not in result:
+                raise RuntimeError("StableGen DAE importer did not finish")
+        elif extension == '.glb':
+            _import_glb(filepath, settings)
+        else:
+            raise ValueError(f"Unsupported model format: {extension}")
         return True
     except Exception as exc:  # noqa: BLE001
         print(f"[BatchTex] FAILED to import: {exc}")
@@ -213,9 +342,11 @@ def _do_cameras():
 def _do_set_ref_image():
     """Set the reference image for the current model on the scene properties."""
     state = _batch_state
-    filepath = state['files'][state['index']][0]
+    entry = state['files'][state['index']]
+    filepath = entry['model_path']
     ref = _find_ref_image(filepath, state['top_dir'],
-                          state['settings'].get('ref_image_dir', ''))
+                          state['settings'].get('ref_image_dir', ''),
+                          entry.get('reference_path', ''))
     scene = bpy.context.scene
     arch = getattr(scene, 'model_architecture', 'sdxl')
 
@@ -401,13 +532,9 @@ def _apply_baked_material(context, obj):
 def _do_export():
     """Export the current textured mesh to GLB."""
     state = _batch_state
-    rel_path = state['files'][state['index']][1]
-    name = os.path.splitext(os.path.basename(rel_path))[0]
-    rel_dir = os.path.dirname(rel_path)
-    file_out_dir = os.path.join(state['out_dir'], rel_dir) if rel_dir else state['out_dir']
-    os.makedirs(file_out_dir, exist_ok=True)
-
-    out_path = os.path.join(file_out_dir, f"{name}.glb")
+    entry = state['files'][state['index']]
+    out_path = os.path.join(state['out_dir'], entry['output_relative_path'])
+    os.makedirs(os.path.dirname(out_path), exist_ok=True)
 
     # Select all mesh objects
     bpy.ops.object.select_all(action='DESELECT')
@@ -448,12 +575,10 @@ def _batch_tex_tick():
         next_idx = state['index'] + 1
         # Skip files whose output GLB already exists (resume support)
         while next_idx < state['total']:
-            rel_path = state['files'][next_idx][1]
-            name = os.path.splitext(os.path.basename(rel_path))[0]
-            rel_dir = os.path.dirname(rel_path)
-            file_out_dir = (os.path.join(state['out_dir'], rel_dir)
-                           if rel_dir else state['out_dir'])
-            out_path = os.path.join(file_out_dir, f"{name}.glb")
+            entry = state['files'][next_idx]
+            rel_path = entry['relative_path']
+            out_path = os.path.join(
+                state['out_dir'], entry['output_relative_path'])
             if os.path.exists(out_path):
                 print(f"[BatchTex] Skipping {next_idx + 1}/{state['total']}: "
                       f"{rel_path} (already exported)")
@@ -471,7 +596,7 @@ def _batch_tex_tick():
         state['index'] = next_idx
         state['phase'] = 'import'
         _sync_wm()
-        rel = state['files'][next_idx][1]
+        rel = state['files'][next_idx]['relative_path']
         print(f"[BatchTex] {next_idx + 1}/{state['total']}: {rel}")
         return _TICK_INTERVAL
 
@@ -573,21 +698,21 @@ def _batch_tex_tick():
 # ── Operators ───────────────────────────────────────────────────────────────
 
 class BatchTextureDAE(bpy.types.Operator):
-    """Batch import .dae files, auto-place cameras, generate textures,
+    """Batch import DAE/GLB files, auto-place cameras, generate textures,
     bake, and export to .glb — fully automated pipeline."""
 
     bl_idname = "stablegen.batch_texture_dae"
-    bl_label = "Batch Texture DAE Files"
+    bl_label = "Batch Texture DAE / GLB Files"
     bl_options = {'REGISTER'}
 
     directory: bpy.props.StringProperty(
         name="Directory",
-        description="Directory containing .dae files",
+        description="Directory containing DAE/GLB files or a batch manifest",
         subtype='DIR_PATH',
     )  # type: ignore
 
     filter_glob: bpy.props.StringProperty(
-        default="*.dae",
+        default="*.dae;*.glb;*.csv",
         options={'HIDDEN'},
     )  # type: ignore
 
@@ -601,6 +726,16 @@ class BatchTextureDAE(bpy.types.Operator):
         name="Recursive",
         description="Scan subdirectories recursively",
         default=True,
+    )  # type: ignore
+
+    manifest_path: bpy.props.StringProperty(
+        name="Batch Manifest",
+        description=(
+            "Optional CSV with model_path, reference_path, and output_path. "
+            "Manifest paths are exact and relative to the CSV location"
+        ),
+        default="",
+        subtype='FILE_PATH',
     )  # type: ignore
 
     ref_image_dir: bpy.props.StringProperty(
@@ -720,6 +855,7 @@ class BatchTextureDAE(bpy.types.Operator):
         box = layout.box()
         box.prop(self, "output_dir")
         box.prop(self, "recursive")
+        box.prop(self, "manifest_path")
         box.prop(self, "ref_image_dir")
         box.prop(self, "bake")
         if self.bake:
@@ -758,27 +894,36 @@ class BatchTextureDAE(bpy.types.Operator):
         box.label(text="Camera placement uses TRELLIS.2 camera settings")
 
     def execute(self, context):
-        if not self.directory or not os.path.isdir(self.directory):
-            self.report({'ERROR'}, "No valid directory selected")
+        manifest_path = bpy.path.abspath(self.manifest_path).strip()
+        if manifest_path:
+            try:
+                top_dir, model_files = load_batch_manifest(manifest_path)
+            except ValueError as exc:
+                self.report({'ERROR'}, str(exc))
+                return {'CANCELLED'}
+        else:
+            top_dir = bpy.path.abspath(self.directory).rstrip('/\\')
+            if not top_dir or not os.path.isdir(top_dir):
+                self.report({'ERROR'}, "No valid model directory selected")
+                return {'CANCELLED'}
+            model_files = discover_model_files(top_dir, self.recursive)
+
+        if not model_files:
+            self.report({'WARNING'}, "No DAE or GLB files found")
             return {'CANCELLED'}
 
-        dae_files = self._collect_dae_files()
-        if not dae_files:
-            self.report({'WARNING'}, "No .dae files found")
-            return {'CANCELLED'}
-
-        out_dir = self.output_dir or os.path.join(
-            self.directory.rstrip('/\\'), "textured")
+        configured_output = bpy.path.abspath(self.output_dir).strip()
+        out_dir = configured_output or os.path.join(top_dir, "textured")
         os.makedirs(out_dir, exist_ok=True)
 
         scene = context.scene
         _batch_state.update({
             'active': True,
             'cancelled': False,
-            'files': dae_files,
+            'files': model_files,
             'index': -1,
-            'total': len(dae_files),
-            'top_dir': self.directory.rstrip('/\\'),
+            'total': len(model_files),
+            'top_dir': top_dir,
             'out_dir': out_dir,
             'phase': 'idle',
             'settle_count': 0,
@@ -820,26 +965,12 @@ class BatchTextureDAE(bpy.types.Operator):
         })
         _sync_wm()
 
-        self.report({'INFO'}, f"Batch texturing started: {len(dae_files)} file(s)")
-        print(f"[BatchTex] Starting: {len(dae_files)} file(s) from '{self.directory}'")
+        self.report({'INFO'},
+                    f"Batch texturing started: {len(model_files)} file(s)")
+        source = manifest_path or top_dir
+        print(f"[BatchTex] Starting: {len(model_files)} file(s) from '{source}'")
         bpy.app.timers.register(_batch_tex_tick, first_interval=0.1)
         return {'FINISHED'}
-
-    def _collect_dae_files(self):
-        root = self.directory.rstrip('/\\')
-        results = []
-        if self.recursive:
-            for dirpath, _dirs, files in os.walk(root):
-                for f in sorted(files):
-                    if f.lower().endswith('.dae'):
-                        abs_path = os.path.join(dirpath, f)
-                        rel_path = os.path.relpath(abs_path, root)
-                        results.append((abs_path, rel_path))
-        else:
-            for f in sorted(os.listdir(root)):
-                if f.lower().endswith('.dae'):
-                    results.append((os.path.join(root, f), f))
-        return results
 
 
 class BatchTextureDAECancel(bpy.types.Operator):

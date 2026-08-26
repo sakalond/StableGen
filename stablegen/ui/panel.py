@@ -2250,6 +2250,17 @@ class StableGenPanel(bpy.types.Panel):
             if width_mode == 'narrow':
                 row = tools_box.row()
             row.operator("stablegen.batch_import_dae", text="Batch Import DAE", icon="FILE_FOLDER")
+            row = tools_box.row()
+            row.operator(
+                "stablegen.batch_texture_dae",
+                text="Batch Texture DAE / GLB",
+                icon="TEXTURE",
+            )
+            row.operator(
+                "stablegen.batch_texture_dae_cancel",
+                text="Cancel Batch",
+                icon="CANCEL",
+            )
         
         row = tools_box.row()
         if config_error_message:

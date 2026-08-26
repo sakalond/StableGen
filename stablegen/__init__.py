@@ -211,7 +211,9 @@ def register():
 
 def unregister():
     from .mesh_gen.batch import unregister_batch
+    from .dae_import.batch_texture import unregister_batch_texture
     unregister_batch()
+    unregister_batch_texture()
     cleanup_retarget_overlays()
 
     unregister_properties(
