@@ -340,14 +340,23 @@ def _do_cameras():
 
 
 def _do_set_ref_image():
-    """Set the reference image for the current model on the scene properties."""
+    """Set this model's reference image and never retain the previous one."""
     state = _batch_state
     entry = state['files'][state['index']]
     filepath = entry['model_path']
+    scene = bpy.context.scene
+
+    # A valid path from the previous house must never leak into this one when
+    # lookup fails. Clear both supported reference mechanisms before looking
+    # up the current entry.
+    scene.use_ipadapter = False
+    scene.ipadapter_image = ""
+    scene.qwen_use_external_style_image = False
+    scene.qwen_external_style_image = ""
+
     ref = _find_ref_image(filepath, state['top_dir'],
                           state['settings'].get('ref_image_dir', ''),
                           entry.get('reference_path', ''))
-    scene = bpy.context.scene
     arch = getattr(scene, 'model_architecture', 'sdxl')
 
     if ref:
@@ -361,20 +370,10 @@ def _do_set_ref_image():
         elif arch == 'flux1':
             scene.use_ipadapter = True
             scene.ipadapter_image = ref
+        return True
     else:
         print("[BatchTex] No reference image found")
-        # If the currently set path doesn't exist, disable IPAdapter
-        # to avoid validation errors (e.g. paths from another machine).
-        if arch == 'sdxl' and scene.use_ipadapter:
-            cur = bpy.path.abspath(scene.ipadapter_image)
-            if not cur or not os.path.isfile(cur):
-                scene.use_ipadapter = False
-                print("[BatchTex] Disabled IPAdapter (path not found)")
-        elif arch in ('qwen_image_edit', 'flux2_klein') and scene.qwen_use_external_style_image:
-            cur = bpy.path.abspath(scene.qwen_external_style_image)
-            if not cur or not os.path.isfile(cur):
-                scene.qwen_use_external_style_image = False
-                print("[BatchTex] Disabled external style image (path not found)")
+        return False
 
 
 def _do_start_texturing():
@@ -620,8 +619,17 @@ def _batch_tex_tick():
             state['phase'] = 'idle'
             return _TICK_INTERVAL
 
-        # Set reference image before texturing
-        _do_set_ref_image()
+        # Set reference image before texturing. Manifest batches are strict:
+        # validation guarantees a reference for every row, so a lookup failure
+        # indicates unsafe state and must stop instead of generating with a
+        # stale or missing house image.
+        has_reference = _do_set_ref_image()
+        if (not has_reference and
+                state['settings'].get('require_reference', False)):
+            rel = state['files'][state['index']]['relative_path']
+            print(f"[BatchTex] Stopping: required reference missing for {rel}")
+            state['cancelled'] = True
+            return _TICK_INTERVAL
 
         state['phase'] = 'texturing'
         state['settle_count'] = 0
@@ -906,7 +914,21 @@ class BatchTextureDAE(bpy.types.Operator):
             if not top_dir or not os.path.isdir(top_dir):
                 self.report({'ERROR'}, "No valid model directory selected")
                 return {'CANCELLED'}
-            model_files = discover_model_files(top_dir, self.recursive)
+
+            # The file selector primarily populates ``directory``. When the
+            # prepared batch root is selected, automatically use its exact
+            # manifest instead of falling back to heuristic recursive lookup.
+            default_manifest = os.path.join(top_dir, "batch_manifest.csv")
+            if os.path.isfile(default_manifest):
+                manifest_path = default_manifest
+                try:
+                    top_dir, model_files = load_batch_manifest(manifest_path)
+                except ValueError as exc:
+                    self.report({'ERROR'}, str(exc))
+                    return {'CANCELLED'}
+                self.report({'INFO'}, "Using batch_manifest.csv from selected directory")
+            else:
+                model_files = discover_model_files(top_dir, self.recursive)
 
         if not model_files:
             self.report({'WARNING'}, "No DAE or GLB files found")
@@ -946,6 +968,7 @@ class BatchTextureDAE(bpy.types.Operator):
                 'bake_resolution': self.bake_resolution,
                 # Reference image directory
                 'ref_image_dir': self.ref_image_dir.rstrip('/\\') if self.ref_image_dir else '',
+                'require_reference': bool(manifest_path),
                 # Camera settings (read from current scene trellis2_* properties)
                 'camera_count': getattr(scene, 'trellis2_camera_count', 8),
                 'placement_mode': getattr(scene, 'trellis2_placement_mode', 'normal_weighted'),

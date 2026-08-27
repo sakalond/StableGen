@@ -153,5 +153,21 @@ def filename_contains_model_stem(filename: str, model_stem: str) -> bool:
     """Match a model stem without allowing house 25 to match house 250."""
     if not model_stem:
         return False
-    pattern = rf"(?<![0-9A-Za-z]){re.escape(model_stem)}(?![0-9A-Za-z])"
-    return re.search(pattern, filename, flags=re.IGNORECASE) is not None
+
+    # Libuse model files use names such as ``cp_162_3D_model.glb`` while the
+    # corresponding facade is named ``cp_162_001_col_cr_front.png``. Match
+    # both the complete stem and the house-id prefix, retaining token
+    # boundaries so cp_2 can never match cp_20 or cp_162.
+    stems = [model_stem]
+    house_stem = re.sub(
+        r"(?:[_\-\s]*3d[_\-\s]*model)$", "", model_stem,
+        flags=re.IGNORECASE,
+    ).rstrip("_- ")
+    if house_stem and house_stem.casefold() != model_stem.casefold():
+        stems.append(house_stem)
+
+    for stem in stems:
+        pattern = rf"(?<![0-9A-Za-z]){re.escape(stem)}(?![0-9A-Za-z])"
+        if re.search(pattern, filename, flags=re.IGNORECASE):
+            return True
+    return False
