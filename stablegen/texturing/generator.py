@@ -785,6 +785,7 @@ class ComfyUIGenerate(_PBRMixin, bpy.types.Operator):
         
         context.scene.generation_status = 'running'
         context.scene.sg_last_gen_error = False
+        context.scene.sg_last_gen_error_message = ""
         ComfyUIGenerate._is_running = True
 
         print("[StableGen] Executing ComfyUI Generation")
@@ -1141,7 +1142,12 @@ class ComfyUIGenerate(_PBRMixin, bpy.types.Operator):
                     # Bake the texture if it doesn't exist
                     self._stage = f"Baking UV Textures ({obj.name})"
                     prepare_baking(context)
-                    unwrap(obj, method='pack', overlap_only=True)
+                    unwrap(
+                        obj,
+                        method='pack',
+                        overlap_only=True,
+                        texture_resolution=2048,
+                    )
                     bake_texture(context, obj, texture_resolution=2048, output_dir=get_dir_path(context, "baked"))
                 
                 # Check if the material is compatible (uses projection shader)
@@ -1286,8 +1292,10 @@ class ComfyUIGenerate(_PBRMixin, bpy.types.Operator):
                 finally:
                     self._restore_texturing_pose(context)
                 if self._error:
-                    if self._error == "'25'" or self._error == "'111'" or self._error == "'5'":
-                        # Probably canceled by user, quietly return
+                    context.scene.sg_last_gen_error_message = str(self._error)
+                    if context.scene.generation_status == 'waiting':
+                        # Explicit cancellation is tracked by generation_status;
+                        # missing output-node keys are real generation failures.
                         context.scene.generation_status = 'idle'
                         context.scene.sg_last_gen_error = True
                         self.report({'WARNING'}, "Generation cancelled.")

@@ -6,7 +6,9 @@ user intervention.  Follows the same timer-based state-machine pattern
 as :pymod:`mesh_gen.batch`.
 """
 
+import json
 import os
+from datetime import datetime
 import bpy  # pylint: disable=import-error
 
 from ..utils import sg_modal_active
@@ -31,11 +33,16 @@ _batch_state = {
     'out_dir': '',
     'phase': 'idle',      # idle | import | cameras | texturing | bake | export
     'settle_count': 0,
+    'retry_count': 0,
+    'bake_retry_count': 0,
+    'failures': [],
     # Operator settings (copied from the invoking operator)
     'settings': {},
 }
 
 _SETTLE_TICKS = 12
+_BAKE_SETTLE_TICKS = 4
+_BAKE_RETRIES = 2
 _TICK_INTERVAL = 0.5
 
 
@@ -59,6 +66,126 @@ def _sync_wm():
         _redraw()
     except Exception:  # noqa: BLE001
         pass
+
+
+def _failure_report_path():
+    """Return the persistent report path for skipped batch entries."""
+    return os.path.join(_batch_state['out_dir'], 'batch_failures.json')
+
+
+def _load_failure_report(out_dir):
+    """Load failures from an earlier/resumed run, if present."""
+    path = os.path.join(out_dir, 'batch_failures.json')
+    try:
+        with open(path, 'r', encoding='utf-8') as handle:
+            data = json.load(handle)
+        failures = data.get('failures', [])
+        return failures if isinstance(failures, list) else []
+    except FileNotFoundError:
+        return []
+    except Exception as exc:  # noqa: BLE001
+        print(f"[BatchTex] Could not read existing failure report: {exc}")
+        return []
+
+
+def _write_failure_report():
+    """Atomically persist failures so an unattended run is auditable."""
+    state = _batch_state
+    path = _failure_report_path()
+    tmp_path = path + '.tmp'
+    payload = {
+        'schema': 1,
+        'updated_at': datetime.now().astimezone().isoformat(timespec='seconds'),
+        'total_models': state['total'],
+        'failure_count': len(state['failures']),
+        'failures': state['failures'],
+    }
+    try:
+        os.makedirs(state['out_dir'], exist_ok=True)
+        with open(tmp_path, 'w', encoding='utf-8') as handle:
+            json.dump(payload, handle, indent=2, ensure_ascii=False)
+            handle.write('\n')
+        os.replace(tmp_path, path)
+    except Exception as exc:  # noqa: BLE001
+        print(f"[BatchTex] Could not write failure report: {exc}")
+
+
+def _record_failure(stage, error, attempts=None):
+    """Record the current model's terminal failure once."""
+    state = _batch_state
+    entry = state['files'][state['index']]
+    record = {
+        'index': state['index'] + 1,
+        'relative_path': entry['relative_path'],
+        'model_path': entry['model_path'],
+        'reference_path': entry.get('reference_path', ''),
+        'output_relative_path': entry['output_relative_path'],
+        'stage': stage,
+        'error': str(error),
+        'attempts': (
+            int(attempts)
+            if attempts is not None else state['retry_count'] + 1
+        ),
+        'failed_at': datetime.now().astimezone().isoformat(timespec='seconds'),
+    }
+    # Replace an older record for the same output when a resumed run fails
+    # again, instead of accumulating indistinguishable duplicates.
+    state['failures'] = [
+        item for item in state['failures']
+        if item.get('output_relative_path') != entry['output_relative_path']
+    ]
+    state['failures'].append(record)
+    _write_failure_report()
+
+
+def _clear_generation_error():
+    """Reset per-attempt generation state before retrying a clean import."""
+    try:
+        scene = bpy.context.scene
+        scene.sg_last_gen_error = False
+        scene.sg_last_gen_error_message = ''
+        scene.generation_status = 'idle'
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def _retry_or_skip(stage, error):
+    """Retry the current model, or log and skip it after retries expire."""
+    state = _batch_state
+    max_retries = state['settings'].get('generation_retries', 2)
+    current_attempt = state['retry_count'] + 1
+    total_attempts = max_retries + 1
+    rel = state['files'][state['index']]['relative_path']
+
+    if state['retry_count'] < max_retries:
+        state['retry_count'] += 1
+        print(f"[BatchTex] {stage} failed for {rel}: {error}")
+        print(f"[BatchTex] Retrying current model "
+              f"(attempt {state['retry_count'] + 1}/{total_attempts})")
+        _clear_generation_error()
+        state['phase'] = 'import'
+        state['settle_count'] = 0
+        _sync_wm()
+        return _TICK_INTERVAL
+
+    _record_failure(stage, error)
+    print(f"[BatchTex] {stage} failed for {rel} after "
+          f"{current_attempt}/{total_attempts} attempt(s): {error}")
+
+    if state['settings'].get('continue_on_error', True):
+        print("[BatchTex] Skipping failed model and continuing batch")
+        _clear_generation_error()
+        state['phase'] = 'idle'
+        state['settle_count'] = 0
+        state['retry_count'] = 0
+        _sync_wm()
+        return _TICK_INTERVAL
+
+    print("[BatchTex] Stop-on-error is enabled — stopping batch")
+    state['active'] = False
+    state['phase'] = 'idle'
+    _sync_wm()
+    return None
 
 
 # ── Reference image resolution ──────────────────────────────────────────────
@@ -386,16 +513,18 @@ def _do_start_texturing():
     from .. import utils as _sg_utils
     _sg_utils._sg_bypass_modal_check = True
     try:
-        bpy.ops.object.test_stable('INVOKE_DEFAULT')
+        result = bpy.ops.object.test_stable('INVOKE_DEFAULT')
     finally:
         _sg_utils._sg_bypass_modal_check = False
+    if not ({'RUNNING_MODAL', 'FINISHED'} & set(result)):
+        raise RuntimeError(f"Texture generation operator returned {set(result)}")
     print("[BatchTex] Texture generation started")
 
 
 def _do_bake():
     """Bake textures for all mesh objects using the utility functions directly."""
     from ..texturing.rendering import prepare_baking, bake_texture
-    from ..utils import get_dir_path
+    from ..utils import get_dir_path, get_file_path
 
     settings = _batch_state['settings']
     tex_res = settings.get('bake_resolution', 2048)
@@ -403,11 +532,17 @@ def _do_bake():
     context = bpy.context
     original_engine = context.scene.render.engine
 
-    prepare_baking(context)
+    baked_objects = []
+    try:
+        prepare_baking(context)
 
-    mesh_objects = [obj for obj in context.scene.objects if obj.type == 'MESH']
-    for obj in mesh_objects:
-        try:
+        mesh_objects = [
+            obj for obj in context.scene.objects if obj.type == 'MESH'
+        ]
+        if not mesh_objects:
+            raise RuntimeError("No mesh objects available for baking")
+
+        for obj in mesh_objects:
             # ── Create a fresh BakeUV and unwrap directly ──
             # Remove all non-projection UV maps (DAE originals are per-material
             # SketchUp UVs, not suitable as a bake atlas)
@@ -457,22 +592,149 @@ def _do_bake():
                 bpy.ops.uv.smart_project(correct_aspect=False)
             bpy.ops.object.mode_set(mode='OBJECT')
 
-            bake_texture(context, obj, texture_resolution=tex_res,
-                         output_dir=get_dir_path(context, "baked"))
-            # Apply baked texture as a simple Principled BSDF material so
-            # GLB export sees a standard material instead of the complex
-            # StableGen projection node tree.
+            baked = bake_texture(
+                context,
+                obj,
+                texture_resolution=tex_res,
+                output_dir=get_dir_path(context, "baked"),
+            )
+            if not baked:
+                raise RuntimeError(f"Bake did not run for {obj.name}")
+
+            baked_path = get_file_path(
+                context, "baked", object_name=obj.name)
+            if not _baked_file_has_signal(baked_path):
+                raise RuntimeError(
+                    f"Bake output for {obj.name} is uniformly black; "
+                    "keeping the projection material and retrying"
+                )
+            baked_objects.append(obj)
+
+        # Only replace projection materials after every object has a verified
+        # bake. A failed attempt remains recoverable and can be retried.
+        for obj in baked_objects:
             _apply_baked_material(context, obj)
-        except Exception as exc:  # noqa: BLE001
-            print(f"[BatchTex] Bake failed for {obj.name}: {exc}")
+        print("[BatchTex] Bake complete")
+        return True
+    finally:
+        if context.scene.render.engine != original_engine:
+            context.scene.render.engine = original_engine
 
-    if context.scene.render.engine != original_engine:
-        context.scene.render.engine = original_engine
-    print("[BatchTex] Bake complete")
 
-    if context.scene.render.engine != original_engine:
-        context.scene.render.engine = original_engine
-    print("[BatchTex] Bake complete")
+def _baked_file_has_signal(filepath):
+    """Return whether a saved batch bake contains any non-black RGB value."""
+    if not filepath or not os.path.isfile(filepath):
+        return False
+    try:
+        from PIL import Image
+
+        with Image.open(filepath) as image:
+            extrema = image.convert('RGB').getextrema()
+        return any(high > 0 for _low, high in extrema)
+    except Exception as exc:  # noqa: BLE001
+        print(f"[BatchTex] Could not validate baked image {filepath}: {exc}")
+        return False
+
+
+def _refresh_projection_for_bake(context):
+    """Reload projection inputs and force dependency-graph evaluation."""
+    seen_images = set()
+    for obj in context.scene.objects:
+        if obj.type != 'MESH':
+            continue
+        obj.data.update()
+        for material in obj.data.materials:
+            if not material or not material.use_nodes:
+                continue
+            material.node_tree.update_tag()
+            for node in material.node_tree.nodes:
+                image = getattr(node, 'image', None)
+                if image is None or image.as_pointer() in seen_images:
+                    continue
+                seen_images.add(image.as_pointer())
+                filepath = bpy.path.abspath(image.filepath)
+                if filepath and os.path.isfile(filepath):
+                    image.reload()
+                image.update()
+    context.view_layer.update()
+
+
+def _write_camera_recovery_state(context):
+    """Persist exact camera transforms needed to reproject saved views."""
+    from ..utils import get_dir_path, get_file_path
+
+    state = _batch_state
+    entry = state['files'][state['index']]
+    cameras = sorted(
+        (obj for obj in context.scene.objects if obj.type == 'CAMERA'),
+        key=lambda camera: camera.name,
+    )
+    payload = {
+        'schema': 1,
+        'relative_path': entry['relative_path'],
+        'model_path': entry['model_path'],
+        'output_relative_path': entry['output_relative_path'],
+        'output_timestamp': context.scene.output_timestamp,
+        'cameras': [],
+    }
+    for index, camera in enumerate(cameras):
+        data = camera.data
+        payload['cameras'].append({
+            'index': index,
+            'name': camera.name,
+            'matrix_world': [
+                [float(value) for value in row]
+                for row in camera.matrix_world
+            ],
+            'type': data.type,
+            'lens': float(data.lens),
+            'sensor_width': float(data.sensor_width),
+            'sensor_height': float(data.sensor_height),
+            'shift_x': float(data.shift_x),
+            'shift_y': float(data.shift_y),
+            'resolution_x': int(camera.get(
+                'sg_res_x', context.scene.render.resolution_x)),
+            'resolution_y': int(camera.get(
+                'sg_res_y', context.scene.render.resolution_y)),
+            'generated_image': get_file_path(
+                context, 'generated', camera_id=index, material_id=0),
+        })
+
+    revision_dir = get_dir_path(context, 'revision')
+    path = os.path.join(revision_dir, 'batch_camera_state.json')
+    tmp_path = path + '.tmp'
+    try:
+        with open(tmp_path, 'w', encoding='utf-8') as handle:
+            json.dump(payload, handle, indent=2, ensure_ascii=False)
+            handle.write('\n')
+        os.replace(tmp_path, path)
+        print(f"[BatchTex] Saved camera recovery state: {path}")
+    except Exception as exc:  # noqa: BLE001
+        print(f"[BatchTex] Could not save camera recovery state: {exc}")
+
+
+def _finish_terminal_bake_failure(error):
+    """Log a verified bake failure and either skip or stop the batch."""
+    state = _batch_state
+    attempts = state['bake_retry_count'] + 1
+    _record_failure('bake', error, attempts=attempts)
+    rel = state['files'][state['index']]['relative_path']
+    print(
+        f"[BatchTex] Bake failed for {rel} after {attempts} attempt(s): "
+        f"{error}"
+    )
+    state['bake_retry_count'] = 0
+    state['settle_count'] = 0
+    if state['settings'].get('continue_on_error', True):
+        print("[BatchTex] Skipping failed model and continuing batch")
+        state['phase'] = 'idle'
+        _sync_wm()
+        return _TICK_INTERVAL
+    print("[BatchTex] Stop-on-error is enabled — stopping batch")
+    state['active'] = False
+    state['phase'] = 'idle'
+    _sync_wm()
+    return None
 
 
 def _apply_baked_material(context, obj):
@@ -589,10 +851,16 @@ def _batch_tex_tick():
             state['active'] = False
             state['phase'] = 'idle'
             _sync_wm()
-            print(f"[BatchTex] Complete! {state['total']} file(s) processed.")
+            failed = len(state['failures'])
+            print(f"[BatchTex] Complete! {state['total']} file(s) processed, "
+                  f"{failed} failed/skipped.")
+            if failed:
+                print(f"[BatchTex] Failure report: {_failure_report_path()}")
             return None
 
         state['index'] = next_idx
+        state['retry_count'] = 0
+        state['bake_retry_count'] = 0
         state['phase'] = 'import'
         _sync_wm()
         rel = state['files'][next_idx]['relative_path']
@@ -603,9 +871,7 @@ def _batch_tex_tick():
     if phase == 'import':
         ok = _do_import()
         if not ok:
-            print(f"[BatchTex] Skipping file {state['index'] + 1} (import failed)")
-            state['phase'] = 'idle'
-            return _TICK_INTERVAL
+            return _retry_or_skip('import', 'Model import failed')
 
         state['phase'] = 'cameras'
         return _TICK_INTERVAL
@@ -615,9 +881,7 @@ def _batch_tex_tick():
         try:
             _do_cameras()
         except Exception as exc:  # noqa: BLE001
-            print(f"[BatchTex] Camera placement failed: {exc}")
-            state['phase'] = 'idle'
-            return _TICK_INTERVAL
+            return _retry_or_skip('camera placement', exc)
 
         # Set reference image before texturing. Manifest batches are strict:
         # validation guarantees a reference for every row, so a lookup failure
@@ -628,6 +892,7 @@ def _batch_tex_tick():
                 state['settings'].get('require_reference', False)):
             rel = state['files'][state['index']]['relative_path']
             print(f"[BatchTex] Stopping: required reference missing for {rel}")
+            _record_failure('reference', 'Required manifest reference missing')
             state['cancelled'] = True
             return _TICK_INTERVAL
 
@@ -643,9 +908,7 @@ def _batch_tex_tick():
             try:
                 _do_start_texturing()
             except Exception as exc:  # noqa: BLE001
-                print(f"[BatchTex] Texturing failed to start: {exc}")
-                state['phase'] = 'export'
-                return _TICK_INTERVAL
+                return _retry_or_skip('texturing startup', exc)
             state['settle_count'] = 1
             return _TICK_INTERVAL
 
@@ -665,28 +928,61 @@ def _batch_tex_tick():
         except Exception:  # noqa: BLE001
             had_error = False
         gen_status = getattr(bpy.context.scene, 'generation_status', 'idle')
-        if had_error or gen_status == 'waiting':
-            print("[BatchTex] Generation was cancelled/failed — stopping batch")
+        if gen_status == 'waiting':
+            print("[BatchTex] Generation was cancelled by user — stopping batch")
             state['active'] = False
             state['phase'] = 'idle'
             _sync_wm()
             return None
+        if had_error:
+            error = getattr(
+                bpy.context.scene,
+                'sg_last_gen_error_message',
+                '',
+            ) or 'Texture generation failed'
+            return _retry_or_skip('texturing', error)
+
+        # Preserve the exact camera rig before baking/export. Generated views
+        # can then be reprojected without rerunning the image model.
+        try:
+            _write_camera_recovery_state(bpy.context)
+        except Exception as exc:  # noqa: BLE001
+            print(f"[BatchTex] Could not save camera recovery state: {exc}")
 
         # Texturing done — move to bake
         if _batch_state['settings'].get('bake', True):
             state['phase'] = 'bake'
             state['settle_count'] = 0
+            state['bake_retry_count'] = 0
         else:
             state['phase'] = 'export'
         return _TICK_INTERVAL
 
     # ── BAKE (synchronous — no operator popup) ──────────────────────────
     if phase == 'bake':
+        # Generation completion and Cycles/image dependency evaluation are
+        # separate Blender events. Give the graph time to settle before each
+        # attempt, particularly in long unattended runs.
+        if state['settle_count'] < _BAKE_SETTLE_TICKS:
+            state['settle_count'] += 1
+            return _TICK_INTERVAL
         try:
+            _refresh_projection_for_bake(bpy.context)
             _do_bake()
         except Exception as exc:  # noqa: BLE001
-            print(f"[BatchTex] Bake failed: {exc}")
+            if state['bake_retry_count'] < _BAKE_RETRIES:
+                state['bake_retry_count'] += 1
+                state['settle_count'] = 0
+                print(
+                    f"[BatchTex] Bake attempt "
+                    f"{state['bake_retry_count']}/{_BAKE_RETRIES + 1} "
+                    f"failed: {exc}"
+                )
+                print("[BatchTex] Retrying bake without regenerating images")
+                return _TICK_INTERVAL
+            return _finish_terminal_bake_failure(exc)
 
+        state['bake_retry_count'] = 0
         state['phase'] = 'export'
         return _TICK_INTERVAL
 
@@ -768,6 +1064,26 @@ class BatchTextureDAE(bpy.types.Operator):
         default=2048,
         min=512,
         max=8192,
+    )  # type: ignore
+
+    generation_retries: bpy.props.IntProperty(
+        name="Generation Retries",
+        description=(
+            "Number of clean re-import and texturing retries before a model "
+            "is skipped"
+        ),
+        default=2,
+        min=0,
+        max=10,
+    )  # type: ignore
+
+    continue_on_error: bpy.props.BoolProperty(
+        name="Continue After Failed Model",
+        description=(
+            "After retries are exhausted, log and skip the failed model "
+            "instead of stopping the entire batch"
+        ),
+        default=True,
     )  # type: ignore
 
     # ── Import / cleanup settings (same as BatchImportDAE) ──
@@ -900,6 +1216,8 @@ class BatchTextureDAE(bpy.types.Operator):
         box = layout.box()
         box.label(text="Uses current scene generation settings")
         box.label(text="Camera placement uses TRELLIS.2 camera settings")
+        box.prop(self, "generation_retries")
+        box.prop(self, "continue_on_error")
 
     def execute(self, context):
         manifest_path = bpy.path.abspath(self.manifest_path).strip()
@@ -937,6 +1255,7 @@ class BatchTextureDAE(bpy.types.Operator):
         configured_output = bpy.path.abspath(self.output_dir).strip()
         out_dir = configured_output or os.path.join(top_dir, "textured")
         os.makedirs(out_dir, exist_ok=True)
+        existing_failures = _load_failure_report(out_dir)
 
         scene = context.scene
         _batch_state.update({
@@ -949,6 +1268,9 @@ class BatchTextureDAE(bpy.types.Operator):
             'out_dir': out_dir,
             'phase': 'idle',
             'settle_count': 0,
+            'retry_count': 0,
+            'bake_retry_count': 0,
+            'failures': existing_failures,
             'settings': {
                 # Import settings
                 'merge_threshold': self.merge_threshold,
@@ -966,6 +1288,8 @@ class BatchTextureDAE(bpy.types.Operator):
                 # Bake settings
                 'bake': self.bake,
                 'bake_resolution': self.bake_resolution,
+                'generation_retries': self.generation_retries,
+                'continue_on_error': self.continue_on_error,
                 # Reference image directory
                 'ref_image_dir': self.ref_image_dir.rstrip('/\\') if self.ref_image_dir else '',
                 'require_reference': bool(manifest_path),

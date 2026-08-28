@@ -4,6 +4,7 @@ import json
 import uuid
 import websocket
 import socket
+import time
 import urllib.request
 import urllib.parse
 import email.utils
@@ -243,6 +244,78 @@ class _WorkflowBase:
             print(f"[StableGen] HTTP image fallback failed: {e}")
             return []
 
+    @staticmethod
+    def _queue_contains_prompt(entries, prompt_id):
+        """Return True when a ComfyUI queue payload contains *prompt_id*."""
+        for entry in entries or []:
+            if isinstance(entry, (list, tuple)):
+                if len(entry) > 1 and str(entry[1]) == str(prompt_id):
+                    return True
+            elif isinstance(entry, dict):
+                queued_id = entry.get('prompt_id') or entry.get('id')
+                if queued_id is not None and str(queued_id) == str(prompt_id):
+                    return True
+        return False
+
+    @staticmethod
+    def _history_error_message(history_entry):
+        """Extract the most useful execution error from a history entry."""
+        status = history_entry.get('status', {})
+        for message in reversed(status.get('messages', [])):
+            if not isinstance(message, (list, tuple)) or len(message) < 2:
+                continue
+            if message[0] != 'execution_error' or not isinstance(message[1], dict):
+                continue
+            data = message[1]
+            node_id = data.get('node_id', '?')
+            detail = (data.get('exception_message') or data.get('error')
+                      or 'Unknown ComfyUI execution error')
+            return f"node {node_id}: {detail}"
+        return status.get('status_str') or 'Unknown ComfyUI execution error'
+
+    def _get_prompt_runtime_state(self, server_address, prompt_id):
+        """Return ``(state, detail)`` for a queued ComfyUI prompt.
+
+        ``state`` is one of ``completed``, ``error``, ``running``, ``queued``,
+        ``unknown`` (server responded but the prompt is between states), or
+        ``unavailable`` (both status requests failed).
+        """
+        history_error = None
+        try:
+            history_url = (
+                f"http://{server_address}/history/"
+                f"{urllib.parse.quote(str(prompt_id))}"
+            )
+            history = json.loads(urllib.request.urlopen(
+                history_url, timeout=get_timeout('api')).read())
+            entry = history.get(prompt_id) or history.get(str(prompt_id))
+            if entry:
+                status = entry.get('status', {})
+                status_str = str(status.get('status_str', '')).lower()
+                if status_str in {'error', 'failed'}:
+                    return 'error', self._history_error_message(entry)
+                if status.get('completed'):
+                    return 'completed', status_str or 'completed'
+                return 'running', status_str or 'history entry is active'
+        except Exception as exc:  # noqa: BLE001
+            history_error = exc
+
+        queue_error = None
+        try:
+            queue_url = f"http://{server_address}/queue"
+            queue = json.loads(urllib.request.urlopen(
+                queue_url, timeout=get_timeout('api')).read())
+            if self._queue_contains_prompt(queue.get('queue_running'), prompt_id):
+                return 'running', 'present in ComfyUI running queue'
+            if self._queue_contains_prompt(queue.get('queue_pending'), prompt_id):
+                return 'queued', 'present in ComfyUI pending queue'
+            return 'unknown', 'not yet visible in history or queue'
+        except Exception as exc:  # noqa: BLE001
+            queue_error = exc
+
+        detail = f"history: {history_error}; queue: {queue_error}"
+        return 'unavailable', detail
+
     def _connect_to_websocket(self, server_address, client_id):
         """Establishes WebSocket connection to ComfyUI server."""
         try:
@@ -250,10 +323,11 @@ class _WorkflowBase:
             # Use a short timeout for the initial TCP+WS handshake.
             ws.settimeout(get_timeout('api'))
             ws.connect(f"ws://{server_address}/ws?clientId={client_id}")
-            # Switch to a longer timeout for recv() during generation —
-            # ComfyUI may take a while between progress messages (model
-            # loading, TRELLIS.2 processing, etc.).
-            ws.settimeout(get_timeout('transfer'))
+            # This is a heartbeat interval, not a generation deadline. Slow
+            # nodes can legitimately emit no WebSocket events for minutes;
+            # timeout handling below checks /history and /queue and continues
+            # waiting while the prompt is still active.
+            ws.settimeout(get_timeout('generation_heartbeat'))
             return ws
         except ConnectionRefusedError:
             self._error = f"Connection to ComfyUI WebSocket was refused at {server_address}. Is ComfyUI running and accessible?"
@@ -317,18 +391,69 @@ class _WorkflowBase:
 
         # Send the prompt to the queue
         prompt_id = self._queue_prompt(prompt, client_id, server_address)
+
+        # Make every texturing workflow cancellable while blocked in recv().
+        # cancel_generate() closes this socket after interrupting ComfyUI.
+        if hasattr(self.operator, '_active_ws'):
+            self.operator._active_ws = ws
+            type(self.operator)._active_ws = ws
         
         # Process the WebSocket messages and collect images
         output_images = {}
         current_node = ""
+        unavailable_heartbeats = 0
+        unknown_heartbeats = 0
         
         while True:
             try:
                 out = ws.recv()
+                unavailable_heartbeats = 0
+                unknown_heartbeats = 0
             except websocket.WebSocketTimeoutException:
-                print(f"[StableGen] WebSocket recv timed out after "
-                      f"{get_timeout('transfer')}s. The server may be "
-                      f"slow or the connection was lost.")
+                heartbeat = get_timeout('generation_heartbeat')
+                state, detail = self._get_prompt_runtime_state(
+                    server_address, prompt_id)
+                if state == 'completed':
+                    print(f"[StableGen] No WebSocket event for {heartbeat}s, "
+                          "but ComfyUI history reports completion. "
+                          "Recovering the result via HTTP.")
+                    break
+                if state == 'error':
+                    self.operator._error = f"ComfyUI execution error: {detail}"
+                    print(f"[StableGen] {self.operator._error}")
+                    break
+                if state in {'running', 'queued'}:
+                    unavailable_heartbeats = 0
+                    unknown_heartbeats = 0
+                    print(f"[StableGen] No WebSocket event for {heartbeat}s; "
+                          f"prompt is still {state} ({detail}). Continuing to wait.")
+                    continue
+                if state == 'unknown':
+                    unavailable_heartbeats = 0
+                    unknown_heartbeats += 1
+                    print(f"[StableGen] No WebSocket event for {heartbeat}s; "
+                          f"prompt state is temporarily unknown "
+                          f"({unknown_heartbeats}/5). Continuing to wait.")
+                    if unknown_heartbeats < 5:
+                        continue
+                    self.operator._error = (
+                        f"ComfyUI stopped reporting prompt {prompt_id} in both "
+                        "history and queue after five heartbeat checks."
+                    )
+                    print(f"[StableGen] {self.operator._error}")
+                    break
+
+                unavailable_heartbeats += 1
+                print(f"[StableGen] No WebSocket event for {heartbeat}s and "
+                      f"ComfyUI status is unavailable "
+                      f"({unavailable_heartbeats}/3): {detail}")
+                if unavailable_heartbeats < 3:
+                    continue
+                self.operator._error = (
+                    f"Lost contact with ComfyUI while waiting for prompt "
+                    f"{prompt_id} after three heartbeat checks."
+                )
+                print(f"[StableGen] {self.operator._error}")
                 break
             except (ConnectionError, OSError, Exception) as ws_err:
                 print(f"[StableGen] WebSocket error during generation: {ws_err}")
@@ -392,31 +517,69 @@ class _WorkflowBase:
                     images_output.append(out[8:])  # Skip the first 8 bytes (header)
                     output_images[current_node] = images_output
 
-        # --- Validate received images; fall back to HTTP if corrupt ----------
-        save_node = NODES.get('save_image')
-        if save_node and save_node in output_images:
-            needs_http = False
-            for img_bytes in output_images[save_node]:
-                if not self._validate_image_bytes(img_bytes):
-                    needs_http = True
-                    break
+        if hasattr(self.operator, '_active_ws'):
+            if getattr(self.operator, '_active_ws', None) is ws:
+                self.operator._active_ws = None
+            if getattr(type(self.operator), '_active_ws', None) is ws:
+                type(self.operator)._active_ws = None
 
-            if needs_http and fallback_node_id:
-                print("[StableGen] WebSocket image data is corrupt "
-                      "(likely packet loss on remote network). "
-                      "Falling back to HTTP /view download...")
-                http_images = self._get_images_via_http(
+        # --- Validate received images; fall back to HTTP if missing/corrupt --
+        save_node = NODES.get('save_image')
+        ws_images = output_images.get(save_node, []) if save_node else []
+        needs_http = (
+            bool(save_node)
+            and (not ws_images or any(
+                not self._validate_image_bytes(img_bytes)
+                for img_bytes in ws_images
+            ))
+        )
+
+        if needs_http and fallback_node_id:
+            reason = "missing" if not ws_images else "corrupt"
+            print(f"[StableGen] WebSocket image data is {reason}. "
+                  "Falling back to HTTP /history + /view download...")
+
+            # ComfyUI can announce execution completion just before the
+            # history entry or SaveImage file becomes visible. Retry briefly
+            # so a harmless publication race does not fail a long generation.
+            http_images = []
+            retry_delays = (0.0, 0.25, 0.5, 1.0, 2.0)
+            for attempt, delay in enumerate(retry_delays, start=1):
+                if delay:
+                    time.sleep(delay)
+                candidates = self._get_images_via_http(
                     server_address, prompt_id, fallback_node_id)
-                if http_images:
-                    output_images[save_node] = http_images
-                    print(f"[StableGen] Successfully retrieved "
-                          f"{len(http_images)} image(s) via HTTP fallback.")
-                else:
-                    print("[StableGen] HTTP fallback also failed. "
-                          "The image data may be unrecoverable.")
-            elif needs_http:
-                print("[StableGen] WebSocket image data is corrupt "
-                      "and no HTTP fallback node was injected.")
+                if candidates and all(
+                        self._validate_image_bytes(data)
+                        for data in candidates):
+                    http_images = candidates
+                    break
+                if attempt < len(retry_delays):
+                    print(f"[StableGen] HTTP image fallback not ready "
+                          f"(attempt {attempt}/{len(retry_delays)}); retrying...")
+
+            if http_images:
+                output_images[save_node] = http_images
+                print(f"[StableGen] Successfully retrieved "
+                      f"{len(http_images)} image(s) via HTTP fallback.")
+            else:
+                print("[StableGen] HTTP fallback also failed. "
+                      "The image data may be unrecoverable.")
+        elif needs_http:
+            print("[StableGen] WebSocket image data is missing or corrupt "
+                  "and no HTTP fallback node was injected.")
+
+        final_images = output_images.get(save_node, []) if save_node else []
+        if (not save_node or not final_images or any(
+                not self._validate_image_bytes(data)
+                for data in final_images)):
+            if not self.operator._error:
+                self.operator._error = (
+                    f"ComfyUI completed but StableGen received no valid image "
+                    f"from output node {save_node!r}."
+                )
+            print(f"[StableGen] {self.operator._error}")
+            return {"error": "missing_output"}
 
         return output_images
 

@@ -1979,6 +1979,252 @@ def _set_bake_uv_active(obj):
     return _ensure_bake_uv(obj)
 
 
+def _projection_bake_face_mask(obj, threshold=1.0e-8):
+    """Return faces that can receive color from a projection material.
+
+    Projection materials read ``_SG_VisWeight_*`` POINT attributes and
+    interpolate them across each face. A face whose vertices are zero in
+    every such attribute cannot receive any projected texture, so giving it a
+    full BakeUV island only wastes atlas resolution.
+
+    ``None`` means the object has neither baked visibility nor projection UV
+    data and should retain the normal all-face unwrap behavior.
+    """
+    if obj is None or obj.type != 'MESH' or not obj.data:
+        return None
+
+    mesh = obj.data
+    visibility_attributes = [
+        attribute for attribute in mesh.attributes
+        if (
+            attribute.name.startswith("_SG_VisWeight_")
+            and attribute.domain == 'POINT'
+            and attribute.data_type == 'FLOAT'
+        )
+    ]
+    if not mesh.polygons:
+        return np.zeros(0, dtype=bool)
+
+    loop_vertices = np.empty(len(mesh.loops), dtype=np.int32)
+    mesh.loops.foreach_get("vertex_index", loop_vertices)
+    face_starts = np.empty(len(mesh.polygons), dtype=np.int32)
+    mesh.polygons.foreach_get("loop_start", face_starts)
+
+    if visibility_attributes:
+        vertex_coverage = np.zeros(len(mesh.vertices), dtype=np.float32)
+        values = np.empty(len(mesh.vertices), dtype=np.float32)
+        for attribute in visibility_attributes:
+            attribute.data.foreach_get("value", values)
+            np.maximum(vertex_coverage, values, out=vertex_coverage)
+        loop_coverage = vertex_coverage[loop_vertices]
+        return (
+            np.maximum.reduceat(loop_coverage, face_starts)
+            > float(threshold)
+        )
+
+    # Compatibility fallback for older projection materials that predate
+    # _SG_VisWeight attributes. Projection image nodes use CLIP extension, so
+    # a face wholly outside every camera's [0, 1] UV rectangle cannot
+    # contribute. Bounding-box intersection is intentionally conservative:
+    # it can retain extra faces, but cannot discard a triangle crossing a view
+    # merely because all three corners lie outside it.
+    projection_attributes = [
+        attribute for attribute in mesh.attributes
+        if (
+            attribute.name.startswith("ProjectionUV_")
+            and attribute.domain == 'CORNER'
+            and attribute.data_type == 'FLOAT_VECTOR'
+        )
+    ]
+    if not projection_attributes:
+        return None
+
+    covered_faces = np.zeros(len(mesh.polygons), dtype=bool)
+    vectors = np.empty(len(mesh.loops) * 3, dtype=np.float32)
+    for attribute in projection_attributes:
+        attribute.data.foreach_get("vector", vectors)
+        uv = vectors.reshape((-1, 3))[:, :2]
+        min_u = np.minimum.reduceat(uv[:, 0], face_starts)
+        max_u = np.maximum.reduceat(uv[:, 0], face_starts)
+        min_v = np.minimum.reduceat(uv[:, 1], face_starts)
+        max_v = np.maximum.reduceat(uv[:, 1], face_starts)
+        covered_faces |= (
+            (max_u >= 0.0)
+            & (min_u <= 1.0)
+            & (max_v >= 0.0)
+            & (min_v <= 1.0)
+        )
+    return covered_faces
+
+
+def _ensure_projection_visibility_for_bake(obj):
+    """Backfill visibility weights for legacy projection materials."""
+    mesh = getattr(obj, "data", None)
+    if mesh is None or any(
+        attribute.name.startswith("_SG_VisWeight_")
+        and attribute.domain == 'POINT'
+        for attribute in mesh.attributes
+    ):
+        return
+
+    projection_pairs = []
+    for attribute in mesh.attributes:
+        if not attribute.name.startswith("ProjectionUV_"):
+            continue
+        parts = attribute.name.rsplit('_', 2)
+        if len(parts) != 3:
+            continue
+        try:
+            projection_pairs.append((int(parts[1]), int(parts[2])))
+        except ValueError:
+            continue
+    if not projection_pairs:
+        return
+
+    from .view_plan import order_cameras
+
+    max_camera_index = max(camera_index for camera_index, _ in projection_pairs)
+    cameras = order_cameras(
+        scene_obj
+        for scene_obj in bpy.context.scene.objects
+        if scene_obj.type == 'CAMERA'
+    )
+    if len(cameras) <= max_camera_index:
+        print(
+            f"[StableGen] Warning: cannot rebuild projection visibility for "
+            f"{obj.name}; expected at least {max_camera_index + 1} cameras, "
+            f"found {len(cameras)}. Using conservative camera-UV coverage."
+        )
+        return
+
+    # Visibility is geometry/camera dependent, not material-ID dependent. One
+    # representative material ID supplies the union needed for UV allocation.
+    material_id = min(material_id for _, material_id in projection_pairs)
+    angle_thresholds = []
+    for material in mesh.materials:
+        if not material or not material.use_nodes:
+            continue
+        for node in material.node_tree.nodes:
+            if (
+                getattr(node, "label", "").startswith("AngleThreshold-")
+                and len(node.inputs) > 1
+            ):
+                try:
+                    angle_thresholds.append(float(node.inputs[1].default_value))
+                except (AttributeError, TypeError, ValueError):
+                    pass
+    angle_threshold = max(
+        angle_thresholds
+        or [
+            float(getattr(bpy.context.scene, "discard_factor", 90.0)),
+            float(getattr(
+                bpy.context.scene,
+                "sg_material_discard_factor",
+                90.0,
+            )),
+        ]
+    )
+    try:
+        from .projection import _bake_visibility_weights
+
+        scene = bpy.context.scene
+        original_silhouette_margin = getattr(
+            scene,
+            "sg_silhouette_margin",
+            None,
+        )
+        if original_silhouette_margin is not None:
+            # Silhouette erosion only removes uncertain edge pixels. Atlas
+            # coverage should remain conservative and needs just one ray per
+            # candidate vertex, not the extra 4/8 offset rays.
+            scene.sg_silhouette_margin = 0
+        try:
+            print(
+                f"[StableGen] Rebuilding legacy projection visibility for "
+                f"BakeUV on {obj.name}"
+            )
+            _bake_visibility_weights(
+                bpy.context,
+                [obj],
+                cameras[:max_camera_index + 1],
+                material_id,
+                stop_index=max_camera_index,
+                angle_threshold=angle_threshold,
+            )
+        finally:
+            if original_silhouette_margin is not None:
+                scene.sg_silhouette_margin = original_silhouette_margin
+    except Exception as exc:
+        print(
+            f"[StableGen] Warning: could not rebuild projection visibility "
+            f"for {obj.name}: {exc}. Using conservative camera-UV coverage."
+        )
+
+
+def _compact_uncovered_projection_uvs(
+        obj, covered_faces, texture_resolution):
+    """Fill the tile with covered UVs and collapse uncovered faces."""
+    bm = bmesh.from_edit_mesh(obj.data)
+    bm.faces.ensure_lookup_table()
+    bm.faces.index_update()
+    uv_layer = bm.loops.layers.uv.active
+    if uv_layer is None:
+        return
+
+    resolution = max(1, int(texture_resolution or 2048))
+    bake_margin = max(
+        0,
+        int(getattr(bpy.context.scene.render.bake, "margin", 16)),
+    )
+    guard = min(
+        0.2,
+        max(2.0 / resolution, (bake_margin + 2.0) / resolution),
+    )
+
+    covered_loops = [
+        loop
+        for face in bm.faces
+        if (
+            face.index < len(covered_faces)
+            and bool(covered_faces[face.index])
+        )
+        for loop in face.loops
+    ]
+    if covered_loops:
+        min_u = min(loop[uv_layer].uv.x for loop in covered_loops)
+        max_u = max(loop[uv_layer].uv.x for loop in covered_loops)
+        min_v = min(loop[uv_layer].uv.y for loop in covered_loops)
+        max_v = max(loop[uv_layer].uv.y for loop in covered_loops)
+        span_u = max(max_u - min_u, 1.0e-12)
+        span_v = max(max_v - min_v, 1.0e-12)
+        target_span = max(0.01, 1.0 - 2.0 * guard)
+        scale_u = target_span / span_u
+        scale_v = target_span / span_v
+    else:
+        min_u = min_v = 0.0
+        scale_u = scale_v = 1.0
+
+    for face in bm.faces:
+        is_covered = (
+            face.index < len(covered_faces)
+            and bool(covered_faces[face.index])
+        )
+        for loop in face.loops:
+            if is_covered:
+                uv = loop[uv_layer].uv
+                # The UV map and its baked image are consumed together, so a
+                # global per-axis reframe is lossless. It avoids keeping a
+                # wide, short island footprint centered in a square texture.
+                uv.x = guard + (uv.x - min_u) * scale_u
+                uv.y = guard + (uv.y - min_v) * scale_v
+            else:
+                # Degenerate UV faces occupy no atlas area. The guard around
+                # (0, 0) prevents their bake margin touching useful islands.
+                loop[uv_layer].uv = (0.0, 0.0)
+
+    bmesh.update_edit_mesh(obj.data, loop_triangles=False, destructive=False)
+
+
 def _pin_unlinked_image_textures_to_uv(nodes, links, uv_name, exclude_nodes=()):
     if not uv_name:
         return None
@@ -2178,7 +2424,7 @@ def _activate_mesh_for_object_ops(obj):
     }
 
 
-def unwrap(obj, method, overlap_only):
+def unwrap(obj, method, overlap_only, texture_resolution=2048):
         """     
         Unwraps the UVs of the given object using the selected method.         
         :param obj: Blender object.         
@@ -2188,6 +2434,13 @@ def unwrap(obj, method, overlap_only):
             return
         
         op_context = _activate_mesh_for_object_ops(obj)
+        _ensure_projection_visibility_for_bake(obj)
+        covered_faces = _projection_bake_face_mask(obj)
+        projection_coverage_pack = covered_faces is not None
+        selective_projection_pack = (
+            projection_coverage_pack
+            and not bool(np.all(covered_faces))
+        )
 
         _ensure_bake_uv(obj)
 
@@ -2197,7 +2450,7 @@ def unwrap(obj, method, overlap_only):
             # Ensure UV selection sync is OFF
             bpy.context.scene.tool_settings.use_uv_select_sync = False
 
-            if overlap_only:
+            if overlap_only and not selective_projection_pack:
                 # Deselect
                 bpy.ops.uv.select_all(action='DESELECT')
                 # Check if the object has overlapping UVs, if not, skip unwrapping
@@ -2232,19 +2485,52 @@ def unwrap(obj, method, overlap_only):
                     return
 
             bpy.context.scene.tool_settings.use_uv_select_sync = True
-            # Select all faces
-            bpy.ops.mesh.select_all(action='SELECT')
+            if selective_projection_pack:
+                bpy.ops.mesh.select_all(action='DESELECT')
+                bm = bmesh.from_edit_mesh(obj.data)
+                bm.faces.ensure_lookup_table()
+                bm.faces.index_update()
+                for face in bm.faces:
+                    face.select_set(
+                        face.index < len(covered_faces)
+                        and bool(covered_faces[face.index])
+                    )
+                bmesh.update_edit_mesh(
+                    obj.data, loop_triangles=False, destructive=False)
+            else:
+                bpy.ops.mesh.select_all(action='SELECT')
             
-            if method == 'basic':
-                bpy.ops.uv.unwrap(method='ANGLE_BASED', margin=0.001)
-            elif method == 'smart':
-                bpy.ops.uv.smart_project()
-            elif method == 'cube':
-                bpy.ops.uv.cube_project(cube_size=1.0)
-            elif method == 'lightmap':
-                bpy.ops.uv.lightmap_pack()
-            elif method == 'pack':
-                bpy.ops.uv.pack_islands()
+            has_selected_faces = (
+                not selective_projection_pack
+                or bool(np.any(covered_faces))
+            )
+            if has_selected_faces:
+                if method == 'basic':
+                    bpy.ops.uv.unwrap(method='ANGLE_BASED', margin=0.001)
+                elif method == 'smart':
+                    bpy.ops.uv.smart_project(
+                        rotate_method='AXIS_ALIGNED',
+                        scale_to_bounds=True,
+                    )
+                elif method == 'cube':
+                    bpy.ops.uv.cube_project(cube_size=1.0)
+                elif method == 'lightmap':
+                    bpy.ops.uv.lightmap_pack()
+                elif method == 'pack':
+                    bpy.ops.uv.pack_islands()
+
+            if projection_coverage_pack:
+                _compact_uncovered_projection_uvs(
+                    obj,
+                    covered_faces,
+                    texture_resolution,
+                )
+                covered_count = int(np.count_nonzero(covered_faces))
+                print(
+                    f"[StableGen] Filled BakeUV with {covered_count}/"
+                    f"{len(covered_faces)} projection-covered faces on "
+                    f"{obj.name}; collapsed fully uncovered faces"
+                )
 
             bpy.ops.uv.select_all(action='DESELECT')
             bpy.ops.object.mode_set(mode='OBJECT')
@@ -2260,107 +2546,130 @@ def bake_texture(context, obj, texture_resolution, suffix = "", view_transform =
         if _is_gltf_not_exported_helper(obj) or _is_bone_custom_shape_object(obj):
             print(f"[StableGen] Skipping helper mesh during bake: {obj.name}")
             return False
-        bpy.context.scene.display_settings.display_device = 'sRGB'
-        # Backup original view transform
-        original_view_transform = bpy.context.scene.view_settings.view_transform
-        # Backup whether the object was enabled for rendering
-        original_render = obj.hide_render
-    
-        bpy.context.scene.view_settings.view_transform = view_transform
-        # Set the object to be rendered
-        obj.hide_render = False
-
-        source_uv_name = _first_source_uv_name(obj)
-        _set_bake_uv_active(obj)
-
-        # Create a new image for baking
-        image_name = f"{obj.name}_baked{suffix}" 
-        image = bpy.data.images.new(name=image_name, width=texture_resolution, height=texture_resolution)
-
         if not obj.data.materials:
             print("[StableGen] No materials found")
             return False
 
-        original_materials, original_active_index, copied_materials = _copy_material_slots_for_bake(obj)
-        if not copied_materials:
-            _restore_material_slots_after_bake(
-                obj, original_materials, original_active_index, copied_materials)
-            print("[StableGen] No material slots found")
-            return False
+        scene = bpy.context.scene
+        scene.display_settings.display_device = 'sRGB'
+        original_view_transform = scene.view_settings.view_transform
+        original_render = obj.hide_render
+        original_materials = []
+        original_active_index = obj.active_material_index
+        copied_materials = []
 
-        op_context = _activate_mesh_for_object_ops(obj)
-        _set_bake_uv_active(obj)
+        try:
+            scene.view_settings.view_transform = view_transform
+            obj.hide_render = False
 
-        for mat in copied_materials:
-            mat.use_nodes = True
-            nodes = mat.node_tree.nodes
-            links = mat.node_tree.links
+            source_uv_name = _first_source_uv_name(obj)
+            bake_uv = _set_bake_uv_active(obj)
 
-            tex_image = nodes.new("ShaderNodeTexImage")
-            tex_image.image = image
-            tex_image.location = (0, 0)
-            nodes.active = tex_image
+            image_name = f"{obj.name}_baked{suffix}"
+            old_image = bpy.data.images.get(image_name)
+            if old_image is not None and old_image.users == 0:
+                bpy.data.images.remove(old_image)
+            image = bpy.data.images.new(
+                name=image_name,
+                width=texture_resolution,
+                height=texture_resolution,
+            )
 
-            _pin_unlinked_image_textures_to_uv(
-                nodes, links, source_uv_name, exclude_nodes={tex_image})
-        
-            # Check if there is a BSDF node before the output node
-            output = None
-            for node in nodes:
-                if node.type == 'OUTPUT_MATERIAL':
-                    output = node
-                    break
+            (original_materials,
+             original_active_index,
+             copied_materials) = _copy_material_slots_for_bake(obj)
+            if not copied_materials:
+                print("[StableGen] No material slots found")
+                return False
 
-            before_output = output.inputs[0].links[0].from_node if output and output.inputs[0].is_linked else None
-            if before_output and before_output.type != 'BSDF_PRINCIPLED':
-                bsdf_node = nodes.new("ShaderNodeBsdfPrincipled")
-                bsdf_node.location = (before_output.location[0] + 200, before_output.location[1])
-                # Connect the before output node to the BSDF node
-                links.new(before_output.outputs[0], bsdf_node.inputs[0])
-                # Connect the BSDF node to the output node
-                links.new(bsdf_node.outputs[0], output.inputs[0])
+            op_context = _activate_mesh_for_object_ops(obj)
+            bake_uv = _set_bake_uv_active(obj)
 
-            # Disconnect Metallic so the DIFFUSE color-only pass returns the
-            # true Base Color.  Principled BSDF multiplies diffuse by
-            # (1 - Metallic), which would dim metallic areas incorrectly.
-            for node in nodes:
-                if node.type == 'BSDF_PRINCIPLED':
-                    met = node.inputs.get("Metallic")
-                    if met:
-                        for link in list(met.links):
-                            links.remove(link)
-                        met.default_value = 0.0
-                    break
-            
-        # Bake the texture
-        # Ensure OBJECT mode — bake fails silently in EDIT mode
-        with bpy.context.temp_override(**op_context):
-            if bpy.context.mode != 'OBJECT':
-                bpy.ops.object.mode_set(mode='OBJECT')
-            bpy.ops.object.bake(type='DIFFUSE', width=texture_resolution, height=texture_resolution)
-       
-        # Save the image if required
-        if not os.path.exists(output_dir):
-            os.makedirs(output_dir)
-        if suffix == "":
-            image.filepath_raw = os.path.join(output_dir, f"{obj.name}.png")
-        else:
-            image.filepath_raw = os.path.join(output_dir, f"{obj.name}_baked{suffix}.png")
-        image.file_format = 'PNG'
-        image.save()
+            for mat in copied_materials:
+                mat.use_nodes = True
+                nodes = mat.node_tree.nodes
+                links = mat.node_tree.links
 
-        # Remove tex_image node
-        nodes.remove(tex_image)
+                tex_image = nodes.new("ShaderNodeTexImage")
+                tex_image.image = image
+                tex_image.location = (0, 0)
+                nodes.active = tex_image
 
-        # Restore original view transform
-        bpy.context.scene.view_settings.view_transform = original_view_transform
-        # Restore original render settings
-        obj.hide_render = original_render
+                _pin_unlinked_image_textures_to_uv(
+                    nodes, links, source_uv_name, exclude_nodes={tex_image})
 
-        _restore_material_slots_after_bake(
-            obj, original_materials, original_active_index, copied_materials)
-                
-        return True
+                output = next(
+                    (node for node in nodes
+                     if node.type == 'OUTPUT_MATERIAL'),
+                    None,
+                )
+                before_output = (
+                    output.inputs[0].links[0].from_node
+                    if output and output.inputs[0].is_linked else None
+                )
+                if before_output and before_output.type != 'BSDF_PRINCIPLED':
+                    bsdf_node = nodes.new("ShaderNodeBsdfPrincipled")
+                    bsdf_node.location = (
+                        before_output.location[0] + 200,
+                        before_output.location[1],
+                    )
+                    links.new(before_output.outputs[0], bsdf_node.inputs[0])
+                    links.new(bsdf_node.outputs[0], output.inputs[0])
+
+                # DIFFUSE color-only is multiplied by (1 - Metallic).
+                # Disconnect Metallic so the pass returns true Base Color.
+                for node in nodes:
+                    if node.type == 'BSDF_PRINCIPLED':
+                        metallic = node.inputs.get("Metallic")
+                        if metallic:
+                            for link in list(metallic.links):
+                                links.remove(link)
+                            metallic.default_value = 0.0
+                        break
+                mat.node_tree.update_tag()
+
+            obj.data.update()
+            context.view_layer.update()
+
+            # Operators can return CANCELLED without raising.  Treat anything
+            # other than FINISHED as a real failure; otherwise an untouched
+            # newly-created (black) image would be saved and exported.
+            with bpy.context.temp_override(**op_context):
+                if bpy.context.mode != 'OBJECT':
+                    bpy.ops.object.mode_set(mode='OBJECT')
+                bake_result = bpy.ops.object.bake(
+                    'EXEC_DEFAULT',
+                    type='DIFFUSE',
+                    width=texture_resolution,
+                    height=texture_resolution,
+                    uv_layer=bake_uv.name if bake_uv else '',
+                )
+            if 'FINISHED' not in bake_result:
+                raise RuntimeError(
+                    f"Cycles bake returned {set(bake_result)} for {obj.name}"
+                )
+
+            if output_dir is None:
+                output_dir = get_dir_path(context, "baked")
+            os.makedirs(output_dir, exist_ok=True)
+            if suffix == "":
+                image.filepath_raw = os.path.join(output_dir, f"{obj.name}.png")
+            else:
+                image.filepath_raw = os.path.join(
+                    output_dir, f"{obj.name}_baked{suffix}.png")
+            image.file_format = 'PNG'
+            image.save()
+            return True
+        finally:
+            scene.view_settings.view_transform = original_view_transform
+            obj.hide_render = original_render
+            if original_materials or copied_materials:
+                _restore_material_slots_after_bake(
+                    obj,
+                    original_materials,
+                    original_active_index,
+                    copied_materials,
+                )
 
 def _has_non_projection_uv(obj):
     """Return True if the object has at least one UV map that can be used
@@ -3023,14 +3332,29 @@ class BakeTextures(bpy.types.Operator):
                     if self.try_unwrap != 'none':
                         if not _has_non_projection_uv(obj):
                             # No usable UV exists — must unwrap
-                            unwrap(obj, self.try_unwrap, self.overlap_only)
+                            unwrap(
+                                obj,
+                                self.try_unwrap,
+                                self.overlap_only,
+                                self.texture_resolution,
+                            )
                         elif self.overlap_only:
                             # Only re-unwrap if existing UVs overlap
                             if _uvs_likely_overlap(obj):
-                                unwrap(obj, self.try_unwrap, self.overlap_only)
+                                unwrap(
+                                    obj,
+                                    self.try_unwrap,
+                                    self.overlap_only,
+                                    self.texture_resolution,
+                                )
                         else:
                             # Always re-unwrap when overlap_only is disabled
-                            unwrap(obj, self.try_unwrap, self.overlap_only)
+                            unwrap(
+                                obj,
+                                self.try_unwrap,
+                                self.overlap_only,
+                                self.texture_resolution,
+                            )
 
                     self._progress = 100
                 elif self._phase == 'bake':
