@@ -630,6 +630,7 @@ StableGen builds upon the fantastic work of many individuals and communities. Ou
 
 * **Academic Roots:** This plugin originated as a Bachelor's Thesis by Ondřej Sakala at the Czech Technical University in Prague (Faculty of Information Technology), supervised by Ing. Radek Richtr, Ph.D. 
     * Full thesis available at: [https://dspace.cvut.cz/handle/10467/123567](https://dspace.cvut.cz/handle/10467/123567)
+* **Study Stay Support:** Part of StableGen's development was carried out by Ondřej Sakala during a study stay at Kanazawa University in summer 2026. Travel costs for this stay were supported by a grant from Nadace „Nadání Josefa, Marie a Zdeňky Hlávkových“. I gratefully acknowledge this support.
 * **Core Technologies & Communities:**
     * **ComfyUI** by ComfyAnonymous ([GitHub](https://github.com/comfyanonymous/ComfyUI)) for the powerful and flexible backend.
     * **ComfyUI-TRELLIS2** by PozzettiAndrea ([GitHub](https://github.com/PozzettiAndrea/ComfyUI-TRELLIS2)) for the TRELLIS.2 ComfyUI integration.
