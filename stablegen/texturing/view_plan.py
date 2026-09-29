@@ -16,6 +16,17 @@ from typing import Any, Iterable, Mapping, Sequence
 _NATURAL_PARTS = re.compile(r"(\d+)")
 
 
+def generation_cameras(scene):
+    """Scope regression passes without unlinking cameras used by existing materials."""
+    cameras = [obj for obj in scene.objects if obj.type == 'CAMERA']
+    if scene.get('_sg_regression_output'):
+        scope = scene.get('_sg_regression_camera_scope')
+        if scope in {'base', 'detail'}:
+            cameras = [obj for obj in cameras
+                       if bool(obj.get('_sg_regression_detail_camera')) == (scope == 'detail')]
+    return cameras
+
+
 def natural_name_key(name: str) -> tuple:
     """Return a stable natural-sort key (``Camera_2`` before ``Camera_10``)."""
     return tuple(

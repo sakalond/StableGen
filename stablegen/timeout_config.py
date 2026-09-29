@@ -2,17 +2,28 @@
 
 import bpy  # pylint: disable=import-error
 
-_DEFAULTS = {'ping': 1.0, 'api': 10.0, 'transfer': 120.0, 'reboot': 120.0, 'mesh_gen': 600.0, 'scan': 10.0}
+_DEFAULTS = {
+    'ping': 1.0,
+    'api': 10.0,
+    'transfer': 120.0,
+    'generation_heartbeat': 120.0,
+    'reboot': 120.0,
+    'mesh_gen': 600.0,
+    'scan': 10.0,
+}
 
 
 def get_timeout(category, default=None):
     """Return a timeout value (seconds) from the addon preferences.
 
     Args:
-        category: One of ``'ping'``, ``'api'``, ``'transfer'``, ``'reboot'``.
+        category: One of ``'ping'``, ``'api'``, ``'transfer'``,
+                  ``'generation_heartbeat'``, ``'reboot'``, ``'mesh_gen'``,
+                  or ``'scan'``.
         default:  Fallback value if the preference cannot be read.
                   When *None*, built-in defaults are:
-                  ping=1.0, api=10.0, transfer=120.0, reboot=120.0.
+                  ping=1.0, api=10.0, transfer=120.0,
+                  generation_heartbeat=120.0, reboot=120.0.
     """
     if default is None:
         default = _DEFAULTS.get(category, 10.0)

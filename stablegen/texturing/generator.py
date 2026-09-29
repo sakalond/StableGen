@@ -859,8 +859,9 @@ class ComfyUIGenerate(_PBRMixin, bpy.types.Operator):
         elif total_pixels > upper_bound:
             target_mp = target_px / 1_000_000
             self.report({'WARNING'}, f"High resolution detected. Resolutions above {target_mp:.1f} MP may reduce performance and quality.")
-        
-        self._cameras = [obj for obj in bpy.context.scene.objects if obj.type == 'CAMERA']
+
+        from .view_plan import generation_cameras
+        self._cameras = generation_cameras(context.scene)
         if not self._cameras:
             self.report({'ERROR'}, "No cameras found in the scene. Use 'Add Cameras' to create them.")
             context.scene.generation_status = 'idle'
@@ -1330,7 +1331,7 @@ class ComfyUIGenerate(_PBRMixin, bpy.types.Operator):
                 # Clear output directories which are not needed anymore
                 addon_prefs = context.preferences.addons[_ADDON_PKG].preferences
                 # Save blend file in the output directory if enabled
-                if addon_prefs.save_blend_file:
+                if addon_prefs.save_blend_file and not context.scene.get('_sg_regression_output'):
                     blend_dir = get_dir_path(context, "revision")
                     # Save the current blend file in the output directory
                     scene_name = os.path.splitext(os.path.basename(bpy.data.filepath))[0]

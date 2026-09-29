@@ -49,6 +49,7 @@ from .cameras import (
     MoveCameraOrder, ApplyCameraOrderPreset,
 )
 from .debug_tools import debug_classes as _debug_classes
+from .texturing.regression import REGRESSION_CLASSES
 from .texturing import masked_edit
 from .utils import AddHDRI, ApplyModifiers, CurvesToMesh
 from .texturing.generator import (
@@ -194,6 +195,7 @@ classes = [
 ]
 # Append debug classes (defined in debug_tools.py)
 classes.extend(_debug_classes)
+classes.extend(REGRESSION_CLASSES)
 classes.extend(masked_edit.MASKED_EDIT_CLASSES)
 
 

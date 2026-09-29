@@ -2301,6 +2301,13 @@ class StableGenPanel(bpy.types.Panel):
             row.alignment = 'CENTER'
             row.label(text="Debug / Diagnostics", icon="GHOST_ENABLED")
 
+            from ..texturing.regression import SG_OT_TexturingRegression
+            if SG_OT_TexturingRegression._active is not None:
+                debug_box.label(text=SG_OT_TexturingRegression.status)
+                debug_box.operator("stablegen.stop_texturing_regression", icon="CANCEL")
+            else:
+                debug_box.operator("stablegen.texturing_regression", icon="SEQUENCE")
+
             row = debug_box.row()
             row.operator("stablegen.export_retarget_debug_bundle",
                          text="Export Retarget Test Bundle",

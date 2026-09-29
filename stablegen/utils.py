@@ -5,6 +5,7 @@ from datetime import datetime
 # ── Heavy modal operators that should block most other panel buttons ──
 _SG_BLOCKED_MODALS = frozenset({
     'STABLEGEN_OT_masked_edit',
+    'STABLEGEN_OT_texturing_regression',
     'OBJECT_OT_test_stable',
     'OBJECT_OT_bake_textures',
     'OBJECT_OT_add_cameras',
@@ -276,6 +277,10 @@ def get_generation_dirs(context):
 	
 	# Define directory structure
 	revision_dir = os.path.join(base_dir, scene_name, timestamp)
+	# Debug regression passes have isolated output paths without changing preferences.
+	regression_output = context.scene.get('_sg_regression_output')
+	if regression_output:
+		revision_dir = regression_output
 	masked_output = context.scene.get("_sg_masked_output")
 	if masked_output:
 		revision_dir = masked_output

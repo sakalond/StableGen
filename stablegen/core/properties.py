@@ -644,6 +644,12 @@ def register_properties(update_model_list, ControlNetUnit, LoRAUnit,
         description="True if the most recent generation ended with an error",
         default=False,
     )
+    bpy.types.Scene.sg_last_gen_error_message = bpy.props.StringProperty(
+        name="Last Generation Error Message",
+        description="Diagnostic message from the most recent generation error",
+        default="",
+        options={'SKIP_SAVE'},
+    )
     bpy.types.Scene.generation_progress = bpy.props.FloatProperty(
         name="Generation Progress", description="Current progress of image generation",
         default=0.0, min=0.0, max=100.0, update=update_parameters,

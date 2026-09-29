@@ -148,6 +148,15 @@ class StableGenAddonPreferences(bpy.types.AddonPreferences):
         default=120.0, min=10.0, max=600.0, step=100, precision=0,
     )  # type: ignore
 
+    timeout_generation_heartbeat: bpy.props.FloatProperty(
+        name="Generation Heartbeat (s)",
+        description=(
+            "Interval without WebSocket events before StableGen checks "
+            "ComfyUI history and queue; this does not cancel active generation"
+        ),
+        default=120.0, min=10.0, max=600.0, step=100, precision=0,
+    )  # type: ignore
+
     timeout_reboot: bpy.props.FloatProperty(
         name="Reboot Timeout (s)",
         description="How long to wait for ComfyUI server to come back after a reboot",
@@ -224,6 +233,7 @@ class StableGenAddonPreferences(bpy.types.AddonPreferences):
             col.prop(self, "timeout_ping")
             col.prop(self, "timeout_api")
             col.prop(self, "timeout_transfer")
+            col.prop(self, "timeout_generation_heartbeat")
             col.prop(self, "timeout_reboot")
             col.prop(self, "timeout_mesh_gen")
             col.prop(self, "timeout_scan")
