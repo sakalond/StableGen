@@ -2302,6 +2302,95 @@ class StableGenPanel(bpy.types.Panel):
             row = tools_box.row()
         row.operator("object.stablegen_reproject", text="Reproject Textures", icon="FILE_REFRESH")
 
+        from ..debug_tools import SG_OT_InteractiveDiscardCheck
+        discard_check = SG_OT_InteractiveDiscardCheck._active
+        if discard_check is None:
+            row = tools_box.row()
+            row.operator(
+                "stablegen.interactive_discard_check",
+                text="Interactive Discard Check",
+                icon="CAMERA_DATA",
+            )
+        else:
+            preview_box = tools_box.box()
+            header = preview_box.row()
+            header.label(text="Interactive Discard Check", icon="CAMERA_DATA")
+            if SG_OT_InteractiveDiscardCheck.status:
+                preview_box.label(text=SG_OT_InteractiveDiscardCheck.status)
+
+            preview_box.prop(scene, "discard_factor", text="Discard Angle", slider=True)
+            context_box = preview_box.box()
+            context_box.label(text="Context Render Options")
+
+            if scene.model_architecture != 'qwen_image_21':
+                context_box.prop(
+                    scene,
+                    "qwen_prompt_gray_background",
+                    text="Prompt: Gray Background",
+                    toggle=True,
+                )
+
+            colors_box = context_box.box()
+            colors_box.label(text="Context Render Colors")
+            if scene.model_architecture != 'qwen_image_21':
+                colors_box.prop(
+                    scene, "qwen_guidance_background_color", text="Background"
+                )
+            colors_box.prop(
+                scene, "qwen_guidance_fallback_color", text="Fallback"
+            )
+
+            context_box.prop(
+                scene,
+                "qwen_use_confidence_context",
+                text="Confidence-Gated Context",
+                toggle=True,
+                icon="MOD_MASK",
+            )
+            if scene.qwen_use_confidence_context:
+                context_box.prop(
+                    scene, "qwen_trust_threshold", text="Trusted Quality", slider=True
+                )
+            else:
+                context_box.prop(
+                    scene,
+                    "qwen_context_fallback_dilation",
+                    text="Legacy Fallback Dilate (px)",
+                    slider=True,
+                )
+                context_box.prop(
+                    scene,
+                    "qwen_context_cleanup",
+                    text="Legacy Cleanup",
+                    toggle=True,
+                    icon="BRUSH_DATA",
+                )
+                if scene.qwen_context_cleanup:
+                    context_box.prop(
+                        scene,
+                        "qwen_context_cleanup_hue_tolerance",
+                        text="Hue Tol (°)",
+                        slider=True,
+                    )
+                    context_box.prop(
+                        scene,
+                        "qwen_context_cleanup_value_adjust",
+                        text="Value Adjust",
+                        slider=True,
+                    )
+
+            actions = preview_box.row(align=True)
+            actions.operator(
+                "stablegen.interactive_discard_apply",
+                text="Apply Settings",
+                icon="CHECKMARK",
+            )
+            actions.operator(
+                "stablegen.interactive_discard_cancel",
+                text="Cancel",
+                icon="LOOP_BACK",
+            )
+
         row = tools_box.row()
         row.operator("object.stablegen_mirror_reproject", text="Mirror Last Projection", icon="MOD_MIRROR")
         if width_mode == 'narrow':
@@ -2320,80 +2409,61 @@ class StableGenPanel(bpy.types.Panel):
         if prefs and prefs.preferences.enable_debug:
             layout.separator()
             debug_box = layout.box()
-            row = debug_box.row()
-            row.alignment = 'CENTER'
-            row.label(text="Debug / Diagnostics", icon="GHOST_ENABLED")
+            title = debug_box.row()
+            title.alignment = 'CENTER'
+            title.label(text="Debug / Diagnostics", icon="GHOST_ENABLED")
 
             from ..texturing.regression import SG_OT_TexturingRegression
+            from ..debug_tools import SG_OT_DebugProjectionLine
+
+            columns = 1 if width_mode == 'narrow' else 2
+            debug_box.label(text="Projection")
+            grid = debug_box.grid_flow(row_major=True, columns=columns,
+                                       even_columns=True, even_rows=True, align=True)
+            grid.operator('stablegen.debug_solid_colors', text='Solid Colors', icon='COLOR')
+            grid.operator('stablegen.debug_grid_pattern', text='Grid Pattern', icon='MESH_GRID')
+            grid.operator('stablegen.debug_coverage_heatmap', text='Coverage Heatmap', icon='AREA_SWAP')
+            grid.operator('stablegen.debug_visibility_material', text='Visibility Material', icon='HIDE_OFF')
+            grid.operator('stablegen.debug_per_camera_weight', text='Camera Weight', icon='CAMERA_DATA')
+            grid.operator('stablegen.debug_feather_preview', text='Feather Preview', icon='MOD_SMOOTH')
+            grid.operator('stablegen.debug_confidence_diagnostic', text='Confidence', icon='SHADING_RENDERED')
+            grid.operator('stablegen.debug_uv_seam_viz', text='UV Seams', icon='UV')
+
+            grid = debug_box.grid_flow(row_major=True, columns=columns,
+                                       even_columns=True, even_rows=True, align=True)
+            grid.operator('stablegen.debug_dppg_material', text='DPPG Masks', icon='MATERIAL_DATA')
+            grid.operator('stablegen.debug_restore_dppg_material', text='Restore Projection', icon='LOOP_BACK')
+            grid.operator('stablegen.debug_projection_line', text='Projection Line', icon='IPO_LINEAR')
+            grid.operator('stablegen.debug_open_projection_line', text='Open Line Report', icon='URL')
+            if SG_OT_DebugProjectionLine.status:
+                debug_box.label(text=SG_OT_DebugProjectionLine.status)
+
+            debug_box.separator(factor=0.5)
+            debug_box.label(text="Workflow Tests")
             if SG_OT_TexturingRegression._active is not None:
                 debug_box.label(text=SG_OT_TexturingRegression.status)
-                debug_box.operator("stablegen.stop_texturing_regression", icon="CANCEL")
+                debug_box.operator('stablegen.stop_texturing_regression', icon='CANCEL')
             else:
-                debug_box.operator("stablegen.texturing_regression", icon="SEQUENCE")
+                debug_box.operator('stablegen.texturing_regression', icon='SEQUENCE')
+            debug_box.operator('stablegen.export_retarget_debug_bundle',
+                               text='Export Retarget Test Bundle', icon='EXPORT')
 
-            row = debug_box.row()
-            row.operator("stablegen.export_retarget_debug_bundle",
-                         text="Export Retarget Test Bundle",
-                         icon="EXPORT")
+            debug_box.separator(factor=0.5)
+            debug_box.label(text="Mesh and Rig")
+            grid = debug_box.grid_flow(row_major=True, columns=columns,
+                                       even_columns=True, even_rows=True, align=True)
+            grid.operator('stablegen.debug_skinning_weights', text='Skin Weights', icon='GROUP_VERTEX')
+            grid.operator('stablegen.debug_clear_skinning_weights', text='Clear Skin Colors', icon='X')
+            debug_box.operator('stablegen.debug_convert_fortune_rig',
+                               text='Convert Existing Rig to Fortune', icon='ARMATURE_DATA')
+            debug_box.operator('stablegen.debug_make_solid', text='Debug Make Solid', icon='MOD_REMESH')
 
-            row = debug_box.row()
-            row.operator("stablegen.debug_solid_colors", text="Draw Solid Colors", icon="COLOR")
-            if width_mode == 'narrow':
-                row = debug_box.row()
-            row.operator("stablegen.debug_grid_pattern", text="Grid Pattern", icon="MESH_GRID")
-
-            row = debug_box.row()
-            row.operator("stablegen.debug_coverage_heatmap", text="Coverage Heatmap", icon="AREA_SWAP")
-            if width_mode == 'narrow':
-                row = debug_box.row()
-            row.operator("stablegen.debug_visibility_material", text="Visibility Material", icon="HIDE_OFF")
-
-            row = debug_box.row()
-            row.operator("stablegen.debug_uv_seam_viz", text="UV Seam Visualizer", icon="UV")
-            if width_mode == 'narrow':
-                row = debug_box.row()
-            row.operator("stablegen.debug_restore_material", text="Remove Debug Mats", icon="TRASH")
-
-            row = debug_box.row()
-            op = row.operator("stablegen.debug_per_camera_weight", text="Per-Camera Weight", icon="CAMERA_DATA")
-            if width_mode == 'narrow':
-                row = debug_box.row()
-            op2 = row.operator("stablegen.debug_feather_preview", text="Feather Preview", icon="MOD_SMOOTH")
-
-            row = debug_box.row()
-            row.operator("stablegen.debug_confidence_diagnostic", text="Confidence Diagnostics", icon="SHADING_RENDERED")
-
-            row = debug_box.row()
-            row.operator(
-                "stablegen.debug_skinning_weights",
-                text="Skinning Weight Colors",
-                icon="GROUP_VERTEX",
-            )
-            if width_mode == 'narrow':
-                row = debug_box.row()
-            row.operator(
-                "stablegen.debug_clear_skinning_weights",
-                text="Clear Skin Colors",
-                icon="X",
-            )
-
-            row = debug_box.row()
-            row.operator(
-                "stablegen.debug_convert_fortune_rig",
-                text="Convert Existing Rig to Fortune",
-                icon="ARMATURE_DATA",
-            )
-
-            row = debug_box.row()
-            row.operator("stablegen.debug_make_solid", text="Debug Make Solid", icon="MOD_REMESH")
-
-            row = debug_box.row()
-            row.operator(
-                "stablegen.debug_force_generation_idle",
-                text="Force Generation Idle",
-                icon="CANCEL",
-            )
-
+            debug_box.separator(factor=0.5)
+            debug_box.label(text="Recovery")
+            grid = debug_box.grid_flow(row_major=True, columns=columns,
+                                       even_columns=True, even_rows=True, align=True)
+            grid.operator('stablegen.debug_restore_material', text='Remove Debug Mats', icon='TRASH')
+            grid.operator('stablegen.debug_force_generation_idle', text='Force Generation Idle', icon='CANCEL')
         # --- Narrow panel hint ---
         if width_mode == 'narrow':
             hint_row = layout.row()

@@ -1483,7 +1483,8 @@ def expand_mask_to_blocks(mask_file_path, block_size=8):
 
 
 def _export_visibility_impl(context, to_export, obj=None, camera_visibility=None,
-                            prepare_only=False, camera_render=None, camera_id=None):
+                            prepare_only=False, camera_render=None, camera_id=None,
+                            output_object_name=None):
     """     
     Exports the visibility of the mesh by temporarily altering the shading nodes.
     :param context: Blender context.
@@ -1766,9 +1767,12 @@ def _export_visibility_impl(context, to_export, obj=None, camera_visibility=None
     # Bake or render the texture
     if not camera_visibility:
         output_dir = get_dir_path(context, "uv_inpaint")["visibility"]
-        output_file = f"{obj.name}_baked_visibility"
+        output_file = f"{output_object_name or obj.name}_baked_visibility"
         prepare_baking(context)
-        bake_texture(context, obj, suffix="_visibility", texture_resolution=1024, view_transform='Raw', output_dir=output_dir)
+        if not bake_texture(context, obj, suffix="_visibility", texture_resolution=1024,
+                            view_transform='Raw', output_dir=output_dir,
+                            output_name=output_file):
+            raise RuntimeError(f"Could not bake visibility for {output_object_name or obj.name}")
         # Use openCV to normalize the image
         image_path = os.path.join(output_dir, f"{output_file}.png")
         image = cv2.imread(image_path, cv2.IMREAD_GRAYSCALE)
@@ -1821,6 +1825,7 @@ def export_visibility(context, to_export, obj=None, camera_visibility=None,
                 camera_visibility=camera_visibility,
                 prepare_only=False, camera_render=camera_render,
                 camera_id=camera_id,
+                output_object_name=obj.name if obj is not None else None,
             )
 
 
@@ -2544,7 +2549,8 @@ def unwrap(obj, method, overlap_only, texture_resolution=2048):
             bpy.ops.uv.select_all(action='DESELECT')
             bpy.ops.object.mode_set(mode='OBJECT')
 
-def bake_texture(context, obj, texture_resolution, suffix = "", view_transform = 'Standard', output_dir = None):
+def bake_texture(context, obj, texture_resolution, suffix = "", view_transform = 'Standard', output_dir = None,
+                 output_name=None):
         """     
         Bakes the texture of the given object.         
         :param context: Blender context.         
@@ -2574,7 +2580,7 @@ def bake_texture(context, obj, texture_resolution, suffix = "", view_transform =
             source_uv_name = _first_source_uv_name(obj)
             bake_uv = _set_bake_uv_active(obj)
 
-            image_name = f"{obj.name}_baked{suffix}"
+            image_name = output_name or f"{obj.name}_baked{suffix}"
             old_image = bpy.data.images.get(image_name)
             if old_image is not None and old_image.users == 0:
                 bpy.data.images.remove(old_image)
@@ -2661,7 +2667,9 @@ def bake_texture(context, obj, texture_resolution, suffix = "", view_transform =
             if output_dir is None:
                 output_dir = get_dir_path(context, "baked")
             os.makedirs(output_dir, exist_ok=True)
-            if suffix == "":
+            if output_name is not None:
+                image.filepath_raw = os.path.join(output_dir, f"{output_name}.png")
+            elif suffix == "":
                 image.filepath_raw = os.path.join(output_dir, f"{obj.name}.png")
             else:
                 image.filepath_raw = os.path.join(

@@ -1835,9 +1835,28 @@ def project_image(
     for area in context.screen.areas:
         area.tag_redraw()
     
-    # Apply projection to all mesh objects for each camera
+    # Apply projection to all mesh objects for each camera. Interactive
+    # diagnostics can reuse the attributes created by the original generation;
+    # this keeps a live preview from repeatedly applying UV Project modifiers.
+    if reuse_projection_uv:
+        missing = [
+            f"{obj.name}:ProjectionUV_{i}_{mat_id}"
+            for i, _camera in enumerate(cameras)
+            for obj in to_project
+            if obj.data.attributes.get(f"ProjectionUV_{i}_{mat_id}") is None
+        ]
+        if missing:
+            sample = ", ".join(missing[:3])
+            raise RuntimeError(
+                "Existing projection UV data is missing (" + sample + "). "
+                "Run texture generation or Reproject Textures first."
+            )
+
+    # Apply projection to all mesh objects for each camera.
     for i, camera in enumerate(cameras):
         for x, obj in enumerate(to_project):
+            if reuse_projection_uv:
+                continue
             # We can skip the UV Projection step in sequential mode for i > 0
             if context.scene.generation_method != 'sequential' or stop_index == 0:
                 # Deselect all objects
@@ -1901,11 +1920,12 @@ def project_image(
                     original_uv_map = obj.data.uv_layers[1]
                 obj.data.uv_layers.active = original_uv_map
 
-    # Clean up buffer UV map from all objects
-    for obj in to_project:
-        buffer_uv = obj.data.uv_layers.get(_SG_BUFFER_UV_NAME)
-        if buffer_uv:
-            obj.data.uv_layers.remove(buffer_uv)
+    # Clean up the temporary buffer only when this call created projection UVs.
+    if not reuse_projection_uv:
+        for obj in to_project:
+            buffer_uv = obj.data.uv_layers.get(_SG_BUFFER_UV_NAME)
+            if buffer_uv:
+                obj.data.uv_layers.remove(buffer_uv)
 
     # ── Optional: bake per-vertex visibility weights ──────────────────
     use_baked_weights = (
@@ -1928,7 +1948,15 @@ def project_image(
                 and obj.data.attributes.get(f"_SG_ProjectionDepth_{cam_idx}_{mat_id}") is None)
             for obj in to_project for cam_idx in range(len(cameras))
         )
-        if not is_sequential or stop_index == 0 or missing_bake:
+        if reuse_projection_uv and missing_bake:
+            # Saved projection materials from before transform-stable weights
+            # can legitimately have reusable ProjectionUV attributes without
+            # the newer _SG_VisWeight attributes.  An interactive preview must
+            # stay non-destructive, so use the dynamic raycast graph rather
+            # than baking new mesh data merely to inspect the context.
+            use_baked_weights = False
+        if (not reuse_projection_uv
+                and (not is_sequential or stop_index == 0 or missing_bake)):
             _bake_visibility_weights(context, to_project, cameras, mat_id)
 
     # Switch to Cycles (needed for Raycast shader node on all versions)
@@ -2905,6 +2933,7 @@ def project_image(
         subtract_node = nodes.new("ShaderNodeMath")
         subtract_node.operation = 'SUBTRACT'
         subtract_node.inputs[0].default_value = mat_id
+        subtract_node.label = 'SGMaterialIndex'
         subtract_node.location = (-1000, 0)
     return True
     

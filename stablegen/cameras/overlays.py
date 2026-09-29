@@ -17,6 +17,15 @@ _ADDON_PKG = __package__.rsplit('.', 1)[0]
 _sg_crop_draw_handle = None
 
 
+def _sg_camera_overlay_color(camera):
+    """Use the solid-projection diagnostic color when assigned to this camera."""
+    color = camera.get('_sg_debug_projection_color')
+    if color is not None:
+        return color
+    prefs = bpy.context.preferences.addons.get(_ADDON_PKG)
+    return prefs.preferences.overlay_color if prefs else (0.3, 0.5, 1.0)
+
+
 def _sg_draw_crop_overlays():
     """SpaceView3D draw callback: renders a coloured rectangle inside each
     camera's pyramid to visualise the actual (non-square) crop region."""
@@ -72,8 +81,7 @@ def _sg_draw_crop_overlays():
         indices = [(0, 1), (1, 2), (2, 3), (3, 0)]
         batch = batch_for_shader(shader, 'LINES', {"pos": coords}, indices=indices)
         shader.bind()
-        _prefs = bpy.context.preferences.addons.get(_ADDON_PKG)
-        _oc = _prefs.preferences.overlay_color if _prefs else (0.3, 0.5, 1.0)
+        _oc = _sg_camera_overlay_color(obj)
         shader.uniform_float("color", (_oc[0], _oc[1], _oc[2], 0.9))
         gpu.state.line_width_set(2.0)
         gpu.state.blend_set('ALPHA')
@@ -112,9 +120,6 @@ def _sg_draw_view_labels():
 
     font_id = 0
     blf.size(font_id, 13)
-    _prefs = bpy.context.preferences.addons.get(_ADDON_PKG)
-    _oc = _prefs.preferences.overlay_color if _prefs else (0.3, 0.5, 1.0)
-    blf.color(font_id, _oc[0], _oc[1], _oc[2], 0.95)
 
     # Build a lookup of camera name -> prompt text
     prompt_lookup = {item.name: item.prompt for item in scene.camera_prompts
@@ -129,6 +134,8 @@ def _sg_draw_view_labels():
         co_2d = location_3d_to_region_2d(region, rv3d, obj.location)
         if co_2d is None:
             continue
+        _oc = _sg_camera_overlay_color(obj)
+        blf.color(font_id, _oc[0], _oc[1], _oc[2], 0.95)
         # Offset slightly below the camera marker
         blf.position(font_id, co_2d.x - blf.dimensions(font_id, label)[0] * 0.5,
                      co_2d.y - 20, 0)
