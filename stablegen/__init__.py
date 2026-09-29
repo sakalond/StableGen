@@ -49,6 +49,7 @@ from .cameras import (
     MoveCameraOrder, ApplyCameraOrderPreset,
 )
 from .debug_tools import debug_classes as _debug_classes
+from .texturing import masked_edit
 from .utils import AddHDRI, ApplyModifiers, CurvesToMesh
 from .texturing.generator import (
     ComfyUIGenerate, Reproject, Regenerate, MirrorReproject,
@@ -193,11 +194,14 @@ classes = [
 ]
 # Append debug classes (defined in debug_tools.py)
 classes.extend(_debug_classes)
+classes.extend(masked_edit.MASKED_EDIT_CLASSES)
 
 
 def register():
     for cls in classes:
         bpy.utils.register_class(cls)
+
+    masked_edit.register_properties()
 
     register_properties(
         update_model_list=update_model_list,
@@ -211,6 +215,7 @@ def register():
 
 
 def unregister():
+    masked_edit.unregister_properties()
     from .mesh_gen.batch import unregister_batch
     from .dae_import.batch_texture import unregister_batch_texture
     unregister_batch()

@@ -767,7 +767,13 @@ class ComfyUIGenerate(_PBRMixin, bpy.types.Operator):
         if ComfyUIGenerate._is_running:
             self.cancel_generate(context)
             return {'FINISHED'}
-        
+
+        # Keep keyboard shortcuts and other callers of the standard Generate
+        # operator consistent with the mode selected in the panel.
+        from .masked_edit import is_masked_edit_mode
+        if is_masked_edit_mode(context.scene):
+            return bpy.ops.stablegen.masked_edit()
+
         self._generation_method_on_start = context.scene.generation_method
 
         # Clear the upload cache at the start of a new generation

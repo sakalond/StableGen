@@ -67,6 +67,12 @@ def _fmt_diff_val(v):
     return str(v)
 
 
+def _is_masked_edit_mode(scene):
+    if scene.model_architecture.startswith('qwen'):
+        return scene.qwen_generation_method == 'masked_edit'
+    return scene.generation_method == 'masked_edit'
+
+
 def _preset_diff(context):
     """Return list of (param, current_formatted, preset_formatted) for
     parameters that differ between the scene and the selected preset.
@@ -113,8 +119,11 @@ class StableGenPanel(bpy.types.Panel):
     bl_space_type = "VIEW_3D"
     bl_region_type = "UI"
     bl_category = "StableGen"
-    bl_context = "objectmode"
     bl_ui_units_x = 600
+
+    @classmethod
+    def poll(cls, context):
+        return context.mode in {'OBJECT', 'PAINT_TEXTURE'}
 
     def draw_header(self, _):
         """     
@@ -175,6 +184,7 @@ class StableGenPanel(bpy.types.Panel):
         # Determine if we are in TRELLIS.2 mode (used by generate button & later sections)
         _arch_mode = getattr(scene, 'architecture_mode', 'sdxl')
         _is_trellis2_mode = (_arch_mode == 'trellis2')
+        _masked_edit_mode = not _is_trellis2_mode and _is_masked_edit_mode(scene)
 
         # ── Prerequisite warnings (shown inline before the Generate button) ──
         if not _is_trellis2_mode and not config_error_message:
@@ -443,7 +453,45 @@ class StableGenPanel(bpy.types.Panel):
                                         text="Generate 3D Mesh", icon="MESH_ICOSPHERE")
         else:
             # --- Standard Diffusion Generate Button ---
-            if config_error_message:
+            if _masked_edit_mode:
+                from ..texturing.masked_edit import SG_OT_MaskedEdit
+                masked_preview = any(o.sg_mask_original for o in scene.objects)
+                if config_error_message:
+                    action_row.operator('stablegen.masked_edit', text='Cannot edit: ' + config_error_message, icon='ERROR')
+                    action_row.enabled = False
+                elif SG_OT_MaskedEdit._active:
+                    masked_op = SG_OT_MaskedEdit._active
+                    action_row.operator('stablegen.stop_masked_edit', text='Stop After Current View', icon='CANCEL')
+                    progress_col = layout.column()
+                    stage_pct = max(0.0, min(getattr(masked_op, '_progress', 0.0), 100.0))
+                    stage = getattr(masked_op, '_stage', 'Preparing Masked Edit')
+                    progress_col.progress(
+                        text=f'{stage} ({stage_pct:.0f}%)',
+                        factor=stage_pct / 100.0,
+                    )
+                    overall_pct = max(0.0, min(getattr(masked_op, '_overall_progress', 0.0), 100.0))
+                    progress_col.progress(
+                        text=getattr(masked_op, '_overall_label', 'Overall Masked Edit'),
+                        factor=overall_pct / 100.0,
+                    )
+                elif masked_preview:
+                    action_row.operator('stablegen.resolve_masked_edit', text='Apply', icon='CHECKMARK').apply = True
+                    action_row.operator('stablegen.resolve_masked_edit', text='Discard', icon='LOOP_BACK').apply = False
+                elif scene.model_architecture not in {'sdxl', 'qwen_image_edit', 'qwen_image_21'}:
+                    action_row.operator('stablegen.masked_edit', text='Masked Edit requires Qwen or SDXL', icon='ERROR')
+                    action_row.enabled = False
+                elif not bpy.app.online_access:
+                    action_row.operator('stablegen.masked_edit', text='Enable online access in preferences', icon='ERROR')
+                    action_row.enabled = False
+                elif not scene.model_name or scene.model_name == 'NONE_FOUND':
+                    action_row.operator('stablegen.masked_edit', text='Cannot edit: Model Directory Empty', icon='ERROR')
+                    action_row.enabled = False
+                else:
+                    action_row.operator('stablegen.masked_edit', text='Generate Masked Edit', icon='PLAY')
+                if scene.sg_masked_status and not SG_OT_MaskedEdit._active:
+                    status_row = layout.row()
+                    status_row.label(text=scene.sg_masked_status)
+            elif config_error_message:
                 # Split the row to have the error message/disabled button and the refresh button
                 if config_error_message == "Cannot reach server":
                     split = action_row.split(factor=0.85, align=True) # Adjust factor as needed
@@ -1825,9 +1873,15 @@ class StableGenPanel(bpy.types.Panel):
             else:
                 mode_specific_outer_box = None
             if mode_specific_outer_box: # This is the box where all mode-specific UIs should go
-                
+                if _masked_edit_mode:
+                    from ..texturing.masked_edit import draw_masked_edit_controls
+                    row = mode_specific_outer_box.row()
+                    row.alignment = 'CENTER'
+                    row.label(text='Masked Edit Parameters', icon='BRUSH_DATA')
+                    draw_masked_edit_controls(mode_specific_outer_box, context)
+
                 # Qwen Local Edit Mode Parameters
-                if scene.model_architecture.startswith('qwen') and scene.qwen_generation_method == 'local_edit':
+                elif scene.model_architecture.startswith('qwen') and scene.qwen_generation_method == 'local_edit':
                     row = mode_specific_outer_box.row()
                     row.alignment = 'CENTER'
                     row.label(text="Qwen Local Edit Parameters", icon='BRUSH_DATA')

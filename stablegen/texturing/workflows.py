@@ -736,7 +736,7 @@ class _TexturingWorkflowMixin:
                     return "Change and transfer the format of '{main_prompt}' in image 1 to the style from image 2"
 
 
-    def generate_qwen_refine(self, context, camera_id=None):
+    def generate_qwen_refine(self, context, camera_id=None, masked_edit=None):
         """Generates an image using the Qwen-Image-Edit workflow for refinement."""
         server_address = context.preferences.addons[_ADDON_PKG].preferences.server_address
         client_id = str(uuid.uuid4())
@@ -788,7 +788,7 @@ class _TexturingWorkflowMixin:
         prompt[NODES['guidance_map_loader']]['inputs']['image'] = render_info['name']
 
         # --- Configure Style Image (Image 2) ---
-        use_prev_ref = context.scene.qwen_refine_use_prev_ref
+        use_prev_ref = context.scene.qwen_refine_use_prev_ref and masked_edit is None
         style_image_info = None
         
         if use_prev_ref and camera_id > 0:
@@ -799,13 +799,17 @@ class _TexturingWorkflowMixin:
             prompt[NODES['style_map_loader']]['inputs']['image'] = style_image_info['name']
         else:
             # Fallback to external style image if configured
-            if context.scene.qwen_use_external_style_image:
+            if masked_edit is not None:
+                style_image_info = masked_edit.get('overlay')
+                if style_image_info:
+                    prompt[NODES['style_map_loader']]['inputs']['image'] = style_image_info['name']
+            elif context.scene.qwen_use_external_style_image:
                  style_image_info = self.operator._get_uploaded_image_info(context, "custom", filename=bpy.path.abspath(context.scene.qwen_external_style_image))
                  if style_image_info:
                      prompt[NODES['style_map_loader']]['inputs']['image'] = style_image_info['name']
             
             # Fallback to TRELLIS.2 input image as style
-            if not style_image_info and getattr(context.scene, 'architecture_mode', '') == 'trellis2' and getattr(context.scene, 'qwen_use_trellis2_style', False):
+            if masked_edit is None and not style_image_info and getattr(context.scene, 'architecture_mode', '') == 'trellis2' and getattr(context.scene, 'qwen_use_trellis2_style', False):
                 t2_path = getattr(context.scene, 'trellis2_last_input_image', '')
                 if t2_path and os.path.exists(bpy.path.abspath(t2_path)):
                     style_image_info = self.operator._get_uploaded_image_info(context, "custom", filename=bpy.path.abspath(t2_path))
@@ -819,9 +823,10 @@ class _TexturingWorkflowMixin:
                 del prompt[NODES['neg_prompt']]['inputs']['image2']
 
         # --- Configure Depth Map (Image 3) ---
-        use_depth = context.scene.qwen_refine_use_depth
-        depth_info = None
-        if use_depth:
+        use_depth = (bool(masked_edit.get('depth')) if masked_edit is not None
+                     else context.scene.qwen_refine_use_depth)
+        depth_info = masked_edit.get('depth') if masked_edit is not None else None
+        if use_depth and masked_edit is None:
             depth_info = self.operator._get_uploaded_image_info(context, "controlnet", subtype="depth", camera_id=camera_id)
         
         if depth_info:
@@ -835,6 +840,10 @@ class _TexturingWorkflowMixin:
         # --- Prompt ---
         user_prompt = _texturing_prompt(context.scene)
         final_prompt = f"Modify image1 to {user_prompt}"
+        if masked_edit is not None:
+            from .masked_edit import qwen_edit_instruction
+            final_prompt = qwen_edit_instruction(
+                masked_edit['prompt'], bool(style_image_info), masked_edit.get('prompt_template'))
         if depth_info:
             final_prompt += "\n\nImage3 is a depth map of the same view; use it to preserve scene geometry."
         
@@ -844,8 +853,10 @@ class _TexturingWorkflowMixin:
             self._convert_to_qwen_image_21(prompt, NODES, context)
         else:
             # --- Reference Latent chain (Qwen unzoom fix) ---
+            # The overlay is a semantic selection guide, never an appearance latent.
             self._build_qwen_reference_latent_chain(
                 prompt, NODES,
+                **({'latent_slots': ('image1',)} if masked_edit is not None else {}),
             )
             prompt[NODES['sampler']]['inputs']['seed'] = context.scene.seed
             prompt[NODES['sampler']]['inputs']['steps'] = context.scene.steps
@@ -2644,6 +2655,45 @@ class _TexturingWorkflowMixin:
         prompt[NODES['sampler']]["inputs"]["negative"] = [final_node, 1]
         
         return prompt
+
+    def generate_masked_sdxl(self, context, render_info, mask_info, instruction):
+        """Masked image-space inpainting, independent of the selected base preset mode."""
+        prompt, nodes = self._create_img2img_base_prompt(context)
+        for key in ('235', '236', '237', '239'):
+            prompt.pop(key, None)
+        sampler = prompt[nodes['sampler']]['inputs']
+        # The base builder may insert Differential Diffusion for the scene mode.
+        dd = prompt.pop(nodes['differential_diffusion'], None)
+        if sampler['model'] == [nodes['differential_diffusion'], 0]:
+            sampler['model'] = dd['inputs']['model']
+        prompt[nodes['pos_prompt']]['inputs']['text'] = instruction
+        prompt[nodes['render_image']]['inputs']['image'] = render_info['name']
+        prompt[nodes['input_image']]['inputs']['image'] = render_info['name']
+        prompt[nodes['mask_image']]['inputs']['image'] = mask_info['name']
+        # Mask expansion/feathering is prepared once by Masked Edit, not by preset settings.
+        prompt[nodes['grow_mask']]['inputs']['expand'] = 0
+        mask = [nodes['image_to_mask'], 0]
+        encoder = prompt[nodes['vae_encode_inpaint']]['inputs']
+        encoder['pixels'] = [nodes['input_image'], 0]
+        encoder['mask'] = mask
+        encoder['grow_mask_by'] = 0
+        sampler['latent_image'] = [nodes['vae_encode_inpaint'], 0]
+        sampler['positive'] = [nodes['pos_prompt'], 0]
+        sampler['negative'] = [nodes['neg_prompt'], 0]
+        sampler['denoise'] = context.scene.sg_masked_strength
+        self._save_prompt_to_file(prompt, get_generation_dirs(context)['revision'], workflow='masked_sdxl')
+        server = context.preferences.addons[_ADDON_PKG].preferences.server_address
+        client_id = str(uuid.uuid4())
+        ws = self._connect_to_websocket(server, client_id)
+        if ws is None:
+            raise RuntimeError('Could not connect to ComfyUI')
+        try:
+            images = self._execute_prompt_and_get_images(ws, prompt, client_id, server, nodes)
+        finally:
+            ws.close()
+        if not images or 'error' in images:
+            raise RuntimeError(self.operator._error or 'Masked inpainting failed')
+        return images[nodes['save_image']][0]
 
     def refine(self, context, controlnet_info=None, mask_info=None, render_info=None, ipadapter_ref_info=None):
         """     
