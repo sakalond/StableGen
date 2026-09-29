@@ -764,12 +764,14 @@ def create_native_raycast_visibility(nodes, links, camera, geometry, context, i,
 
     clamp_dot2 = nodes.new("ShaderNodeMath")
     clamp_dot2.operation = 'MINIMUM'
+    clamp_dot2.label = f'FacingSignedDot-{i}-{mat_id}'
     clamp_dot2.location = (x_base + 500, y_base - 150)
     clamp_dot2.inputs[1].default_value = 1.0
     links.new(clamp_dot.outputs[0], clamp_dot2.inputs[0])
 
     facing_dot = nodes.new("ShaderNodeMath")
     facing_dot.location = (x_base + 600, y_base - 150)
+    facing_raw = facing_dot
     if getattr(context.scene, 'sg_allow_backface_projection', False):
         facing_dot.operation = 'ABSOLUTE'
         links.new(clamp_dot2.outputs[0], facing_dot.inputs[0])
@@ -785,6 +787,8 @@ def create_native_raycast_visibility(nodes, links, camera, geometry, context, i,
         facing_clamp.inputs[1].default_value = 0.0
         links.new(facing_dot.outputs[0], facing_clamp.inputs[0])
         facing_dot = facing_clamp
+
+    facing_dot.label = f'FacingWeight-{i}-{mat_id}'
 
     acos_node = nodes.new("ShaderNodeMath")
     acos_node.operation = 'ARCCOSINE'
@@ -833,6 +837,51 @@ def create_native_raycast_visibility(nodes, links, camera, geometry, context, i,
     links.new(combine2.outputs[0], final_weight.inputs[0])
     links.new(power_node.outputs[0], final_weight.inputs[1])
 
+    # Presentation metadata only: keep the native graph's large camera math
+    # readable without changing any operation, input or connection.
+    stage_names = {
+        'Camera basis and frustum': '''
+            add_camera_loc subtract normalize_node length_node camera_fov_node
+            camera_aspect_node camera_dir_node camera_up_node norm_forward
+            cross_fwd_up norm_right cross_right_fwd norm_up_vec neg_forward
+            dot_d_right dot_d_up dot_d_neg_fwd cam_z_check fov_half filmw
+            filmh neg_cam_z x_proj y_proj shift_x_amount centered_x
+            shift_y_amount centered_y abs_x x_in_bounds abs_y y_in_bounds
+            frustum_xy frustum_ok''',
+        'Raycast visibility': '''
+            raycast threshold_plus hit_dist_plus dist_check occlusion_ok''',
+        'Facing and angle': '''
+            dot_d_normal clamp_dot clamp_dot2 facing_raw facing_dot acos_node
+            to_degrees angle_check power_node combine1 combine2 final_weight''',
+    }
+    readable_names = {
+        'add_camera_loc': 'Camera position',
+        'subtract': 'Camera to surface',
+        'normalize_node': 'View direction',
+        'length_node': 'Camera distance',
+        'camera_fov_node': 'Camera field of view',
+        'camera_aspect_node': 'Camera aspect',
+        'camera_dir_node': 'Camera forward',
+        'camera_up_node': 'Camera up',
+        'frustum_ok': 'Inside camera frame',
+        'raycast': 'Raycast to surface',
+        'threshold_plus': 'Ray length tolerance',
+        'hit_dist_plus': 'Hit distance tolerance',
+        'dist_check': 'Target depth matches hit',
+        'occlusion_ok': 'Visible from camera',
+        'dot_d_normal': 'View facing angle',
+        'facing_raw': 'Apply backface setting',
+        'combine1': 'Frustum and occlusion',
+        'combine2': 'Apply discard angle',
+    }
+    available = locals()
+    for stage, names in stage_names.items():
+        for name in names.split():
+            node = available[name]
+            node['sg_layout_stage'] = stage
+            if not node.label:
+                node.label = readable_names.get(name, name.replace('_', ' ').capitalize())
+
     return (final_weight, subtract, normalize_node, length_node,
             add_camera_loc, camera_fov_node, camera_aspect_node,
             camera_dir_node, camera_up_node)
@@ -846,6 +895,7 @@ def create_native_feather(nodes, links, normalize_node, camera_fov_node, camera_
     
     Returns the feather output node (ShaderNodeMath).
     """
+    before = {node.as_pointer() for node in nodes}
     x_base = -400
     y_base = (-800) * i - 400  # Offset below the raycast nodes
 
@@ -1044,6 +1094,14 @@ def create_native_feather(nodes, links, normalize_node, camera_fov_node, camera_
         # No feathering: result = cam_z_check (1 if in front, 0 behind)
         final_feather = cam_z_check
         final_feather.label = f"Feather-{i}-{mat_id}"
+
+    for node in nodes:
+        if node.as_pointer() not in before:
+            node['sg_layout_stage'] = 'Frame edge and vignette'
+            if not node.label:
+                node.label = 'Frame edge ' + (
+                    node.operation.replace('_', ' ').lower()
+                    if hasattr(node, 'operation') else node.bl_label.lower())
 
     return final_feather
 
@@ -1784,12 +1842,14 @@ def project_image(
 
                 if legacy_priority:
                     map_range_node = nodes_collection.new("ShaderNodeMapRange")
+                    map_range_node.label = f'EarlyPriorityMap-{level}-{i}'
                     map_range_node.location = (x_offset - 400, y_offset + vert_offset)
                     map_range_node.inputs[1].default_value = context.scene.early_priority_strength
                     links.new(div_node.outputs[0], map_range_node.inputs[0])
 
                 # Create a MixRGB node for color blending of the two inputs
                 mix_node = nodes_collection.new("ShaderNodeMixRGB")
+                mix_node.label = f'CameraMix-{level}-{i}'
                 mix_node.location = (x_offset - 200, y_offset + vert_offset)
                 mix_node.use_clamp = True
                 # Connect first color to Color1 and second color to Color2
@@ -2016,6 +2076,9 @@ def project_image(
         mat.use_nodes = True
         nodes = mat.node_tree.nodes
         links = mat.node_tree.links
+        layout_existing = ({node.as_pointer() for node in nodes}
+                           if is_local_edit else set())
+        layout_camera_nodes = {}
         
         previous_node = None
         output = None
@@ -2125,9 +2188,6 @@ def project_image(
             output = nodes.new("ShaderNodeOutputMaterial")
             output.location = (3000, 0)
         
-        geometry = nodes.new("ShaderNodeNewGeometry")
-        geometry.location = (-600, 0)
-
         use_native_raycast = bpy.app.version >= (5, 1, 0)
 
         tex_image_nodes = []
@@ -2268,7 +2328,13 @@ def project_image(
             in {'REPLACE_STYLE', 'ADDITIONAL'}
         )
 
+        geometry_nodes = []
         for i, camera in enumerate(cameras):
+            camera_node_start = {node.as_pointer() for node in nodes}
+            # Geometry is evaluated at the current shading point. Keeping an
+            # instance in each view avoids links spanning every camera row.
+            geometry = nodes.new("ShaderNodeNewGeometry")
+            geometry_nodes.append(geometry)
             # Add image texture node
             tex_image = nodes.new("ShaderNodeTexImage")
             if i <= stop_index:
@@ -2848,6 +2914,13 @@ def project_image(
                         confidence_quality = accepted_quality
                 confidence_quality_nodes.append(confidence_quality)
 
+            # Record ownership only for layout. A local edit can append another
+            # complete view pass without touching the older material graph.
+            for camera_node in nodes:
+                pointer = camera_node.as_pointer()
+                if pointer not in camera_node_start:
+                    layout_camera_nodes[pointer] = i
+
         # Expose a confidence-only max chain for context rendering.  This
         # node does not mix RGB. Continuous weighted blending retains a separate
         # best-source trust signal to Qwen.
@@ -2886,6 +2959,7 @@ def project_image(
         for i, camera in enumerate(cameras):
             tex_image = tex_image_nodes[i]
             uv_map_node = uv_map_nodes[i]
+            geometry = geometry_nodes[i]
 
             # Connect UV → Texture (needed for both paths)
             uv_output = "Vector" if uv_map_node.type == 'ATTRIBUTE' else "UV"
@@ -2935,6 +3009,24 @@ def project_image(
         subtract_node.inputs[0].default_value = mat_id
         subtract_node.label = 'SGMaterialIndex'
         subtract_node.location = (-1000, 0)
+        from .graph_controls import install_projection_controls
+        install_projection_controls(
+            mat, context.scene,
+            [node for node in nodes if node.as_pointer() not in layout_existing],
+            layout_camera_nodes,
+        )
+        from .node_layout import organize_projection_material
+        layout_nodes = [node for node in nodes
+                        if node.as_pointer() not in layout_existing]
+        if is_local_edit and output not in layout_nodes:
+            # The output is reused by appended edit passes. Move its frame to
+            # the latest pass so the visible graph still ends at the output.
+            layout_nodes.append(output)
+        organize_projection_material(
+            mat, layout_nodes,
+            layout_camera_nodes, cameras, stop_index, local_edit=is_local_edit,
+            feather_method=getattr(context.scene, 'sg_guard_feather_method', 'ORIGINAL'),
+        )
     return True
     
 
@@ -3048,6 +3140,10 @@ def reset_projection_material_nodes(material, angle_threshold, exponent):
         from .surface_blend import update
         update(material, angle_threshold, exponent)
     nodes = material.node_tree.nodes
+    for key, value in (('discard_angle', angle_threshold), ('exponent', exponent)):
+        control = nodes.get('SG Control | ' + key)
+        if control is not None and control.type == 'VALUE':
+            control.outputs[0].default_value = value
     has_sharp = any(
         node.type == 'MATH' and node.operation == 'POWER'
         and node.label.startswith('SharpW-') for node in nodes
