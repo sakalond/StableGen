@@ -35,9 +35,6 @@ def _prepare_compositor_render(scene, node_tree):
     ``_finish_compositor_render``.
     """
     nodes = node_tree.nodes
-    if not getattr(scene, 'sg_rework_safe_render_state', False):
-        nodes.clear()
-        return None
     state = {
         "pointers": {node.as_pointer() for node in nodes},
         "muted_outputs": [],
@@ -614,11 +611,6 @@ def _render_edge_feather_mask_impl(context, to_export, camera, camera_index, fea
 
 
 def render_edge_feather_mask(context, to_export, camera, camera_index, feather_width=30, softness=1.0):
-    if not getattr(context.scene, 'sg_rework_safe_render_state', False):
-        return _render_edge_feather_mask_impl(
-            context, to_export, camera, camera_index,
-            feather_width=feather_width, softness=softness,
-        )
     all_meshes = [obj for obj in context.scene.objects if obj.type == 'MESH']
     with _RenderStateTransaction(context, all_meshes):
         return _render_edge_feather_mask_impl(
@@ -1132,12 +1124,6 @@ def _export_emit_image_impl(context, to_export, camera_id=None, bg_color=(0.5, 0
 
 
 def export_emit_image(context, to_export, camera_id=None, bg_color=(0.5, 0.5, 0.5), view_transform='Standard', fallback_color=(0,0,0)):
-    if not getattr(context.scene, 'sg_rework_safe_render_state', False):
-        with _legacy_render_dither(context.scene):
-            return _export_emit_image_impl(
-                context, to_export, camera_id=camera_id, bg_color=bg_color,
-                view_transform=view_transform, fallback_color=fallback_color,
-            )
     with _RenderStateTransaction(context, to_export):
         with _temporary_render_copies(context, to_export) as (copies, _mapping):
             return _export_emit_image_impl(
@@ -1228,11 +1214,6 @@ def _export_render_impl(context, camera_id=None, output_dir=None, filename=None)
 
 
 def export_render(context, camera_id=None, output_dir=None, filename=None):
-    if not getattr(context.scene, 'sg_rework_safe_render_state', False):
-        with _legacy_render_dither(context.scene):
-            return _export_render_impl(
-                context, camera_id=camera_id, output_dir=output_dir, filename=filename
-            )
     objects = [obj for obj in context.view_layer.objects if obj.type == 'MESH']
     with _RenderStateTransaction(context, objects):
         return _export_render_impl(
@@ -1339,11 +1320,6 @@ def _export_viewport_impl(context, camera_id=None, output_dir=None, filename=Non
 
 def export_viewport(context, camera_id=None, output_dir=None, filename=None):
     """Viewport export with full scene-state restoration on every exit path."""
-    if not getattr(context.scene, 'sg_rework_safe_render_state', False):
-        with _legacy_render_dither(context.scene):
-            return _export_viewport_impl(
-                context, camera_id=camera_id, output_dir=output_dir, filename=filename
-            )
     objects = [obj for obj in context.view_layer.objects if obj.type == 'MESH']
     with _RenderStateTransaction(context, objects):
         return _export_viewport_impl(
@@ -1523,16 +1499,10 @@ def _export_visibility_impl(context, to_export, obj=None, camera_visibility=None
 
         # Reworked sequential materials expose source acquisition quality
         # independently from RGB fusion. Prefer that max-quality signal; old
-        # ownership graphs remain supported as a compatibility fallback.
         source_quality = next(
             (node for node in nodes if node.label == 'SGBestSourceQuality'),
             None,
         )
-        if source_quality is None:
-            source_quality = next(
-                (node for node in nodes if node.label == 'SGOwnerQuality'),
-                None,
-            )
         if source_quality is not None:
             trusted = nodes.new("ShaderNodeMath")
             trusted.operation = 'GREATER_THAN'
@@ -1798,12 +1768,6 @@ def export_visibility(context, to_export, obj=None, camera_visibility=None,
             context, to_export, obj=obj, camera_visibility=camera_visibility,
             prepare_only=True, camera_render=camera_render, camera_id=camera_id,
         )
-    if not getattr(context.scene, 'sg_rework_safe_render_state', False):
-        with _legacy_render_dither(context.scene):
-            return _export_visibility_impl(
-                context, to_export, obj=obj, camera_visibility=camera_visibility,
-                prepare_only=False, camera_render=camera_render, camera_id=camera_id,
-            )
     with _RenderStateTransaction(context, objects):
         with _temporary_render_copies(context, objects) as (copies, mapping):
             mapped_obj = mapping.get(obj) if obj is not None else None

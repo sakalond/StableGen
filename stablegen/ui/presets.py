@@ -4,7 +4,7 @@ import math
 import bpy  # pylint: disable=import-error
 import mathutils  # pylint: disable=import-error
 from ..utils import sg_modal_active
-from ..feature_flags import TEXTURING_REWORK_DEFAULTS
+from ..feature_flags import TEXTURING_DEFAULTS, EXPERIMENTAL_FEATURE_DEFAULTS, experiments_enabled
 
 PRESETS = {
     "DEFAULT": {"description": "Default settings for general purpose generation", "control_after_generate": "fixed", "model_architecture": "sdxl", "steps": 8, "cfg": 1.5, "sampler": "dpmpp_2s_ancestral", "scheduler": "sgm_uniform", "fallback_color": mathutils.Color((0.0, 0.0, 0.0)),  "discard_factor": 90.0, "weight_exponent": 3.0, "weight_exponent_generation_only": False, "weight_exponent_after_generation": 15.0, "view_blend_use_color_match": False, "view_blend_color_match_method": "hm-mvgd-hm", "view_blend_color_match_strength": 1.0, "clip_skip": 1, "auto_rescale": True, "overwrite_material": True, "generation_method": "sequential", "refine_images": False, "refine_steps": 8, "refine_sampler": "dpmpp_2s_ancestral", "refine_scheduler": "sgm_uniform", "denoise": 0.8, "refine_cfg": 1.5, "refine_prompt": "", "refine_upscale_method": "lanczos", "sequential_smooth": True, "sequential_custom_camera_order": "", "sequential_factor": 0.7, "sequential_factor_smooth": 0.15, "sequential_factor_smooth_2": 1.0, "sequential_ipadapter": False, "sequential_ipadapter_mode": "first", "sequential_ipadapter_regenerate": False, "ipadapter_weight_type": "style", "ipadapter_strength": 1.0, "ipadapter_start": 0.0, "ipadapter_end": 1.0, "differential_diffusion": True, "differential_noise": True, "blur_mask": True, "blur_mask_radius": 1, "blur_mask_sigma": 1.0, "grow_mask_by": 3, "canny_threshold_low": 0, "canny_threshold_high": 80, "pbr_decomposition": False, "controlnet_units": [{'unit_type': 'depth', 'model_name': 'controlnet_depth_sdxl.safetensors', 'strength': 0.5, 'start_percent': 0.0, 'end_percent': 1.0, 'is_union': False, 'use_union_type': True}], "lora_units": [{'model_name': 'sdxl_lightning_8step_lora.safetensors', 'model_strength': 1.0, 'clip_strength': 1.0}]},
@@ -51,217 +51,214 @@ PRESETS["QWEN 2509 FULL STEPS (EXPERIMENTAL)"] = {
     "lora_units": [],
 }
 
-# Built-in presets intentionally start from the pre-rework behavior. Users can
-# enable experiments after applying a preset; custom presets persist explicit
-# feature choices through GEN_PARAMETERS below.
-EXPERIMENTAL_FEATURE_DEFAULTS = dict(TEXTURING_REWORK_DEFAULTS)
+# Regular controls are available without enabling research features.
+PRESETS["QWEN PRECISE+"] = {
+    **PRESETS["QWEN PRECISE"],
+    "description": (
+        "Qwen Precise with the evaluated combination of three context and projection controls for sequential multi-view texturing. "
+        "Confidence-Gated Context (CGC) keeps reliable existing texture as context and marks low-quality regions for repair. "
+        "Acquisition Quality Weighting (AQW) favors source views with better projected detail and acquisition quality when blending textures. "
+        "Depth/Part Projection Guard (DPPG) reduces projection contributions near depth, object and material boundaries to limit foreground silhouettes leaking onto rear surfaces. "
+        "Retains Qwen Precise's 4-step Lightning setup, sampler and context settings; uses a 0.50 trust threshold, a 3 px silhouette margin and backface projection. "
+        "Experimental options are off. Intended to improve context reliability and projection consistency, but fine patterns and material continuity can still vary, and some assets may look better with standard Qwen Precise."
+    ),
+    "qwen_use_confidence_context": True,
+    "sg_rework_acquisition_quality": True,
+    "sg_rework_projection_guard": True,
+    "qwen_trust_threshold": 0.5,
+    "sg_silhouette_margin": 3,
+    "sg_allow_backface_projection": True,
+    **EXPERIMENTAL_FEATURE_DEFAULTS,
+}
+
 
 # Global list of all generation parameter names to check for a preset.
 GEN_PARAMETERS = [
-    "control_after_generate",
-    "model_architecture",
-    "steps",
-    "cfg",
-    "sampler",
-    "scheduler",
-    "fallback_color",
-    "discard_factor",
-    "discard_factor_generation_only",
-    "discard_factor_after_generation",
-    "weight_exponent",
-    "weight_exponent_generation_only",
-    "weight_exponent_after_generation",
-    "view_blend_use_color_match",
-    "view_blend_color_match_method",
-    "view_blend_color_match_strength",
-    "clip_skip",
-    "auto_rescale",
-    "auto_rescale_target_mp",
-    "overwrite_material",
-    "generation_method", 
-    "refine_images",
-    "refine_steps",
-    "refine_sampler",
-    "refine_scheduler",
-    "denoise",
-    "refine_cfg",
-    "refine_prompt",
-    "refine_upscale_method",
-    "sequential_smooth",
-    "sequential_custom_camera_order",
-    "sequential_factor",
-    "sequential_factor_smooth",
-    "sequential_factor_smooth_2",
-    "sequential_ipadapter",
-    "sequential_ipadapter_mode",
-    "sequential_desaturate_factor",
-    "sequential_contrast_factor",
-    "sequential_ipadapter_regenerate",
-    "ipadapter_weight_type",
-    "ipadapter_strength",
-    "ipadapter_start",
-    "ipadapter_end",
-    "early_priority",
-    "early_priority_strength",
-    "sg_texel_ownership",
-    "sg_texel_replacement_margin",
-    "sg_allow_trusted_replacement",
-    "sg_ownership_blend_mode",
-    "sg_ownership_seam_width",
-    "sg_ownership_lowpass_sigma",
-    "sg_auto_view_sequence",
-    "sg_anchor_camera",
-    "sg_texturing_frame",
-    "sg_freeze_ownership_after_generation",
-    "sg_rework_camera_plan",
-    "sg_rework_aligned_resolution",
-    "sg_rework_full_resolution_scale",
-    "sg_rework_safe_render_state",
-    "sg_rework_reset_controls",
-    "sg_rework_sdxl_registration",
-    "sg_rework_acquisition_quality",
-    "sg_rework_initial_view_priority",
-    "sg_rework_projection_guard",
-    "sg_rework_projection_rebuild",
-    "sg_rework_projection_geometry",
-    "sg_rework_consistent_frame",
-    "sg_rework_workflow_validation",
-    "sg_rework_qwen_workflow",
-    "qwen_global_style_vlm_only",
-    "qwen_latent_locked_context",
-    "sg_rework_final_display",
-    "differential_diffusion",
-    "differential_noise",
-    "blur_mask",
-    "blur_mask_radius",
-    "blur_mask_sigma",
-    "grow_mask_by",
-    "canny_threshold_low",
-    "canny_threshold_high",
-    "qwen_guidance_map_type",
-    "qwen_voronoi_mode",
-    "qwen_use_external_style_image",
-    "qwen_external_style_image",
-    "qwen_context_render_mode",
-    "qwen_external_style_initial_only",
-    "qwen_use_custom_prompts",
-    "qwen_custom_prompt_initial",
-    "qwen_custom_prompt_seq_none",
-    "qwen_custom_prompt_seq_replace",
-    "qwen_custom_prompt_seq_additional",
-    "qwen_guidance_fallback_color",
-    "qwen_guidance_background_color",
-    "qwen_context_cleanup",
-    "qwen_context_cleanup_hue_tolerance",
-    "qwen_context_cleanup_value_adjust",
-    "qwen_context_fallback_dilation",
-    "qwen_use_confidence_context",
-    "qwen_regularize_context_mask",
-    "qwen_use_projection_write_masks",
-    "qwen_reject_residual_fallback",
-    "qwen_trust_threshold",
-    "qwen_mask_min_island_area",
-    "qwen_mask_min_hole_area",
-    "qwen_mask_min_strip_width",
-    "qwen_mask_uncertainty_dilation",
-    "qwen_mask_keep_largest_components",
-    "qwen_residual_fallback_tolerance",
-    "qwen_prompt_gray_background",
-    "qwen_rescale_alignment",
-    "qwen_generation_method",
-    "qwen_refine_use_prev_ref",
-    "qwen_refine_use_depth",
-    "qwen_timestep_zero_ref",
-    "refine_angle_ramp_active",
-    "refine_angle_ramp_pos_0",
-    "refine_angle_ramp_pos_1",
-    "visibility_vignette",
-    "visibility_vignette_width",
-    "visibility_vignette_softness",
-    "visibility_vignette_blur",
-    "sg_silhouette_margin",
-    "sg_silhouette_depth",
-    "sg_silhouette_rays",
-    "sg_allow_backface_projection",
-    "refine_feather_ramp_pos_0",
-    "refine_feather_ramp_pos_1",
-    "refine_edge_feather_projection",
-    "refine_edge_feather_width",
-    "refine_edge_feather_softness",
-    # --- TRELLIS.2 ---
-    "trellis2_texture_mode",
-    "trellis2_initial_image_arch",
-    "trellis2_camera_count",
-    "trellis2_placement_mode",
-    "trellis2_auto_prompts",
-    "trellis2_exclude_bottom",
-    "trellis2_exclude_bottom_angle",
-    "trellis2_auto_aspect",
-    "trellis2_occlusion_mode",
-    "trellis2_consider_existing",
-    "trellis2_delete_cameras",
-    "trellis2_coverage_target",
-    "trellis2_max_auto_cameras",
-    "trellis2_fan_angle",
-    "trellis2_resolution",
-    "trellis2_precision",
-    "trellis2_attn_backend",
-    "trellis2_seed",
-    "trellis2_ss_guidance",
-    "trellis2_ss_steps",
-    "trellis2_shape_guidance",
-    "trellis2_shape_steps",
-    "trellis2_tex_guidance",
-    "trellis2_tex_steps",
-    "trellis2_max_tokens",
-    "trellis2_texture_size",
-    "trellis2_decimation",
-    "trellis2_remesh",
-    "trellis2_decimate_method",
-    "trellis2_remesh_method",
-    "trellis2_post_processing_enabled",
-    "trellis2_autorig_enabled",
-    "trellis2_autorig_use_transfer",
-    "trellis2_autorig_use_skeleton",
-    "trellis2_autorig_use_postprocess",
-    "trellis2_autorig_cleanup_cross_limb_weights",
-    "trellis2_autorig_garment_mode",
-    "trellis2_autorig_bone_display_type",
-    "trellis2_autorig_bone_heuristic",
-    "trellis2_autorig_top_k",
-    "trellis2_autorig_top_p",
-    "trellis2_autorig_temperature",
-    "trellis2_autorig_repetition_penalty",
-    "trellis2_autorig_num_beams",
-    "trellis2_autorig_model_ckpt",
-    "trellis2_autorig_hf_path",
-
-    "trellis2_bg_removal",
-    "trellis2_background_color",
-    "trellis2_import_scale",
-    "trellis2_clamp_elevation",
-    "trellis2_max_elevation",
-    "trellis2_min_elevation",
-    "trellis2_auto_lighting",
-
-    # --- General workflow settings (not prompt/seed/model/paths) ---
-    "use_ipadapter",
-    "sequential_ipadapter_regenerate_wo_controlnet",
-    "allow_modify_existing_textures",
-    "ask_object_prompts",
-    "weight_exponent_mask",
-    "mask_blocky",
-    "architecture_mode",
-    "use_camera_prompts",
-    "sg_use_custom_camera_order",
-    "generation_mode",
-    "texture_objects",
-    "use_flux_lora",
-    "qwen_use_trellis2_style",
-    "qwen_trellis2_style_initial_only",
-    "trellis2_skip_texture",
-    "pbr_decomposition",
-    "pbr_albedo_saturation_mode",
+    'control_after_generate',
+    'model_architecture',
+    'steps',
+    'cfg',
+    'sampler',
+    'scheduler',
+    'fallback_color',
+    'discard_factor',
+    'discard_factor_generation_only',
+    'discard_factor_after_generation',
+    'weight_exponent',
+    'weight_exponent_generation_only',
+    'weight_exponent_after_generation',
+    'view_blend_use_color_match',
+    'view_blend_color_match_method',
+    'view_blend_color_match_strength',
+    'clip_skip',
+    'auto_rescale',
+    'auto_rescale_target_mp',
+    'overwrite_material',
+    'generation_method',
+    'refine_images',
+    'refine_steps',
+    'refine_sampler',
+    'refine_scheduler',
+    'denoise',
+    'refine_cfg',
+    'refine_prompt',
+    'refine_upscale_method',
+    'sequential_smooth',
+    'sequential_custom_camera_order',
+    'sequential_factor',
+    'sequential_factor_smooth',
+    'sequential_factor_smooth_2',
+    'sequential_ipadapter',
+    'sequential_ipadapter_mode',
+    'sequential_desaturate_factor',
+    'sequential_contrast_factor',
+    'sequential_ipadapter_regenerate',
+    'ipadapter_weight_type',
+    'ipadapter_strength',
+    'ipadapter_start',
+    'ipadapter_end',
+    'early_priority',
+    'early_priority_strength',
+    'sg_auto_view_sequence',
+    'sg_anchor_camera',
+    'sg_texturing_frame',
+    'sg_rework_aligned_resolution',
+    'sg_rework_full_resolution_scale',
+    'sg_rework_acquisition_quality',
+    'sg_rework_projection_guard',
+    'qwen_global_style_vlm_only',
+    'qwen_context_vlm_only',
+    'qwen_latent_locked_context',
+    'qwen_latent_lock_neutral_fill',
+    'sg_rework_final_display',
+    'differential_diffusion',
+    'differential_noise',
+    'blur_mask',
+    'blur_mask_radius',
+    'blur_mask_sigma',
+    'grow_mask_by',
+    'canny_threshold_low',
+    'canny_threshold_high',
+    'qwen_guidance_map_type',
+    'qwen_voronoi_mode',
+    'qwen_use_external_style_image',
+    'qwen_external_style_image',
+    'qwen_context_render_mode',
+    'qwen_external_style_initial_only',
+    'qwen_use_custom_prompts',
+    'qwen_custom_prompt_initial',
+    'qwen_custom_prompt_seq_none',
+    'qwen_custom_prompt_seq_replace',
+    'qwen_custom_prompt_seq_additional',
+    'qwen_guidance_fallback_color',
+    'qwen_guidance_background_color',
+    'qwen_context_cleanup',
+    'qwen_context_cleanup_hue_tolerance',
+    'qwen_context_cleanup_value_adjust',
+    'qwen_context_fallback_dilation',
+    'qwen_use_confidence_context',
+    'qwen_regularize_context_mask',
+    'qwen_use_projection_write_masks',
+    'qwen_reject_residual_fallback',
+    'qwen_trust_threshold',
+    'qwen_mask_min_island_area',
+    'qwen_mask_min_hole_area',
+    'qwen_mask_min_strip_width',
+    'qwen_mask_uncertainty_dilation',
+    'qwen_mask_keep_largest_components',
+    'qwen_residual_fallback_tolerance',
+    'qwen_prompt_gray_background',
+    'qwen_rescale_alignment',
+    'qwen_generation_method',
+    'qwen_refine_use_prev_ref',
+    'qwen_refine_use_depth',
+    'qwen_timestep_zero_ref',
+    'refine_angle_ramp_active',
+    'refine_angle_ramp_pos_0',
+    'refine_angle_ramp_pos_1',
+    'visibility_vignette',
+    'visibility_vignette_width',
+    'visibility_vignette_softness',
+    'visibility_vignette_blur',
+    'sg_silhouette_margin',
+    'sg_silhouette_depth',
+    'sg_silhouette_rays',
+    'sg_allow_backface_projection',
+    'refine_feather_ramp_pos_0',
+    'refine_feather_ramp_pos_1',
+    'refine_edge_feather_projection',
+    'refine_edge_feather_width',
+    'refine_edge_feather_softness',
+    'trellis2_texture_mode',
+    'trellis2_initial_image_arch',
+    'trellis2_camera_count',
+    'trellis2_placement_mode',
+    'trellis2_auto_prompts',
+    'trellis2_exclude_bottom',
+    'trellis2_exclude_bottom_angle',
+    'trellis2_auto_aspect',
+    'trellis2_occlusion_mode',
+    'trellis2_consider_existing',
+    'trellis2_delete_cameras',
+    'trellis2_coverage_target',
+    'trellis2_max_auto_cameras',
+    'trellis2_fan_angle',
+    'trellis2_resolution',
+    'trellis2_precision',
+    'trellis2_attn_backend',
+    'trellis2_seed',
+    'trellis2_ss_guidance',
+    'trellis2_ss_steps',
+    'trellis2_shape_guidance',
+    'trellis2_shape_steps',
+    'trellis2_tex_guidance',
+    'trellis2_tex_steps',
+    'trellis2_max_tokens',
+    'trellis2_texture_size',
+    'trellis2_decimation',
+    'trellis2_remesh',
+    'trellis2_decimate_method',
+    'trellis2_remesh_method',
+    'trellis2_post_processing_enabled',
+    'trellis2_autorig_enabled',
+    'trellis2_autorig_use_transfer',
+    'trellis2_autorig_use_skeleton',
+    'trellis2_autorig_use_postprocess',
+    'trellis2_autorig_cleanup_cross_limb_weights',
+    'trellis2_autorig_garment_mode',
+    'trellis2_autorig_bone_display_type',
+    'trellis2_autorig_bone_heuristic',
+    'trellis2_autorig_top_k',
+    'trellis2_autorig_top_p',
+    'trellis2_autorig_temperature',
+    'trellis2_autorig_repetition_penalty',
+    'trellis2_autorig_num_beams',
+    'trellis2_autorig_model_ckpt',
+    'trellis2_autorig_hf_path',
+    'trellis2_bg_removal',
+    'trellis2_background_color',
+    'trellis2_import_scale',
+    'trellis2_clamp_elevation',
+    'trellis2_max_elevation',
+    'trellis2_min_elevation',
+    'trellis2_auto_lighting',
+    'use_ipadapter',
+    'sequential_ipadapter_regenerate_wo_controlnet',
+    'allow_modify_existing_textures',
+    'ask_object_prompts',
+    'weight_exponent_mask',
+    'mask_blocky',
+    'architecture_mode',
+    'use_camera_prompts',
+    'sg_use_custom_camera_order',
+    'generation_mode',
+    'texture_objects',
+    'use_flux_lora',
+    'qwen_use_trellis2_style',
+    'qwen_trellis2_style_initial_only',
+    'trellis2_skip_texture',
+    'pbr_decomposition',
+    'pbr_albedo_saturation_mode',
 ]
 
 # ── Preset diff preview helpers ──────────────────────────────────────────
@@ -280,6 +277,8 @@ def get_preset_items(self, context):
     # Classify each preset into its architecture group.
     groups = {}  # group_key -> list of (identifier, name, description)
     for key, preset in PRESETS.items():
+        if '(EXPERIMENTAL)' in key and not experiments_enabled(context):
+            continue
         if preset.get('architecture_mode') == 'trellis2':
             grp = 'trellis2'
         else:
@@ -324,11 +323,14 @@ def update_parameters(self, context):
     
     # Compare current values with every stock preset's stored values
     for name, preset in PRESETS.items():
+        if '(EXPERIMENTAL)' in name and not experiments_enabled(context):
+            continue
+        expected = preset if preset.get('custom', False) else {**TEXTURING_DEFAULTS, **preset}
         # First check regular parameters
         if all(
             (lambda v1, v2: math.isclose(v1, v2, rel_tol=1e-7, abs_tol=0.0) if isinstance(v1, (int, float)) and isinstance(v2, (int, float)) else v1 == v2)
-            (current.get(key), normalize_value(key, preset.get(key)))
-            for key in GEN_PARAMETERS if key in preset
+            (current.get(key), normalize_value(key, expected.get(key)))
+            for key in GEN_PARAMETERS if key in expected
         ):
             units_match = True
 
@@ -446,18 +448,18 @@ class ResetQwenPrompt(bpy.types.Operator):
 
 
 class ResetTexturingExperiments(bpy.types.Operator):
-    """Restore the explicit rigging-branch compatibility baseline."""
+    """Reset research settings without changing graduated controls."""
 
     bl_idname = "stablegen.reset_texturing_experiments"
     bl_label = "Disable All Texturing Experiments"
-    bl_description = "Set every texturing rework feature to its legacy-compatible default"
+    bl_description = "Reset experimental texturing settings; keep regular features and their values"
     bl_options = {'REGISTER', 'UNDO'}
 
     def execute(self, context):
-        for name, default in TEXTURING_REWORK_DEFAULTS.items():
+        for name, default in EXPERIMENTAL_FEATURE_DEFAULTS.items():
             if hasattr(context.scene, name):
                 setattr(context.scene, name, default)
-        self.report({'INFO'}, "All texturing experiments disabled; legacy baseline active")
+        self.report({'INFO'}, "Experimental settings reset; regular texturing settings retained")
         return {'FINISHED'}
 
 class ApplyPreset(bpy.types.Operator):
@@ -472,11 +474,14 @@ class ApplyPreset(bpy.types.Operator):
 
     def execute(self, context):
         preset = context.scene.stablegen_preset
+        if '(EXPERIMENTAL)' in preset and not experiments_enabled(context):
+            self.report({'ERROR'}, "Enable experimental texturing in add-on preferences first")
+            return {'CANCELLED'}
         if preset in PRESETS:
             values = PRESETS[preset]
 
             if not values.get("custom", False):
-                for key, value in EXPERIMENTAL_FEATURE_DEFAULTS.items():
+                for key, value in TEXTURING_DEFAULTS.items():
                     if hasattr(context.scene, key):
                         setattr(context.scene, key, value)
             

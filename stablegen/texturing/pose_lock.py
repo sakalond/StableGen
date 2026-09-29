@@ -79,8 +79,7 @@ def ensure_texturing_frame(
     if active_frame is not None:
         target = int(active_frame)
     elif (force_configured
-          or (honor_consistent
-              and getattr(scene, 'sg_rework_consistent_frame', False))):
+          or (honor_consistent)):
         target = int(getattr(scene, 'sg_texturing_frame', legacy_frame))
     else:
         target = int(legacy_frame)

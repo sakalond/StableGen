@@ -19,7 +19,7 @@ from .callbacks import (
     update_print_dithered,
 )
 from . import ADDON_PKG
-from ..feature_flags import TEXTURING_REWORK_DEFAULTS
+from ..feature_flags import TEXTURING_DEFAULTS
 
 
 # ── Helper(s) used by properties ───────────────────────────────────────────
@@ -787,97 +787,55 @@ def register_properties(update_model_list, ControlNetUnit, LoRAUnit,
     bpy.types.Scene.sg_allow_backface_projection = bpy.props.BoolProperty(
         name="Allow Backface Projection",
         description="Use legacy two-sided projection weights. Leave disabled for characters and closed meshes so a camera cannot write through back-facing surfaces",
-        default=TEXTURING_REWORK_DEFAULTS["sg_allow_backface_projection"], update=update_parameters,
+        default=TEXTURING_DEFAULTS["sg_allow_backface_projection"], update=update_parameters,
     )
 
-    # Texturing pipeline rework feature gates.  These deliberately default to
-    # False so a newly opened scene follows the rigging-branch projection and
-    # sequential-context behavior.  Each gate controls one independently
-    # testable behavior instead of enabling the rework as an inseparable set.
-    bpy.types.Scene.sg_rework_camera_plan = bpy.props.BoolProperty(
-        name="Canonical Camera Plan",
-        description="Snapshot camera order, transforms, intrinsics, prompts, and per-camera resolutions for the whole run",
-        default=TEXTURING_REWORK_DEFAULTS["sg_rework_camera_plan"], update=update_parameters,
-    )
+    # Scene values remain serializable. Research switches are gated at runtime
+    # by the addon preference; CGC/AQW/DPPG are ordinary controls.
     bpy.types.Scene.sg_rework_aligned_resolution = bpy.props.BoolProperty(
         name="Improved Aligned Resolution",
         description="Use the new joint aspect/megapixel/alignment resolution search instead of legacy proportional rounding",
-        default=TEXTURING_REWORK_DEFAULTS["sg_rework_aligned_resolution"], update=update_parameters,
+        default=TEXTURING_DEFAULTS["sg_rework_aligned_resolution"], update=update_parameters,
     )
     bpy.types.Scene.sg_rework_full_resolution_scale = bpy.props.BoolProperty(
         name="Force 100% Guide Resolution",
         description="Temporarily force Blender resolution percentage to 100 so guides and Qwen inputs match the configured pixel dimensions",
-        default=TEXTURING_REWORK_DEFAULTS["sg_rework_full_resolution_scale"], update=update_parameters,
-    )
-    bpy.types.Scene.sg_rework_safe_render_state = bpy.props.BoolProperty(
-        name="Transactional Render State",
-        description="Snapshot and restore render, compositor, material-slot, and scene state around pipeline renders",
-        default=TEXTURING_REWORK_DEFAULTS["sg_rework_safe_render_state"], update=update_parameters,
-    )
-    bpy.types.Scene.sg_rework_reset_controls = bpy.props.BoolProperty(
-        name="Corrected Angle/Exponent Reset",
-        description="Reset normalized projection weights and baked visibility consistently on completion, cancellation, and errors",
-        default=TEXTURING_REWORK_DEFAULTS["sg_rework_reset_controls"], update=update_parameters,
-    )
-    bpy.types.Scene.sg_rework_sdxl_registration = bpy.props.BoolProperty(
-        name="Corrected SDXL Mask Registration",
-        description="Use the corrected uncropped SDXL sequential mask and projection-alpha registration path",
-        default=TEXTURING_REWORK_DEFAULTS["sg_rework_sdxl_registration"], update=update_parameters,
+        default=TEXTURING_DEFAULTS["sg_rework_full_resolution_scale"], update=update_parameters,
     )
     bpy.types.Scene.sg_rework_acquisition_quality = bpy.props.BoolProperty(
         name="Acquisition Quality Weighting",
         description="Weight views using projected density and source-camera acquisition quality in addition to legacy visibility/frontality",
-        default=TEXTURING_REWORK_DEFAULTS["sg_rework_acquisition_quality"], update=update_parameters,
-    )
-    bpy.types.Scene.sg_rework_initial_view_priority = bpy.props.BoolProperty(
-        name="Confidence-Aware Initial View Priority",
-        description="Use early-view priority only as trusted-owner replacement resistance instead of the legacy recursive blend bias",
-        default=TEXTURING_REWORK_DEFAULTS["sg_rework_initial_view_priority"], update=update_parameters,
+        default=TEXTURING_DEFAULTS["sg_rework_acquisition_quality"], update=update_parameters,
     )
     bpy.types.Scene.sg_rework_projection_guard = bpy.props.BoolProperty(
         name="Depth/Part Projection Guard",
         description="Reject projection near depth, object-ID, and material-ID discontinuities to reduce foreground silhouettes on rear surfaces",
-        default=TEXTURING_REWORK_DEFAULTS["sg_rework_projection_guard"], update=update_parameters,
-    )
-    bpy.types.Scene.sg_rework_projection_rebuild = bpy.props.BoolProperty(
-        name="Rebuild Sequential Projection Graph",
-        description="Rebuild the complete projection material after each generated view instead of using the legacy patch-in-place update",
-        default=TEXTURING_REWORK_DEFAULTS["sg_rework_projection_rebuild"], update=update_parameters,
-    )
-    bpy.types.Scene.sg_rework_projection_geometry = bpy.props.BoolProperty(
-        name="Projection Geometry Corrections",
-        description="Use signed facing, parented camera transforms, camera shift, orthographic support, evaluated meshes, and scale-aware ray tolerances",
-        default=TEXTURING_REWORK_DEFAULTS["sg_rework_projection_geometry"], update=update_parameters,
-    )
-    bpy.types.Scene.sg_rework_consistent_frame = bpy.props.BoolProperty(
-        name="Consistent Texturing Frame",
-        description="Evaluate guides, visibility, projection, and baking at the explicit Texturing Frame",
-        default=TEXTURING_REWORK_DEFAULTS["sg_rework_consistent_frame"], update=update_parameters,
-    )
-    bpy.types.Scene.sg_rework_workflow_validation = bpy.props.BoolProperty(
-        name="Workflow Graph Validation",
-        description="Validate generated Qwen/SDXL workflow graphs and semantic image slots before submission",
-        default=TEXTURING_REWORK_DEFAULTS["sg_rework_workflow_validation"], update=update_parameters,
-    )
-    bpy.types.Scene.sg_rework_qwen_workflow = bpy.props.BoolProperty(
-        name="Corrected Qwen Workflow Routing",
-        description="Use corrected Qwen style-slot routing, TRELLIS initial-only fallback, and refine sampler/model configuration",
-        default=TEXTURING_REWORK_DEFAULTS["sg_rework_qwen_workflow"], update=update_parameters,
+        default=TEXTURING_DEFAULTS["sg_rework_projection_guard"], update=update_parameters,
     )
     bpy.types.Scene.qwen_global_style_vlm_only = bpy.props.BoolProperty(
         name="Global Style Reference: VLM Only",
         description="In Qwen Additional Context mode, keep Image 3 available for visual-language style analysis but exclude it from full-resolution ReferenceLatent conditioning so it competes less with the spatial RGB context",
-        default=TEXTURING_REWORK_DEFAULTS["qwen_global_style_vlm_only"], update=update_parameters,
+        default=TEXTURING_DEFAULTS["qwen_global_style_vlm_only"], update=update_parameters,
+    )
+    bpy.types.Scene.qwen_context_vlm_only = bpy.props.BoolProperty(
+        name="Projected Context: VLM Only",
+        description="Experimental: keep the magenta context image available for visual-language analysis but omit its spatial reference latent on later Qwen context views. May reduce copied missing-texture patches while weakening detail and color continuity",
+        default=TEXTURING_DEFAULTS["qwen_context_vlm_only"], update=update_parameters,
     )
     bpy.types.Scene.qwen_latent_locked_context = bpy.props.BoolProperty(
         name="Latent-Locked Context Inpainting",
         description="For later sequential Qwen views, initialize the sampler from the RGB context render and use the exported visibility repair mask as a latent noise mask. White/repair pixels denoise; black/trusted pixels are restored after every sampling step",
-        default=TEXTURING_REWORK_DEFAULTS["qwen_latent_locked_context"], update=update_parameters,
+        default=TEXTURING_DEFAULTS["qwen_latent_locked_context"], update=update_parameters,
+    )
+    bpy.types.Scene.qwen_latent_lock_neutral_fill = bpy.props.BoolProperty(
+        name="Neutral Fill for Latent Lock",
+        description="Replace repair pixels with neutral gray before encoding the protected context latent to reduce magenta contamination at its boundary. Keeps the existing repair mask unchanged; requires Latent-Locked Context Inpainting",
+        default=TEXTURING_DEFAULTS["qwen_latent_lock_neutral_fill"], update=update_parameters,
     )
     bpy.types.Scene.sg_rework_final_display = bpy.props.BoolProperty(
         name="Continuous Final Display Rebuild",
         description="After sequential generation, rebuild the final material without generation-only binary Qwen write masks so it matches Reproject",
-        default=TEXTURING_REWORK_DEFAULTS["sg_rework_final_display"], update=update_parameters,
+        default=TEXTURING_DEFAULTS["sg_rework_final_display"], update=update_parameters,
     )
     bpy.types.Scene.sg_silhouette_depth = bpy.props.FloatProperty(
         name="Silhouette Depth",
@@ -1230,12 +1188,12 @@ def register_properties(update_model_list, ControlNetUnit, LoRAUnit,
     bpy.types.Scene.qwen_use_confidence_context = bpy.props.BoolProperty(
         name="Confidence-Gated Context",
         description="Build an ownership-independent best-source quality field and replace low-quality context with an explicit binary repair mask. Continuous RGB projection blending is preserved",
-        default=TEXTURING_REWORK_DEFAULTS["qwen_use_confidence_context"], update=update_parameters,
+        default=TEXTURING_DEFAULTS["qwen_use_confidence_context"], update=update_parameters,
     )
     bpy.types.Scene.qwen_regularize_context_mask = bpy.props.BoolProperty(
         name="Regularize Context Boundary",
         description="Apply island, hole, strip, dilation, and part-aware cleanup to the explicit binary Qwen repair mask",
-        default=TEXTURING_REWORK_DEFAULTS["qwen_regularize_context_mask"], update=update_parameters,
+        default=TEXTURING_DEFAULTS["qwen_regularize_context_mask"], update=update_parameters,
     )
     bpy.types.Scene.qwen_trust_threshold = bpy.props.FloatProperty(
         name="Trusted Source Threshold",
@@ -1270,12 +1228,12 @@ def register_properties(update_model_list, ControlNetUnit, LoRAUnit,
     bpy.types.Scene.qwen_use_projection_write_masks = bpy.props.BoolProperty(
         name="Protect Trusted Texture",
         description="Restrict each later Qwen camera's projection contribution to its binary editable/write mask",
-        default=TEXTURING_REWORK_DEFAULTS["qwen_use_projection_write_masks"], update=update_parameters
+        default=TEXTURING_DEFAULTS["qwen_use_projection_write_masks"], update=update_parameters
     )
     bpy.types.Scene.qwen_reject_residual_fallback = bpy.props.BoolProperty(
         name="Reject Residual Magenta",
         description="Remove residual fallback-color pixels from a Qwen camera's explicit projection write mask",
-        default=TEXTURING_REWORK_DEFAULTS["qwen_reject_residual_fallback"], update=update_parameters,
+        default=TEXTURING_DEFAULTS["qwen_reject_residual_fallback"], update=update_parameters,
     )
     bpy.types.Scene.qwen_residual_fallback_tolerance = bpy.props.IntProperty(
         name="Residual Fallback Tolerance",
@@ -1314,6 +1272,9 @@ def register_properties(update_model_list, ControlNetUnit, LoRAUnit,
     )
 
     # ── UI section toggles ─────────────────────────────────────────────
+    bpy.types.Scene.show_texturing_experiments = bpy.props.BoolProperty(
+        name="Experimental Texturing", default=True,
+    )
     bpy.types.Scene.show_core_settings = bpy.props.BoolProperty(
         name="Core Generation Settings",
         description="Parameters used for the image generation process. Also includes LoRAs for faster generation.",
@@ -1373,41 +1334,6 @@ def register_properties(update_model_list, ControlNetUnit, LoRAUnit,
         description="Anchor already-reliable early-view detail by raising its replacement margin. Poorly observed side texels remain untrusted and replaceable",
         default=False, update=update_parameters
     )
-    bpy.types.Scene.sg_texel_ownership = bpy.props.BoolProperty(
-        name="Per-Texel View Ownership",
-        description="Select one camera per surface point and keep its detail until a later camera has meaningfully higher confidence. This creates harder camera boundaries than weighted blending",
-        default=False, update=update_parameters
-    )
-    bpy.types.Scene.sg_texel_replacement_margin = bpy.props.FloatProperty(
-        name="Ownership Replacement Margin",
-        description="Extra confidence a later camera needs before replacing the current per-texel owner",
-        default=0.05, min=0.0, max=1.0, update=update_parameters
-    )
-    bpy.types.Scene.sg_allow_trusted_replacement = bpy.props.BoolProperty(
-        name="Allow Trusted Quality Upgrades",
-        description="Permit a later camera to replace trusted detail only when its source quality exceeds the owner by the replacement margin",
-        default=False, update=update_parameters,
-    )
-    bpy.types.Scene.sg_ownership_blend_mode = bpy.props.EnumProperty(
-        name="Ownership Detail Fusion",
-        description="Choose how camera detail is fused after confidence resolution",
-        items=[
-            ('OWNER', "Single Detail Owner", "Keep high-frequency detail from one owner; blend only low-frequency seam colour"),
-            ('HARD', "Hard Owner", "Keep one owner with no seam colour matching"),
-            ('LEGACY', "Legacy Weighted Blend", "Use the previous weighted camera averaging behavior"),
-        ],
-        default='OWNER', update=update_parameters,
-    )
-    bpy.types.Scene.sg_ownership_seam_width = bpy.props.FloatProperty(
-        name="Ownership Seam Width",
-        description="Quality-distance band where only low-frequency colour is blended between detail owners",
-        default=0.08, min=0.0, max=0.5, update=update_parameters,
-    )
-    bpy.types.Scene.sg_ownership_lowpass_sigma = bpy.props.FloatProperty(
-        name="Ownership Low-Pass Radius",
-        description="Image-space Gaussian radius used for seam colour matching; high-frequency detail remains owned by one camera",
-        default=8.0, min=0.1, max=64.0, update=update_parameters,
-    )
     bpy.types.Scene.sg_auto_view_sequence = bpy.props.BoolProperty(
         name="Overlap-Aware View Sequence",
         description="Order non-custom camera plans through nearby bridge views to reduce angular jumps and context discontinuities",
@@ -1422,11 +1348,6 @@ def register_properties(update_model_list, ControlNetUnit, LoRAUnit,
         name="Texturing Frame",
         description="Explicit frame used consistently for evaluated character geometry, visibility, projection, and baking",
         default=1, update=update_parameters,
-    )
-    bpy.types.Scene.sg_freeze_ownership_after_generation = bpy.props.BoolProperty(
-        name="Freeze Ownership to UV Texture",
-        description="Bake resolved camera ownership to UV textures after generation so pose, camera, and scene visibility changes cannot alter the final texture",
-        default=False, update=update_parameters,
     )
     bpy.types.Scene.sg_material_discard_factor = bpy.props.FloatProperty(
         name="Material Discard Angle", default=90.0, options={'HIDDEN'}
@@ -2056,82 +1977,175 @@ def unregister_properties(load_handler, _sg_queue_load_handler):
 
     _simple_scene_props = [
         'use_flux_lora',
-        'comfyui_prompt', 'use_separate_texture_prompt', 'texture_prompt',
-        'comfyui_negative_prompt', 'model_name', 'sg_model_name_backup',
-        'seed', 'control_after_generate', 'steps', 'cfg',
-        'sampler', 'scheduler', 'show_advanced_params', 'show_generation_params',
-        'auto_rescale', 'qwen_rescale_alignment', 'auto_rescale_target_mp',
-        'generation_method', 'use_ipadapter',
-        'refine_images', 'refine_steps', 'refine_sampler', 'refine_scheduler',
-        'denoise', 'refine_cfg', 'refine_prompt', 'refine_upscale_method',
-        'generation_status', 'sg_last_gen_error', 'generation_progress',
-        'overwrite_material', 'bake_visibility_weights',
-        'discard_factor', 'discard_factor_generation_only', 'discard_factor_after_generation',
-        'weight_exponent', 'weight_exponent_generation_only', 'weight_exponent_after_generation',
-        'view_blend_use_color_match', 'view_blend_color_match_method', 'view_blend_color_match_strength',
-        'allow_modify_existing_textures', 'ask_object_prompts', 'fallback_color',
-        'controlnet_units', 'controlnet_units_index', 'lora_units', 'lora_units_index',
-        'weight_exponent_mask', 'sequential_smooth',
-        'canny_threshold_low', 'canny_threshold_high',
-        'sequential_factor_smooth', 'sequential_factor_smooth_2', 'sequential_factor',
-        'grow_mask_by', 'mask_blocky',
-        'visibility_vignette', 'visibility_vignette_width', 'visibility_vignette_softness',
+        'comfyui_prompt',
+        'use_separate_texture_prompt',
+        'texture_prompt',
+        'comfyui_negative_prompt',
+        'model_name',
+        'sg_model_name_backup',
+        'sg_qwen_21_architecture_migrated',
+        'sg_qwen_prompt_template_migrated',
+        'seed',
+        'control_after_generate',
+        'steps',
+        'cfg',
+        'sampler',
+        'scheduler',
+        'show_advanced_params',
+        'show_generation_params',
+        'auto_rescale',
+        'qwen_rescale_alignment',
+        'qwen_image_21_native_rgba',
+        'auto_rescale_target_mp',
+        'generation_method',
+        'use_ipadapter',
+        'refine_images',
+        'refine_steps',
+        'refine_sampler',
+        'refine_scheduler',
+        'denoise',
+        'refine_cfg',
+        'refine_prompt',
+        'refine_upscale_method',
+        'generation_status',
+        'sg_last_gen_error',
+        'sg_last_gen_error_message',
+        'generation_progress',
+        'overwrite_material',
+        'bake_visibility_weights',
+        'discard_factor',
+        'discard_factor_generation_only',
+        'discard_factor_after_generation',
+        'weight_exponent',
+        'weight_exponent_generation_only',
+        'weight_exponent_after_generation',
+        'view_blend_use_color_match',
+        'view_blend_color_match_method',
+        'view_blend_color_match_strength',
+        'allow_modify_existing_textures',
+        'ask_object_prompts',
+        'fallback_color',
+        'controlnet_units',
+        'controlnet_units_index',
+        'lora_units',
+        'lora_units_index',
+        'weight_exponent_mask',
+        'sequential_smooth',
+        'canny_threshold_low',
+        'canny_threshold_high',
+        'sequential_factor_smooth',
+        'sequential_factor_smooth_2',
+        'sequential_factor',
+        'grow_mask_by',
+        'mask_blocky',
+        'visibility_vignette',
+        'visibility_vignette_width',
+        'visibility_vignette_softness',
         'visibility_vignette_blur',
-        'sg_silhouette_margin', 'sg_silhouette_depth', 'sg_silhouette_rays',
+        'sg_silhouette_margin',
+        'sg_silhouette_feather',
+        'sg_projection_guard_scale',
+        'sg_guard_feather_method',
+        'sg_guard_directional',
+        'sg_guard_foreground_margin',
+        'sg_guard_coverage_rescue',
+        'sg_silhouette_depth',
+        'sg_silhouette_rays',
         'sg_allow_backface_projection',
-        'sg_rework_camera_plan', 'sg_rework_aligned_resolution',
+        'sg_rework_aligned_resolution',
         'sg_rework_full_resolution_scale',
-        'sg_rework_safe_render_state', 'sg_rework_reset_controls',
-        'sg_rework_sdxl_registration', 'sg_rework_acquisition_quality',
-        'sg_rework_initial_view_priority',
-        'sg_rework_projection_guard', 'sg_rework_projection_rebuild',
-        'sg_rework_projection_geometry',
-        'sg_rework_consistent_frame', 'sg_rework_workflow_validation',
-        'sg_rework_qwen_workflow', 'qwen_global_style_vlm_only',
+        'sg_rework_acquisition_quality',
+        'sg_rework_projection_guard',
+        'qwen_global_style_vlm_only',
+        'qwen_context_vlm_only',
         'qwen_latent_locked_context',
+        'qwen_latent_lock_neutral_fill',
         'sg_rework_final_display',
-        'sg_texel_ownership', 'sg_texel_replacement_margin',
-        'sg_allow_trusted_replacement', 'sg_ownership_blend_mode',
-        'sg_ownership_seam_width', 'sg_ownership_lowpass_sigma',
-        'sg_auto_view_sequence', 'sg_anchor_camera', 'sg_texturing_frame',
-        'sg_freeze_ownership_after_generation', 'sg_material_discard_factor',
+        'sg_auto_view_sequence',
+        'sg_anchor_camera',
+        'sg_texturing_frame',
+        'sg_material_discard_factor',
         'sg_material_weight_exponent',
-        'refine_angle_ramp_active', 'refine_angle_ramp_pos_0', 'refine_angle_ramp_pos_1',
-        'refine_feather_ramp_pos_0', 'refine_feather_ramp_pos_1',
-        'refine_edge_feather_projection', 'refine_edge_feather_width', 'refine_edge_feather_softness',
-        'differential_diffusion', 'differential_noise',
-        'blur_mask', 'blur_mask_radius', 'blur_mask_sigma',
+        'refine_angle_ramp_active',
+        'refine_angle_ramp_pos_0',
+        'refine_angle_ramp_pos_1',
+        'refine_feather_ramp_pos_0',
+        'refine_feather_ramp_pos_1',
+        'refine_edge_feather_projection',
+        'refine_edge_feather_width',
+        'refine_edge_feather_softness',
+        'differential_diffusion',
+        'differential_noise',
+        'blur_mask',
+        'blur_mask_radius',
+        'blur_mask_sigma',
         'sequential_custom_camera_order',
-        'ipadapter_strength', 'ipadapter_start', 'ipadapter_end',
-        'ipadapter_image', 'ipadapter_weight_type',
-        'sequential_ipadapter', 'sequential_ipadapter_mode',
-        'sequential_desaturate_factor', 'sequential_contrast_factor',
-        'sequential_ipadapter_regenerate', 'sequential_ipadapter_regenerate_wo_controlnet',
-        'clip_skip', 'stablegen_preset', 'active_preset',
-        'model_architecture', 'architecture_mode',
-        'output_timestamp', 'camera_prompts', 'use_camera_prompts',
-        'sg_camera_order', 'sg_camera_order_index', 'sg_use_custom_camera_order',
-        'show_core_settings', 'show_lora_settings', 'show_camera_options',
-        'show_scene_understanding_settings', 'show_output_material_settings',
-        'show_image_guidance_settings', 'show_masking_inpainting_settings',
+        'ipadapter_strength',
+        'ipadapter_start',
+        'ipadapter_end',
+        'ipadapter_image',
+        'ipadapter_weight_type',
+        'sequential_ipadapter',
+        'sequential_ipadapter_mode',
+        'sequential_desaturate_factor',
+        'sequential_contrast_factor',
+        'sequential_ipadapter_regenerate',
+        'sequential_ipadapter_regenerate_wo_controlnet',
+        'clip_skip',
+        'stablegen_preset',
+        'active_preset',
+        'model_architecture',
+        'architecture_mode',
+        'output_timestamp',
+        'camera_prompts',
+        'use_camera_prompts',
+        'sg_camera_order',
+        'sg_camera_order_index',
+        'sg_use_custom_camera_order',
+        'show_core_settings',
+        'show_texturing_experiments',
+        'show_lora_settings',
+        'show_camera_options',
+        'show_scene_understanding_settings',
+        'show_output_material_settings',
+        'show_image_guidance_settings',
+        'show_masking_inpainting_settings',
         'show_mode_specific_settings',
-        'generation_mode', 'early_priority_strength', 'early_priority', 'texture_objects',
-        'qwen_generation_method', 'qwen_refine_use_prev_ref', 'qwen_refine_use_depth',
+        'generation_mode',
+        'early_priority_strength',
+        'early_priority',
+        'texture_objects',
+        'qwen_generation_method',
+        'qwen_refine_use_prev_ref',
+        'qwen_refine_use_depth',
         'qwen_timestep_zero_ref',
-        'qwen_guidance_map_type', 'qwen_voronoi_mode', 'qwen_context_render_mode',
-        'qwen_use_external_style_image', 'qwen_external_style_image',
+        'qwen_guidance_map_type',
+        'qwen_voronoi_mode',
+        'qwen_context_render_mode',
+        'qwen_use_external_style_image',
+        'qwen_external_style_image',
         'qwen_external_style_initial_only',
-        'qwen_use_custom_prompts', 'qwen_custom_prompt_initial',
-        'qwen_custom_prompt_seq_none', 'qwen_custom_prompt_seq_replace',
+        'qwen_use_custom_prompts',
+        'qwen_prompt_template',
+        'qwen_custom_prompt_initial',
+        'qwen_custom_prompt_seq_none',
+        'qwen_custom_prompt_seq_replace',
         'qwen_custom_prompt_seq_additional',
-        'qwen_guidance_fallback_color', 'qwen_guidance_background_color',
-        'qwen_context_cleanup', 'qwen_context_cleanup_hue_tolerance',
-        'qwen_context_cleanup_value_adjust', 'qwen_context_fallback_dilation',
-        'qwen_use_confidence_context', 'qwen_regularize_context_mask',
-        'qwen_use_projection_write_masks', 'qwen_residual_fallback_tolerance',
+        'qwen_guidance_fallback_color',
+        'qwen_guidance_background_color',
+        'qwen_context_cleanup',
+        'qwen_context_cleanup_hue_tolerance',
+        'qwen_context_cleanup_value_adjust',
+        'qwen_context_fallback_dilation',
+        'qwen_use_confidence_context',
+        'qwen_regularize_context_mask',
+        'qwen_use_projection_write_masks',
+        'qwen_residual_fallback_tolerance',
         'qwen_reject_residual_fallback',
-        'qwen_trust_threshold', 'qwen_mask_min_island_area',
-        'qwen_mask_min_hole_area', 'qwen_mask_min_strip_width',
+        'qwen_trust_threshold',
+        'qwen_mask_min_island_area',
+        'qwen_mask_min_hole_area',
+        'qwen_mask_min_strip_width',
         'qwen_mask_uncertainty_dilation',
         'qwen_mask_keep_largest_components',
         'qwen_prompt_gray_background',

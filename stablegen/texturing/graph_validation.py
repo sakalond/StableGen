@@ -72,14 +72,22 @@ def qwen_reference_latent_slots(
     context_mode: str,
     is_initial_image: bool,
     global_style_vlm_only: bool,
+    context_vlm_only: bool = False,
 ) -> tuple[str, ...]:
     """Return Qwen image slots that should receive spatial reference latents.
 
-    Image 3 remains connected to ``TextEncodeQwenImageEditPlus`` when the
-    VLM-only experiment is active; omitting it here removes only its manual
-    full-resolution ReferenceLatent conditioning.
+    Omitted slots remain connected to ``TextEncodeQwenImageEditPlus``.
+    These experiments remove only manual full-resolution ReferenceLatent
+    conditioning. Image 2 is context only on later views in a context mode;
+    initial/external style references must keep their existing behavior.
     """
     slots = ["image1", "image2", "image3"]
+    if (
+        context_vlm_only
+        and context_mode in {"REPLACE_STYLE", "ADDITIONAL"}
+        and not is_initial_image
+    ):
+        slots.remove("image2")
     if (
         global_style_vlm_only
         and context_mode == "ADDITIONAL"
@@ -97,6 +105,7 @@ def attach_qwen_latent_lock(
     context_image_name: str,
     repair_mask_name: str,
     start_node_id: int = 650,
+    neutral_fill: bool = False,
 ) -> dict[str, str]:
     """Attach sampler-level Qwen context inpainting to ``prompt``.
 
@@ -109,6 +118,12 @@ def attach_qwen_latent_lock(
     slots are dynamically reordered between Replace Style and Additional
     modes; keeping the latent-lock path separate prevents semantic slot changes
     from silently changing which image is protected.
+
+    Optional neutral fill removes the repair sentinel before VAE encoding.
+    Encoding magenta directly can contaminate protected boundary latents even
+    when the sampler mask is correct. The inpaint encoder uses neutral gray in
+    repair pixels; grow_mask_by=0 and the explicit mask node preserve the same
+    protected region as the original experiment.
     """
     sampler_node_id = str(sampler_node_id)
     vae_node_id = str(vae_node_id)
@@ -163,6 +178,13 @@ def attach_qwen_latent_lock(
         "class_type": "ImageToMask",
         "_meta": {"title": "Qwen Latent Lock - Image to Mask"},
     }
+    if neutral_fill:
+        prompt[context_encode]["class_type"] = "VAEEncodeForInpaint"
+        prompt[context_encode]["inputs"].update({
+            "mask": [image_to_mask, 0],
+            "grow_mask_by": 0,
+        })
+        prompt[context_encode]["_meta"]["title"] = "Qwen Latent Lock - Neutral Repair Fill"
     prompt[set_noise_mask] = {
         "inputs": {
             "samples": [context_encode, 0],

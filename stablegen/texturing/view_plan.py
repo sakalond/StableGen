@@ -113,18 +113,6 @@ def initial_view_prior(index: int, count: int, strength: float) -> float:
     return 1.0 - (0.75 * strength * rank)
 
 
-def should_replace_owner(
-    currently_covered: bool,
-    owner_confidence: float,
-    new_confidence: float,
-    replacement_margin: float,
-) -> bool:
-    """Reference rule used by the shader-node ownership implementation."""
-    return (
-        not currently_covered
-        or float(new_confidence)
-        > float(owner_confidence) + max(0.0, float(replacement_margin))
-    )
 
 
 @dataclass(frozen=True)

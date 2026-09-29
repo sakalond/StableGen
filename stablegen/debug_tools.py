@@ -1492,30 +1492,28 @@ class SG_OT_DebugRestoreMaterial(bpy.types.Operator):
 
 
 # ═════════════════════════════════════════════════════════════════════════
-# 10. Live Ownership / Confidence Diagnostics
+# 10. Live Confidence Diagnostics
 # ═════════════════════════════════════════════════════════════════════════
 
-class SG_OT_DebugOwnershipDiagnostic(bpy.types.Operator):
-    """Visualize values from the actual projection ownership graph.
+class SG_OT_DebugConfidenceDiagnostic(bpy.types.Operator):
+    """Visualize values from the actual projection confidence graph.
 
     The material is copied before its output is replaced, so the diagnostic
     cannot alter the production graph. Undo restores the original slots.
     """
-    bl_idname = "stablegen.debug_ownership_diagnostic"
-    bl_label = "Ownership Diagnostic"
+    bl_idname = "stablegen.debug_confidence_diagnostic"
+    bl_label = "Confidence Diagnostic"
     bl_options = {'REGISTER', 'UNDO'}
 
     mode: bpy.props.EnumProperty(
         name="Diagnostic",
         items=[
-            ('OWNER', "Owner Camera", "Hue identifies the selected source camera"),
-            ('QUALITY', "Owner Quality", "Resolved acquisition quality of the owner"),
+            ('QUALITY', "Best Source Quality", "Resolved acquisition quality of accepted sources"),
             ('ACQUISITION', "Camera Quality", "Raw acquisition quality for the active camera"),
-            ('TRUSTED', "Trusted Context", "White where owner quality reaches the trust threshold"),
+            ('TRUSTED', "Trusted Context", "White where source quality reaches the trust threshold"),
             ('REPAIR', "Repair Mask", "White where the current view must regenerate context"),
             ('WRITE', "Write Mask", "Authoritative generated-pixel write mask for the active camera"),
             ('GUARD', "Depth/Part Guard", "Rear-surface rejection mask for the active camera"),
-            ('FALLBACK', "Fallback Only", "White where no trusted owner exists"),
         ],
         default='QUALITY',
     )  # type: ignore
@@ -1558,17 +1556,15 @@ class SG_OT_DebugOwnershipDiagnostic(bpy.types.Operator):
                     nodes = mat.node_tree.nodes
                     links = mat.node_tree.links
 
-                    owner_quality = self._find_node(nodes, exact="SGOwnerQuality")
-                    if self.mode == 'OWNER':
-                        source = self._find_node(nodes, exact="SGOwnerCamera")
-                    elif self.mode == 'QUALITY':
-                        source = owner_quality
+                    source_quality = self._find_node(nodes, exact="SGBestSourceQuality")
+                    if self.mode == 'QUALITY':
+                        source = source_quality
                     elif self.mode == 'ACQUISITION':
                         source = self._find_node(
                             nodes, prefix=f"AcquisitionQuality-{camera_index}-"
                         )
                     elif self.mode in {'TRUSTED', 'REPAIR'}:
-                        source = owner_quality
+                        source = source_quality
                     elif self.mode == 'WRITE':
                         source = self._find_node(
                             nodes, prefix=f"SequentialWriteWeight-{camera_index}-"
@@ -1578,7 +1574,7 @@ class SG_OT_DebugOwnershipDiagnostic(bpy.types.Operator):
                             nodes, prefix=f"ProjectionGuardWeight-{camera_index}-"
                         )
                     else:
-                        source = self._find_node(nodes, exact="OwnerUncovered")
+                        source = None
 
                     if source is None or not source.outputs:
                         bpy.data.materials.remove(mat)
@@ -1604,19 +1600,8 @@ class SG_OT_DebugOwnershipDiagnostic(bpy.types.Operator):
 
                     ramp = nodes.new("ShaderNodeValToRGB")
                     ramp.label = f"SGDebug-{self.mode}"
-                    if self.mode == 'OWNER':
-                        normalize = nodes.new("ShaderNodeMath")
-                        normalize.operation = 'DIVIDE'
-                        normalize.inputs[1].default_value = max(len(cameras) - 1, 1)
-                        links.new(value_socket, normalize.inputs[0])
-                        value_socket = normalize.outputs[0]
-                        ramp.color_ramp.elements[0].color = (1.0, 0.0, 0.0, 1.0)
-                        ramp.color_ramp.elements[1].color = (0.0, 0.2, 1.0, 1.0)
-                        middle = ramp.color_ramp.elements.new(0.5)
-                        middle.color = (0.0, 1.0, 0.1, 1.0)
-                    else:
-                        ramp.color_ramp.elements[0].color = (0.0, 0.0, 0.0, 1.0)
-                        ramp.color_ramp.elements[1].color = (1.0, 1.0, 1.0, 1.0)
+                    ramp.color_ramp.elements[0].color = (0.0, 0.0, 0.0, 1.0)
+                    ramp.color_ramp.elements[1].color = (1.0, 1.0, 1.0, 1.0)
                     links.new(value_socket, ramp.inputs['Fac'])
 
                     emission = nodes.new("ShaderNodeEmission")
@@ -1906,6 +1891,6 @@ debug_classes = [
     SG_OT_DebugSkinningWeights,
     SG_OT_DebugClearSkinningWeights,
     SG_OT_DebugRestoreMaterial,
-    SG_OT_DebugOwnershipDiagnostic,
+    SG_OT_DebugConfidenceDiagnostic,
     SG_OT_DebugMakeSolid,
 ]

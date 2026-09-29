@@ -1,40 +1,44 @@
-"""StableGen texturing experiment switches and legacy-compatible defaults."""
+"""Regular texturing defaults and preference-gated research options."""
 
-# This mapping is deliberately Blender-independent so tests and preset code can
-# verify the baseline without importing the add-on registration graph.
-TEXTURING_REWORK_DEFAULTS = {
-    "sg_rework_camera_plan": False,
-    "sg_rework_aligned_resolution": False,
-    "sg_rework_full_resolution_scale": False,
-    "sg_rework_safe_render_state": False,
-    "sg_rework_reset_controls": False,
-    "sg_rework_sdxl_registration": False,
-    "sg_rework_acquisition_quality": False,
-    "sg_rework_initial_view_priority": False,
-    "sg_rework_projection_guard": False,
-    "sg_rework_projection_rebuild": False,
-    "sg_rework_projection_geometry": False,
-    "sg_rework_consistent_frame": False,
-    "sg_rework_workflow_validation": False,
-    "sg_rework_qwen_workflow": False,
-    "qwen_global_style_vlm_only": False,
-    "qwen_latent_locked_context": False,
-    "sg_rework_final_display": False,
+GRADUATED_FEATURE_DEFAULTS = {
     "qwen_use_confidence_context": False,
-    "qwen_regularize_context_mask": False,
-    "qwen_use_projection_write_masks": False,
-    "qwen_reject_residual_fallback": False,
-    "sg_texel_ownership": False,
-    "sg_auto_view_sequence": False,
-    "sg_freeze_ownership_after_generation": False,
-    # Legacy projection used abs(dot), i.e. two-sided/backface contribution.
+    "sg_rework_acquisition_quality": False,
+    "sg_rework_projection_guard": False,
     "sg_allow_backface_projection": True,
+}
+EXPERIMENTAL_FEATURE_DEFAULTS = dict.fromkeys((
+    "sg_rework_aligned_resolution", "sg_rework_full_resolution_scale",
+    "sg_rework_final_display", "qwen_global_style_vlm_only",
+    "qwen_context_vlm_only", "qwen_latent_locked_context",
+    "qwen_latent_lock_neutral_fill", "qwen_regularize_context_mask",
+    "qwen_use_projection_write_masks", "qwen_reject_residual_fallback",
+    "sg_auto_view_sequence",
+), False)
+TEXTURING_DEFAULTS = {
+    **GRADUATED_FEATURE_DEFAULTS, **EXPERIMENTAL_FEATURE_DEFAULTS,
 }
 
 
-def all_rework_features_disabled(scene):
-    """Return True when *scene* is configured for the legacy baseline."""
-    return all(
-        getattr(scene, name, default) == default
-        for name, default in TEXTURING_REWORK_DEFAULTS.items()
-    )
+def experiments_enabled(context=None):
+    """Fail closed when the addon is absent, including background helpers."""
+    try:
+        if context is None:
+            import bpy
+            context = bpy.context
+        addon = context.preferences.addons.get(__package__)
+        return bool(addon and addon.preferences.enable_texturing_experiments)
+    except (AttributeError, ImportError, KeyError, ReferenceError):
+        return False
+
+
+def experimental_enabled(scene, name, context=None):
+    """Saved switches are effective only while the application gate permits."""
+    if name not in EXPERIMENTAL_FEATURE_DEFAULTS:
+        raise ValueError(f"Not a texturing experiment: {name}")
+    return experiments_enabled(context) and bool(getattr(scene, name, False))
+
+
+def active_experiments(scene, context=None):
+    if not experiments_enabled(context):
+        return []
+    return [name for name in EXPERIMENTAL_FEATURE_DEFAULTS if getattr(scene, name, False)]

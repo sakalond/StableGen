@@ -58,6 +58,12 @@ class StableGenAddonPreferences(bpy.types.AddonPreferences):
     """Preferences for the StableGen addon."""
     bl_idname = ADDON_PKG
 
+    enable_texturing_experiments: bpy.props.BoolProperty(
+        name="Enable Experimental Texturing Features",
+        description="Show research controls and allow their saved settings to affect texturing; disabling keeps saved values but prevents experimental execution",
+        default=False,
+    )  # type: ignore
+
     server_address: bpy.props.StringProperty(
         name="Server Address",
         description="Address of the ComfyUI server",
@@ -178,6 +184,7 @@ class StableGenAddonPreferences(bpy.types.AddonPreferences):
 
         layout.prop(self, "save_blend_file")
         layout.prop(self, "enable_print_tab")
+        layout.prop(self, "enable_texturing_experiments")
         layout.prop(self, "enable_scene_queue")
 
         layout.separator()

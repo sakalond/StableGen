@@ -1,3 +1,4 @@
+from ..feature_flags import experimental_enabled
 """ComfyUI texture generation operator (core pipeline)."""
 
 import os
@@ -54,7 +55,7 @@ from .pose_lock import (
     restore_active_texturing_frame,
     set_active_texturing_frame,
 )
-from ..feature_flags import TEXTURING_REWORK_DEFAULTS
+from ..feature_flags import active_experiments
 
 import websocket
 
@@ -94,12 +95,12 @@ class Regenerate(bpy.types.Operator):
         return True
 
     def execute(self, context):
-        """     
-        Executes the operator.         
-        :param context: Blender context.         
-        :return: {'FINISHED'}     
         """
-        
+        Executes the operator.
+        :param context: Blender context.
+        :return: {'FINISHED'}
+        """
+
         self._original_overwrite_material = context.scene.overwrite_material
         # Set the flag to reproject
         context.scene.generation_mode = 'regenerate_selected'
@@ -124,7 +125,7 @@ class Regenerate(bpy.types.Operator):
         for obj in self._to_texture:
             if not obj.active_material or not obj.active_material.use_nodes:
                 continue
-            
+
             nodes = obj.active_material.node_tree.nodes
             for node in nodes:
                 # OSL script nodes (internal or external)
@@ -146,13 +147,13 @@ class Regenerate(bpy.types.Operator):
         # Switch to modal and wait for completion
         print("[StableGen] Going modal")
         return {'RUNNING_MODAL'}
-    
+
     def modal(self, context, event):
-        """     
-        Handles modal events.         
-        :param context: Blender context.         
-        :param event: Blender event.         
-        :return: {'PASS_THROUGH'}     
+        """
+        Handles modal events.
+        :param context: Blender context.
+        :param event: Blender event.
+        :return: {'PASS_THROUGH'}
         """
         if event.type == 'TIMER':
             running = False
@@ -192,10 +193,10 @@ class Reproject(bpy.types.Operator):
         return True
 
     def execute(self, context):
-        """     
-        Executes the operator.         
-        :param context: Blender context.         
-        :return: {'FINISHED'}     
+        """
+        Executes the operator.
+        :param context: Blender context.
+        :return: {'FINISHED'}
         """
         if context.scene.texture_objects == 'all':
             to_texture = [obj for obj in bpy.context.view_layer.objects if obj.type == 'MESH' and not obj.hide_get()]
@@ -226,7 +227,7 @@ class Reproject(bpy.types.Operator):
                         f"generated image.")
                     print(f"[StableGen] {image_path} does not exist")
                     return {'CANCELLED'}
-        
+
         self._original_method = context.scene.generation_method
         self._original_overwrite_material = context.scene.overwrite_material
         # Set the flag to reproject
@@ -347,12 +348,12 @@ class Reproject(bpy.types.Operator):
                 self.report({'INFO'}, "Reprojection complete.")
                 return {'FINISHED'}
         return {'PASS_THROUGH'}
-    
+
 
 
 class ComfyUIGenerate(_PBRMixin, bpy.types.Operator):
     """Generate textures using ComfyUI (to all mesh objects using all cameras in the scene)
-    
+
     - Multiple modes are available. Choose by setting Generation Mode in the UI.
     - This includes texture generation and projection to the mesh objects.
     - By default, the generated textures will only be visible in the Rendered viewport shading mode."""
@@ -463,7 +464,7 @@ class ComfyUIGenerate(_PBRMixin, bpy.types.Operator):
         bpy.app.timers.register(_callback)
         self._wait_event.wait()
         self._wait_event.clear()
-                
+
     def _get_qwen_context_colors(self, context):
         fallback = (1.0, 0.0, 1.0)
         background = (1.0, 0.0, 1.0)
@@ -522,7 +523,7 @@ class ComfyUIGenerate(_PBRMixin, bpy.types.Operator):
                 object_ids.astype(np.int32) * 256 + material_ids.astype(np.int32)
             )
 
-        if getattr(context.scene, 'qwen_regularize_context_mask', False):
+        if experimental_enabled(context.scene, 'qwen_regularize_context_mask'):
             repair_mask = regularize_repair_mask(
                 repair_mask,
                 threshold=127,
@@ -580,7 +581,7 @@ class ComfyUIGenerate(_PBRMixin, bpy.types.Operator):
 
     def _reject_qwen_fallback_writes(self, context, camera_id, image_path, fallback_color):
         """Keep residual sentinel pixels out of the projection material."""
-        if not getattr(context.scene, "qwen_reject_residual_fallback", False):
+        if not experimental_enabled(context.scene, 'qwen_reject_residual_fallback'):
             return
         if context.scene.qwen_context_render_mode not in {'REPLACE_STYLE', 'ADDITIONAL'}:
             return
@@ -753,10 +754,10 @@ class ComfyUIGenerate(_PBRMixin, bpy.types.Operator):
         return True
 
     def execute(self, context):
-        """     
-        Executes the operator.         
-        :param context: Blender context.         
-        :return: {'RUNNING_MODAL'}     
+        """
+        Executes the operator.
+        :param context: Blender context.
+        :return: {'RUNNING_MODAL'}
         """
         if ComfyUIGenerate._is_running:
             self.cancel_generate(context)
@@ -766,11 +767,11 @@ class ComfyUIGenerate(_PBRMixin, bpy.types.Operator):
 
         # Clear the upload cache at the start of a new generation
         self._uploaded_images_cache.clear()
-        
+
         # Timestamp for output directory
         if context.scene.generation_mode == 'standard':
             context.scene.output_timestamp = datetime.now().strftime("%Y-%m-%dT%H-%M-%S")
-        
+
         # If UV inpainting and we're in prompt collection mode, collect prompts first.
         if context.scene.generation_method == 'uv_inpaint' and self.show_prompt_dialog:
             self._object_prompts[self.current_object_name] = self.current_object_prompt
@@ -782,21 +783,18 @@ class ComfyUIGenerate(_PBRMixin, bpy.types.Operator):
             else:
                 self.show_prompt_dialog = False
 
-        
+
         context.scene.generation_status = 'running'
         context.scene.sg_last_gen_error = False
         context.scene.sg_last_gen_error_message = ""
         ComfyUIGenerate._is_running = True
 
         print("[StableGen] Executing ComfyUI Generation")
-        enabled_experiments = [
-            name for name, default in TEXTURING_REWORK_DEFAULTS.items()
-            if getattr(context.scene, name, default) != default
-        ]
+        enabled_experiments = active_experiments(context.scene, context)
         if enabled_experiments:
             print("[StableGen] Texturing experiments enabled: " + ", ".join(enabled_experiments))
         else:
-            print("[StableGen] Texturing feature set: legacy rigging-branch baseline")
+            print("[StableGen] Standard texturing; no research options active")
 
         if context.scene.model_architecture in ('qwen_image_edit', 'flux2_klein') and not context.scene.generation_mode == 'project_only':
             context.scene.generation_method = 'sequential' # Force sequential for edit models
@@ -810,7 +808,7 @@ class ComfyUIGenerate(_PBRMixin, bpy.types.Operator):
         self._original_resolution_percentage = render.resolution_percentage
         self._original_resolution_x = render.resolution_x
         self._original_resolution_y = render.resolution_y
-        if getattr(context.scene, 'sg_rework_full_resolution_scale', False):
+        if experimental_enabled(context.scene, 'sg_rework_full_resolution_scale'):
             render.resolution_percentage = 100
 
         resolution_x = render.resolution_x
@@ -836,9 +834,7 @@ class ComfyUIGenerate(_PBRMixin, bpy.types.Operator):
         upper_bound = int(target_px * 1.2)
         lower_bound = int(target_px * 0.8)
 
-        use_aligned_search = getattr(
-            context.scene, 'sg_rework_aligned_resolution', False
-        )
+        use_aligned_search = experimental_enabled(context.scene, 'sg_rework_aligned_resolution')
         if context.scene.auto_rescale and ((total_pixels > upper_bound or total_pixels < lower_bound) or (resolution_x % align_step != 0 or resolution_y % align_step != 0)):
             if use_aligned_search:
                 render.resolution_x, render.resolution_y = choose_aligned_resolution(
@@ -868,7 +864,7 @@ class ComfyUIGenerate(_PBRMixin, bpy.types.Operator):
             render.resolution_x = self._original_resolution_x
             render.resolution_y = self._original_resolution_y
             return {'CANCELLED'}
-        use_camera_plan = getattr(context.scene, 'sg_rework_camera_plan', False)
+        use_camera_plan = True
         order_names = []
         if context.scene.sg_use_custom_camera_order and len(context.scene.sg_camera_order) > 0:
             order_names = [item.name for item in context.scene.sg_camera_order]
@@ -904,14 +900,13 @@ class ComfyUIGenerate(_PBRMixin, bpy.types.Operator):
         pose_locked = self._begin_texturing_pose_lock(
             context, pose_lock_targets
         )
-        if (not pose_locked
-                and getattr(context.scene, 'sg_rework_consistent_frame', False)):
+        if (not pose_locked):
             self._original_texturing_frame = context.scene.frame_current
             context.scene.frame_set(int(getattr(context.scene, 'sg_texturing_frame', 1)))
 
         if (context.scene.generation_mode == 'standard'
                 and not order_names
-                and getattr(context.scene, 'sg_auto_view_sequence', False)):
+                and experimental_enabled(context.scene, 'sg_auto_view_sequence')):
             anchor_name = getattr(context.scene, 'sg_anchor_camera', '')
             if not anchor_name and context.scene.camera:
                 anchor_name = context.scene.camera.name
@@ -1038,7 +1033,7 @@ class ComfyUIGenerate(_PBRMixin, bpy.types.Operator):
         self._selected_camera_ids = [i for i, cam in enumerate(self._cameras) if cam in bpy.context.selected_objects] #TEST
         if len(self._selected_camera_ids) == 0:
             self._selected_camera_ids = list(range(len(self._cameras))) # All cameras selected if none are selected
-        
+
         # Check if there is at least one ControlNet unit
         controlnet_units = getattr(context.scene, "controlnet_units", [])
         if not controlnet_units and not (context.scene.use_flux_lora and context.scene.model_architecture == 'flux1') and context.scene.model_architecture != 'flux2_klein':
@@ -1051,11 +1046,11 @@ class ComfyUIGenerate(_PBRMixin, bpy.types.Operator):
             render.resolution_y = self._original_resolution_y
             self._restore_texturing_pose(context)
             return {'CANCELLED'}
-        
+
         # If there are curves within the scene, warn the user
         if any(obj.type == 'CURVE' for obj in bpy.context.view_layer.objects):
             self.report({'WARNING'}, "Curves detected in the scene. Consider using 'Convert Curves to Mesh' in the Tools section.")
-        
+
         if context.scene.generation_mode == 'project_only':
             print(f"[StableGen] Reprojecting images for {len(self._cameras)} cameras")
         elif context.scene.generation_mode == 'standard':
@@ -1126,14 +1121,14 @@ class ComfyUIGenerate(_PBRMixin, bpy.types.Operator):
         # UV inpainting mode preparation
         if context.scene.generation_method == 'uv_inpaint':
             # Check if there are baked textures for all objects
-            
+
             if self.show_prompt_dialog:
                 # Start the prompt collection process with the first object
                 if not self._object_prompts:  # Only if prompts haven't been collected
                     self.current_object_name = self._to_texture[0].name
                     self._restore_texturing_pose(context)
                     return context.window_manager.invoke_props_dialog(self, width=400)
-                
+
             # Continue with normal execution if all prompts are collected
             for obj in self._to_texture:
                 # Use get_file_path to check for baked texture existence
@@ -1149,7 +1144,7 @@ class ComfyUIGenerate(_PBRMixin, bpy.types.Operator):
                         texture_resolution=2048,
                     )
                     bake_texture(context, obj, texture_resolution=2048, output_dir=get_dir_path(context, "baked"))
-                
+
                 # Check if the material is compatible (uses projection shader)
                 active_material = obj.active_material
                 if not active_material or not active_material.use_nodes:
@@ -1180,7 +1175,7 @@ class ComfyUIGenerate(_PBRMixin, bpy.types.Operator):
                     render.resolution_y = self._original_resolution_y
                     self._restore_texturing_pose(context)
                     return {'CANCELLED'}
-                    
+
                 # Export visibility masks for each object
                 self._stage = f"Computing Visibility ({obj.name})"
                 export_visibility(context, None, obj)
@@ -1203,7 +1198,7 @@ class ComfyUIGenerate(_PBRMixin, bpy.types.Operator):
                         ref_rgb=ref_np,
                         scene=context.scene,
                     )
-        
+
         self.prompt_text = context.scene.comfyui_prompt
 
         self._progress = 0.0
@@ -1242,25 +1237,25 @@ class ComfyUIGenerate(_PBRMixin, bpy.types.Operator):
 
         # Add modal timer
         context.window_manager.modal_handler_add(self)
-        self._timer = context.window_manager.event_timer_add(0.5, window=context.window)       
-        print("[StableGen] Starting thread") 
+        self._timer = context.window_manager.event_timer_add(0.5, window=context.window)
+        print("[StableGen] Starting thread")
         if context.scene.generation_method == 'grid':
             self._thread = threading.Thread(target=self.async_generate, args=(context,))
         else:
             _start_cam = self._current_image  # 0 normally, first_selected for sequential regen
             self._thread = threading.Thread(target=self.async_generate, args=(context, _start_cam))
-        
+
         self._thread.start()
 
         return {'RUNNING_MODAL'}
 
 
     def modal(self, context, event):
-        """     
-        Handles modal events.         
-        :param context: Blender context.         
-        :param event: Blender event.         
-        :return: {'PASS_THROUGH'}     
+        """
+        Handles modal events.
+        :param context: Blender context.
+        :param event: Blender event.
+        :return: {'PASS_THROUGH'}
         """
         if event.type == 'TIMER':
             redraw_ui(context)
@@ -1282,7 +1277,7 @@ class ComfyUIGenerate(_PBRMixin, bpy.types.Operator):
                 # after the worker exits, before either success or error can
                 # return from the operator.
                 try:
-                    if (getattr(context.scene, 'sg_rework_reset_controls', False)
+                    if (True
                             or not self._error):
                         self._reset_projection_state(context)
                 except Exception as reset_error:
@@ -1314,7 +1309,7 @@ class ComfyUIGenerate(_PBRMixin, bpy.types.Operator):
                     return {'CANCELLED'}
                 if not context.scene.generation_mode == 'project_only':
                     self.report({'INFO'}, "Generation complete.")
-                
+
                 # If viewport rendering mode is 'Rendered' and mode is 'regenerate_selected', switch to 'Solid' and then back to 'Rendered' to refresh the viewport
                 if context.scene.generation_mode == 'regenerate_selected' and context.area.spaces.active.shading.type == 'RENDERED':
                     context.area.spaces.active.shading.type = 'SOLID'
@@ -1343,15 +1338,15 @@ class ComfyUIGenerate(_PBRMixin, bpy.types.Operator):
                     bpy.ops.wm.save_as_mainfile(filepath=blend_file_path, copy=True)
                 remove_empty_dirs(context)
                 return {'FINISHED'}
-            
+
             # Handle prompt collection for UV inpainting
             if context.scene.generation_method == 'uv_inpaint' and self.show_prompt_dialog:
-                current_index = next((i for i, obj in enumerate(self._to_texture) 
+                current_index = next((i for i, obj in enumerate(self._to_texture)
                                     if obj.name == self.current_object_name), -1)
-                
+
                 # Store the current prompt
                 self._object_prompts[self.current_object_name] = self.current_object_prompt
-                
+
                 # Move to next object or finish
                 if current_index < len(self._to_texture) - 1:
                     self.current_object_name = self._to_texture[current_index + 1].name
@@ -1365,40 +1360,6 @@ class ComfyUIGenerate(_PBRMixin, bpy.types.Operator):
 
     def _reset_projection_state(self, context):
         """Restore final display controls after every worker termination."""
-        if not getattr(context.scene, 'sg_rework_reset_controls', False):
-            # Rigging-branch behavior: update only the original OSL/native
-            # inputs.  This intentionally does not touch the normalized
-            # SharpW nodes or rebake attributes; the corrected behavior is a
-            # separate opt-in experiment.
-            applicable = (
-                getattr(self, '_generation_method_on_start', None) == 'sequential'
-                or context.scene.model_architecture in ('qwen_image_edit', 'flux2_klein')
-            )
-            if context.scene.discard_factor_generation_only and applicable:
-                angle = context.scene.discard_factor_after_generation
-                for obj in getattr(self, '_to_texture', ()):
-                    material = getattr(obj, 'active_material', None)
-                    if not material or not material.use_nodes:
-                        continue
-                    for node in material.node_tree.nodes:
-                        if node.type == 'SCRIPT' and 'AngleThreshold' in node.inputs:
-                            node.inputs['AngleThreshold'].default_value = angle
-                        elif (node.type == 'MATH' and node.operation == 'LESS_THAN'
-                              and node.label.startswith('AngleThreshold-')):
-                            node.inputs[1].default_value = angle
-            if context.scene.weight_exponent_generation_only and applicable:
-                exponent = context.scene.weight_exponent_after_generation
-                for obj in getattr(self, '_to_texture', ()):
-                    material = getattr(obj, 'active_material', None)
-                    if not material or not material.use_nodes:
-                        continue
-                    for node in material.node_tree.nodes:
-                        if node.type == 'SCRIPT' and 'Power' in node.inputs:
-                            node.inputs['Power'].default_value = exponent
-                        elif (node.type == 'MATH' and node.operation == 'POWER'
-                              and node.label == 'power_weight'):
-                            node.inputs[1].default_value = exponent
-            return
 
         applicable = (
             getattr(self, '_generation_method_on_start', None) == 'sequential'
@@ -1436,12 +1397,12 @@ class ComfyUIGenerate(_PBRMixin, bpy.types.Operator):
                 angle_threshold=reset_angle,
                 power_exponent=reset_exponent,
             )
-    
+
     def cancel_generate(self, context):
-        """     
-        Cancels the generation process using api.interupt().    
-        :param context: Blender context.         
-        :return: None     
+        """
+        Cancels the generation process using api.interupt().
+        :param context: Blender context.
+        :return: None
         """
         server_address = context.preferences.addons[_ADDON_PKG].preferences.server_address
         client_id = str(uuid.uuid4())
@@ -1606,7 +1567,7 @@ class ComfyUIGenerate(_PBRMixin, bpy.types.Operator):
                     and context.scene.qwen_refine_use_depth)
                 or (getattr(context.scene, 'sg_rework_projection_guard', False)
                     and context.scene.generation_method == 'sequential')
-                or (getattr(context.scene, 'qwen_regularize_context_mask', False)
+                or (experimental_enabled(context.scene, 'qwen_regularize_context_mask')
                     and context.scene.generation_method == 'sequential')
             )
             if need_depth and context.scene.generation_method != 'uv_inpaint':
@@ -1742,10 +1703,10 @@ class ComfyUIGenerate(_PBRMixin, bpy.types.Operator):
                     return
 
     def async_generate(self, context, camera_id = None):
-        """     
-        Asynchronously generates the image using ComfyUI.         
-        :param context: Blender context.         
-        :return: None     
+        """
+        Asynchronously generates the image using ComfyUI.
+        :param context: Blender context.
+        :return: None
         """
         self._error = None
         self._pbr_maps = {}  # camera_key → {map_name: file_path}
@@ -1868,7 +1829,7 @@ class ComfyUIGenerate(_PBRMixin, bpy.types.Operator):
                     else:
                         self._stage = "Uploading to Server"
                     self._progress = 0
-                    
+
                     # Generate the image
                     if context.scene.generation_method in ('refine', 'local_edit'):
                         if context.scene.model_architecture == 'flux1':
@@ -1990,7 +1951,7 @@ class ComfyUIGenerate(_PBRMixin, bpy.types.Operator):
                         image_path = get_file_path(context, "generated", camera_id=camera_id, material_id=self._material_id)
                     else: # Grid mode initial generation
                         image_path = get_file_path(context, "generated", filename="generated_image_grid") # Save grid to a specific name
-                    
+
                     with open(image_path, 'wb') as f:
                         f.write(image)
 
@@ -2005,11 +1966,11 @@ class ComfyUIGenerate(_PBRMixin, bpy.types.Operator):
                             fallback_color,
                         )
 
-                    
+
                     # Use hack to re-generate the image using IPAdapter to match IPAdapter style
                     if camera_id == 0 and (context.scene.generation_method == 'sequential' or context.scene.generation_method == 'separate' or context.scene.generation_method in ('refine', 'local_edit'))\
                             and context.scene.sequential_ipadapter and context.scene.sequential_ipadapter_regenerate and not context.scene.use_ipadapter and context.scene.sequential_ipadapter_mode == 'first':
-                                
+
                         # Restore original strengths
                         if context.scene.sequential_ipadapter_regenerate_wo_controlnet:
                             for i, unit in enumerate(context.scene.controlnet_units):
@@ -2109,7 +2070,7 @@ class ComfyUIGenerate(_PBRMixin, bpy.types.Operator):
                             with open(image_path, 'wb') as f:
                                 f.write(image)
                     self._threads_left = 0
-                
+
         except Exception as e:
             self._error = str(e)
             traceback.print_exc()
@@ -2179,7 +2140,7 @@ class ComfyUIGenerate(_PBRMixin, bpy.types.Operator):
                 # generation-only Qwen write masks.  This is intentionally
                 # opt-in so the default remains byte-for-byte compatible with
                 # the rigging-branch sequential material behavior.
-                if getattr(context.scene, 'sg_rework_final_display', False):
+                if experimental_enabled(context.scene, 'sg_rework_final_display'):
                     original_method = context.scene.generation_method
                     try:
                         context.scene.generation_method = 'separate'
@@ -2201,7 +2162,6 @@ class ComfyUIGenerate(_PBRMixin, bpy.types.Operator):
                     )
                     if getattr(context.scene, 'pbr_auto_lighting', False):
                         _pbr_setup_studio_lights(context, self._to_texture)
-                self._freeze_projection_ownership(context)
                 return None
             self._stage = "Projecting Image"
             redraw_ui(context)
@@ -2230,10 +2190,9 @@ class ComfyUIGenerate(_PBRMixin, bpy.types.Operator):
                 if getattr(context.scene, 'pbr_auto_lighting', False):
                     _pbr_setup_studio_lights(context, self._to_texture)
 
-            self._freeze_projection_ownership(context)
 
             return None
-        
+
         if context.scene.view_blend_use_color_match and self._to_texture:
             self._stage = "Matching Colors"
             # Use the first object in the target list as the color reference
@@ -2253,7 +2212,12 @@ class ComfyUIGenerate(_PBRMixin, bpy.types.Operator):
                         scene=context.scene,
                     )
 
-        bpy.app.timers.register(image_project_callback)
+        # Keep the worker alive until projection finishes. Otherwise modal
+        # cleanup can restore sequential mode before this callback executes,
+        # causing it to skip the entire reproject (and hide projection errors).
+        self._run_on_main_thread(image_project_callback)
+        if self._error:
+            return
 
         # Update seed based on control parameter
         if context.scene.control_after_generate == 'increment':
@@ -2263,29 +2227,7 @@ class ComfyUIGenerate(_PBRMixin, bpy.types.Operator):
         elif context.scene.control_after_generate == 'randomize':
             context.scene.seed = np.random.randint(0, 1000000)
 
-    def _freeze_projection_ownership(self, context):
-        """Bake live camera ownership into production UV textures when enabled."""
-        ownership_active = bool(
-            getattr(context.scene, 'sg_texel_ownership', False)
-        )
-        if not (ownership_active
-                and getattr(context.scene, 'sg_freeze_ownership_after_generation', False)):
-            return
-        self._stage = "Freezing Texture Ownership"
-        output_dir = get_dir_path(context, "baked")
-        prepare_baking(context)
-        for obj in self._to_texture:
-            if bake_texture(
-                context,
-                obj,
-                texture_resolution=2048,
-                view_transform='Standard',
-                output_dir=output_dir,
-            ):
-                baked_path = os.path.join(output_dir, f"{obj.name}.png")
-                flatten_projection_material_for_refine(context, obj, baked_path)
-                obj["sg_ownership_frozen"] = True
-                obj["sg_ownership_texture"] = baked_path
+
 
     def draw(self, context):
         layout = self.layout
@@ -2309,84 +2251,14 @@ class ComfyUIGenerate(_PBRMixin, bpy.types.Operator):
                 return self.execute(context)
             return context.window_manager.invoke_props_dialog(self, width=400)
         return self.execute(context)
-    
-    def _export_depthmap_legacy(self, context, camera_id=None):
-        """Rigging-branch depth exporter, intentionally kept unchanged."""
-        print("[StableGen] Exporting depth map")
-        original_engine = bpy.context.scene.render.engine
-        original_view_transform = bpy.context.scene.view_settings.view_transform
-        original_film_transparent = bpy.context.scene.render.film_transparent
-        original_use_compositing = bpy.context.scene.render.use_compositing
-        original_filepath = bpy.context.scene.render.filepath
 
-        ensure_texturing_frame(
-            bpy.context.scene, honor_consistent=False
-        )
 
-        output_dir = get_dir_path(context, "controlnet")["depth"]
-        output_file = f"depth_map{camera_id}" if camera_id is not None else "depth_map"
-
-        if not os.path.exists(output_dir):
-            os.makedirs(output_dir)
-
-        view_layer = bpy.context.view_layer
-        bpy.context.scene.render.engine = 'BLENDER_WORKBENCH'
-        bpy.context.scene.display_settings.display_device = 'sRGB'
-        bpy.context.scene.view_settings.view_transform = 'Raw'
-
-        original_pass_z = view_layer.use_pass_z
-        view_layer.use_pass_z = True
-
-        bpy.context.scene.render.use_compositing = True
-        bpy.context.scene.use_nodes = True
-        node_tree = get_compositor_node_tree(bpy.context.scene)
-        nodes = node_tree.nodes
-        links = node_tree.links
-        compositor_state = _prepare_compositor_render(context.scene, node_tree)
-
-        bpy.context.scene.render.image_settings.file_format = 'PNG'
-
-        for node in nodes:
-            nodes.remove(node)
-
-        render_layers_node = nodes.new(type="CompositorNodeRLayers")
-        render_layers_node.location = (0, 0)
-
-        normalize_node = nodes.new(type="CompositorNodeNormalize")
-        normalize_node.location = (200, 0)
-        links.new(render_layers_node.outputs["Depth"], normalize_node.inputs[0])
-
-        invert_node = nodes.new(type="CompositorNodeInvert")
-        invert_node.location = (400, 0)
-        color_input = invert_node.inputs["Color"] if "Color" in invert_node.inputs else invert_node.inputs[1]
-        links.new(normalize_node.outputs[0], color_input)
-
-        output_node = nodes.new(type="CompositorNodeOutputFile")
-        output_node.location = (600, 0)
-        configure_output_node_paths(output_node, output_dir, output_file)
-        links.new(invert_node.outputs[0], output_node.inputs[0])
-
-        try:
-            bpy.ops.render.render(write_still=True)
-        finally:
-            _finish_compositor_render(node_tree, compositor_state)
-
-        bpy.context.scene.view_settings.view_transform = 'Standard'
-        print(f"[StableGen] Depth map saved to: {os.path.join(output_dir, output_file)}.png")
-
-        bpy.context.scene.render.engine = original_engine
-        bpy.context.scene.view_settings.view_transform = original_view_transform
-        bpy.context.scene.render.film_transparent = original_film_transparent
-        bpy.context.scene.render.use_compositing = original_use_compositing
-        bpy.context.scene.render.filepath = original_filepath
-        view_layer.use_pass_z = original_pass_z
-
-    def _export_depthmap_impl(self, context, camera_id=None):
-        """     
-        Exports the depth map of the scene.         
-        :param context: Blender context.         
-        :param camera_id: ID of the camera.         
-        :return: None     
+    def _export_depthmap_impl(self, context, camera_id=None, guard_scale=1):
+        """
+        Exports the depth map of the scene.
+        :param context: Blender context.
+        :param camera_id: ID of the camera.
+        :return: None
         """
         print("[StableGen] Exporting depth map")
         ensure_texturing_frame(context.scene)
@@ -2452,7 +2324,7 @@ class ComfyUIGenerate(_PBRMixin, bpy.types.Operator):
         nodes = node_tree.nodes
         links = node_tree.links
         compositor_state = _prepare_compositor_render(context.scene, node_tree)
-        
+
         # Ensure animation format is not selected
         bpy.context.scene.render.image_settings.file_format = 'PNG'
 
@@ -2509,7 +2381,7 @@ class ComfyUIGenerate(_PBRMixin, bpy.types.Operator):
         )
         use_part_ids = (
             use_projection_guard
-            or getattr(context.scene, 'qwen_regularize_context_mask', False)
+            or experimental_enabled(context.scene, 'qwen_regularize_context_mask')
         )
         has_object_ids = use_part_ids and _add_index_output(
             "IndexOB", f"object_id{camera_id}", -200
@@ -2591,7 +2463,7 @@ class ComfyUIGenerate(_PBRMixin, bpy.types.Operator):
         bpy.context.scene.view_settings.view_transform = 'Standard'
 
         print(f"[StableGen] Depth map saved to: {os.path.join(output_dir, output_file)}.png")
-        
+
         # Restore original settings
         bpy.context.scene.render.engine = original_engine
         bpy.context.scene.view_settings.view_transform = original_view_transform
@@ -2601,25 +2473,6 @@ class ComfyUIGenerate(_PBRMixin, bpy.types.Operator):
         view_layer.use_pass_z = original_pass_z
 
     def export_depthmap(self, context, camera_id=None):
-        use_legacy_depth = not any((
-            getattr(context.scene, 'sg_rework_safe_render_state', False),
-            getattr(context.scene, 'sg_rework_projection_guard', False),
-            getattr(context.scene, 'qwen_regularize_context_mask', False),
-            getattr(context.scene, 'sg_rework_consistent_frame', False),
-        ))
-        if use_legacy_depth:
-            # The reworked depth/ID exporter deliberately disables output
-            # dithering because categorical ID passes must remain exact. Some
-            # files produced while that path was active therefore retain a
-            # scene dither value of zero. The legacy Workbench exporter used
-            # Blender's default 1.0 dither, which changes roughly ten percent
-            # of 8-bit depth samples by one LSB and makes its PNGs materially
-            # larger. Normalize only the all-off compatibility call, then
-            # restore the user's scene value so old/new depth inputs are
-            # deterministic even when the source .blend was previously used
-            # with rework features.
-            with _legacy_render_dither(context.scene):
-                return self._export_depthmap_legacy(context, camera_id=camera_id)
         meshes = [obj for obj in context.view_layer.objects if obj.type == 'MESH']
         with _RenderStateTransaction(context, meshes):
             return self._export_depthmap_impl(context, camera_id=camera_id)
@@ -2632,9 +2485,6 @@ class ComfyUIGenerate(_PBRMixin, bpy.types.Operator):
         :param camera_id: ID of the camera.
         :return: None
         """
-        if not getattr(context.scene, 'sg_rework_safe_render_state', False):
-            with _legacy_render_dither(context.scene):
-                return self._export_normal_impl(context, camera_id=camera_id)
         meshes = [obj for obj in context.view_layer.objects if obj.type == 'MESH']
         with _RenderStateTransaction(context, meshes):
             return self._export_normal_impl(context, camera_id=camera_id)
@@ -2856,7 +2706,7 @@ class ComfyUIGenerate(_PBRMixin, bpy.types.Operator):
             context.scene.sequential_ipadapter_mode == 'recent' and
             (context.scene.sequential_ipadapter or context.scene.model_architecture in ('qwen_image_edit', 'flux2_klein'))
         )
-        
+
         temp_image_path = None
         upload_path = local_path
 
@@ -2870,11 +2720,11 @@ class ComfyUIGenerate(_PBRMixin, bpy.types.Operator):
                         if desaturate > 0.0:
                             enhancer = ImageEnhance.Color(img)
                             img = enhancer.enhance(1.0 - desaturate)
-                        
+
                         if contrast > 0.0:
                             enhancer = ImageEnhance.Contrast(img)
                             img = enhancer.enhance(1.0 - contrast)
-                        
+
                         # Save to a temporary file for upload
                         temp_dir = get_dir_path(context, "temp")
                         os.makedirs(temp_dir, exist_ok=True)

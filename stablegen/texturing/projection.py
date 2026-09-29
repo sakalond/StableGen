@@ -1,3 +1,4 @@
+from ..feature_flags import experimental_enabled
 import bpy
 import os
 from math import atan, tan, pi
@@ -15,8 +16,6 @@ def _is_projection_mesh(obj):
     """Consistent render/visibility filter for production geometry."""
     if obj.type != 'MESH' or obj.hide_get():
         return False
-    if not getattr(bpy.context.scene, 'sg_rework_projection_geometry', False):
-        return True
     if obj.hide_render:
         return False
     if obj.get("sg_rig_helper", False) or obj.get("sg_exclude_texturing", False):
@@ -48,51 +47,15 @@ def _scene_projection_scale(context):
     )
 
 
-def _ensure_lowpass_texture(image_path, sigma=8.0):
-    """Create/update a low-pass companion used only for ownership seams."""
-    if not image_path or not os.path.exists(image_path):
-        return None
-    root, extension = os.path.splitext(image_path)
-    sigma_value = max(0.1, float(sigma))
-    sigma_key = f"{sigma_value:.2f}".replace('.', '_')
-    output_path = f"{root}_sg_lowpass_s{sigma_key}{extension or '.png'}"
-    try:
-        if (os.path.exists(output_path)
-                and os.path.getmtime(output_path) >= os.path.getmtime(image_path)):
-            return output_path
-        import cv2
-        source = cv2.imread(image_path, cv2.IMREAD_UNCHANGED)
-        if source is None:
-            return None
-        result = source.copy()
-        channels = result[:, :, :3] if result.ndim == 3 else result
-        blurred = cv2.GaussianBlur(
-            channels, (0, 0), sigmaX=sigma_value
-        )
-        if result.ndim == 3:
-            result[:, :, :3] = blurred
-        else:
-            result = blurred
-        cv2.imwrite(output_path, result)
-        return output_path
-    except Exception as error:
-        print(f"[StableGen] Low-frequency seam texture failed: {error}")
-        return None
 
 
 def _camera_world_location(camera):
     """Return camera position in world space (including parent transforms)."""
-    if getattr(bpy.context.scene, 'sg_rework_projection_geometry', False):
-        return camera.matrix_world.translation.copy()
-    return camera.location.copy()
+    return camera.matrix_world.translation.copy()
 
 
 def _scene_ray_epsilon(context):
     """Scale ray tolerances to the scene instead of assuming metre-sized assets."""
-    if not getattr(context.scene, 'sg_rework_projection_geometry', False):
-        # The legacy native graph used +0.01 ray length and +0.001 hit
-        # tolerance; callers multiply this base by ten for ray length.
-        return 0.001
     corners = []
     for obj in context.view_layer.objects:
         if not _is_projection_mesh(obj):
@@ -197,8 +160,6 @@ def _bake_visibility_weights(
         filmh  = filmw / aspect
         camera_type = (
             camera.data.type
-            if getattr(scene, 'sg_rework_projection_geometry', False)
-            else 'PERSP'
         )
         ortho_half_h = max(float(camera.data.ortho_scale) * 0.5, 1e-8)
         ortho_half_w = ortho_half_h * aspect
@@ -209,15 +170,15 @@ def _bake_visibility_weights(
             np.array(cam_right, dtype=np.float64),
             np.array(cam_up_vec, dtype=np.float64),
             filmw, filmh,
-            float(camera.data.shift_x) if getattr(scene, 'sg_rework_projection_geometry', False) else 0.0,
-            float(camera.data.shift_y) if getattr(scene, 'sg_rework_projection_geometry', False) else 0.0,
+            float(camera.data.shift_x),
+            float(camera.data.shift_y),
             cam_loc,  # keep mathutils Vector for BVH calls
             camera_type, ortho_half_w, ortho_half_h,
         ))
 
     # Build scene-wide BVH for occlusion (matches ShaderNodeRaycast behaviour,
     # which checks ALL visible scene geometry, not just the current object).
-    use_corrected_geometry = getattr(scene, 'sg_rework_projection_geometry', False)
+    use_corrected_geometry = True
     depsgraph = context.evaluated_depsgraph_get() if use_corrected_geometry else None
     scene_bm = bmesh.new()
     vert_offset = 0
@@ -684,7 +645,6 @@ def create_native_raycast_visibility(nodes, links, camera, geometry, context, i,
     shift_x_amount.operation = 'MULTIPLY'
     shift_x_amount.inputs[1].default_value = (
         2.0 * float(camera.data.shift_x)
-        if getattr(context.scene, 'sg_rework_projection_geometry', False) else 0.0
     )
     links.new(filmw.outputs[0], shift_x_amount.inputs[0])
     centered_x = nodes.new("ShaderNodeMath")
@@ -696,7 +656,6 @@ def create_native_raycast_visibility(nodes, links, camera, geometry, context, i,
     shift_y_amount.operation = 'MULTIPLY'
     shift_y_amount.inputs[1].default_value = (
         2.0 * float(camera.data.shift_y)
-        if getattr(context.scene, 'sg_rework_projection_geometry', False) else 0.0
     )
     links.new(filmh.outputs[0], shift_y_amount.inputs[0])
     centered_y = nodes.new("ShaderNodeMath")
@@ -979,7 +938,6 @@ def create_native_feather(nodes, links, normalize_node, camera_fov_node, camera_
     shift_x_amount.operation = 'MULTIPLY'
     shift_x_amount.inputs[1].default_value = (
         2.0 * float(camera.data.shift_x)
-        if getattr(context.scene, 'sg_rework_projection_geometry', False) else 0.0
     )
     links.new(filmw.outputs[0], shift_x_amount.inputs[0])
     centered_x = nodes.new("ShaderNodeMath")
@@ -991,7 +949,6 @@ def create_native_feather(nodes, links, normalize_node, camera_fov_node, camera_
     shift_y_amount.operation = 'MULTIPLY'
     shift_y_amount.inputs[1].default_value = (
         2.0 * float(camera.data.shift_y)
-        if getattr(context.scene, 'sg_rework_projection_geometry', False) else 0.0
     )
     links.new(filmh.outputs[0], shift_y_amount.inputs[0])
     centered_y = nodes.new("ShaderNodeMath")
@@ -1096,6 +1053,8 @@ def project_image(
     stop_index=1000000,
     cameras=None,
     view_plan=None,
+    force_rebuild=False,
+    reuse_projection_uv=False,
 ):
     """     
     Projects an image onto all mesh objects using UV Project Modifier.     
@@ -1395,11 +1354,6 @@ def project_image(
                 v_off = -200 * idx
                 all_w_outputs.append(_get_weight_output(weight_nodes[idx], v_off))
 
-            # Keep these unmodified source-camera acquisition qualities for
-            # ownership.  Initial-view priority is applied later only as
-            # replacement resistance for a trusted owner; it must never turn
-            # poor grazing coverage into trusted context.
-            acquisition_outputs = list(all_w_outputs)
 
             # ── Step 3: Find per-pixel maximum ────────────────────────
             max_node = nodes_collection.new("ShaderNodeMath")
@@ -1459,254 +1413,6 @@ def project_image(
             # Replace weight_nodes with sharpened-normalised nodes
             weight_nodes = powered_nodes
 
-            # Binary Qwen write masks and per-texel ownership solve different
-            # problems. Write masks prevent a later generated view from writing
-            # protected context; ownership selects exactly one camera for
-            # high-frequency detail and therefore creates harder territories.
-            # Keep ownership genuinely opt-in so disabling the UI toggle
-            # restores continuous weighted blending without disabling Qwen's
-            # protection masks.
-            use_confidence_ownership = bool(
-                getattr(context.scene, 'sg_texel_ownership', False)
-            )
-            legacy_blend = getattr(
-                context.scene, 'sg_ownership_blend_mode', 'OWNER'
-            ) == 'LEGACY'
-            if use_confidence_ownership and not legacy_blend:
-                # Sequential single-owner detail.  Untrusted owners remain
-                # replaceable; trusted owners lock unless explicit quality
-                # upgrades are enabled.
-                owner_color = shaders[0]
-                owner_low = lowpass_tex_image_nodes[0]
-                seam_low = owner_low
-                owner_quality = acquisition_outputs[0]
-                margin = max(
-                    0.0,
-                    float(getattr(context.scene, 'sg_texel_replacement_margin', 0.05)),
-                )
-                trust_threshold = float(getattr(
-                    context.scene, 'qwen_trust_threshold', 0.7
-                ))
-                allow_upgrade = bool(getattr(
-                    context.scene, 'sg_allow_trusted_replacement', False
-                ))
-                priority_strength = (
-                    float(getattr(context.scene, 'early_priority_strength', 0.5))
-                    if (getattr(context.scene, 'early_priority', False)
-                        and getattr(context.scene, 'sg_rework_initial_view_priority', False))
-                    else 0.0
-                )
-
-                owner_camera = nodes_collection.new("ShaderNodeValue")
-                owner_camera.outputs[0].default_value = 0.0
-                owner_camera.label = "SGOwnerCamera-0"
-                owner_priority = nodes_collection.new("ShaderNodeValue")
-                owner_priority.outputs[0].default_value = priority_strength * 0.25
-                owner_priority.label = "SGOwnerPriority-0"
-
-                for idx in range(1, len(shaders)):
-                    new_quality = acquisition_outputs[idx]
-                    old_owner_low = owner_low
-
-                    owner_trusted = nodes_collection.new("ShaderNodeMath")
-                    owner_trusted.operation = 'GREATER_THAN'
-                    owner_trusted.inputs[1].default_value = trust_threshold - 1e-7
-                    owner_trusted.label = f"OwnerTrusted-{idx}"
-                    links.new(owner_quality, owner_trusted.inputs[0])
-
-                    owner_untrusted = nodes_collection.new("ShaderNodeMath")
-                    owner_untrusted.operation = 'SUBTRACT'
-                    owner_untrusted.inputs[0].default_value = 1.0
-                    links.new(owner_trusted.outputs[0], owner_untrusted.inputs[1])
-
-                    candidate_valid = nodes_collection.new("ShaderNodeMath")
-                    candidate_valid.operation = 'GREATER_THAN'
-                    candidate_valid.inputs[1].default_value = 0.0
-                    links.new(new_quality, candidate_valid.inputs[0])
-
-                    replace_untrusted = nodes_collection.new("ShaderNodeMath")
-                    replace_untrusted.operation = 'MULTIPLY'
-                    links.new(owner_untrusted.outputs[0], replace_untrusted.inputs[0])
-                    links.new(candidate_valid.outputs[0], replace_untrusted.inputs[1])
-
-                    margin_node = nodes_collection.new("ShaderNodeMath")
-                    margin_node.operation = 'ADD'
-                    margin_node.location = (x_offset - 200, y_offset - 180 * idx)
-                    margin_node.inputs[1].default_value = margin
-                    margin_node.label = f"OwnerMargin-{idx}"
-                    links.new(owner_quality, margin_node.inputs[0])
-
-                    priority_margin = nodes_collection.new("ShaderNodeMath")
-                    priority_margin.operation = 'ADD'
-                    links.new(margin_node.outputs[0], priority_margin.inputs[0])
-                    links.new(owner_priority.outputs[0], priority_margin.inputs[1])
-
-                    replace = nodes_collection.new("ShaderNodeMath")
-                    replace.operation = 'GREATER_THAN'
-                    replace.location = (x_offset, y_offset - 180 * idx)
-                    replace.label = f"OwnerReplace-{idx}"
-                    links.new(new_quality, replace.inputs[0])
-                    links.new(priority_margin.outputs[0], replace.inputs[1])
-
-                    replace_trusted = nodes_collection.new("ShaderNodeMath")
-                    replace_trusted.operation = 'MULTIPLY'
-                    replace_trusted.inputs[1].default_value = 1.0 if allow_upgrade else 0.0
-                    links.new(replace.outputs[0], replace_trusted.inputs[0])
-
-                    replace_or_empty = nodes_collection.new("ShaderNodeMath")
-                    replace_or_empty.operation = 'MAXIMUM'
-                    replace_or_empty.location = (x_offset + 100, y_offset - 180 * idx)
-                    replace_or_empty.label = f"OwnerAccept-{idx}"
-                    links.new(replace_untrusted.outputs[0], replace_or_empty.inputs[0])
-                    links.new(replace_trusted.outputs[0], replace_or_empty.inputs[1])
-
-                    select_color = nodes_collection.new("ShaderNodeMixRGB")
-                    select_color.location = (x_offset + 200, y_offset - 180 * idx)
-                    select_color.label = f"TexelOwner-{idx}"
-                    links.new(replace_or_empty.outputs[0], select_color.inputs["Fac"])
-                    links.new(owner_color.outputs[0], select_color.inputs["Color1"])
-                    links.new(shaders[idx].outputs[0], select_color.inputs["Color2"])
-
-                    select_low = nodes_collection.new("ShaderNodeMixRGB")
-                    select_low.label = f"LowFrequencyOwner-{idx}"
-                    links.new(replace_or_empty.outputs[0], select_low.inputs["Fac"])
-                    links.new(seam_low.outputs[0], select_low.inputs["Color1"])
-                    links.new(lowpass_tex_image_nodes[idx].outputs[0], select_low.inputs["Color2"])
-
-                    if getattr(context.scene, 'sg_ownership_blend_mode', 'OWNER') == 'OWNER':
-                        difference = nodes_collection.new("ShaderNodeMath")
-                        difference.operation = 'SUBTRACT'
-                        links.new(new_quality, difference.inputs[0])
-                        links.new(owner_quality, difference.inputs[1])
-                        absolute_difference = nodes_collection.new("ShaderNodeMath")
-                        absolute_difference.operation = 'ABSOLUTE'
-                        links.new(difference.outputs[0], absolute_difference.inputs[0])
-                        near_boundary = nodes_collection.new("ShaderNodeMath")
-                        near_boundary.operation = 'LESS_THAN'
-                        near_boundary.inputs[1].default_value = float(getattr(
-                            context.scene, 'sg_ownership_seam_width', 0.08
-                        ))
-                        links.new(absolute_difference.outputs[0], near_boundary.inputs[0])
-                        candidate_trusted = nodes_collection.new("ShaderNodeMath")
-                        candidate_trusted.operation = 'GREATER_THAN'
-                        candidate_trusted.inputs[1].default_value = trust_threshold - 1e-7
-                        links.new(new_quality, candidate_trusted.inputs[0])
-                        both_trusted = nodes_collection.new("ShaderNodeMath")
-                        both_trusted.operation = 'MULTIPLY'
-                        links.new(owner_trusted.outputs[0], both_trusted.inputs[0])
-                        links.new(candidate_trusted.outputs[0], both_trusted.inputs[1])
-                        seam_factor = nodes_collection.new("ShaderNodeMath")
-                        seam_factor.operation = 'MULTIPLY'
-                        links.new(near_boundary.outputs[0], seam_factor.inputs[0])
-                        links.new(both_trusted.outputs[0], seam_factor.inputs[1])
-                        low_average = nodes_collection.new("ShaderNodeMixRGB")
-                        low_average.inputs["Fac"].default_value = 0.5
-                        links.new(owner_low.outputs[0], low_average.inputs["Color1"])
-                        links.new(lowpass_tex_image_nodes[idx].outputs[0], low_average.inputs["Color2"])
-                        blended_seam_low = nodes_collection.new("ShaderNodeMixRGB")
-                        blended_seam_low.label = f"LowFrequencySeam-{idx}"
-                        links.new(seam_factor.outputs[0], blended_seam_low.inputs["Fac"])
-                        links.new(select_low.outputs[0], blended_seam_low.inputs["Color1"])
-                        links.new(low_average.outputs[0], blended_seam_low.inputs["Color2"])
-                        next_seam_low = blended_seam_low
-                    else:
-                        next_seam_low = select_low
-
-                    confidence_delta = nodes_collection.new("ShaderNodeMath")
-                    confidence_delta.operation = 'SUBTRACT'
-                    confidence_delta.location = (x_offset + 200, y_offset - 180 * idx - 90)
-                    links.new(new_quality, confidence_delta.inputs[0])
-                    links.new(owner_quality, confidence_delta.inputs[1])
-                    selected_delta = nodes_collection.new("ShaderNodeMath")
-                    selected_delta.operation = 'MULTIPLY'
-                    selected_delta.location = (x_offset + 350, y_offset - 180 * idx - 90)
-                    links.new(confidence_delta.outputs[0], selected_delta.inputs[0])
-                    links.new(replace_or_empty.outputs[0], selected_delta.inputs[1])
-                    selected_confidence = nodes_collection.new("ShaderNodeMath")
-                    selected_confidence.operation = 'ADD'
-                    selected_confidence.location = (x_offset + 500, y_offset - 180 * idx - 90)
-                    selected_confidence.label = f"OwnerConfidence-{idx}"
-                    links.new(owner_quality, selected_confidence.inputs[0])
-                    links.new(selected_delta.outputs[0], selected_confidence.inputs[1])
-
-                    camera_delta = nodes_collection.new("ShaderNodeMath")
-                    camera_delta.operation = 'SUBTRACT'
-                    camera_delta.inputs[0].default_value = float(idx)
-                    links.new(owner_camera.outputs[0], camera_delta.inputs[1])
-                    selected_camera_delta = nodes_collection.new("ShaderNodeMath")
-                    selected_camera_delta.operation = 'MULTIPLY'
-                    links.new(camera_delta.outputs[0], selected_camera_delta.inputs[0])
-                    links.new(replace_or_empty.outputs[0], selected_camera_delta.inputs[1])
-                    selected_camera = nodes_collection.new("ShaderNodeMath")
-                    selected_camera.operation = 'ADD'
-                    selected_camera.label = f"SGOwnerCamera-{idx}"
-                    links.new(owner_camera.outputs[0], selected_camera.inputs[0])
-                    links.new(selected_camera_delta.outputs[0], selected_camera.inputs[1])
-
-                    candidate_priority = priority_strength * 0.25 * (
-                        1.0 - idx / float(max(len(shaders) - 1, 1))
-                    )
-                    priority_delta = nodes_collection.new("ShaderNodeMath")
-                    priority_delta.operation = 'SUBTRACT'
-                    priority_delta.inputs[0].default_value = candidate_priority
-                    links.new(owner_priority.outputs[0], priority_delta.inputs[1])
-                    selected_priority_delta = nodes_collection.new("ShaderNodeMath")
-                    selected_priority_delta.operation = 'MULTIPLY'
-                    links.new(priority_delta.outputs[0], selected_priority_delta.inputs[0])
-                    links.new(replace_or_empty.outputs[0], selected_priority_delta.inputs[1])
-                    selected_priority = nodes_collection.new("ShaderNodeMath")
-                    selected_priority.operation = 'ADD'
-                    selected_priority.label = f"SGOwnerPriority-{idx}"
-                    links.new(owner_priority.outputs[0], selected_priority.inputs[0])
-                    links.new(selected_priority_delta.outputs[0], selected_priority.inputs[1])
-
-                    owner_color = select_color
-                    owner_low = nodes_collection.new("ShaderNodeMixRGB")
-                    owner_low.label = f"SelectedOwnerLow-{idx}"
-                    links.new(replace_or_empty.outputs[0], owner_low.inputs["Fac"])
-                    links.new(old_owner_low.outputs[0], owner_low.inputs["Color1"])
-                    links.new(lowpass_tex_image_nodes[idx].outputs[0], owner_low.inputs["Color2"])
-                    seam_low = next_seam_low
-                    owner_quality = selected_confidence.outputs[0]
-                    owner_camera = selected_camera
-                    owner_priority = selected_priority
-
-                selected_confidence.label = "SGOwnerQuality"
-                selected_camera.label = "SGOwnerCamera"
-
-                if getattr(context.scene, 'sg_ownership_blend_mode', 'OWNER') == 'OWNER':
-                    detail = nodes_collection.new("ShaderNodeMixRGB")
-                    detail.blend_type = 'SUBTRACT'
-                    detail.inputs["Fac"].default_value = 1.0
-                    detail.label = "OwnedHighFrequencyDetail"
-                    links.new(owner_color.outputs[0], detail.inputs["Color1"])
-                    links.new(owner_low.outputs[0], detail.inputs["Color2"])
-                    recompose = nodes_collection.new("ShaderNodeMixRGB")
-                    recompose.blend_type = 'ADD'
-                    recompose.inputs["Fac"].default_value = 1.0
-                    recompose.use_clamp = True
-                    recompose.label = "LowFrequencySeamComposite"
-                    links.new(detail.outputs[0], recompose.inputs["Color1"])
-                    links.new(seam_low.outputs[0], recompose.inputs["Color2"])
-                    owner_color = recompose
-
-                final_mix = nodes_collection.new("ShaderNodeMixRGB")
-                final_mix.location = (x_offset + 450, y_offset)
-                final_mix.inputs["Color2"].default_value = (
-                    *context.scene.fallback_color, 1.0
-                )
-                links.new(owner_color.outputs[0], final_mix.inputs["Color1"])
-                if last_node:
-                    links.new(last_node.outputs[0], final_mix.inputs["Color2"])
-                uncovered = nodes_collection.new("ShaderNodeMath")
-                uncovered.operation = 'COMPARE'
-                uncovered.inputs[1].default_value = 0.0
-                uncovered.inputs[2].default_value = 0.0
-                uncovered.label = "OwnerUncovered"
-                links.new(owner_quality, uncovered.inputs[0])
-                links.new(uncovered.outputs[0], final_mix.inputs["Fac"])
-                return final_mix, selected_confidence
-
         new_shaders = []
         new_weight_nodes = []
         i = 0
@@ -1718,7 +1424,6 @@ def project_image(
                 sum_node.operation = 'ADD'
                 legacy_priority = (
                     context.scene.early_priority
-                    and not getattr(context.scene, 'sg_rework_initial_view_priority', False)
                 )
                 sum_node.location = (
                     (x_offset - 800, y_offset + vert_offset)
@@ -1913,8 +1618,7 @@ def project_image(
     # ── Optional: bake per-vertex visibility weights ──────────────────
     use_baked_weights = (
         getattr(context.scene, 'bake_visibility_weights', False)
-        or (getattr(context.scene, 'sg_rework_projection_geometry', False)
-            and any(camera.data.type == 'ORTHO' for camera in cameras))
+        or (any((camera.data.type == 'ORTHO' for camera in cameras)))
     )
     if use_baked_weights:
         # Always compute weights for ALL cameras (ignore stop_index).
@@ -2001,12 +1705,11 @@ def project_image(
 
 
         rework_requires_rebuild = any((
-            getattr(context.scene, 'sg_rework_projection_rebuild', False),
+            force_rebuild,
             getattr(context.scene, 'sg_rework_projection_guard', False),
-            getattr(context.scene, 'sg_texel_ownership', False),
             getattr(context.scene, 'qwen_use_confidence_context', False),
-            getattr(context.scene, 'qwen_use_projection_write_masks', False),
-            getattr(context.scene, 'sg_rework_sdxl_registration', False),
+            experimental_enabled(context.scene, 'qwen_use_projection_write_masks'),
+            context.scene.model_architecture == 'sdxl',
         ))
         legacy_incremental_update = (
             ((context.scene.generation_method == 'sequential' and stop_index > 0)
@@ -2074,7 +1777,7 @@ def project_image(
             continue
         elif not is_local_edit:
             # Rebuild mode is required for per-view assets that only exist
-            # after generation (write masks, guards, and ownership inputs).
+            # after generation (write masks, guards, and confidence inputs).
             # Clear existing nodes
             for node in nodes:
                 nodes.remove(node)
@@ -2101,7 +1804,6 @@ def project_image(
         use_native_raycast = bpy.app.version >= (5, 1, 0)
 
         tex_image_nodes = []
-        lowpass_tex_image_nodes = []
         uv_map_nodes = []
         subtract_nodes = []
         normalize_nodes = []
@@ -2264,28 +1966,6 @@ def project_image(
             tex_image.label = f"{i}-{mat_id}"
             tex_image_nodes.append(tex_image)
 
-            lowpass_node = tex_image
-            if (getattr(context.scene, 'sg_texel_ownership', False)
-                    and getattr(context.scene, 'sg_ownership_blend_mode', 'OWNER') == 'OWNER'
-                    and i <= stop_index and tex_image.image is not None):
-                source_path = bpy.path.abspath(tex_image.image.filepath)
-                lowpass_path = _ensure_lowpass_texture(
-                    source_path,
-                    getattr(context.scene, 'sg_ownership_lowpass_sigma', 8.0),
-                )
-                if lowpass_path:
-                    lowpass_image = get_or_load_image(
-                        lowpass_path,
-                        force_reload=context.scene.overwrite_material,
-                    )
-                    if lowpass_image:
-                        lowpass_node = nodes.new("ShaderNodeTexImage")
-                        lowpass_node.image = lowpass_image
-                        lowpass_node.extension = 'CLIP'
-                        lowpass_node.label = f"LowPass-{i}-{mat_id}"
-                        lowpass_node.location = (200, -200 * i)
-            lowpass_tex_image_nodes.append(lowpass_node)
-                
             # Add UV map / attribute node
             # Use ShaderNodeAttribute to read from the corner-domain attribute
             uv_map_node = nodes.new("ShaderNodeAttribute")
@@ -2452,12 +2132,10 @@ def project_image(
                 if "CameraShiftX" in script_angle.inputs:
                     script_angle.inputs["CameraShiftX"].default_value = (
                         camera.data.shift_x
-                        if getattr(context.scene, 'sg_rework_projection_geometry', False) else 0.0
                     )
                 if "CameraShiftY" in script_angle.inputs:
                     script_angle.inputs["CameraShiftY"].default_value = (
                         camera.data.shift_y
-                        if getattr(context.scene, 'sg_rework_projection_geometry', False) else 0.0
                     )
                 script_angle.label = f"Angle-{i}-{mat_id}"
 
@@ -2499,12 +2177,10 @@ def project_image(
                     if "CameraShiftX" in script_feather.inputs:
                         script_feather.inputs["CameraShiftX"].default_value = (
                             camera.data.shift_x
-                            if getattr(context.scene, 'sg_rework_projection_geometry', False) else 0.0
                         )
                     if "CameraShiftY" in script_feather.inputs:
                         script_feather.inputs["CameraShiftY"].default_value = (
                             camera.data.shift_y
-                            if getattr(context.scene, 'sg_rework_projection_geometry', False) else 0.0
                         )
                     scripts_to_connect.append(script_feather)
 
@@ -2636,16 +2312,11 @@ def project_image(
                 and context.scene.generation_method == 'sequential'
                 and context.scene.qwen_generation_method == 'generate'
                 and context.scene.qwen_context_render_mode in {'REPLACE_STYLE', 'ADDITIONAL'}
-                and getattr(context.scene, 'qwen_use_projection_write_masks', False)
+                and experimental_enabled(context.scene, 'qwen_use_projection_write_masks')
             )
             qwen_write_weight = None
             use_sdxl_write_mask = (
-                getattr(context.scene, 'sg_rework_sdxl_registration', False)
-                and
-                i > 0
-                and i <= stop_index
-                and context.scene.model_architecture == 'sdxl'
-                and context.scene.generation_method == 'sequential'
+                i > 0 and i <= stop_index and (context.scene.model_architecture == 'sdxl') and (context.scene.generation_method == 'sequential')
             )
             if (use_qwen_write_mask or use_sdxl_write_mask) and script_nodes_outputs:
                 current_weight = script_nodes_outputs[-1]
@@ -2677,12 +2348,12 @@ def project_image(
                 guard_weight = _create_projection_guard_weight(i, mat_id)
                 if guard_weight is not None:
                     # A projection guard marks depth/object/material boundaries
-                    # as unsafe for ownership, but it must not delete the last
+                    # as unsafe for projection, but it must not delete the last
                     # available coverage. Complex character meshes can have
                     # dense ID boundaries around hair, facial parts, fingers,
                     # clothing openings, and adjacent mesh pieces. If every
                     # camera is hard-zeroed at the same surface point, the
-                    # ownership graph falls through to the material's black
+                    # weighted graph falls through to the material's black
                     # fallback. Keep a tiny, untrusted confidence floor: safe
                     # views still beat it overwhelmingly, while the best weak
                     # source fills a texel only when no guarded source exists.
@@ -2752,8 +2423,7 @@ def project_image(
                 confidence_quality_nodes.append(confidence_quality)
 
         # Expose a confidence-only max chain for context rendering.  This
-        # node never selects or mixes RGB, so disabling texel ownership keeps
-        # the continuous weighted material while still providing a genuine
+        # node does not mix RGB. Continuous weighted blending retains a separate
         # best-source trust signal to Qwen.
         if confidence_context_active and confidence_quality_nodes:
             best_quality = nodes.new("ShaderNodeMath")
@@ -2794,9 +2464,6 @@ def project_image(
             # Connect UV → Texture (needed for both paths)
             uv_output = "Vector" if uv_map_node.type == 'ATTRIBUTE' else "UV"
             links.new(uv_map_node.outputs[uv_output], tex_image.inputs["Vector"])
-            lowpass_tex = lowpass_tex_image_nodes[i]
-            if lowpass_tex is not tex_image:
-                links.new(uv_map_node.outputs[uv_output], lowpass_tex.inputs["Vector"])
 
             if use_baked_weights or use_native_raycast:
                 # Baked-weights path: all links already made during creation.
@@ -2947,7 +2614,7 @@ def get_or_load_image(filepath, force_reload=False):
 
 
 def reset_projection_material_nodes(material, angle_threshold, exponent):
-    """Reset display controls without changing stored ownership confidence."""
+    """Reset display controls without changing stored source confidence."""
     if not material or not material.use_nodes:
         return False
     nodes = material.node_tree.nodes

@@ -1,3 +1,4 @@
+from ..feature_flags import experimental_enabled
 import bpy
 import os
 import json
@@ -81,12 +82,11 @@ def _generation_prompt(scene):
 class _TexturingWorkflowMixin:
     def _queue_prompt(self, prompt, client_id, server_address):
         """Validate every dynamically edited texturing graph at submission."""
-        if getattr(bpy.context.scene, 'sg_rework_workflow_validation', False):
-            issues = validate_workflow_graph(prompt)
-            if issues:
-                message = "Invalid texturing workflow: " + "; ".join(issues)
-                self.operator._error = message
-                raise ValueError(message)
+        issues = validate_workflow_graph(prompt)
+        if issues:
+            message = "Invalid texturing workflow: " + "; ".join(issues)
+            self.operator._error = message
+            raise ValueError(message)
         return super()._queue_prompt(prompt, client_id, server_address)
 
     """Texturing workflow methods for WorkflowManager."""
@@ -123,18 +123,6 @@ class _TexturingWorkflowMixin:
                   f"({len(img_bytes)} bytes): {e}  — returning raw bytes.")
             return img_bytes
 
-        if not getattr(bpy.context.scene, 'sg_rework_sdxl_registration', False):
-            # Rigging-branch behavior used a fixed eight-pixel crop regardless
-            # of the call-site default.
-            legacy_border = 8
-            width, height = img.size
-            if width > 2 * legacy_border and height > 2 * legacy_border:
-                img = img.crop((
-                    legacy_border,
-                    legacy_border,
-                    width - legacy_border,
-                    height - legacy_border,
-                ))
         # Corrected mode never crops because projection registration is not
         # adjusted for a changed image extent.
         w, h = img.size
@@ -591,31 +579,30 @@ class _TexturingWorkflowMixin:
         # --- Reference Latent chain (Qwen unzoom fix) ---
         self._build_qwen_reference_latent_chain(prompt, NODES)
 
-        if getattr(context.scene, 'sg_rework_qwen_workflow', False):
-            prompt[NODES['sampler']]['inputs']['seed'] = context.scene.seed
-            prompt[NODES['sampler']]['inputs']['steps'] = context.scene.steps
-            prompt[NODES['sampler']]['inputs']['cfg'] = context.scene.cfg
-            prompt[NODES['sampler']]['inputs']['sampler_name'] = context.scene.sampler
-            prompt[NODES['sampler']]['inputs']['scheduler'] = context.scene.scheduler
-            prompt[NODES['sampler']]['inputs']['denoise'] = 1.0
+        prompt[NODES['sampler']]['inputs']['seed'] = context.scene.seed
+        prompt[NODES['sampler']]['inputs']['steps'] = context.scene.steps
+        prompt[NODES['sampler']]['inputs']['cfg'] = context.scene.cfg
+        prompt[NODES['sampler']]['inputs']['sampler_name'] = context.scene.sampler
+        prompt[NODES['sampler']]['inputs']['scheduler'] = context.scene.scheduler
+        prompt[NODES['sampler']]['inputs']['denoise'] = 1.0
 
-            if is_nunchaku:
-                prompt[NODES['unet_loader']] = {
-                    "inputs": {
-                        "model_name": context.scene.model_name,
-                        "cpu_offload": "auto",
-                        "num_blocks_on_gpu": 1,
-                        "use_pin_memory": "enable",
-                    },
-                    "class_type": "NunchakuQwenImageDiTLoader",
-                    "_meta": {"title": "Nunchaku Qwen-Image DiT Loader"},
-                }
-            else:
-                prompt[NODES['unet_loader']]['inputs']['unet_name'] = context.scene.model_name
+        if is_nunchaku:
+            prompt[NODES['unet_loader']] = {
+                "inputs": {
+                    "model_name": context.scene.model_name,
+                    "cpu_offload": "auto",
+                    "num_blocks_on_gpu": 1,
+                    "use_pin_memory": "enable",
+                },
+                "class_type": "NunchakuQwenImageDiTLoader",
+                "_meta": {"title": "Nunchaku Qwen-Image DiT Loader"},
+            }
+        else:
+            prompt[NODES['unet_loader']]['inputs']['unet_name'] = context.scene.model_name
 
         graph_issues = (validate_workflow_graph(
             prompt, (NODES['pos_prompt'], NODES['neg_prompt'])
-        ) if getattr(context.scene, 'sg_rework_workflow_validation', False) else [])
+        ))
         if graph_issues:
             self.operator._error = "Invalid Qwen refine workflow: " + "; ".join(graph_issues)
             return {"error": "invalid_workflow"}
@@ -874,8 +861,6 @@ class _TexturingWorkflowMixin:
                 # VL processing and the reference latent chain see ~1 MP.
                 style_slot = (
                     qwen_style_semantic_slot(context_mode, is_initial_image)
-                    if getattr(context.scene, 'sg_rework_qwen_workflow', False)
-                    else 'image2'
                 )
                 prompt[NODES['pos_prompt']]['inputs'][style_slot] = [scale_node_key, 0]
                 prompt[NODES['neg_prompt']]['inputs'][style_slot] = [scale_node_key, 0]
@@ -902,9 +887,7 @@ class _TexturingWorkflowMixin:
         # visibility repair mask authoritative inside the sampler.  It is
         # available only for later sequential views that actually have a
         # context render; the initial view keeps the legacy depth-start latent.
-        latent_lock_enabled = bool(getattr(
-            context.scene, 'qwen_latent_locked_context', False
-        ))
+        latent_lock_enabled = bool(experimental_enabled(context.scene, 'qwen_latent_locked_context'))
         latent_lock_active = (
             latent_lock_enabled
             and not is_initial_image
@@ -930,6 +913,7 @@ class _TexturingWorkflowMixin:
                 vae_node_id=NODES['vae_loader'],
                 context_image_name=context_render_info['name'],
                 repair_mask_name=repair_mask_info['name'],
+                neutral_fill=bool(experimental_enabled(context.scene, 'qwen_latent_lock_neutral_fill')),
             )
             print(
                 "[StableGen] Qwen latent-locked context active for camera "
@@ -975,7 +959,7 @@ class _TexturingWorkflowMixin:
 
         graph_issues = (validate_workflow_graph(
             prompt, (NODES['pos_prompt'], NODES['neg_prompt'])
-        ) if getattr(context.scene, 'sg_rework_workflow_validation', False) else [])
+        ))
         if graph_issues:
             self.operator._error = "Invalid Qwen edit workflow: " + "; ".join(graph_issues)
             return {"error": "invalid_workflow"}
@@ -2386,6 +2370,9 @@ class _TexturingWorkflowMixin:
         if not context.scene.generation_method == 'uv_inpaint':
             prompt = self._refine_build_controlnet_chain(prompt, context, controlnet_info, NODES)
         else:
+            # UV textures do not use ControlNet; the template's union selector
+            # references a loader that only the ControlNet builder creates.
+            prompt.pop('239', None)
             if context.scene.differential_diffusion:
                 prompt[NODES['sampler']]["inputs"]["positive"] = [NODES['inpaint_conditioning'], 0]
                 prompt[NODES['sampler']]["inputs"]["negative"] = [NODES['inpaint_conditioning'], 1]
@@ -2529,25 +2516,18 @@ class _TexturingWorkflowMixin:
         # Set the input for the clip skip node
         prompt[NODES['clip_skip']]["inputs"]["clip"] = final_lora_clip_out
 
-        # If using IPAdapter, set the model input
-        _is_original_render_ipadapter = (
-            context.scene.sequential_ipadapter
-            and context.scene.sequential_ipadapter_mode == 'original_render'
-            and context.scene.generation_method == 'local_edit'
-        )
-        _is_trellis2_input_ipadapter = (
-            context.scene.sequential_ipadapter
-            and context.scene.sequential_ipadapter_mode == 'trellis2_input'
-        )
-        if (context.scene.use_ipadapter or _is_original_render_ipadapter or _is_trellis2_input_ipadapter or (context.scene.sequential_ipadapter and self.operator._current_image > 0)) and context.scene.generation_method != 'uv_inpaint':
-            # Set the model input for IPAdapter
-            prompt[NODES['ipadapter_loader']]["inputs"]["model"] = current_model_out
-            current_model_out = [NODES['ipadapter'], 0]
+        # Prepare IPAdapter's upstream model, but route through it only when
+        # refine() has an actual reference image. Otherwise its nodes are removed.
+        prompt[NODES['ipadapter_loader']]["inputs"]["model"] = current_model_out
 
         if context.scene.differential_diffusion and NODES['differential_diffusion'] in prompt and context.scene.generation_method not in ('refine', 'local_edit'):
             # Set model input for differential diffusion
             prompt[NODES['differential_diffusion']]["inputs"]["model"] = current_model_out
             current_model_out = [NODES['differential_diffusion'], 0]
+        else:
+            # Local/global img2img refinement does not use Differential Diffusion.
+            # Its template input points at IPAdapter, which may be removed later.
+            prompt.pop(NODES['differential_diffusion'], None)
 
         # Set the model for sampler node
         prompt[NODES['sampler']]["inputs"]["model"] = current_model_out
@@ -2556,6 +2536,11 @@ class _TexturingWorkflowMixin:
 
     def _configure_refinement_mode(self, prompt, context, render_info, mask_info, NODES):
         """Configures the prompt based on the specific refinement mode."""
+        if not render_info or not render_info.get('name'):
+            raise ValueError('Refinement input image is missing or could not be uploaded to ComfyUI')
+        if context.scene.generation_method in ('uv_inpaint', 'sequential') and (
+                not mask_info or not mask_info.get('name')):
+            raise ValueError('Inpainting visibility mask is missing or could not be uploaded to ComfyUI')
         # Configure based on generation method
         if context.scene.generation_method in ('refine', 'local_edit'):
             prompt[NODES['vae_encode']]["inputs"]["pixels"] = [NODES['render_image'], 0]  # Use render directly
@@ -2572,16 +2557,9 @@ class _TexturingWorkflowMixin:
             prompt[NODES['mask_image']]["inputs"]["image"] = mask_info['name']
             prompt[NODES['input_image']]["inputs"]["image"] = render_info['name']
             
-            if getattr(context.scene, 'sg_rework_sdxl_registration', False):
-                # One authoritative processed mask drives every inpaint consumer.
-                final_mask = sdxl_final_mask_reference(context.scene.blur_mask, NODES)
-                prompt[NODES['inpaint_conditioning']]["inputs"]["mask"] = final_mask
-                prompt[NODES['vae_encode_inpaint']]["inputs"]["mask"] = final_mask
-            elif not context.scene.blur_mask:
-                # Exact pre-rework graph mutation. With blur enabled, retain
-                # the template's original mask links.
-                prompt[NODES['inpaint_conditioning']]["inputs"]["mask"] = [NODES['grow_mask'], 0]
-                prompt[NODES['vae_encode_inpaint']]["inputs"]["mask"] = [NODES['grow_mask'], 0]
+            final_mask = sdxl_final_mask_reference(context.scene.blur_mask, NODES)
+            prompt[NODES['inpaint_conditioning']]["inputs"]["mask"] = final_mask
+            prompt[NODES['vae_encode_inpaint']]["inputs"]["mask"] = final_mask
             
             # Set blur parameters
             prompt[NODES['blur']]["inputs"]["sigma"] = context.scene.blur_mask_sigma
@@ -2681,12 +2659,15 @@ class _TexturingWorkflowMixin:
         # Build the ControlNet chain
         prompt, final = self._build_controlnet_chain_extended(
             context, prompt, pos_input, neg_input, vae_input, 
-            controlnet_info
+            controlnet_info or {}
         )
         
         # Connect final outputs to KSampler
         prompt[NODES['sampler']]["inputs"]["positive"] = [final, 0]
-        prompt[NODES['sampler']]["inputs"]["negative"] = [final, 1]
+        prompt[NODES['sampler']]["inputs"]["negative"] = (
+            [neg_input, 1 if neg_input == NODES['inpaint_conditioning'] else 0]
+            if final == pos_input else [final, 1]
+        )
         
         return prompt
 
