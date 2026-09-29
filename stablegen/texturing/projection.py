@@ -283,6 +283,13 @@ def _bake_visibility_weights(
 
             # ── Vectorised frustum + angle pre-filter ──────────────────
             to_vert = positions_np - cam_loc_np                     # (N, 3)
+            # Freeze receiver depth alongside visibility so moving/posing a
+            # baked projection cannot change its foreground exemption.
+            depth_name = f"_SG_ProjectionDepth_{cam_idx}_{mat_id}"
+            depth_attr = obj.data.attributes.get(depth_name)
+            if depth_attr is None:
+                depth_attr = obj.data.attributes.new(name=depth_name, type='FLOAT', domain='POINT')
+            depth_attr.data.foreach_set('value', np.einsum('ij,j->i', to_vert, cam_dir_np))
             if camera_type == 'ORTHO':
                 dists = np.einsum('ij,j->i', to_vert, cam_dir_np)
                 valid = dists > 1e-8
@@ -339,7 +346,7 @@ def _bake_visibility_weights(
                     )
                 hit_loc, _, _, hit_dist = scene_tree.ray_cast(
                     ray_origin, d_mu, float(dists[vi]) + ray_epsilon * (
-                        20.0 if getattr(scene, 'sg_rework_projection_geometry', False) else 10.0
+                        20.0
                     ))
                 if hit_loc is not None and dists[vi] > hit_dist + ray_epsilon:
                     occluded[vi] = True
@@ -401,26 +408,23 @@ def _bake_visibility_weights(
                             )
                         h_loc, _, _, h_dist = scene_tree.ray_cast(
                             offset_origin, d_off_mu, dist_v + ray_epsilon * (
-                                20.0 if getattr(scene, 'sg_rework_projection_geometry', False) else 10.0
+                                20.0
                             ))
-                        if getattr(scene, 'sg_rework_projection_geometry', False):
-                            scene_scale = _scene_projection_scale(context)
-                            relative_depth = getattr(scene, 'sg_silhouette_depth', 0.05)
-                            if camera_type == 'ORTHO':
-                                pixel_footprint = (
-                                    (2.0 * ortho_half_w) / max(cam_res_x_n, 1)
-                                    * max(silhouette_margin_px, 1)
-                                )
-                            else:
-                                pixel_footprint = (
-                                    dist_v * rad_per_px * max(silhouette_margin_px, 1)
-                                )
-                            depth_thr = max(
-                                scene_scale * relative_depth,
-                                pixel_footprint * 0.5,
+                        scene_scale = _scene_projection_scale(context)
+                        relative_depth = getattr(scene, 'sg_silhouette_depth', 0.05)
+                        if camera_type == 'ORTHO':
+                            pixel_footprint = (
+                                (2.0 * ortho_half_w) / max(cam_res_x_n, 1)
+                                * max(silhouette_margin_px, 1)
                             )
                         else:
-                            depth_thr = getattr(scene, 'sg_silhouette_depth', 0.05)
+                            pixel_footprint = (
+                                dist_v * rad_per_px * max(silhouette_margin_px, 1)
+                            )
+                        depth_thr = max(
+                            scene_scale * relative_depth,
+                            pixel_footprint * 0.5,
+                        )
                         if h_loc is not None and dist_v > h_dist + depth_thr:
                             is_edge = True
                             break
@@ -1059,6 +1063,201 @@ def _get_voronoi_placeholder(color=(1.0, 0.0, 1.0)):
     return img
 
 
+def _projection_feather_math(nodes, links, operation, label, a, b):
+    node = nodes.new('ShaderNodeMath')
+    node.operation = operation
+    node.label = label
+    if operation == 'COMPARE':
+        node.inputs[2].default_value = 0.0
+    for i, value in enumerate((a, b)):
+        if isinstance(value, (int, float)):
+            node.inputs[i].default_value = value
+        else:
+            links.new(value, node.inputs[i])
+    return node
+
+
+def _apply_guard_coverage_rescue(nodes, links, guarded, raw, guards, feathers, threshold,
+                               occlusion_feathers=None, occlusion_influences=None,
+                               feather_method=None):
+    """Ease rejection continuously when no comparable trusted view survives.
+
+    Work with raw quality before exponentiation, retaining raycast, alpha and
+    write-mask validity. Confidence continues using the original guarded graph.
+    """
+    def math(op, label, a, b):
+        return _projection_feather_math(nodes, links, op, label, a, b).outputs[0]
+    def protect_occlusions(fades):
+        if occlusion_feathers is None:
+            return fades
+        if feather_method == 'BOUNDARY_CROSSFADE':
+            # Restore the original crossfade handoff: each camera retains its
+            # own rescued guard feather, limited by its occlusion feather.
+            # Lifting every competitor exposed a hard guard edge on the cheek.
+            return [math('MINIMUM', f'GuardOcclusionFade-{i}',
+                         fade if fade is not None else 1.0, occlusion)
+                    if occlusion is not None else fade
+                    for i, (fade, occlusion) in enumerate(zip(fades, occlusion_feathers))]
+        # A handoff needs an unfaded receiving view. Suppressing that view
+        # with the older guard feather rescales/compresses the occlusion ramp.
+        # Share the occlusion transition region across ALL visible competitors,
+        # not just the departing view. Retain part-seam feathering elsewhere,
+        # returning to it smoothly over the occlusion field's outer shoulder.
+        influence = 1.0 if occlusion_influences is None else 0.0
+        for i, field in enumerate(occlusion_influences or []):
+            if field is not None:
+                visible = math('GREATER_THAN', f'OcclusionHandoffVisible-{i}', raw[i], 0.0)
+                active = math('MULTIPLY', f'OcclusionHandoffActive-{i}', visible, field)
+                influence = math('MAXIMUM', f'OcclusionHandoffRegion-{i}', influence, active)
+        result = []
+        for i, (fade, occlusion) in enumerate(zip(fades, occlusion_feathers)):
+            if occlusion is None:
+                result.append(fade)
+                continue
+            legacy = fade if fade is not None else 1.0
+            lifted = math('ADD', f'OcclusionHandoffLegacy-{i}', legacy,
+                          math('MULTIPLY', f'OcclusionHandoffLift-{i}', influence,
+                               math('SUBTRACT', f'OcclusionHandoffMissing-{i}', 1.0, legacy)))
+            result.append(math('MINIMUM', f'GuardOcclusionFade-{i}', lifted, occlusion))
+        return result
+    if not any(g is not None for g in guards):
+        return guarded, protect_occlusions(feathers)
+    best, trusted = 0.0, 0.0
+    for i, (quality, guard, feather) in enumerate(zip(raw, guards, feathers)):
+        best = math('MAXIMUM', f'GuardRescueBest-{i}', best, quality)
+        reliability = guard if guard is not None else 1.0
+        if feather is not None:
+            reliability = math('MULTIPLY', f'GuardRescueReliability-{i}', reliability, feather)
+        accepted = math('MULTIPLY', f'GuardRescueAccepted-{i}', quality, reliability)
+        trusted = math('MAXIMUM', f'GuardRescueTrusted-{i}', trusted, accepted)
+    threshold_product = math('MULTIPLY', 'GuardRescueThreshold', best, threshold)
+    denominator = math('MAXIMUM', 'GuardRescueSafeThreshold', threshold_product, 1e-8)
+    fraction = math('DIVIDE', 'GuardRescueFraction', trusted, denominator)
+    t = math('MINIMUM', 'GuardRescueClamped', fraction, 1.0)
+    smooth = math('MULTIPLY', 'GuardRescueSmooth', math('MULTIPLY', 'GuardRescueSquare', t, t),
+                  math('SUBTRACT', 'GuardRescueCurve', 3.0, math('MULTIPLY', 'GuardRescueTwice', 2.0, t)))
+    # Threshold zero means rescue is OFF, not full rescue. Keep the graph
+    # present so its threshold can later be changed from one shader control.
+    active = math('GREATER_THAN', 'GuardRescueActive', threshold, 0.0)
+    strength = math('SUBTRACT', 'GuardRescueStrength', 1.0,
+                    math('MULTIPLY', 'GuardRescueReduction', active,
+                         math('SUBTRACT', 'GuardRescueMissing', 1.0, smooth)))
+    restored = math('SUBTRACT', 'GuardRescueRestored', 1.0, strength)
+    outputs, fades = [], []
+    for i, (quality, guard, feather) in enumerate(zip(raw, guards, feathers)):
+        if guard is None:
+            outputs.append(guarded[i]); fades.append(feather); continue
+        effective = math('ADD', f'GuardRescueEffective-{i}', restored,
+                         math('MULTIPLY', f'GuardRescueRetained-{i}', strength, guard))
+        floor = math('MAXIMUM', f'GuardRescueFloor-{i}', effective, 0.001)
+        outputs.append(math('MULTIPLY', f'GuardCoverageWeight-{i}', quality, floor))
+        fades.append(math('ADD', f'GuardRescueFeather-{i}', restored,
+                          math('MULTIPLY', f'GuardRescueFade-{i}', strength, feather))
+                     if feather is not None else None)
+    # Rescue may restore a conservative guard, but cannot restore the fade
+    # toward a real occluder. Apply this limit after rescue, before the common
+    # post-exponent feather stage. Raw raycast/alpha validity stays untouched.
+    return outputs, protect_occlusions(fades)
+
+
+def _crossfade_projection_feathers(nodes, links, weights, feathers, bases):
+    """Integrate normalized camera combinations over feather thresholds.
+
+    For two views with feathers f and 1 this is f * mix(A, B) + (1-f) * B.
+    The same construction handles overlapping fades without independent weight
+    caps. Equal thresholds share one interval; invisible views cannot open one.
+    Normalize by the best feather to retain coverage when every view is unsafe.
+    """
+    def math(op, label, a, b):
+        return _projection_feather_math(nodes, links, op, label, a, b).outputs[0]
+
+    levels = []
+    maximum = 0.0
+    for i, (base, feather) in enumerate(zip(bases, feathers)):
+        visible = math('GREATER_THAN', f'CrossfadeVisible-{i}', base, 0.0)
+        floor = math('MAXIMUM', f'CrossfadeFloor-{i}', feather if feather is not None else 1.0, 0.001)
+        level = math('MULTIPLY', f'CrossfadeLevel-{i}', floor, visible)
+        levels.append(level)
+        maximum = math('MAXIMUM', f'CrossfadeMaxLevel-{i}', maximum, level)
+
+    result = [0.0] * len(weights)
+    for i, level in enumerate(levels):
+        lower, ties, best = 0.0, 0.0, 0.0
+        selected = []
+        for j, (other, base) in enumerate(zip(levels, bases)):
+            below = math('GREATER_THAN', f'CrossfadeBelow-{i}-{j}', level, other)
+            lower = math('MAXIMUM', f'CrossfadeLower-{i}-{j}', lower,
+                         math('MULTIPLY', f'CrossfadeLowerCandidate-{i}-{j}', other, below))
+            ties = math('ADD', f'CrossfadeTies-{i}-{j}', ties,
+                        math('COMPARE', f'CrossfadeEqual-{i}-{j}', level, other))
+            include = math('SUBTRACT', f'CrossfadeInclude-{i}-{j}', 1.0, below)
+            quality = math('MULTIPLY', f'CrossfadeQuality-{i}-{j}', base, include)
+            selected.append(quality)
+            best = math('MAXIMUM', f'CrossfadeBest-{i}-{j}', best, quality)
+        interval = math('DIVIDE', f'CrossfadeInterval-{i}',
+                        math('SUBTRACT', f'CrossfadeGap-{i}', level, lower),
+                        math('MULTIPLY', f'CrossfadeIntervalScale-{i}', maximum, ties))
+        # Rescale each subset BEFORE sharpening: a weak but sole remaining
+        # camera must not underflow to black at high exponents.
+        powered, total = [], 0.0
+        for j, quality in enumerate(selected):
+            normalized = math('DIVIDE', f'CrossfadeNormalized-{i}-{j}', quality, best)
+            power = math('POWER', f'SharpW-Feather-{i}-{j}', normalized, weights[j].inputs[1].default_value)
+            powered.append(power)
+            total = math('ADD', f'CrossfadeTotal-{i}-{j}', total, power)
+        for j, power in enumerate(powered):
+            share = math('DIVIDE', f'CrossfadeShare-{i}-{j}', power, total)
+            result[j] = math('ADD', f'CrossfadeAccumulated-{i}-{j}', result[j],
+                             math('MULTIPLY', f'CrossfadeContribution-{i}-{j}', interval, share))
+    return [_projection_feather_math(nodes, links, 'MULTIPLY', f'PostExponentFeather-{i}', value, 1.0)
+            for i, value in enumerate(result)]
+
+
+def _apply_projection_feathers(nodes, links, weights, feathers, bases, influences, method):
+    """Apply a continuous, post-exponent fade without replacing view preference.
+
+    Keep the rejected core dark in the texture. A small constant floor retains
+    last-source coverage without the white-core discontinuity that caused halos.
+    """
+    if not any(feather is not None for feather in feathers):
+        return weights
+    if method == 'BOUNDARY_CROSSFADE':
+        return _crossfade_projection_feathers(nodes, links, weights, feathers, bases)
+    if method == 'LOCAL_UNSHARPEN':
+        def math(op, label, a, b):
+            return _projection_feather_math(nodes, links, op, label, a, b).outputs[0]
+        influence = 0.0
+        for i, (base, field) in enumerate(zip(bases, influences)):
+            if field is None:
+                continue
+            visible = math('GREATER_THAN', f'FeatherVisible-{i}', base, 0.0)
+            active = math('MULTIPLY', f'FeatherActive-{i}', field, visible)
+            influence = math('MAXIMUM', f'FeatherInfluence-{i}', influence, active)
+        sharp_fraction = math('SUBTRACT', 'FeatherSharpFraction', 1.0, influence)
+        weights = [
+            _projection_feather_math(nodes, links, 'ADD', f'FeatherPreference-{i}',
+                math('MULTIPLY', f'FeatherSharp-{i}', weight.outputs[0], sharp_fraction),
+                math('MULTIPLY', f'FeatherSoft-{i}', base, influence))
+            for i, (weight, base) in enumerate(zip(weights, bases))]
+    result = []
+    for i, (weight, feather) in enumerate(zip(weights, feathers)):
+        if feather is None:
+            result.append(weight)
+            continue
+        floor = nodes.new('ShaderNodeMath')
+        floor.operation = 'MAXIMUM'
+        floor.label = f'ProjectionFeatherFloor-{i}'
+        floor.inputs[1].default_value = 0.001
+        links.new(feather, floor.inputs[0])
+        faded = nodes.new('ShaderNodeMath')
+        faded.operation = 'MULTIPLY'
+        faded.label = f'PostExponentFeather-{i}'
+        links.new(weight.outputs[0], faded.inputs[0])
+        links.new(floor.outputs[0], faded.inputs[1])
+        result.append(faded)
+    return result
+
+
 def project_image(
     context,
     to_project,
@@ -1072,6 +1271,17 @@ def project_image(
     """     
     Projects an image onto all mesh objects using UV Project Modifier.     
     """
+    surface_blend = (getattr(context.scene, 'sg_guard_feather_method', 'ORIGINAL') == 'SURFACE_BLEND'
+                     and getattr(context.scene, 'sg_rework_projection_guard', False)
+                     and getattr(context.scene, 'sg_silhouette_feather', 0) > 0)
+    if surface_blend:
+        if (context.scene.generation_method in {'local_edit', 'refine'}
+                or (context.scene.model_architecture.startswith('qwen')
+                    and context.scene.qwen_generation_method == 'local_edit')):
+            raise ValueError('Surface Blend preview supports base multi-view projection; use Local Unsharpen for local refinement')
+        # A newly generated view changes the joint solution. Do not reuse a
+        # sequential material containing the previous camera set's field.
+        force_rebuild = True
     def build_mix_tree(shaders, weight_nodes, nodes_collection, links, last_node=None, level=0, stop_index=1000000):
         """
         Recursively builds a binary tree of mix shader nodes.
@@ -1092,6 +1302,28 @@ def project_image(
         Returns:
         A tuple (final_shader, final_weight_node).
         """
+
+        if level == 0 and surface_blend and len(shaders) > 1:
+            from .surface_blend import build
+            key = build(context, to_project, cameras, shaders, mat, mat_id, stop_index)
+            solved = []
+            for idx, original in enumerate(weight_nodes):
+                if isinstance(original, tuple):
+                    raise ValueError('Surface Blend preview requires ordinary multi-view projection')
+                raw = original
+                if raw.label.startswith('DepthPartFeathered-'):
+                    raw = raw.inputs[0].links[0].from_node
+                if raw.label.startswith('DepthPartGuarded-'):
+                    raw = raw.inputs[0].links[0].from_node
+                field = nodes_collection.new('ShaderNodeAttribute')
+                field.attribute_name = key + f'Weight{idx}'
+                field.label = f'SurfaceBlendWeight-{idx}'
+                valid = _projection_feather_math(nodes_collection, links, 'GREATER_THAN',
+                                                 f'SurfaceBlendVisible-{idx}', raw.outputs[0], 0.)
+                solved.append(_projection_feather_math(nodes_collection, links, 'MULTIPLY',
+                              f'SurfaceBlendFinal-{idx}', field.outputs['Fac'], valid.outputs[0]))
+            return build_mix_tree(shaders, solved, nodes_collection, links, last_node, level=1,
+                                  stop_index=stop_index)
 
         def _combine_angle_feather(nodes_col, lnk, cr_angle_out, cr_feather_out, loc):
             """Combine angle-ramp and feather-ramp outputs into a single
@@ -1363,10 +1595,48 @@ def project_image(
 
             # ── Step 2: Get base weight outputs (now power = 1) ───────
             all_w_outputs = []
+            feather_outputs = []
+            influence_outputs = []
+            raw_outputs = []
+            guard_outputs = []
+            occlusion_outputs = []
+            occlusion_influence_outputs = []
             for idx in range(len(weight_nodes)):
                 v_off = -200 * idx
-                all_w_outputs.append(_get_weight_output(weight_nodes[idx], v_off))
-
+                influence = nodes_collection.get(f"SGFeatherInfluence-{idx}-{mat_id}")
+                influence_outputs.append(influence.outputs[0] if influence else None)
+                occlusion_influence = nodes_collection.get(f"SGOcclusionInfluence-{idx}-{mat_id}")
+                occlusion_influence_outputs.append(occlusion_influence.outputs[0] if occlusion_influence else None)
+                if occlusion_influence is not None:
+                    influence_outputs[-1] = _projection_feather_math(
+                        nodes_collection, links, 'MAXIMUM', f'OcclusionCombinedInfluence-{idx}',
+                        influence_outputs[-1] if influence_outputs[-1] is not None else 0.0,
+                        occlusion_influence.outputs[0]).outputs[0]
+                occlusion = nodes_collection.get(f"SGOcclusionFeather-{idx}-{mat_id}")
+                occlusion_outputs.append(occlusion.outputs[0] if occlusion else None)
+                weight = weight_nodes[idx]
+                if (not isinstance(weight, tuple)
+                        and weight.label.startswith('DepthPartFeathered-')):
+                    # Preserve the existing hard guard and source preference.
+                    # Apply only the extra continuous fade after sharpening.
+                    all_w_outputs.append(weight.inputs[0].links[0].from_socket)
+                    feather_outputs.append(weight.inputs[1].links[0].from_socket)
+                else:
+                    all_w_outputs.append(_get_weight_output(weight, v_off))
+                    feather_outputs.append(None)
+                guard_node = all_w_outputs[-1].node
+                if guard_node.label.startswith('DepthPartGuarded-'):
+                    raw_outputs.append(guard_node.inputs[0].links[0].from_socket)
+                    guard_floor = guard_node.inputs[1].links[0].from_node
+                    guard_outputs.append(guard_floor.inputs[0].links[0].from_socket)
+                else:
+                    raw_outputs.append(all_w_outputs[-1])
+                    guard_outputs.append(None)
+            all_w_outputs, feather_outputs = _apply_guard_coverage_rescue(
+                nodes_collection, links, all_w_outputs, raw_outputs, guard_outputs, feather_outputs,
+                getattr(context.scene, 'sg_guard_coverage_rescue', 0.0), occlusion_outputs,
+                occlusion_influence_outputs,
+                getattr(context.scene, 'sg_guard_feather_method', 'ORIGINAL'))
 
             # ── Step 3: Find per-pixel maximum ────────────────────────
             max_node = nodes_collection.new("ShaderNodeMath")
@@ -1399,6 +1669,7 @@ def project_image(
 
             # ── Step 4: Normalize + re-apply exponent ─────────────────
             powered_nodes = []
+            normalized_outputs = []
             for idx, w_out in enumerate(all_w_outputs):
                 # norm_w = base_w / max(base_w)
                 div = nodes_collection.new("ShaderNodeMath")
@@ -1422,9 +1693,13 @@ def project_image(
                 pw.inputs[1].default_value = user_exponent
                 links.new(div.outputs[0], pw.inputs[0])
                 powered_nodes.append(pw)
+                normalized_outputs.append(div.outputs[0])
 
             # Replace weight_nodes with sharpened-normalised nodes
-            weight_nodes = powered_nodes
+            weight_nodes = _apply_projection_feathers(
+                nodes_collection, links, powered_nodes, feather_outputs,
+                normalized_outputs, influence_outputs,
+                getattr(context.scene, 'sg_guard_feather_method', 'ORIGINAL'))
 
         new_shaders = []
         new_weight_nodes = []
@@ -1551,6 +1826,10 @@ def project_image(
         )
     else:
         cameras = list(cameras)
+
+    if surface_blend:
+        from .surface_blend import validate
+        validate(context, to_project, cameras)
     
     # Force refresh of the UI
     for area in context.screen.areas:
@@ -1644,6 +1923,9 @@ def project_image(
         is_sequential = context.scene.generation_method == 'sequential'
         missing_bake = any(
             obj.data.attributes.get(f"_SG_VisWeight_{cam_idx}_{mat_id}") is None
+            or (getattr(context.scene, 'sg_rework_projection_guard', False)
+                and getattr(context.scene, 'sg_silhouette_feather', 0) > 0
+                and obj.data.attributes.get(f"_SG_ProjectionDepth_{cam_idx}_{mat_id}") is None)
             for obj in to_project for cam_idx in range(len(cameras))
         )
         if not is_sequential or stop_index == 0 or missing_bake:
@@ -1698,6 +1980,9 @@ def project_image(
             for original_mat in original_materials:
                 if original_mat != mat:
                     obj.data.materials.append(original_mat)
+
+        if surface_blend and mat.name in processed_materials:
+            continue
 
         # Enable use of nodes
         mat.use_nodes = True
@@ -2393,6 +2678,95 @@ def project_image(
                     links.new(script_nodes_outputs[-1].outputs[0], guarded.inputs[0])
                     links.new(guard_floor.outputs[0], guarded.inputs[1])
                     script_nodes_outputs[-1] = guarded
+                    if (len(cameras) > 1
+                            and getattr(context.scene, 'sg_silhouette_feather', 0) > 0):
+                        feather_path = os.path.join(
+                            get_dir_path(context, "inpaint")["visibility"],
+                            f"projection_guard_feather{i}.png",
+                        )
+                        if os.path.isfile(feather_path):
+                            feather_image = get_or_load_image(
+                                feather_path, force_reload=context.scene.overwrite_material)
+                            if feather_image is not None:
+                                feather_image.colorspace_settings.name = 'Non-Color'
+                                feather_tex = nodes.new("ShaderNodeTexImage")
+                                feather_tex.image = feather_image
+                                feather_tex.extension = 'CLIP'
+                                feather_tex.interpolation = 'Linear'
+                                feather_tex.label = f"ProjectionGuardFeather-{i}-{mat_id}"
+                                uv = uv_map_nodes[i]
+                                links.new(uv.outputs['Vector' if uv.type == 'ATTRIBUTE' else 'UV'],
+                                          feather_tex.inputs['Vector'])
+                                feathered = nodes.new("ShaderNodeMath")
+                                feathered.operation = 'MULTIPLY'
+                                feathered.label = f"DepthPartFeathered-{i}-{mat_id}"
+                                links.new(guarded.outputs[0], feathered.inputs[0])
+                                links.new(feather_tex.outputs[0], feathered.inputs[1])
+                                script_nodes_outputs[-1] = feathered
+                                occlusion_path = os.path.join(os.path.dirname(feather_path),
+                                                              f"projection_occlusion_geometry{i}.png")
+                                calibration_path = os.path.splitext(occlusion_path)[0] + '.json'
+                                if os.path.isfile(occlusion_path) and os.path.isfile(calibration_path):
+                                    import json
+                                    with open(calibration_path) as stream:
+                                        distance_scale = float(json.load(stream)['distance_scale'])
+                                    occlusion_image = get_or_load_image(
+                                        occlusion_path, force_reload=context.scene.overwrite_material)
+                                    occlusion_image.colorspace_settings.name = 'Non-Color'
+                                    occlusion_tex = nodes.new("ShaderNodeTexImage")
+                                    occlusion_tex.label = f"ProjectionOcclusionFeather-{i}-{mat_id}"
+                                    occlusion_tex.image = occlusion_image
+                                    occlusion_tex.extension = 'CLIP'
+                                    occlusion_tex.interpolation = 'Linear'
+                                    links.new(feather_tex.inputs['Vector'].links[0].from_socket,
+                                              occlusion_tex.inputs['Vector'])
+                                    channels = nodes.new('ShaderNodeSeparateColor')
+                                    links.new(occlusion_tex.outputs['Color'], channels.inputs[0])
+                                    # Cycles' Z pass is camera-axis depth, not
+                                    # Euclidean distance along the perspective ray.
+                                    if use_baked_weights:
+                                        receiver = nodes.new('ShaderNodeAttribute')
+                                        receiver.attribute_name = f'_SG_ProjectionDepth_{i}_{mat_id}'
+                                        depth_socket = receiver.outputs['Fac']
+                                        divisor = distance_scale
+                                    else:
+                                        coordinates = nodes.new('ShaderNodeTexCoord')
+                                        coordinates.object = camera
+                                        camera_space = nodes.new('ShaderNodeSeparateXYZ')
+                                        links.new(coordinates.outputs['Object'], camera_space.inputs[0])
+                                        depth_socket = camera_space.outputs['Z']
+                                        divisor = -distance_scale / max(camera.matrix_world.to_scale().z, 1e-12)
+                                    normalized = _projection_feather_math(nodes, links, 'DIVIDE',
+                                        f'OcclusionReceiverDepth-{i}', depth_socket, divisor)
+                                    far = _projection_feather_math(nodes, links, 'GREATER_THAN',
+                                        f'OcclusionReceiverFar-{i}', normalized.outputs[0], channels.outputs['Blue'])
+                                    rejected = _projection_feather_math(nodes, links, 'SUBTRACT',
+                                        f'OcclusionInverseFade-{i}', 1.0, channels.outputs['Red'])
+                                    rejected = _projection_feather_math(nodes, links, 'MULTIPLY',
+                                        f'OcclusionFarFade-{i}', far.outputs[0], rejected.outputs[0])
+                                    protected = _projection_feather_math(nodes, links, 'SUBTRACT',
+                                        f'OcclusionProtectedFade-{i}', 1.0, rejected.outputs[0])
+                                    protected.name = f'SGOcclusionFeather-{i}-{mat_id}'
+                                    # Merge the receiver-aware shoulder into local
+                                    # unsharpen after loading the ordinary guard field.
+                                    occlusion_shoulder = _projection_feather_math(nodes, links, 'MULTIPLY',
+                                        f'OcclusionInfluence-{i}', far.outputs[0], channels.outputs['Green'])
+                                    occlusion_shoulder.name = f'SGOcclusionInfluence-{i}-{mat_id}'
+                                if getattr(context.scene, 'sg_guard_feather_method', 'ORIGINAL') == 'LOCAL_UNSHARPEN':
+                                    influence_path = os.path.join(os.path.dirname(feather_path),
+                                                                  f"projection_guard_influence{i}.png")
+                                    if os.path.isfile(influence_path):
+                                        influence_image = get_or_load_image(
+                                            influence_path, force_reload=context.scene.overwrite_material)
+                                        influence_image.colorspace_settings.name = 'Non-Color'
+                                        influence_tex = nodes.new("ShaderNodeTexImage")
+                                        influence_tex.name = f"SGFeatherInfluence-{i}-{mat_id}"
+                                        influence_tex.label = f"ProjectionGuardInfluence-{i}-{mat_id}"
+                                        influence_tex.image = influence_image
+                                        influence_tex.extension = 'CLIP'
+                                        influence_tex.interpolation = 'Linear'
+                                        links.new(feather_tex.inputs['Vector'].links[0].from_socket,
+                                                  influence_tex.inputs['Vector'])
 
             # Confidence is deliberately independent from colour ownership.
             # Preserve the unnormalised source-camera quality before the mix
@@ -2641,6 +3015,9 @@ def reset_projection_material_nodes(material, angle_threshold, exponent):
     """Reset display controls without changing stored source confidence."""
     if not material or not material.use_nodes:
         return False
+    if material.get('sg_surface_blend') and any(n.label.startswith('SurfaceBlendWeight-') for n in material.node_tree.nodes):
+        from .surface_blend import update
+        update(material, angle_threshold, exponent)
     nodes = material.node_tree.nodes
     has_sharp = any(
         node.type == 'MATH' and node.operation == 'POWER'

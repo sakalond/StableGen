@@ -813,13 +813,52 @@ def register_properties(update_model_list, ControlNetUnit, LoRAUnit,
     bpy.types.Scene.sg_silhouette_margin = bpy.props.IntProperty(
         name="Silhouette Margin",
         description="Pixel margin around occluder silhouettes where projection is suppressed. "
-                    "Prevents thin outlines of foreground geometry (e.g. hands) bleeding onto surfaces behind them.  0 = disabled",
+                    "With Depth-Aware Margins, controls the farther/background side (e.g. dress behind a hand), not the image backdrop. "
+                    "Also controls the separate baked-visibility silhouette rays. 0 disables this margin; Foreground Margin is separate. Reproject to apply",
         default=3, min=0, max=20, update=update_parameters,
     )
     bpy.types.Scene.sg_allow_backface_projection = bpy.props.BoolProperty(
         name="Allow Backface Projection",
         description="Use legacy two-sided projection weights. Leave disabled for characters and closed meshes so a camera cannot write through back-facing surfaces",
         default=TEXTURING_DEFAULTS["sg_allow_backface_projection"], update=update_parameters,
+    )
+    bpy.types.Scene.sg_silhouette_feather = bpy.props.IntProperty(
+        name="Silhouette Feather",
+        description="DPPG transition width beyond the rejected margin, in generation-image pixels. Feather Method controls interaction with the blending exponent. 0 restores the hard guard. Reproject to update",
+        default=TEXTURING_DEFAULTS['sg_silhouette_feather'], min=0, max=128,
+        update=update_parameters,
+    )
+    bpy.types.Scene.sg_projection_guard_scale = bpy.props.EnumProperty(
+        name="Guard Resolution",
+        description="Render DPPG masks at higher resolution to reduce jagged edges. Margin and feather retain their size in generation-image pixels; guidance images keep their original dimensions. Reproject to update",
+        items=[('1', '1\u00d7', 'Generation resolution'),
+               ('2', '2\u00d7', 'Double width and height'),
+               ('4', '4\u00d7', 'Quadruple width and height; uses more memory')],
+        default=TEXTURING_DEFAULTS['sg_projection_guard_scale'], update=update_parameters,
+    )
+    bpy.types.Scene.sg_guard_directional = bpy.props.BoolProperty(
+        name="Depth-Aware Margins",
+        description="Reject farther surfaces behind depth boundaries more strongly than the visible foreground. Boundaries with no clear depth order retain symmetric part protection. Reproject to apply",
+        default=TEXTURING_DEFAULTS['sg_guard_directional'], update=update_parameters,
+    )
+    bpy.types.Scene.sg_guard_foreground_margin = bpy.props.IntProperty(
+        name="Foreground Margin",
+        description="Rejection margin on the nearer side of a depth boundary, in generation-image pixels. 0 preserves visible foreground such as the chin or a hand. Silhouette Margin controls the farther side. Reproject to apply",
+        default=TEXTURING_DEFAULTS['sg_guard_foreground_margin'], min=0, max=128, update=update_parameters,
+    )
+    bpy.types.Scene.sg_guard_coverage_rescue = bpy.props.FloatProperty(
+        name="Coverage Rescue",
+        description="Ease DPPG rejection when the best remaining trusted view falls below this fraction of the original best view quality. 0 keeps legacy rejection; 0.25 requires at least 25% quality for full rejection. Visibility and image alpha remain enforced. Reproject to apply",
+        default=TEXTURING_DEFAULTS['sg_guard_coverage_rescue'], min=0, max=1, update=update_parameters,
+    )
+    bpy.types.Scene.sg_guard_feather_method = bpy.props.EnumProperty(
+        name="Feather Method",
+        description="How DPPG feathering interacts with camera-weight sharpening. Reproject to apply",
+        items=[('ORIGINAL', 'Original', 'Multiply sharpened weights by the feather; the exponent still affects the final transition'),
+               ('LOCAL_UNSHARPEN', 'Local Unsharpen', 'Use unsharpened weights throughout the feather band, smoothly restoring the exponent farther inside safe regions'),
+               ('BOUNDARY_CROSSFADE', 'Boundary Crossfade', 'Crossfade between normalized camera combinations as masks fade; the exponent controls each combination, not the crossfade curve'),
+               ('SURFACE_BLEND', 'Surface Blend (Preview)', 'Solve camera contributions jointly along the mesh within the feather band. Requires Reproject; detail depends on mesh density. Base multi-view projection only')],
+        default=TEXTURING_DEFAULTS['sg_guard_feather_method'], update=update_parameters,
     )
 
     # Scene values remain serializable. Research switches are gated at runtime

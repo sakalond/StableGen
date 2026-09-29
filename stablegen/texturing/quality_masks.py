@@ -254,6 +254,102 @@ def residual_fallback_percentage(write_mask, generated_bgr, fallback_rgb, tolera
     return float(np.count_nonzero(editable & sentinel) * 100.0 / np.count_nonzero(editable))
 
 
+def feather_projection_guard(guard, width):
+    """Fade into safe pixels without admitting any rejected silhouette pixels."""
+    width = max(0.0, float(width))
+    if width == 0:
+        return guard.copy()
+    allowed = (guard > 0).astype(np.uint8)
+    distance = cv2.distanceTransform(allowed, cv2.DIST_L2, cv2.DIST_MASK_PRECISE)
+    ramp = np.clip(distance / width, 0.0, 1.0)
+    ramp = ramp * ramp * (3.0 - 2.0 * ramp)
+    return np.rint(ramp * 255).astype(np.uint8)
+
+
+def projection_guard_feather_influence(guard, width):
+    """Keep sharpening off across the fade; restore it over one extra width."""
+    width = max(0.0, float(width))
+    if width == 0:
+        return np.zeros_like(guard)
+    distance = cv2.distanceTransform((guard > 0).astype(np.uint8), cv2.DIST_L2, cv2.DIST_MASK_PRECISE)
+    ramp = np.clip((distance - width) / width, 0.0, 1.0)
+    ramp = ramp * ramp * (3.0 - 2.0 * ramp)
+    return np.rint((1.0 - ramp) * 255).astype(np.uint8)
+
+
+def projection_occlusion_fields(depth, width, depth_threshold, object_ids=None, surface_distance=None):
+    """Fade only the far surface approaching a resolved depth discontinuity.
+
+    Unlike a part/margin guard, this field must survive coverage rescue. Carry
+    the nearest boundary's occluder depth so its fade cannot spill onto the
+    near surface (e.g. from the neck onto the visible chin). Object boundaries
+    with a resolved depth order catch thin nearby occluders below the general
+    depth threshold. Flat ID seams and foreground margins do not seed it.
+    """
+    if depth.ndim == 3:
+        depth = cv2.cvtColor(depth, cv2.COLOR_BGR2GRAY)
+    depth = depth.astype(np.uint8)
+    width = max(0.0, float(width))
+    white = np.full(depth.shape, 255, dtype=np.uint8)
+    empty = np.zeros_like(depth)
+    if width == 0:
+        return (white, empty, np.zeros(depth.shape, np.float32)) if surface_distance is not None else (white, empty)
+    threshold = max(0, int(depth_threshold))
+    near = cv2.dilate(depth, np.ones((3, 3), np.uint8))
+    seeds = near.astype(np.int16) - depth > threshold
+    seed_threshold = np.full(depth.shape, threshold, dtype=np.int16)
+    if object_ids is not None:
+        if object_ids.ndim == 3:
+            object_ids = cv2.cvtColor(object_ids, cv2.COLOR_BGR2GRAY)
+        if object_ids.shape != depth.shape:
+            object_ids = cv2.resize(object_ids, (depth.shape[1], depth.shape[0]),
+                                    interpolation=cv2.INTER_NEAREST)
+        padded_depth = np.pad(depth, 1, mode='edge')
+        padded_ids = np.pad(object_ids, 1, mode='edge')
+        object_near = depth.copy()
+        for dy, dx in ((dy, dx) for dy in range(3) for dx in range(3) if (dy, dx) != (1, 1)):
+            neighbor = padded_depth[dy:dy+depth.shape[0], dx:dx+depth.shape[1]]
+            ids = padded_ids[dy:dy+depth.shape[0], dx:dx+depth.shape[1]]
+            # Ignore a single quantization step and never infer ordering from
+            # IDs alone. Compare against the OTHER object's depth explicitly.
+            ordered = (ids != object_ids) & (neighbor.astype(np.int16) - depth > 1)
+            object_near = np.maximum(object_near, np.where(ordered, neighbor, 0))
+        object_seeds = object_near.astype(np.int16) - depth > 1
+        near = np.where(object_seeds, object_near, near)
+        seed_threshold[object_seeds] = 1
+        seeds |= object_seeds
+    if not np.any(seeds):
+        return (white, empty, np.zeros(depth.shape, np.float32)) if surface_distance is not None else (white, empty)
+    allowed = (~seeds).astype(np.uint8)
+    # Labels identify the occluder belonging to the nearest boundary pixel.
+    # Use the precise transform separately for the continuous feather width.
+    _, labels = cv2.distanceTransformWithLabels(
+        allowed, cv2.DIST_L2, 5, labelType=cv2.DIST_LABEL_PIXEL)
+    references = np.zeros(int(labels.max()) + 1, dtype=np.int16)
+    references[labels[seeds]] = near[seeds]
+    thresholds = np.zeros_like(references)
+    thresholds[labels[seeds]] = seed_threshold[seeds]
+    far_side = references[labels] - depth > thresholds[labels]
+    distance = cv2.distanceTransform(allowed, cv2.DIST_L2, cv2.DIST_MASK_PRECISE)
+    ramp = np.clip(distance / width, 0.0, 1.0)
+    fade = ramp * ramp * (3.0 - 2.0 * ramp)
+    shoulder = np.clip((distance - width) / width, 0.0, 1.0)
+    influence = 1.0 - shoulder * shoulder * (3.0 - 2.0 * shoulder)
+    if surface_distance is not None:
+        # Keep the ramp continuous on BOTH sides of the image boundary.
+        # The shader identifies the receiving surface by camera distance;
+        # baking the foreground exemption into this image lets filtering
+        # reintroduce the foreground's white value onto the far surface.
+        nearest = cv2.erode(surface_distance, np.ones((3, 3), np.uint8))
+        midpoint = (nearest + surface_distance) * 0.5
+        reference = np.zeros(int(labels.max()) + 1, dtype=np.float32)
+        reference[labels[seeds]] = midpoint[seeds]
+        return (np.rint(fade * 255).astype(np.uint8),
+                np.rint(influence * 255).astype(np.uint8), reference[labels])
+    return (np.where(far_side, np.rint(fade * 255), 255).astype(np.uint8),
+            np.where(far_side, np.rint(influence * 255), 0).astype(np.uint8))
+
+
 def build_depth_part_rejection_mask(
     depth,
     object_ids=None,
@@ -261,6 +357,7 @@ def build_depth_part_rejection_mask(
     *,
     margin=3,
     depth_threshold=3,
+    foreground_margin=None,
     return_diagnostics=False,
 ):
     """Build a per-pixel projection guard around depth/part silhouettes.
@@ -275,7 +372,7 @@ def build_depth_part_rejection_mask(
         depth = cv2.cvtColor(depth, cv2.COLOR_BGR2GRAY)
     depth = depth.astype(np.uint8)
     margin = max(0, int(margin))
-    if margin == 0:
+    if margin == 0 and (foreground_margin is None or foreground_margin <= 0):
         guard = np.full(depth.shape, 255, dtype=np.uint8)
         diagnostics = {
             "mode": "disabled",
@@ -288,6 +385,7 @@ def build_depth_part_rejection_mask(
     depth_range = cv2.dilate(depth, kernel3) - cv2.erode(depth, kernel3)
     depth_edge = depth_range > max(0, int(depth_threshold))
     edge = depth_edge.copy()
+    id_edge = np.zeros(depth.shape, dtype=bool)
     used_part_ids = False
 
     for ids in (object_ids, material_ids):
@@ -299,7 +397,9 @@ def build_depth_part_rejection_mask(
             ids = cv2.resize(
                 ids, (depth.shape[1], depth.shape[0]), interpolation=cv2.INTER_NEAREST
             )
-        edge |= cv2.dilate(ids, kernel3) != cv2.erode(ids, kernel3)
+        boundary = cv2.dilate(ids, kernel3) != cv2.erode(ids, kernel3)
+        id_edge |= boundary
+        edge |= boundary
         used_part_ids = True
 
     def _guard_from_edges(edges):
@@ -312,7 +412,43 @@ def build_depth_part_rejection_mask(
             )
         return np.where(edge_u8 > 0, 0, 255).astype(np.uint8)
 
-    guard = _guard_from_edges(edge)
+    def _directional_guard(include_ids):
+        # Inverted normalized depth: larger values are nearer the camera.
+        # Carry the opposite side's depth while expanding a rejection band,
+        # then compare at the destination. Ordinary dilation crosses onto the
+        # foreground (e.g. the visible chin above a neck occlusion).
+        threshold = max(0, int(depth_threshold))
+        fg_margin = max(0, int(foreground_margin))
+        near = cv2.dilate(depth, kernel3)
+        far = cv2.erode(depth, kernel3)
+        far_seed = near.astype(np.int16) - depth > threshold
+        near_seed = depth.astype(np.int16) - far > threshold
+        ambiguous = np.zeros_like(id_edge)
+        if include_ids:
+            radius = max(margin, fg_margin, 1) + 1
+            neighborhood = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2*radius+1, 2*radius+1))
+            id_near, id_far = cv2.dilate(depth, neighborhood), cv2.erode(depth, neighborhood)
+            far_ids = id_edge & (id_near.astype(np.int16) - depth > threshold)
+            near_ids = id_edge & (depth.astype(np.int16) - id_far > threshold)
+            near = np.where(far_ids, np.maximum(near, id_near), near)
+            far = np.where(near_ids, np.minimum(far, id_far), far)
+            far_seed |= far_ids
+            near_seed |= near_ids
+            # Without a resolvable depth order, keep symmetric part protection.
+            ambiguous = id_edge & ((id_near.astype(np.int16) - id_far) <= threshold)
+        rejected = np.zeros_like(id_edge)
+        if margin > 0:
+            kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2*margin+1, 2*margin+1))
+            nearer_reference = cv2.dilate(np.where(far_seed, near, 0).astype(np.uint8), kernel)
+            rejected |= nearer_reference.astype(np.int16) - depth > threshold
+            rejected |= cv2.dilate(ambiguous.astype(np.uint8), kernel) > 0
+        if fg_margin > 0:
+            kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2*fg_margin+1, 2*fg_margin+1))
+            farther_reference = cv2.erode(np.where(near_seed, far, 255).astype(np.uint8), kernel)
+            rejected |= depth.astype(np.int16) - farther_reference > threshold
+        return np.where(rejected, 0, 255).astype(np.uint8)
+
+    guard = _guard_from_edges(edge) if foreground_margin is None else _directional_guard(used_part_ids)
 
     # Categorical render passes must be noise-free, but older outputs and
     # third-party render settings can contain one-LSB dither. Treating that as
@@ -333,7 +469,8 @@ def build_depth_part_rejection_mask(
         )
         diagnostics["id_guard_allowed_foreground_percent"] = allowed_fraction * 100.0
         if allowed_fraction < 0.10:
-            guard = _guard_from_edges(depth_edge)
+            guard = (_guard_from_edges(depth_edge) if foreground_margin is None
+                     else _directional_guard(False))
             diagnostics["mode"] = "depth_only_fallback"
             diagnostics["fallback_triggered"] = True
 

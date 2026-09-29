@@ -1364,7 +1364,7 @@ class StableGenPanel(bpy.types.Panel):
                 content_box = None
             if content_box:
                 # Row 1: Discard-Over Angle | Weight Exponent
-                split = content_box.split(factor=0.5, align=True)
+                split = content_box.split(factor=0.5, align=False)
                 sub = split.row()
                 if 'discard_factor' in _diff_props:
                     sub.alert = True
@@ -1385,7 +1385,7 @@ class StableGenPanel(bpy.types.Panel):
                     split.prop(scene, "weight_exponent_generation_only", text="Reset Exponent", toggle=True)
 
                     if scene.discard_factor_generation_only or scene.weight_exponent_generation_only:
-                        split = content_box.split(factor=0.5, align=True)
+                        split = content_box.split(factor=0.5, align=False)
                         if scene.discard_factor_generation_only:
                             split.prop(scene, "discard_factor_after_generation", text="Angle After")
                         else:
@@ -1414,8 +1414,31 @@ class StableGenPanel(bpy.types.Panel):
                     row = content_box.row(align=True)
                 row.prop(scene, "sg_rework_acquisition_quality", text="Acquisition Quality Weighting", toggle=True)
                 content_box.prop(scene, "sg_rework_projection_guard", text="Depth/Part Projection Guard", toggle=True)
-                content_box.prop(scene, "sg_silhouette_margin", text="Silhouette Margin (px)")
-                content_box.prop(scene, "sg_silhouette_depth", text="Silhouette Depth Threshold")
+                if scene.sg_rework_projection_guard:
+                    guard_box = content_box.box()
+                    guard_box.prop(scene, "sg_guard_directional", toggle=True)
+                    row = (guard_box.split(factor=0.5, align=False)
+                           if width_mode == 'wide' and scene.sg_guard_directional
+                           else guard_box.row(align=True))
+                    row.prop(scene, "sg_silhouette_margin", text=(
+                        "Background Margin (px)" if scene.sg_guard_directional else "Silhouette Margin (px)"))
+                    if scene.sg_guard_directional:
+                        if width_mode == 'narrow':
+                            row = guard_box.row(align=True)
+                        row.prop(scene, "sg_guard_foreground_margin", text="Foreground Margin (px)")
+                    row = (guard_box.split(factor=0.5, align=False) if width_mode == 'wide'
+                           else guard_box.row(align=True))
+                    row.prop(scene, "sg_silhouette_depth", text="Depth Threshold")
+                    if width_mode == 'narrow':
+                        row = guard_box.row(align=True)
+                    row.prop(scene, "sg_guard_coverage_rescue")
+                    row = guard_box.row(align=True)
+                    row.prop(scene, "sg_silhouette_feather", text="Silhouette Feather (px)")
+                    row = guard_box.row(align=True)
+                    row.prop(scene, "sg_projection_guard_scale", text="Guard Resolution")
+                    guard_box.prop(scene, "sg_guard_feather_method", text="Feather Method")
+                    if scene.sg_guard_feather_method == 'SURFACE_BLEND':
+                        guard_box.label(text="Reproject to solve; detail follows mesh density", icon='INFO')
 
             if _show_diffusion_sections and experiments_enabled(context):
                 experiments = draw_collapsible_section(

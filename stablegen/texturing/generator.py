@@ -47,6 +47,9 @@ from .quality_masks import (
     reject_fallback_from_write_mask,
     residual_fallback_percentage,
     build_depth_part_rejection_mask,
+    feather_projection_guard,
+    projection_guard_feather_influence,
+    projection_occlusion_fields,
 )
 from .confidence import camera_direction_from_matrix, overlap_aware_order
 from .pose_lock import (
@@ -1563,6 +1566,22 @@ class ComfyUIGenerate(_PBRMixin, bpy.types.Operator):
         controlnet_units = self._controlnet_units
         cameras = self._cameras
 
+        if context.scene.generation_mode == 'project_only':
+            # Reprojection must rebuild the pixel guard with today's margin,
+            # depth threshold and geometry, including runs that never had one.
+            # Other guidance maps and model inference are not needed here.
+            if getattr(context.scene, 'sg_rework_projection_guard', False):
+                for i, camera in enumerate(cameras):
+                    self._stage = f"Rebuilding Projection Guards ({i+1}/{len(cameras)})"
+                    def _render_guard(_i=i, _cam=camera):
+                        self._activate_view(context, _i)
+                        with _SGCameraResolution(context, _cam):
+                            self.export_depthmap(context, camera_id=_i)
+                    self._run_on_main_thread(_render_guard)
+                    if self._error:
+                        return
+            return
+
         if context.scene.generation_mode in ('standard', 'regenerate_selected'):
             need_depth = (
                 any(u["unit_type"] == "depth" for u in controlnet_units)
@@ -2398,6 +2417,25 @@ class ComfyUIGenerate(_PBRMixin, bpy.types.Operator):
         use_projection_guard = getattr(
             context.scene, 'sg_rework_projection_guard', False
         )
+        # Preserve calibrated camera distance for receiver-aware occlusion
+        # feathering. The model's existing normalized depth input is unchanged.
+        distance_scale = None
+        if use_projection_guard:
+            camera_position = context.scene.camera.matrix_world.translation
+            distance_scale = max([1.0] + [
+                (obj.matrix_world @ mathutils.Vector(corner) - camera_position).length
+                for obj in context.view_layer.objects if obj.type == 'MESH' and not obj.hide_render
+                for corner in obj.bound_box]) * 1.01
+            distance_node = nodes.new('ShaderNodeMath')
+            distance_node.operation = 'DIVIDE'
+            distance_node.inputs[1].default_value = distance_scale
+            links.new(render_layers_node.outputs['Depth'], distance_node.inputs[0])
+            distance_output = nodes.new('CompositorNodeOutputFile')
+            configure_output_node_paths(distance_output, output_dir, f'projection_distance{camera_id}')
+            distance_output.format.file_format = 'PNG'
+            distance_output.format.color_depth = '16'
+            distance_output.format.color_mode = 'RGB'
+            links.new(distance_node.outputs[0], distance_output.inputs[0])
         use_part_ids = (
             use_projection_guard
             or experimental_enabled(context.scene, 'qwen_regularize_context_mask')
@@ -2433,7 +2471,9 @@ class ComfyUIGenerate(_PBRMixin, bpy.types.Operator):
                 depth_image,
                 object_image,
                 material_image,
-                margin=getattr(context.scene, 'sg_silhouette_margin', 3),
+                margin=getattr(context.scene, 'sg_silhouette_margin', 3) * guard_scale,
+                foreground_margin=(getattr(context.scene, 'sg_guard_foreground_margin', 0) * guard_scale
+                                   if getattr(context.scene, 'sg_guard_directional', False) else None),
                 depth_threshold=max(
                     1,
                     round(float(getattr(context.scene, 'sg_silhouette_depth', 0.01)) * 255),
@@ -2462,6 +2502,42 @@ class ComfyUIGenerate(_PBRMixin, bpy.types.Operator):
                 guard_dir, f"projection_guard{camera_id}.png"
             )
             cv2.imwrite(guard_path, guard)
+            feather_width = getattr(context.scene, 'sg_silhouette_feather', 0)
+            feather = feather_projection_guard(guard, feather_width * guard_scale)
+            # Keep this field continuous through the rejected band. A white
+            # core creates a second edge under bilinear sampling and a halo.
+            # A constant shader floor preserves last-source coverage without
+            # introducing another mask boundary.
+            feather_path = os.path.join(guard_dir, f"projection_guard_feather{camera_id}.png")
+            cv2.imwrite(feather_path, feather)
+            occlusion, occlusion_influence = projection_occlusion_fields(
+                depth_image, feather_width * guard_scale,
+                max(1, round(float(getattr(context.scene, 'sg_silhouette_depth', 0.01)) * 255)),
+                object_ids=object_image if not guard_diagnostics['fallback_triggered'] else None)
+            distance_path = os.path.join(output_dir, f'projection_distance{camera_id}{frame_suffix}.png')
+            distance_image = cv2.imread(distance_path, cv2.IMREAD_UNCHANGED)
+            if distance_image is None or distance_image.dtype != np.uint16:
+                raise RuntimeError('Projection occlusion distance pass is missing or not 16-bit')
+            if distance_image.ndim == 3:
+                distance_image = distance_image[:, :, 0]
+            ramp, influence, reference = projection_occlusion_fields(
+                depth_image, feather_width * guard_scale,
+                max(1, round(float(getattr(context.scene, 'sg_silhouette_depth', 0.01)) * 255)),
+                object_ids=object_image if not guard_diagnostics['fallback_triggered'] else None,
+                surface_distance=distance_image.astype(np.float32) / 65535.0)
+            # PNG channels R/G/B: continuous ramp, sharpening influence,
+            # midpoint distance separating the occluder and receiving surface.
+            geometry_path = os.path.join(guard_dir, f'projection_occlusion_geometry{camera_id}.png')
+            cv2.imwrite(geometry_path, np.stack((
+                np.rint(np.clip(reference, 0, 1) * 65535).astype(np.uint16),
+                influence.astype(np.uint16) * 257, ramp.astype(np.uint16) * 257), axis=2))
+            with open(os.path.join(guard_dir, f'projection_occlusion_geometry{camera_id}.json'), 'w') as stream:
+                json.dump({'distance_scale': distance_scale}, stream)
+            occlusion_path = os.path.join(guard_dir, f"projection_occlusion_feather{camera_id}.png")
+            cv2.imwrite(occlusion_path, occlusion)
+            cv2.imwrite(os.path.join(guard_dir, f"projection_guard_influence{camera_id}.png"),
+                        np.maximum(projection_guard_feather_influence(guard, feather_width * guard_scale),
+                                   occlusion_influence))
             self._record_confidence_artifacts(
                 context,
                 camera_id,
@@ -2469,6 +2545,16 @@ class ComfyUIGenerate(_PBRMixin, bpy.types.Operator):
                 object_id_map=object_path if has_object_ids else None,
                 material_id_map=material_path if has_material_ids else None,
                 projection_guard=guard_path,
+                projection_guard_feather=feather_path,
+                projection_occlusion_feather=occlusion_path,
+                projection_occlusion_geometry=geometry_path,
+                projection_occlusion_distance_scale=distance_scale,
+                projection_guard_scale=guard_scale,
+                projection_guard_margin=getattr(context.scene, 'sg_silhouette_margin', 3),
+                projection_guard_feather_width=feather_width,
+                projection_guard_directional=getattr(context.scene, 'sg_guard_directional', False),
+                projection_guard_foreground_margin=getattr(context.scene, 'sg_guard_foreground_margin', 0),
+                projection_guard_coverage_rescue=getattr(context.scene, 'sg_guard_coverage_rescue', 0.0),
                 projection_guard_mode=guard_diagnostics["mode"],
                 projection_guard_fallback=guard_diagnostics["fallback_triggered"],
                 projection_guard_id_allowed_foreground_percent=guard_diagnostics[
@@ -2478,6 +2564,16 @@ class ComfyUIGenerate(_PBRMixin, bpy.types.Operator):
                     "allowed_foreground_percent"
                 ],
             )
+
+        # Keep model guidance at the requested resolution; only the projection
+        # masks retain supersampled resolution. IDs must remain categorical.
+        if guard_scale > 1:
+            for path, categorical in ((depth_path, False), (object_path, True), (material_path, True)):
+                data = cv2.imread(path, cv2.IMREAD_UNCHANGED)
+                if data is not None:
+                    size = (data.shape[1] // guard_scale, data.shape[0] // guard_scale)
+                    cv2.imwrite(path, cv2.resize(data, size, interpolation=(
+                        cv2.INTER_NEAREST if categorical else cv2.INTER_AREA)))
 
         bpy.context.scene.view_settings.view_transform = 'Standard'
 
@@ -2494,7 +2590,11 @@ class ComfyUIGenerate(_PBRMixin, bpy.types.Operator):
     def export_depthmap(self, context, camera_id=None):
         meshes = [obj for obj in context.view_layer.objects if obj.type == 'MESH']
         with _RenderStateTransaction(context, meshes):
-            return self._export_depthmap_impl(context, camera_id=camera_id)
+            scale = (int(getattr(context.scene, 'sg_projection_guard_scale', '1'))
+                     if getattr(context.scene, 'sg_rework_projection_guard', False) else 1)
+            context.scene.render.resolution_x *= scale
+            context.scene.render.resolution_y *= scale
+            return self._export_depthmap_impl(context, camera_id=camera_id, guard_scale=scale)
 
     def export_normal(self, context, camera_id=None):
         """

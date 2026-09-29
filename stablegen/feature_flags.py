@@ -16,6 +16,12 @@ EXPERIMENTAL_FEATURE_DEFAULTS = dict.fromkeys((
 ), False)
 TEXTURING_DEFAULTS = {
     **GRADUATED_FEATURE_DEFAULTS, **EXPERIMENTAL_FEATURE_DEFAULTS,
+    'sg_silhouette_feather': 12,
+    'sg_projection_guard_scale': '2',
+    'sg_guard_feather_method': 'ORIGINAL',
+    'sg_guard_directional': True,
+    'sg_guard_foreground_margin': 0,
+    'sg_guard_coverage_rescue': 0.25,
 }
 
 
