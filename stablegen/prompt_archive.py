@@ -8,6 +8,19 @@ from pathlib import Path
 import re
 from typing import Mapping
 
+try:
+    from .comfy_workflow_export import qwen_image_21_ui_workflow
+except ImportError:  # Standalone unit-test import without loading Blender package.
+    import importlib.util
+    _converter_path = Path(__file__).with_name("comfy_workflow_export.py")
+    _converter_spec = importlib.util.spec_from_file_location(
+        "stablegen_comfy_workflow_export", _converter_path
+    )
+    _converter_module = importlib.util.module_from_spec(_converter_spec)
+    assert _converter_spec.loader is not None
+    _converter_spec.loader.exec_module(_converter_module)
+    qwen_image_21_ui_workflow = _converter_module.qwen_image_21_ui_workflow
+
 
 _UNSAFE_FILENAME_CHARS = re.compile(r"[^A-Za-z0-9._-]+")
 
@@ -42,6 +55,7 @@ def archive_prompt(
     submissions for the same view receive a numeric suffix.
     """
     output_path = Path(output_dir)
+    editable_workflow = qwen_image_21_ui_workflow(prompt)
     latest_path = output_path / "prompt.json"
     archive_dir = output_path / "prompts"
 
@@ -62,6 +76,16 @@ def archive_prompt(
         archive_path = archive_dir / f"{stem}_{suffix:02d}.json"
         suffix += 1
 
-    _write_json_atomic(latest_path, prompt)
-    _write_json_atomic(archive_path, prompt)
+    if editable_workflow is None:
+        _write_json_atomic(latest_path, prompt)
+        _write_json_atomic(archive_path, prompt)
+    else:
+        # ``prompt.json`` remains the file users can drag into ComfyUI. Keep
+        # the exact backend graph beside it for API/debug use.
+        api_latest_path = output_path / "prompt_api.json"
+        api_archive_path = archive_dir / f"{archive_path.stem}_api.json"
+        _write_json_atomic(latest_path, editable_workflow)
+        _write_json_atomic(archive_path, editable_workflow)
+        _write_json_atomic(api_latest_path, prompt)
+        _write_json_atomic(api_archive_path, prompt)
     return latest_path, archive_path

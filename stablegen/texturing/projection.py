@@ -47,6 +47,19 @@ def _scene_projection_scale(context):
     )
 
 
+def _multiply_projection_weight_by_alpha(
+    nodes, links, weight_node, image_node, label
+):
+    """Return a projection weight multiplied by an image's alpha channel."""
+    alpha_weighted = nodes.new("ShaderNodeMath")
+    alpha_weighted.operation = 'MULTIPLY'
+    alpha_weighted.label = label
+    links.new(weight_node.outputs[0], alpha_weighted.inputs[0])
+    links.new(image_node.outputs["Alpha"], alpha_weighted.inputs[1])
+    return alpha_weighted
+
+
+
 
 
 def _camera_world_location(camera):
@@ -1710,6 +1723,7 @@ def project_image(
             getattr(context.scene, 'qwen_use_confidence_context', False),
             experimental_enabled(context.scene, 'qwen_use_projection_write_masks'),
             context.scene.model_architecture == 'sdxl',
+            context.scene.model_architecture == 'qwen_image_21',
         ))
         legacy_incremental_update = (
             ((context.scene.generation_method == 'sequential' and stop_index > 0)
@@ -1929,12 +1943,12 @@ def project_image(
             return guard_weight
 
         # Voronoi mode flag: keep natural weights for non-generated cameras
-        voronoi_active = (context.scene.model_architecture in ('qwen_image_edit', 'flux2_klein')
+        voronoi_active = (context.scene.model_architecture in ('qwen_image_edit', 'qwen_image_21', 'flux2_klein')
                           and getattr(context.scene, 'qwen_voronoi_mode', False)
                           and context.scene.generation_method == 'sequential')
         confidence_context_active = (
             getattr(context.scene, 'qwen_use_confidence_context', False)
-            and context.scene.model_architecture == 'qwen_image_edit'
+            and context.scene.model_architecture.startswith('qwen')
             and context.scene.generation_method == 'sequential'
             and context.scene.qwen_generation_method == 'generate'
             and context.scene.qwen_context_render_mode
@@ -2308,7 +2322,7 @@ def project_image(
             use_qwen_write_mask = (
                 i > 0
                 and i <= stop_index
-                and context.scene.model_architecture == 'qwen_image_edit'
+                and context.scene.model_architecture.startswith('qwen')
                 and context.scene.generation_method == 'sequential'
                 and context.scene.qwen_generation_method == 'generate'
                 and context.scene.qwen_context_render_mode in {'REPLACE_STYLE', 'ADDITIONAL'}
@@ -2317,6 +2331,10 @@ def project_image(
             qwen_write_weight = None
             use_sdxl_write_mask = (
                 i > 0 and i <= stop_index and (context.scene.model_architecture == 'sdxl') and (context.scene.generation_method == 'sequential')
+            )
+            use_qwen21_generated_alpha = (
+                i <= stop_index
+                and context.scene.model_architecture == 'qwen_image_21'
             )
             if (use_qwen_write_mask or use_sdxl_write_mask) and script_nodes_outputs:
                 current_weight = script_nodes_outputs[-1]
@@ -2335,14 +2353,20 @@ def project_image(
                         links.new(write_weight.outputs[0], masked_weight.inputs[1])
                         script_nodes_outputs[-1] = masked_weight
 
-            if (use_sdxl_write_mask and script_nodes_outputs
+            if ((use_sdxl_write_mask or use_qwen21_generated_alpha)
+                    and script_nodes_outputs
                     and not isinstance(script_nodes_outputs[-1], tuple)):
-                alpha_weighted = nodes.new("ShaderNodeMath")
-                alpha_weighted.operation = 'MULTIPLY'
-                alpha_weighted.label = f"SDXLFeatherAlpha-{i}-{mat_id}"
-                links.new(script_nodes_outputs[-1].outputs[0], alpha_weighted.inputs[0])
-                links.new(tex_image_nodes[i].outputs["Alpha"], alpha_weighted.inputs[1])
-                script_nodes_outputs[-1] = alpha_weighted
+                script_nodes_outputs[-1] = _multiply_projection_weight_by_alpha(
+                    nodes,
+                    links,
+                    script_nodes_outputs[-1],
+                    tex_image_nodes[i],
+                    (
+                        f"Qwen21GeneratedAlpha-{i}-{mat_id}"
+                        if use_qwen21_generated_alpha
+                        else f"SDXLFeatherAlpha-{i}-{mat_id}"
+                    ),
+                )
 
             if script_nodes_outputs and not isinstance(script_nodes_outputs[-1], tuple):
                 guard_weight = _create_projection_guard_weight(i, mat_id)

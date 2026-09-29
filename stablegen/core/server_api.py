@@ -191,6 +191,15 @@ def fetch_from_comfyui_api(context, endpoint):
     return []
 
 
+def fetch_diffusion_models(server_address):
+    """Merge optional GGUF and standard diffusion-model folders independently."""
+    gguf = _fetch_api_list(server_address, '/models/unet_gguf')
+    diffusion = _fetch_api_list(server_address, '/models/diffusion_models')
+    if gguf is None and diffusion is None:
+        return None
+    return sorted(set((gguf or []) + (diffusion or [])))
+
+
 def _fetch_api_list(server_address, endpoint):
     """Thread-safe variant of *fetch_from_comfyui_api* — takes an explicit
     *server_address* instead of reading from bpy context, so it can run in a

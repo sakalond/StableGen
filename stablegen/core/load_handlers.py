@@ -25,6 +25,65 @@ def load_handler(dummy):
 
     scene = bpy.context.scene
 
+    # Builds saved while Qwen-Image 2.1 shared the Qwen-Image-Edit enum need a
+    # one-time architecture migration.  The filename is used only here for
+    # compatibility; new generations dispatch exclusively by architecture.
+    from ..texturing.qwen_models import is_qwen_image_21_model
+    saved_model_name = (
+        getattr(scene, "sg_model_name_backup", "")
+        or getattr(scene, "model_name", "")
+    )
+    if not getattr(scene, "sg_qwen_21_architecture_migrated", False):
+        if (getattr(scene, "model_architecture", "") == 'qwen_image_edit'
+                and is_qwen_image_21_model(saved_model_name)):
+            scene.model_architecture = 'qwen_image_21'
+            if getattr(scene, "architecture_mode", "") == 'qwen_image_edit':
+                scene.architecture_mode = 'qwen_image_21'
+            elif getattr(scene, "architecture_mode", "") == 'trellis2':
+                if getattr(scene, "trellis2_texture_mode", "") == 'qwen_image_edit':
+                    scene.trellis2_texture_mode = 'qwen_image_21'
+                if getattr(scene, "trellis2_initial_image_arch", "") == 'qwen_image_edit':
+                    scene.trellis2_initial_image_arch = 'qwen_image_21'
+            print("[StableGen] Migrated saved Qwen-Image 2.1 model to its dedicated architecture.")
+        scene.sg_qwen_21_architecture_migrated = True
+
+    # The old Qwen UI stored custom/default as a boolean.  Preserve that
+    # choice once when opening an existing file, then let the enum be the
+    # single source of truth for both Qwen architectures.  Klein continues to
+    # use the legacy boolean and is intentionally excluded.
+    for loaded_scene in bpy.data.scenes:
+        if getattr(loaded_scene, "sg_qwen_prompt_template_migrated", False):
+            continue
+        template_was_saved = loaded_scene.is_property_set(
+            "qwen_prompt_template"
+        )
+        architecture = getattr(loaded_scene, "model_architecture", "")
+        current_template = getattr(
+            loaded_scene, "qwen_prompt_template", ""
+        )
+        if architecture in {'qwen_image_edit', 'qwen_image_21'}:
+            valid_templates = {
+                'QWEN_EDIT_LEGACY', 'QWEN_21_DEFAULT', 'CANVAS_EDIT',
+                'REFERENCE_RECONSTRUCTION', 'CONCISE_TRANSFER',
+                'RESULT_DESCRIPTION', 'CANVAS_AUTHORITY', 'MINIMAL_EDIT',
+                'CUSTOM',
+            }
+            needs_legacy_migration = (
+                not template_was_saved or current_template not in valid_templates
+            )
+            if (needs_legacy_migration
+                    and getattr(
+                        loaded_scene, "qwen_use_custom_prompts", False
+                    )):
+                loaded_scene.qwen_prompt_template = 'CUSTOM'
+            elif needs_legacy_migration:
+                loaded_scene.qwen_prompt_template = (
+                    'QWEN_21_DEFAULT'
+                    if architecture == 'qwen_image_21'
+                    else 'QWEN_EDIT_LEGACY'
+                )
+        loaded_scene.sg_qwen_prompt_template_migrated = True
+
     # Modal operators and worker sockets cannot survive loading a .blend.
     # Older files may nevertheless contain the serialized transient value
     # "running" or "waiting", which leaves the Generate button permanently

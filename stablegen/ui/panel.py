@@ -45,7 +45,8 @@ _PRESET_DIFF_CORE = [
 _DISPLAY_NAMES = {
     'sdxl': 'SDXL',
     'flux1': 'FLUX.1',
-    'qwen_image_edit': 'Qwen',
+    'qwen_image_edit': 'Qwen Image Edit',
+    'qwen_image_21': 'Qwen Image 2.1',
     'flux2_klein': 'FLUX.2 Klein',
     'trellis2': 'TRELLIS.2',
     'standard': 'Standard',
@@ -659,7 +660,7 @@ class StableGenPanel(bpy.types.Panel):
 
         is_trellis2 = getattr(scene, 'architecture_mode', 'sdxl') == 'trellis2'
         trellis2_tex_mode = getattr(scene, 'trellis2_texture_mode', 'native')
-        trellis2_diffusion_texturing = is_trellis2 and trellis2_tex_mode in ('sdxl', 'flux1', 'qwen_image_edit', 'flux2_klein')
+        trellis2_diffusion_texturing = is_trellis2 and trellis2_tex_mode in ('sdxl', 'flux1', 'qwen_image_edit', 'qwen_image_21', 'flux2_klein')
             
         main_params_box = layout.box()
         main_params_col = main_params_box.column()
@@ -1207,12 +1208,27 @@ class StableGenPanel(bpy.types.Panel):
                 split.prop(scene, "scheduler", text="")
                 if 'scheduler' in _diff_props:
                     split.label(text="→ " + _diff_props['scheduler'])
+
+                if scene.model_architecture == 'qwen_image_21':
+                    row = content_box.row()
+                    if 'qwen_image_21_native_rgba' in _diff_props:
+                        row.alert = True
+                    row.prop(
+                        scene,
+                        "qwen_image_21_native_rgba",
+                        text="Native RGBA Output",
+                        toggle=True,
+                    )
+                    if 'qwen_image_21_native_rgba' in _diff_props:
+                        row.label(text="→ " + _diff_props['qwen_image_21_native_rgba'])
                 
-                row = content_box.row()
-                row.prop(scene, "clip_skip", text="Clip Skip")
+                if scene.model_architecture != 'qwen_image_21':
+                    row = content_box.row()
+                    row.prop(scene, "clip_skip", text="Clip Skip")
 
            # --- LoRA Settings ---
-            if _show_diffusion_sections or _show_initial_image_settings:
+            if ((_show_diffusion_sections or _show_initial_image_settings)
+                    and scene.model_architecture != 'qwen_image_21'):
                 content_box = draw_collapsible_section(advanced_params_box, "show_lora_settings", "LoRA Management", icon="MODIFIER")
             else:
                 content_box = None
@@ -1315,8 +1331,8 @@ class StableGenPanel(bpy.types.Panel):
                     sub.label(text="→" + _diff_props['weight_exponent'])
 
                 # Row 2 & 3: Reset toggles and values (only for sequential / qwen)
-                if scene.generation_method == 'sequential' or scene.model_architecture in ('qwen_image_edit', 'flux2_klein'):
-                    split = content_box.split(factor=0.5, align=True)
+                if scene.generation_method == 'sequential' or scene.model_architecture in ('qwen_image_edit', 'qwen_image_21', 'flux2_klein'):
+                    split = content_box.split(factor=0.5, align=False)
                     split.prop(scene, "discard_factor_generation_only", text="Reset Angle", toggle=True)
                     split.prop(scene, "weight_exponent_generation_only", text="Reset Exponent", toggle=True)
 
@@ -1498,9 +1514,11 @@ class StableGenPanel(bpy.types.Panel):
                     sub_box_rescale = content_box.box()
                     row = sub_box_rescale.row()
                     row.prop(scene, "auto_rescale_target_mp", text="Target Megapixels")
-                    if scene.model_architecture.startswith('qwen'):
+                    if scene.model_architecture == 'qwen_image_edit':
                         row = sub_box_rescale.row()
                         row.prop(scene, "qwen_rescale_alignment", text="Qwen VL-Aligned Rescale (112px)", toggle=True, icon="SNAP_INCREMENT")
+                    elif scene.model_architecture == 'qwen_image_21':
+                        sub_box_rescale.label(text="Qwen 2.1 aligns to 32px", icon="SNAP_INCREMENT")
                 row = content_box.row()
                 if 'overwrite_material' in _diff_props:
                     row.alert = True
@@ -1514,12 +1532,12 @@ class StableGenPanel(bpy.types.Panel):
                     content_box = draw_collapsible_section(advanced_params_box, "show_image_guidance_settings", "Image Guidance (IPAdapter & ControlNet)", icon="MODIFIER")
                 elif scene.model_architecture == 'flux2_klein':
                     content_box = draw_collapsible_section(advanced_params_box, "show_image_guidance_settings", "FLUX.2 Klein Guidance", icon="MODIFIER")
-                else: # Qwen Image Edit
-                    content_box = draw_collapsible_section(advanced_params_box, "show_image_guidance_settings", "Qwen-Image-Edit Guidance", icon="MODIFIER")
+                else: # Qwen Image
+                    content_box = draw_collapsible_section(advanced_params_box, "show_image_guidance_settings", "Qwen Image Guidance", icon="MODIFIER")
             else:
                 content_box = None
             if content_box:
-                if scene.model_architecture in ('qwen_image_edit', 'flux2_klein'):
+                if scene.model_architecture in ('qwen_image_edit', 'qwen_image_21', 'flux2_klein'):
                     if scene.model_architecture == 'flux2_klein' or scene.qwen_generation_method == 'generate':
                         split = content_box.split(factor=0.5)
                         split.label(text="Guidance Map:")
@@ -1606,9 +1624,20 @@ class StableGenPanel(bpy.types.Panel):
                     row = content_box.row()
                     row.prop(scene, "qwen_timestep_zero_ref", text="Timestep-Zero References (color shift fix)", toggle=True, icon="COLORSET_08_VEC")
 
-                    row = content_box.row()
-                    row.prop(scene, "qwen_use_custom_prompts", text="Custom Guidance Prompts", toggle=True, icon="TEXT")
-                    if scene.qwen_use_custom_prompts:
+                    if scene.model_architecture in {'qwen_image_edit', 'qwen_image_21'}:
+                        split = content_box.split(factor=0.5)
+                        split.label(text="Prompt Template:")
+                        split.prop(scene, "qwen_prompt_template", text="")
+                        custom_guidance_enabled = scene.qwen_prompt_template == 'CUSTOM'
+                    else:
+                        # FLUX.2 Klein still uses the legacy custom/default control.
+                        row = content_box.row()
+                        row.prop(scene, "qwen_use_custom_prompts", text="Custom Guidance Prompts", toggle=True, icon="TEXT")
+                        custom_guidance_enabled = scene.qwen_use_custom_prompts
+
+                    if (scene.model_architecture in {
+                            'qwen_image_edit', 'qwen_image_21'
+                        } or custom_guidance_enabled):
                         custom_prompt_box = content_box.box()
                         
                         # Initial Image Prompt
@@ -1646,10 +1675,11 @@ class StableGenPanel(bpy.types.Panel):
                         context_box = content_box.box()
                         context_box.label(text="Context Render Options")
 
-                        row = context_box.row()
-                        row.prop(scene, "qwen_prompt_gray_background", text="Prompt: Gray Background", toggle=True)
+                        if scene.model_architecture != 'qwen_image_21':
+                            row = context_box.row()
+                            row.prop(scene, "qwen_prompt_gray_background", text="Prompt: Gray Background", toggle=True)
 
-                        if scene.qwen_use_custom_prompts:
+                        if custom_guidance_enabled:
                             colors_box = context_box.box()
                             colors_box.label(text="Context Render Colors")
                             row = colors_box.row()
@@ -1753,7 +1783,7 @@ class StableGenPanel(bpy.types.Panel):
                             cn_box.operator("stablegen.add_controlnet_unit", text="Add ControlNet Unit", icon="ADD")
                             cn_box.operator("stablegen.remove_controlnet_unit", text="Remove Last ControlNet Unit", icon="REMOVE")
 
-            if _show_diffusion_sections and scene.model_architecture not in ('qwen_image_edit', 'flux2_klein'):
+            if _show_diffusion_sections and scene.model_architecture not in ('qwen_image_edit', 'qwen_image_21', 'flux2_klein'):
                 # --- Inpainting Options (Conditional) ---
                 if scene.generation_method == 'uv_inpaint' or scene.generation_method == 'sequential':
                     content_box = draw_collapsible_section(advanced_params_box, "show_masking_inpainting_settings", "Inpainting Options", icon="MOD_MASK")
@@ -1924,7 +1954,7 @@ class StableGenPanel(bpy.types.Panel):
                             sub_ip_box_separate.prop(scene, "sequential_desaturate_factor", text="Desaturate")
                             sub_ip_box_separate.prop(scene, "sequential_contrast_factor", text="Reduce Contrast")
 
-                        if context.scene.model_architecture not in ('qwen_image_edit', 'flux2_klein'):
+                        if context.scene.model_architecture not in ('qwen_image_edit', 'qwen_image_21', 'flux2_klein'):
                             split = sub_ip_box_separate.split(factor=0.5) 
                             if context.scene.model_architecture == 'sdxl':
                                 split.label(text="Weight Type:")
@@ -2124,7 +2154,7 @@ class StableGenPanel(bpy.types.Panel):
                             sub_ip_seq_box.prop(scene, "sequential_desaturate_factor", text="Desaturate")
                             sub_ip_seq_box.prop(scene, "sequential_contrast_factor", text="Reduce Contrast")
 
-                        if context.scene.model_architecture not in ('qwen_image_edit', 'flux2_klein'):
+                        if context.scene.model_architecture not in ('qwen_image_edit', 'qwen_image_21', 'flux2_klein'):
                             split = sub_ip_seq_box.split(factor=0.5)
                             if context.scene.model_architecture == 'sdxl':
                                 split.label(text="Weight Type:")

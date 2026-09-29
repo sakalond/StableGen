@@ -18,6 +18,14 @@ from .graph_validation import (
     attach_qwen_latent_lock,
     sdxl_final_mask_reference,
 )
+from .qwen_models import (
+    QWEN_IMAGE_21_TEXT_ENCODER,
+    QWEN_IMAGE_21_VAE,
+    qwen_prepared_prompt,
+    qwen_image_21_prompt,
+    qwen_image_21_rgba_prompt,
+    remap_qwen_image_21_prompt,
+)
 
 from io import BytesIO
 import numpy as np
@@ -90,6 +98,150 @@ class _TexturingWorkflowMixin:
         return super()._queue_prompt(prompt, client_id, server_address)
 
     """Texturing workflow methods for WorkflowManager."""
+
+    def _convert_to_qwen_image_21(
+        self, prompt, nodes, context, *, projected_context_target=False
+    ):
+        """Replace the legacy Qwen Edit graph with Qwen-Image 2.1 nodes.
+
+        The caller first performs StableGen's normal reference routing.  This
+        adapter reads those semantic image slots, retains their loader/resize
+        dependencies, and swaps only the ComfyUI model layer.  Camera planning,
+        magenta guides, depth references and sequential projection therefore
+        remain shared with the established Qwen path.
+        """
+        old_encoder = prompt[nodes['pos_prompt']]
+        old_inputs = old_encoder.get('inputs', {})
+        image_refs = [
+            old_inputs[key]
+            for key in ('image1', 'image2', 'image3')
+            if key in old_inputs
+        ]
+        prompt_text = old_inputs.get('prompt', '')
+        if projected_context_target and len(image_refs) >= 2:
+            # The legacy graph routes structure/depth as image 1 and projected
+            # context as image 2. Qwen 2.1 VAE-encodes image 1 as the output
+            # target, so put the context there and retain structure as image 2.
+            image_refs[0], image_refs[1] = image_refs[1], image_refs[0]
+            final_prompt = remap_qwen_image_21_prompt(
+                prompt_text, {1: 2, 2: 1}
+            )
+        else:
+            final_prompt = qwen_image_21_prompt(prompt_text)
+        if getattr(context.scene, 'qwen_image_21_native_rgba', True):
+            final_prompt = qwen_image_21_rgba_prompt(final_prompt)
+
+        graph = {
+            nodes['unet_loader']: {
+                'inputs': {
+                    'unet_name': context.scene.model_name,
+                    'weight_dtype': 'default',
+                },
+                'class_type': 'UNETLoader',
+                '_meta': {'title': 'Load Qwen-Image 2.1 Diffusion Model'},
+            },
+            '3': {
+                'inputs': {
+                    'clip_name': QWEN_IMAGE_21_TEXT_ENCODER,
+                    'type': 'qwen_image',
+                    'device': 'default',
+                },
+                'class_type': 'CLIPLoader',
+                '_meta': {'title': 'Load Qwen3-VL 8B Text Encoder'},
+            },
+            '4': {
+                'inputs': {'vae_name': QWEN_IMAGE_21_VAE},
+                'class_type': 'VAELoader',
+                '_meta': {'title': 'Load Qwen-Image 2.1 VAE'},
+            },
+            nodes['pos_prompt']: {
+                'inputs': {
+                    'clip': ['3', 0],
+                    'prompt': final_prompt,
+                    'negative_prompt': getattr(
+                        context.scene, 'comfyui_negative_prompt', ''
+                    ),
+                    # A camera reference defines the output canvas. Preserve
+                    # its 32px-aligned size instead of rescaling it to 1 MP.
+                    # Text-only generation has no reference size, so retain
+                    # ComfyUI's explicit 1024px square latent fallback.
+                    'resolution': 0 if image_refs else 1024,
+                    'vae': ['4', 0],
+                },
+                'class_type': 'TextEncodeQwenImage21',
+                '_meta': {'title': 'Qwen-Image 2.1 Multi-Image Conditioning'},
+            },
+            nodes['model_sampler']: {
+                'inputs': {
+                    'model': [nodes['unet_loader'], 0],
+                    'device': 'auto',
+                    'dtype': 'default',
+                },
+                'class_type': 'QwenImage21Cache',
+                '_meta': {'title': 'Qwen-Image 2.1 Cache'},
+            },
+            nodes['sampler']: {
+                'inputs': {
+                    'model': [nodes['model_sampler'], 0],
+                    'seed': context.scene.seed,
+                    'steps': context.scene.steps,
+                    'cfg': context.scene.cfg,
+                    'sampler_name': context.scene.sampler,
+                    'scheduler': context.scene.scheduler,
+                    'positive': [nodes['pos_prompt'], 0],
+                    'negative': [nodes['pos_prompt'], 1],
+                    'latent_image': [nodes['pos_prompt'], 2],
+                    'denoise': 1.0,
+                },
+                'class_type': 'KSampler',
+                '_meta': {'title': 'Qwen-Image 2.1 Sampler'},
+            },
+            '2': {
+                'inputs': {
+                    'samples': [nodes['sampler'], 0],
+                    'vae': ['4', 0],
+                },
+                'class_type': 'VAEDecode',
+                '_meta': {'title': 'VAE Decode'},
+            },
+            nodes['save_image']: {
+                'inputs': {'images': ['2', 0]},
+                'class_type': 'SaveImageWebsocket',
+                '_meta': {'title': 'SaveImageWebsocket'},
+            },
+        }
+
+        # Dynamic Qwen 2.1 image inputs are named images.image_1, etc.  Copy
+        # any resize/load chain used by a semantic slot into the replacement
+        # graph so external-style scaling continues to work.
+        def retain_reference(reference):
+            node_id = str(reference[0])
+            if node_id in graph:
+                return
+            source = prompt.get(node_id)
+            if source is None:
+                return
+            graph[node_id] = source
+            for value in source.get('inputs', {}).values():
+                if (
+                    isinstance(value, list)
+                    and len(value) == 2
+                    and isinstance(value[0], (str, int))
+                    and isinstance(value[1], int)
+                ):
+                    retain_reference(value)
+
+        for index, reference in enumerate(image_refs, 1):
+            retain_reference(reference)
+            graph[nodes['pos_prompt']]['inputs'][f'images.image_{index}'] = reference
+
+        prompt.clear()
+        prompt.update(graph)
+        print(
+            '[StableGen] Qwen-Image 2.1 architecture: using '
+            f'{QWEN_IMAGE_21_TEXT_ENCODER}, {QWEN_IMAGE_21_VAE}, '
+            f'{graph[nodes["sampler"]]["inputs"]["steps"]} steps and no legacy LoRA.'
+        )
 
     def _crop_and_vignette(
         self,
@@ -428,8 +580,18 @@ class _TexturingWorkflowMixin:
                 else:
                     return "Reskin this into {main_prompt}{camera_suffix}, while preserve identity keep likeness replica contour, adopting the visual style from image 2."
 
-    def _get_qwen_default_prompts(self, context, is_initial_image):
-        """Gets the default Qwen prompts based on the current context."""
+    def _get_qwen_default_prompts(
+        self,
+        context,
+        is_initial_image,
+        template_id=None,
+        context_mode_override=None,
+    ):
+        """Get the selected Qwen guidance template for the current image roles.
+
+        ``template_id`` is mainly used by the reset operator to retrieve the
+        architecture's built-in wording while the UI is set to Custom.
+        """
         # Check if we are in a real generation context vs. just resetting a prompt
         is_generating = hasattr(self.operator, '_current_image')
         is_subsequent_in_sequence = is_generating and self.operator._current_image > 0
@@ -438,6 +600,11 @@ class _TexturingWorkflowMixin:
         _t2_style = (
             getattr(context.scene, 'architecture_mode', '') == 'trellis2'
             and getattr(context.scene, 'qwen_use_trellis2_style', False)
+        )
+        context_mode = (
+            context_mode_override
+            if context_mode_override is not None
+            else context.scene.qwen_context_render_mode
         )
 
         if is_initial_image:
@@ -452,13 +619,105 @@ class _TexturingWorkflowMixin:
             style_image_provided = (
                 context.scene.qwen_use_external_style_image or
                 context.scene.sequential_ipadapter or
-                context.scene.qwen_context_render_mode in {'REPLACE_STYLE', 'ADDITIONAL'} or
+                context_mode in {'REPLACE_STYLE', 'ADDITIONAL'} or
                 (_t2_style and not getattr(context.scene, 'qwen_trellis2_style_initial_only', False))
             )
-        context_mode = context.scene.qwen_context_render_mode
+        is_qwen21 = context.scene.model_architecture == 'qwen_image_21'
+
+        architecture_default = (
+            'QWEN_21_DEFAULT' if is_qwen21 else 'QWEN_EDIT_LEGACY'
+        )
+        selected_template = template_id or getattr(
+            context.scene, 'qwen_prompt_template', architecture_default
+        )
+        # Compatibility with scenes saved by the short-lived combined entry.
+        if selected_template == 'STABLEGEN_DEFAULT':
+            selected_template = architecture_default
+        if selected_template == 'CUSTOM':
+            if is_initial_image:
+                return context.scene.qwen_custom_prompt_initial
+            if context_mode == 'ADDITIONAL':
+                return context.scene.qwen_custom_prompt_seq_additional
+            if context_mode == 'REPLACE_STYLE':
+                return context.scene.qwen_custom_prompt_seq_replace
+            return context.scene.qwen_custom_prompt_seq_none
+
+        if selected_template not in {
+            'QWEN_EDIT_LEGACY', 'QWEN_21_DEFAULT'
+        }:
+            # Initial-only TRELLIS styling falls back to the first generated
+            # view on later cameras, so an appearance reference still exists.
+            trellis_style_available = _t2_style
+            appearance_reference = (
+                context.scene.qwen_use_external_style_image
+                or trellis_style_available
+                or (
+                    not is_initial_image
+                    and context.scene.sequential_ipadapter
+                )
+            )
+            has_context_canvas = (
+                not is_initial_image
+                and context_mode in {'REPLACE_STYLE', 'ADDITIONAL'}
+            )
+            return qwen_prepared_prompt(
+                selected_template,
+                canvas_image=2 if has_context_canvas else 1,
+                structure_image=1 if has_context_canvas else None,
+                appearance_image=(
+                    3 if has_context_canvas and context_mode == 'ADDITIONAL'
+                    and appearance_reference
+                    else 2 if not has_context_canvas and appearance_reference
+                    else None
+                ),
+                has_magenta_regions=has_context_canvas,
+                gray_background=(
+                    has_context_canvas
+                    and not is_qwen21
+                    and getattr(
+                        context.scene, 'qwen_prompt_gray_background', True
+                    )
+                ),
+            )
 
         # Optional sentence injected into context-render prompts.
         gray_bg = " Replace the background with solid gray." if getattr(context.scene, 'qwen_prompt_gray_background', True) else ""
+
+        if selected_template == 'QWEN_21_DEFAULT' and not is_initial_image and context_mode in {
+            'REPLACE_STYLE', 'ADDITIONAL'
+        }:
+            # These refer to the legacy semantic slots before conversion:
+            # image 2 is projected context, image 1 is structure. The Qwen 2.1
+            # adapter swaps them so the context becomes its required image-1
+            # edit target and also renumbers custom/default prompt references.
+            prompt = (
+                "Edit image 2 into '{main_prompt}'. Preserve its existing "
+                "non-magenta textured regions. Replace every solid magenta "
+                "region with texture that seamlessly continues the surrounding "
+                "surface. Use image 1 only as a geometry and composition guide."
+            )
+            if context_mode == 'ADDITIONAL':
+                prompt += " Use image 3 as the overall appearance reference."
+            return prompt
+
+        if selected_template == 'QWEN_21_DEFAULT' and is_initial_image:
+            prompt = (
+                "Create '{main_prompt}' using image 1 as the geometry and "
+                "composition guide."
+            )
+            if style_image_provided:
+                prompt += " Use image 2 as the overall appearance reference."
+            return prompt
+
+        if (selected_template == 'QWEN_21_DEFAULT'
+                and context_mode not in {'REPLACE_STYLE', 'ADDITIONAL'}):
+            prompt = (
+                "Create '{main_prompt}' using image 1 as the geometry and "
+                "composition guide."
+            )
+            if style_image_provided:
+                prompt += " Use image 2 as the overall appearance reference."
+            return prompt
 
         if is_initial_image:
             if not style_image_provided:
@@ -498,22 +757,27 @@ class _TexturingWorkflowMixin:
             'style_map_loader': "15",   # Image 2 (style)
             'context_render_loader': "16", # Image 3 (context render)
         }
+        is_qwen21 = context.scene.model_architecture == 'qwen_image_21'
 
         # --- Build LoRA chain ---
-        initial_model_input = [NODES['unet_loader'], 0]
-        dummy_clip_input = [NODES['unet_loader'], 0] 
-
-        is_nunchaku = context.scene.model_name.lower().endswith('.safetensors')
-        lora_class = "NunchakuQwenImageLoraLoader" if is_nunchaku else "LoraLoaderModelOnly"
-
-        prompt, final_lora_model_out, _ = self._build_lora_chain(
-            prompt, context,
-            initial_model_input, dummy_clip_input,
-            start_node_id=500, 
-            lora_class_type=lora_class 
+        is_nunchaku = (
+            not is_qwen21
+            and context.scene.model_name.lower().endswith('.safetensors')
         )
-
-        prompt[NODES['model_sampler']]['inputs']['model'] = final_lora_model_out
+        if not is_qwen21:
+            initial_model_input = [NODES['unet_loader'], 0]
+            dummy_clip_input = [NODES['unet_loader'], 0]
+            lora_class = (
+                "NunchakuQwenImageLoraLoader"
+                if is_nunchaku else "LoraLoaderModelOnly"
+            )
+            prompt, final_lora_model_out, _ = self._build_lora_chain(
+                prompt, context,
+                initial_model_input, dummy_clip_input,
+                start_node_id=500,
+                lora_class_type=lora_class,
+            )
+            prompt[NODES['model_sampler']]['inputs']['model'] = final_lora_model_out
 
         # --- Configure Inputs ---
         # Image 1: The current render (structure)
@@ -572,19 +836,23 @@ class _TexturingWorkflowMixin:
         user_prompt = _texturing_prompt(context.scene)
         final_prompt = f"Modify image1 to {user_prompt}"
         if depth_info:
-            final_prompt += ". Use image3 as depth map reference."
+            final_prompt += "\n\nImage3 is a depth map of the same view; use it to preserve scene geometry."
         
         prompt[NODES['pos_prompt']]['inputs']['prompt'] = final_prompt
 
-        # --- Reference Latent chain (Qwen unzoom fix) ---
-        self._build_qwen_reference_latent_chain(prompt, NODES)
-
-        prompt[NODES['sampler']]['inputs']['seed'] = context.scene.seed
-        prompt[NODES['sampler']]['inputs']['steps'] = context.scene.steps
-        prompt[NODES['sampler']]['inputs']['cfg'] = context.scene.cfg
-        prompt[NODES['sampler']]['inputs']['sampler_name'] = context.scene.sampler
-        prompt[NODES['sampler']]['inputs']['scheduler'] = context.scene.scheduler
-        prompt[NODES['sampler']]['inputs']['denoise'] = 1.0
+        if is_qwen21:
+            self._convert_to_qwen_image_21(prompt, NODES, context)
+        else:
+            # --- Reference Latent chain (Qwen unzoom fix) ---
+            self._build_qwen_reference_latent_chain(
+                prompt, NODES,
+            )
+            prompt[NODES['sampler']]['inputs']['seed'] = context.scene.seed
+            prompt[NODES['sampler']]['inputs']['steps'] = context.scene.steps
+            prompt[NODES['sampler']]['inputs']['cfg'] = context.scene.cfg
+            prompt[NODES['sampler']]['inputs']['sampler_name'] = context.scene.sampler
+            prompt[NODES['sampler']]['inputs']['scheduler'] = context.scene.scheduler
+            prompt[NODES['sampler']]['inputs']['denoise'] = 1.0
 
         if is_nunchaku:
             prompt[NODES['unet_loader']] = {
@@ -597,11 +865,13 @@ class _TexturingWorkflowMixin:
                 "class_type": "NunchakuQwenImageDiTLoader",
                 "_meta": {"title": "Nunchaku Qwen-Image DiT Loader"},
             }
-        else:
+        elif not is_qwen21:
             prompt[NODES['unet_loader']]['inputs']['unet_name'] = context.scene.model_name
 
         graph_issues = (validate_workflow_graph(
-            prompt, (NODES['pos_prompt'], NODES['neg_prompt'])
+            prompt,
+            ((NODES['pos_prompt'],) if is_qwen21
+             else (NODES['pos_prompt'], NODES['neg_prompt'])),
         ))
         if graph_issues:
             self.operator._error = "Invalid Qwen refine workflow: " + "; ".join(graph_issues)
@@ -650,25 +920,30 @@ class _TexturingWorkflowMixin:
             'style_map_loader': "15",   # Image 2 (style)
             'context_render_loader': "16", # Image 3 (context render)
         }
+        is_qwen21 = context.scene.model_architecture == 'qwen_image_21'
 
         # --- Build LoRA chain ---
         # The Qwen workflow uses model-only LoRAs. We can reuse the existing
         # chain builder by providing a dummy CLIP input that won't be used.
-        initial_model_input = [NODES['unet_loader'], 0]
-        dummy_clip_input = [NODES['unet_loader'], 0] # Dummy, not used by LoraLoaderModelOnly
-
-        is_nunchaku = context.scene.model_name.lower().endswith('.safetensors')
-        lora_class = "NunchakuQwenImageLoraLoader" if is_nunchaku else "LoraLoaderModelOnly"
-
-        prompt, final_lora_model_out, _ = self._build_lora_chain(
-            prompt, context,
-            initial_model_input, dummy_clip_input,
-            start_node_id=500, # Use a high starting ID to avoid conflicts
-            lora_class_type=lora_class # Specify model-only loader
+        is_nunchaku = (
+            not is_qwen21
+            and context.scene.model_name.lower().endswith('.safetensors')
         )
-
-        # Connect the output of the LoRA chain to the next node in the model path
-        prompt[NODES['model_sampler']]['inputs']['model'] = final_lora_model_out
+        if not is_qwen21:
+            initial_model_input = [NODES['unet_loader'], 0]
+            dummy_clip_input = [NODES['unet_loader'], 0]
+            lora_class = (
+                "NunchakuQwenImageLoraLoader"
+                if is_nunchaku else "LoraLoaderModelOnly"
+            )
+            prompt, final_lora_model_out, _ = self._build_lora_chain(
+                prompt, context,
+                initial_model_input, dummy_clip_input,
+                start_node_id=500,
+                lora_class_type=lora_class,
+            )
+            # Connect the output of the LoRA chain to the next model node.
+            prompt[NODES['model_sampler']]['inputs']['model'] = final_lora_model_out
 
 
         # --- Configure Inputs ---
@@ -707,10 +982,9 @@ class _TexturingWorkflowMixin:
                 NODES['context_render_loader'], NODES['style_map_loader'] = NODES['style_map_loader'], NODES['context_render_loader']
                 prompt[NODES['context_render_loader']]['inputs']['image'] = context_render_info['name']
                 # The prompt needs to reference image 3
-                if context.scene.qwen_use_custom_prompts:
-                    pos_prompt_text = context.scene.qwen_custom_prompt_seq_additional.format(main_prompt=user_prompt)
-                else:
-                    pos_prompt_text = self._get_qwen_default_prompts(context, is_initial_image).format(main_prompt=user_prompt)
+                pos_prompt_text = self._get_qwen_default_prompts(
+                    context, is_initial_image
+                ).format(main_prompt=user_prompt)
                 prompt[NODES['pos_prompt']]['inputs']['prompt'] = pos_prompt_text
             # If mode is REPLACE_STYLE, we will handle it in the style image section below.
             else:
@@ -739,16 +1013,14 @@ class _TexturingWorkflowMixin:
                 self.operator._error = "External style image enabled, but file not found or could not be uploaded."
                 return {"error": "conn_failed"}
             if context_mode != 'ADDITIONAL':
-                if context.scene.qwen_use_custom_prompts:
-                    pos_prompt_text = (context.scene.qwen_custom_prompt_initial if is_initial_image else context.scene.qwen_custom_prompt_seq_none).format(main_prompt=user_prompt)
-                else:
-                    pos_prompt_text = self._get_qwen_default_prompts(context, is_initial_image).format(main_prompt=user_prompt)
+                pos_prompt_text = self._get_qwen_default_prompts(
+                    context, is_initial_image
+                ).format(main_prompt=user_prompt)
                 prompt[NODES['pos_prompt']]['inputs']['prompt'] = pos_prompt_text
             else: # Additional mode
-                if context.scene.qwen_use_custom_prompts:
-                    pos_prompt_text = (context.scene.qwen_custom_prompt_seq_additional if not is_initial_image else context.scene.qwen_custom_prompt_initial).format(main_prompt=user_prompt)
-                else:
-                    pos_prompt_text = self._get_qwen_default_prompts(context, is_initial_image).format(main_prompt=user_prompt)
+                pos_prompt_text = self._get_qwen_default_prompts(
+                    context, is_initial_image
+                ).format(main_prompt=user_prompt)
                 prompt[NODES['pos_prompt']]['inputs']['prompt'] = pos_prompt_text
 
         # Case 1b: TRELLIS.2 input image as style (when no external style configured)
@@ -767,32 +1039,23 @@ class _TexturingWorkflowMixin:
                 if t2_path and os.path.exists(bpy.path.abspath(t2_path)):
                     style_image_info = self.operator._get_uploaded_image_info(context, "custom", filename=bpy.path.abspath(t2_path))
                 if style_image_info:
-                    if context.scene.qwen_use_custom_prompts:
-                        pos_prompt_text = (context.scene.qwen_custom_prompt_initial).format(main_prompt=user_prompt)
-                    else:
-                        pos_prompt_text = self._get_qwen_default_prompts(context, is_initial_image).format(main_prompt=user_prompt)
+                    pos_prompt_text = self._get_qwen_default_prompts(
+                        context, is_initial_image
+                    ).format(main_prompt=user_prompt)
                     prompt[NODES['pos_prompt']]['inputs']['prompt'] = pos_prompt_text
 
         # Case 2: Sequential generation (after first image). The rigging
         # branch used an ``elif`` after the TRELLIS branch, so an enabled
         # initial-only TRELLIS style did not fall through on later views.
         # Preserve that quirk unless the corrected routing experiment is on.
-        if getattr(context.scene, 'sg_rework_qwen_workflow', False):
-            use_sequential_style = style_image_info is None and not is_initial_image
-        else:
-            use_sequential_style = (
-                not use_external_this_frame
-                and not trellis_style_branch
-                and not is_initial_image
-            )
+        use_sequential_style = style_image_info is None and not is_initial_image
         if use_sequential_style:
             if context_mode == 'REPLACE_STYLE':
                 # The context render becomes the style image
                 style_image_info = context_render_info
-                if context.scene.qwen_use_custom_prompts:
-                    pos_prompt_text = context.scene.qwen_custom_prompt_seq_replace.format(main_prompt=user_prompt)
-                else:
-                    pos_prompt_text = self._get_qwen_default_prompts(context, is_initial_image).format(main_prompt=user_prompt)
+                pos_prompt_text = self._get_qwen_default_prompts(
+                    context, is_initial_image
+                ).format(main_prompt=user_prompt)
                 prompt[NODES['pos_prompt']]['inputs']['prompt'] = pos_prompt_text
             elif context.scene.sequential_ipadapter: # Use previous generated image
                 if context.scene.sequential_ipadapter_mode == 'original_render':
@@ -806,10 +1069,9 @@ class _TexturingWorkflowMixin:
                     self.operator._error = f"Sequential mode error: Could not find previous image for camera {ref_cam_id} to use as style."
                     return {"error": "conn_failed"}
                 if context_mode != 'ADDITIONAL':
-                    if context.scene.qwen_use_custom_prompts:
-                        pos_prompt_text = context.scene.qwen_custom_prompt_seq_none.format(main_prompt=user_prompt)
-                    else:
-                        pos_prompt_text = self._get_qwen_default_prompts(context, is_initial_image).format(main_prompt=user_prompt)
+                    pos_prompt_text = self._get_qwen_default_prompts(
+                        context, is_initial_image
+                    ).format(main_prompt=user_prompt)
                     prompt[NODES['pos_prompt']]['inputs']['prompt'] = pos_prompt_text
             # If neither of the above, style_image_info remains None, handled below
 
@@ -828,10 +1090,9 @@ class _TexturingWorkflowMixin:
             else:
                 del prompt[NODES['pos_prompt']]['inputs']['image2']
                 del prompt[NODES['neg_prompt']]['inputs']['image2']
-            if context.scene.qwen_use_custom_prompts:
-                pos_prompt_text = (context.scene.qwen_custom_prompt_initial if is_initial_image else context.scene.qwen_custom_prompt_seq_none).format(main_prompt=user_prompt)
-            else:
-                pos_prompt_text = self._get_qwen_default_prompts(context, is_initial_image).format(main_prompt=user_prompt)
+            pos_prompt_text = self._get_qwen_default_prompts(
+                context, is_initial_image
+            ).format(main_prompt=user_prompt)
             prompt[NODES['pos_prompt']]['inputs']['prompt'] = pos_prompt_text
         else:
             # A style image is provided, so set the loader input.
@@ -865,22 +1126,41 @@ class _TexturingWorkflowMixin:
                 prompt[NODES['pos_prompt']]['inputs'][style_slot] = [scale_node_key, 0]
                 prompt[NODES['neg_prompt']]['inputs'][style_slot] = [scale_node_key, 0]
 
-        # --- Reference Latent chain (Qwen unzoom fix) ---
-        latent_slots = qwen_reference_latent_slots(
-            context_mode,
-            is_initial_image,
-            getattr(context.scene, 'qwen_global_style_vlm_only', False),
-        )
-        if 'image3' not in latent_slots and 'image3' in prompt[NODES['pos_prompt']]['inputs']:
-            print(
-                "[StableGen] Qwen Image 3 global style is VLM-only; "
-                "skipping its ReferenceLatent"
+        if is_qwen21:
+            self._convert_to_qwen_image_21(
+                prompt,
+                NODES,
+                context,
+                projected_context_target=(
+                    not is_initial_image
+                    and context_mode in {'REPLACE_STYLE', 'ADDITIONAL'}
+                    and context_render_info is not None
+                ),
             )
-        self._build_qwen_reference_latent_chain(
-            prompt,
-            NODES,
-            latent_slots=latent_slots,
-        )
+        else:
+            # --- Reference Latent chain (Qwen unzoom fix) ---
+            latent_slots = qwen_reference_latent_slots(
+                context_mode,
+                is_initial_image,
+                experimental_enabled(context.scene, 'qwen_global_style_vlm_only'),
+                bool(
+                    experimental_enabled(context.scene, 'qwen_context_vlm_only')
+                    and context_render_info
+                    and (context_mode == 'ADDITIONAL' or style_image_info == context_render_info)
+                ),
+            )
+            if 'image2' not in latent_slots and 'image2' in prompt[NODES['pos_prompt']]['inputs']:
+                print("[StableGen] Qwen projected context is VLM-only; skipping its ReferenceLatent")
+            if 'image3' not in latent_slots and 'image3' in prompt[NODES['pos_prompt']]['inputs']:
+                print(
+                    "[StableGen] Qwen Image 3 global style is VLM-only; "
+                    "skipping its ReferenceLatent"
+                )
+            self._build_qwen_reference_latent_chain(
+                prompt,
+                NODES,
+                latent_slots=latent_slots,
+            )
 
         # --- Sampler-level latent-locked context inpainting ---
         # Unlike the RGB/magenta conditioning alone, this makes the exported
@@ -933,12 +1213,13 @@ class _TexturingWorkflowMixin:
             )
 
         # --- Configure Sampler ---
-        prompt[NODES['sampler']]['inputs']['seed'] = context.scene.seed
-        prompt[NODES['sampler']]['inputs']['steps'] = context.scene.steps
-        prompt[NODES['sampler']]['inputs']['cfg'] = context.scene.cfg
-        prompt[NODES['sampler']]['inputs']['sampler_name'] = context.scene.sampler
-        prompt[NODES['sampler']]['inputs']['scheduler'] = context.scene.scheduler
-        prompt[NODES['sampler']]['inputs']['denoise'] = 1.0 # Typically 1.0 for this kind of edit
+        if not is_qwen21:
+            prompt[NODES['sampler']]['inputs']['seed'] = context.scene.seed
+            prompt[NODES['sampler']]['inputs']['steps'] = context.scene.steps
+            prompt[NODES['sampler']]['inputs']['cfg'] = context.scene.cfg
+            prompt[NODES['sampler']]['inputs']['sampler_name'] = context.scene.sampler
+            prompt[NODES['sampler']]['inputs']['scheduler'] = context.scene.scheduler
+            prompt[NODES['sampler']]['inputs']['denoise'] = 1.0
 
         # --- Set UNET model ---
         if is_nunchaku:
@@ -954,11 +1235,13 @@ class _TexturingWorkflowMixin:
                     "title": "Nunchaku Qwen-Image DiT Loader"
                 }
              }
-        else:
+        elif not is_qwen21:
             prompt[NODES['unet_loader']]['inputs']['unet_name'] = context.scene.model_name
 
         graph_issues = (validate_workflow_graph(
-            prompt, (NODES['pos_prompt'], NODES['neg_prompt'])
+            prompt,
+            ((NODES['pos_prompt'],) if is_qwen21
+             else (NODES['pos_prompt'], NODES['neg_prompt'])),
         ))
         if graph_issues:
             self.operator._error = "Invalid Qwen edit workflow: " + "; ".join(graph_issues)
@@ -1308,10 +1591,12 @@ class _TexturingWorkflowMixin:
         # Double-check here in case the property wasn't synced yet.
         if getattr(scene, 'architecture_mode', '') == 'trellis2':
             tex_mode = getattr(scene, 'trellis2_texture_mode', 'native')
-            if tex_mode not in ('sdxl', 'flux1', 'qwen_image_edit', 'flux2_klein'):
+            if tex_mode not in ('sdxl', 'flux1', 'qwen_image_edit', 'qwen_image_21', 'flux2_klein'):
                 architecture = getattr(scene, 'trellis2_initial_image_arch', 'sdxl')
 
-        if architecture == 'qwen_image_edit':
+        if architecture == 'qwen_image_21':
+            prompt, save_node = self._build_qwen_image_21_txt2img(context)
+        elif architecture == 'qwen_image_edit':
             prompt, save_node = self._build_qwen_txt2img(context)
         elif architecture == 'flux1':
             prompt, save_node = self._build_flux_txt2img(context)
@@ -2027,6 +2312,35 @@ class _TexturingWorkflowMixin:
         prompt["6"]["inputs"]["model"] = final_model
 
         return prompt, "7"
+
+    def _build_qwen_image_21_txt2img(self, context):
+        """Return a native Qwen-Image 2.1 text-to-image graph."""
+        prompt = json.loads(prompt_text_qwen_image_edit)
+        nodes = {
+            'sampler': "1",
+            'save_image': "5",
+            'model_sampler': "6",
+            'pos_prompt': "12",
+            'neg_prompt': "11",
+            'unet_loader': "13",
+            'guidance_map_loader': "14",
+            'style_map_loader': "15",
+            'context_render_loader': "16",
+        }
+
+        prompt[nodes['pos_prompt']]['inputs']['prompt'] = _generation_prompt(context.scene)
+        for encoder_id in (nodes['pos_prompt'], nodes['neg_prompt']):
+            for slot in ('image1', 'image2', 'image3'):
+                prompt[encoder_id]['inputs'].pop(slot, None)
+        for loader_id in (
+            nodes['guidance_map_loader'],
+            nodes['style_map_loader'],
+            nodes['context_render_loader'],
+        ):
+            prompt.pop(loader_id, None)
+
+        self._convert_to_qwen_image_21(prompt, nodes, context)
+        return prompt, nodes['save_image']
 
     def _create_base_prompt(self, context):
         """Creates and configures the base prompt with user settings."""

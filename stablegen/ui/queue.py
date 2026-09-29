@@ -840,7 +840,7 @@ def _queue_tick():
 
             # Trellis2Generate finished — enter settling phase to wait for
             # _schedule_texture_generation / _deferred_generate to fire.
-            if tex_mode in ('sdxl', 'flux1', 'qwen_image_edit', 'flux2_klein'):
+            if tex_mode in ('sdxl', 'flux1', 'qwen_image_edit', 'qwen_image_21', 'flux2_klein'):
                 _queue_phase = 'settling'
                 _queue_settle_deadline = _time.monotonic() + 15.0  # generous: server may need VRAM flush
                 _queue_texturing_seen = False

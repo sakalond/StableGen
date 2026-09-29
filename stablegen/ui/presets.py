@@ -15,7 +15,7 @@ PRESETS = {
     "UV INPAINTING": {"description": "Recommended UV Inpainting setup. It is recommended to bake texutures manually before running the generation to fine-tune unwrapping and avoid lag when generating.", "control_after_generate": "fixed", "model_architecture": "sdxl", "steps": 10, "cfg": 1.5, "sampler": "dpmpp_2s_ancestral", "scheduler": "sgm_uniform", "fallback_color": mathutils.Color((0.0, 0.0, 0.0)), "discard_factor": 80.0, "weight_exponent": 3.0, "weight_exponent_generation_only": False, "weight_exponent_after_generation": 15.0, "clip_skip": 1, "auto_rescale": True, "overwrite_material": True, "generation_method": "uv_inpaint", "refine_images": False, "refine_steps": 8, "refine_sampler": "dpmpp_2s_ancestral", "refine_scheduler": "sgm_uniform", "denoise": 0.8, "refine_cfg": 1.5, "refine_prompt": "", "refine_upscale_method": "lanczos", "sequential_smooth": True, "sequential_custom_camera_order": "3,0,1,2", "sequential_factor": 0.6000000238418579, "sequential_factor_smooth": 0.11000001430511475, "sequential_factor_smooth_2": 1.0, "sequential_ipadapter": True, "sequential_ipadapter_mode": "first", "sequential_ipadapter_regenerate": False, "ipadapter_weight_type": "style", "ipadapter_strength": 1.0, "ipadapter_start": 0.0, "ipadapter_end": 1.0, "differential_diffusion": True, "differential_noise": True, "blur_mask": True, "blur_mask_radius": 3, "blur_mask_sigma": 1.0, "grow_mask_by": 3, "canny_threshold_low": 0, "canny_threshold_high": 80, "pbr_decomposition": False, "lora_units": [{'model_name': 'sdxl_lightning_8step_lora.safetensors', 'model_strength': 1.0, 'clip_strength': 1.0}]}, # No ControlNet for UV Inpainting by default
     "ARCHITECTURE": {"description": "Prioritizes only the most straight-on camera for each point. This means details generated on flat surfaces will not get blurred by getting generated differently from two or more viewpoints. Does not use visibility masking. Each picture will get generated as new, consistency depends on IPAdapter + geometry.", "control_after_generate": "fixed", "model_architecture": "sdxl", "steps": 8, "cfg": 1.5, "sampler": "dpmpp_2s_ancestral", "scheduler": "sgm_uniform", "fallback_color": mathutils.Color((0.0, 0.0, 0.0)), "discard_factor": 80.0, "weight_exponent": 10.0, "weight_exponent_generation_only": False, "weight_exponent_after_generation": 15.0, "clip_skip": 1, "auto_rescale": True, "overwrite_material": True, "generation_method": "separate", "refine_images": False, "refine_steps": 8, "refine_sampler": "dpmpp_2s_ancestral", "refine_scheduler": "sgm_uniform", "denoise": 0.8, "refine_cfg": 1.5, "refine_prompt": "", "refine_upscale_method": "lanczos", "sequential_smooth": False, "sequential_custom_camera_order": "", "sequential_factor": 0.75, "sequential_factor_smooth": 0.15000000596046448, "sequential_factor_smooth_2": 1.0, "sequential_ipadapter": True, "sequential_ipadapter_mode": "first", "ipadapter_weight_type": "style", "ipadapter_strength": 0.800000011920929, "ipadapter_start": 0.0, "ipadapter_end": 1.0, "differential_diffusion": True, "differential_noise": False, "blur_mask": True, "blur_mask_radius": 3, "blur_mask_sigma": 1.0, "grow_mask_by": 3, "canny_threshold_low": 0, "canny_threshold_high": 80, "pbr_decomposition": False, "controlnet_units": [{'unit_type': 'depth', 'model_name': 'controlnet_depth_sdxl.safetensors', 'strength': 0.6000000238418579, 'start_percent': 0.0, 'end_percent': 1.0, 'is_union': False, 'use_union_type': True}], "lora_units": [{'model_name': 'sdxl_lightning_8step_lora.safetensors', 'model_strength': 1.0, 'clip_strength': 1.0}]},
     "QWEN PRECISE": {"description": "Precise detail when camera overlap is good. Relies on context renders plus the prompt, so sparse coverage can still introduce artifacts.", "control_after_generate": "fixed", "model_architecture": "qwen_image_edit","qwen_generation_method": "generate", "steps": 4, "cfg": 1.0, "sampler": "euler", "scheduler": "simple", "fallback_color": mathutils.Color((0.0, 0.0, 0.0)), "discard_factor": 70.0, "discard_factor_generation_only": True, "discard_factor_after_generation": 90.0, "weight_exponent": 3.0, "weight_exponent_generation_only": False, "weight_exponent_after_generation": 15.0, "qwen_voronoi_mode": False, "clip_skip": 1, "auto_rescale": True, "overwrite_material": True, "generation_method": "sequential", "refine_images": False, "refine_steps": 8, "refine_sampler": "dpmpp_2s_ancestral", "refine_scheduler": "sgm_uniform", "denoise": 0.8, "refine_cfg": 1.5, "refine_prompt": "", "refine_upscale_method": "lanczos", "sequential_smooth": True, "sequential_custom_camera_order": "", "sequential_factor": 0.699999988079071, "sequential_factor_smooth": 0.15000000596046448, "sequential_factor_smooth_2": 1.0, "sequential_ipadapter": False, "sequential_ipadapter_mode": "first", "sequential_desaturate_factor": 0.0, "sequential_contrast_factor": 0.0, "sequential_ipadapter_regenerate": False, "ipadapter_weight_type": "style", "ipadapter_strength": 1.0, "ipadapter_start": 0.0, "ipadapter_end": 1.0, "differential_diffusion": True, "differential_noise": True, "blur_mask": True, "blur_mask_radius": 1, "blur_mask_sigma": 1.0, "grow_mask_by": 3, "canny_threshold_low": 0, "canny_threshold_high": 80, "qwen_guidance_map_type": "depth", "qwen_use_external_style_image": False, "qwen_external_style_image": "", "qwen_context_render_mode": "REPLACE_STYLE", "qwen_external_style_initial_only": False, "qwen_use_custom_prompts": False, "qwen_custom_prompt_initial": "Change the format of image 1 to '{main_prompt}'", "qwen_custom_prompt_seq_none": "Change and transfer the format of '{main_prompt}' in image 1 to the style from image 2", "qwen_custom_prompt_seq_replace": "Change and transfer the format of image 1 to '{main_prompt}'. Replace all solid magenta areas in image 2. Replace the background with solid gray. The style from image 2 should smoothly continue into the previously magenta areas.", "qwen_custom_prompt_seq_additional": "Change and transfer the format of image 1 to '{main_prompt}'. Replace all solid magenta areas in image 2. Replace the background with solid gray. The style from image 2 should smoothly continue into the previously magenta areas. Image 3 represents the overall style of the object.", "qwen_guidance_fallback_color": mathutils.Color((1.0, 0.0, 1.0)), "qwen_guidance_background_color": mathutils.Color((1.0, 0.0, 1.0)), "qwen_context_cleanup": False, "qwen_context_cleanup_hue_tolerance": 0.0, "qwen_context_cleanup_value_adjust": 0.0, "qwen_context_fallback_dilation": 1, "qwen_prompt_gray_background": True, "qwen_rescale_alignment": True, "pbr_decomposition": False, "lora_units": [{'model_name': 'Qwen-Image-Edit-2509-Lightning-4steps-V1.0-bf16.safetensors', 'model_strength': 1.0, 'clip_strength': 0.0}]},
-    "QWEN SAFE": {"description": "Safer fallback when coverage is limited. Uses the previous view (recent mode) instead of context renders to keep global look coherent, at the cost of some fine-detail persistence.", "control_after_generate": "fixed", "model_architecture": "qwen_image_edit", "qwen_generation_method": "generate", "steps": 4, "cfg": 1.0, "sampler": "euler", "scheduler": "simple", "fallback_color": mathutils.Color((0.0, 0.0, 0.0)), "discard_factor": 70.0, "discard_factor_generation_only": True, "discard_factor_after_generation": 90.0, "weight_exponent": 6.0, "weight_exponent_generation_only": False, "weight_exponent_after_generation": 15.0, "qwen_voronoi_mode": False, "clip_skip": 1, "auto_rescale": True, "overwrite_material": True, "generation_method": "sequential", "refine_images": False, "refine_steps": 8, "refine_sampler": "dpmpp_2s_ancestral", "refine_scheduler": "sgm_uniform", "denoise": 0.8, "refine_cfg": 1.5, "refine_prompt": "", "refine_upscale_method": "lanczos", "sequential_smooth": True, "sequential_custom_camera_order": "", "sequential_factor": 0.699999988079071, "sequential_factor_smooth": 0.15000000596046448, "sequential_factor_smooth_2": 1.0, "sequential_ipadapter": True, "sequential_ipadapter_mode": "first", "sequential_desaturate_factor": 0.0, "sequential_contrast_factor": 0.10000000149011612, "sequential_ipadapter_regenerate": False, "ipadapter_weight_type": "style", "ipadapter_strength": 1.0, "ipadapter_start": 0.0, "ipadapter_end": 1.0, "early_priority": False, "early_priority_strength": 0.5, "differential_diffusion": True, "differential_noise": True, "blur_mask": True, "blur_mask_radius": 1, "blur_mask_sigma": 1.0, "grow_mask_by": 3, "canny_threshold_low": 0, "canny_threshold_high": 80, "qwen_guidance_map_type": "depth", "qwen_use_external_style_image": False, "qwen_external_style_image": "", "qwen_context_render_mode": "NONE", "qwen_external_style_initial_only": False, "qwen_use_custom_prompts": False, "qwen_custom_prompt_initial": "Change the format of image 1 to '{main_prompt}'", "qwen_custom_prompt_seq_none": "Change and transfer the format of '{main_prompt}' in image 1 to the style from image 2", "qwen_custom_prompt_seq_replace": "Change and transfer the format of image 1 to '{main_prompt}'. Replace all solid magenta areas in image 2. Replace the background with solid gray. The style from image 2 should smoothly continue into the previously magenta areas.", "qwen_custom_prompt_seq_additional": "Change and transfer the format of image 1 to '{main_prompt}'. Replace all solid magenta areas in image 2. Replace the background with solid gray. The style from image 2 should smoothly continue into the previously magenta areas. Image 3 represents the overall style of the object.", "qwen_guidance_fallback_color": mathutils.Color((1.0, 0.0, 1.0)), "qwen_guidance_background_color": mathutils.Color((1.0, 0.0, 1.0)), "qwen_context_cleanup": False, "qwen_context_cleanup_hue_tolerance": 0.0, "qwen_context_cleanup_value_adjust": 0.0, "qwen_context_fallback_dilation": 1, "qwen_prompt_gray_background": True, "qwen_rescale_alignment": True, "pbr_decomposition": False, "lora_units": [{'model_name': 'Qwen-Image-Edit-2509-Lightning-4steps-V1.0-bf16.safetensors', 'model_strength': 1.0, 'clip_strength': 0.0}]},
+    "QWEN SAFE": {"description": "Safer fallback when coverage is limited. Uses the initial generated view as the reference for every later camera instead of context renders, improving global appearance consistency at the cost of extra conditioning time.", "control_after_generate": "fixed", "model_architecture": "qwen_image_edit", "qwen_generation_method": "generate", "steps": 4, "cfg": 1.0, "sampler": "euler", "scheduler": "simple", "fallback_color": mathutils.Color((0.0, 0.0, 0.0)), "discard_factor": 70.0, "discard_factor_generation_only": True, "discard_factor_after_generation": 90.0, "weight_exponent": 6.0, "weight_exponent_generation_only": False, "weight_exponent_after_generation": 15.0, "qwen_voronoi_mode": False, "clip_skip": 1, "auto_rescale": True, "overwrite_material": True, "generation_method": "sequential", "refine_images": False, "refine_steps": 8, "refine_sampler": "dpmpp_2s_ancestral", "refine_scheduler": "sgm_uniform", "denoise": 0.8, "refine_cfg": 1.5, "refine_prompt": "", "refine_upscale_method": "lanczos", "sequential_smooth": True, "sequential_custom_camera_order": "", "sequential_factor": 0.699999988079071, "sequential_factor_smooth": 0.15000000596046448, "sequential_factor_smooth_2": 1.0, "sequential_ipadapter": True, "sequential_ipadapter_mode": "first", "sequential_desaturate_factor": 0.0, "sequential_contrast_factor": 0.10000000149011612, "sequential_ipadapter_regenerate": False, "ipadapter_weight_type": "style", "ipadapter_strength": 1.0, "ipadapter_start": 0.0, "ipadapter_end": 1.0, "early_priority": False, "early_priority_strength": 0.5, "differential_diffusion": True, "differential_noise": True, "blur_mask": True, "blur_mask_radius": 1, "blur_mask_sigma": 1.0, "grow_mask_by": 3, "canny_threshold_low": 0, "canny_threshold_high": 80, "qwen_guidance_map_type": "depth", "qwen_use_external_style_image": False, "qwen_external_style_image": "", "qwen_context_render_mode": "NONE", "qwen_external_style_initial_only": False, "qwen_use_custom_prompts": False, "qwen_custom_prompt_initial": "Change the format of image 1 to '{main_prompt}'", "qwen_custom_prompt_seq_none": "Change and transfer the format of '{main_prompt}' in image 1 to the style from image 2", "qwen_custom_prompt_seq_replace": "Change and transfer the format of image 1 to '{main_prompt}'. Replace all solid magenta areas in image 2. Replace the background with solid gray. The style from image 2 should smoothly continue into the previously magenta areas.", "qwen_custom_prompt_seq_additional": "Change and transfer the format of image 1 to '{main_prompt}'. Replace all solid magenta areas in image 2. Replace the background with solid gray. The style from image 2 should smoothly continue into the previously magenta areas. Image 3 represents the overall style of the object.", "qwen_guidance_fallback_color": mathutils.Color((1.0, 0.0, 1.0)), "qwen_guidance_background_color": mathutils.Color((1.0, 0.0, 1.0)), "qwen_context_cleanup": False, "qwen_context_cleanup_hue_tolerance": 0.0, "qwen_context_cleanup_value_adjust": 0.0, "qwen_context_fallback_dilation": 1, "qwen_prompt_gray_background": True, "qwen_rescale_alignment": True, "pbr_decomposition": False, "lora_units": [{'model_name': 'Qwen-Image-Edit-2509-Lightning-4steps-V1.0-bf16.safetensors', 'model_strength': 1.0, 'clip_strength': 0.0}]},
     "QWEN ALT": {"description": "Balanced option that mixes additional context renders with sequential references to smooth out coverage while keeping detail reasonable.", "control_after_generate": "fixed", "model_architecture": "qwen_image_edit", "qwen_generation_method": "generate", "steps": 4, "cfg": 1.0, "sampler": "euler", "scheduler": "simple", "fallback_color": mathutils.Color((0.0, 0.0, 0.0)), "discard_factor": 70.0, "discard_factor_generation_only": True, "discard_factor_after_generation": 90.0, "weight_exponent": 3.0, "weight_exponent_generation_only": False, "weight_exponent_after_generation": 15.0, "qwen_voronoi_mode": False, "clip_skip": 1, "auto_rescale": True, "overwrite_material": True, "generation_method": "sequential", "refine_images": False, "refine_steps": 8, "refine_sampler": "dpmpp_2s_ancestral", "refine_scheduler": "sgm_uniform", "denoise": 0.8, "refine_cfg": 1.5, "refine_prompt": "", "refine_upscale_method": "lanczos", "sequential_smooth": True, "sequential_custom_camera_order": "", "sequential_factor": 0.699999988079071, "sequential_factor_smooth": 0.15000000596046448, "sequential_factor_smooth_2": 1.0, "sequential_ipadapter": True, "sequential_ipadapter_mode": "recent", "sequential_desaturate_factor": 0.0, "sequential_contrast_factor": 0.10000000149011612, "sequential_ipadapter_regenerate": False, "ipadapter_weight_type": "style", "ipadapter_strength": 1.0, "ipadapter_start": 0.0, "ipadapter_end": 1.0, "differential_diffusion": True, "differential_noise": True, "blur_mask": True, "blur_mask_radius": 1, "blur_mask_sigma": 1.0, "grow_mask_by": 3, "canny_threshold_low": 0, "canny_threshold_high": 80, "qwen_guidance_map_type": "depth", "qwen_use_external_style_image": False, "qwen_external_style_image": "", "qwen_context_render_mode": "ADDITIONAL", "qwen_external_style_initial_only": False, "qwen_use_custom_prompts": False, "qwen_custom_prompt_initial": "Change the format of image 1 to '{main_prompt}'", "qwen_custom_prompt_seq_none": "Change and transfer the format of '{main_prompt}' in image 1 to the style from image 2", "qwen_custom_prompt_seq_replace": "Change and transfer the format of image 1 to '{main_prompt}'. Replace all solid magenta areas in image 2. Replace the background with solid gray. The style from image 2 should smoothly continue into the previously magenta areas.", "qwen_custom_prompt_seq_additional": "Change and transfer the format of image 1 to '{main_prompt}'. Replace all solid magenta areas in image 2. Replace the background with solid gray. The style from image 2 should smoothly continue into the previously magenta areas. Image 3 represents the overall style of the object.", "qwen_guidance_fallback_color": mathutils.Color((1.0, 0.0, 1.0)), "qwen_guidance_background_color": mathutils.Color((1.0, 0.0, 1.0)), "qwen_context_cleanup": False, "qwen_context_cleanup_hue_tolerance": 0.0, "qwen_context_cleanup_value_adjust": 0.0, "qwen_context_fallback_dilation": 1, "qwen_prompt_gray_background": True, "qwen_rescale_alignment": True, "early_priority": True, "early_priority_strength": 0.5, "pbr_decomposition": False, "lora_units": [{'model_name': 'Qwen-Image-Edit-2509-Lightning-4steps-V1.0-bf16.safetensors', 'model_strength': 1.0, 'clip_strength': 0.0}]},     
     "QWEN VORONOI": {"description": "Voronoi projection mode with exponent 1000 for hard camera segmentation during generation, then resets to 15 for softer blending. Each surface point is dominated by its closest camera. Based on Qwen Precise.", "control_after_generate": "fixed", "model_architecture": "qwen_image_edit", "qwen_generation_method": "generate", "steps": 4, "cfg": 1.0, "sampler": "euler", "scheduler": "simple", "fallback_color": mathutils.Color((0.0, 0.0, 0.0)), "discard_factor": 70.0, "discard_factor_generation_only": True, "discard_factor_after_generation": 90.0, "weight_exponent": 1000.0, "weight_exponent_generation_only": True, "weight_exponent_after_generation": 15.0, "qwen_voronoi_mode": True, "clip_skip": 1, "auto_rescale": True, "overwrite_material": True, "generation_method": "sequential", "refine_images": False, "refine_steps": 8, "refine_sampler": "dpmpp_2s_ancestral", "refine_scheduler": "sgm_uniform", "denoise": 0.8, "refine_cfg": 1.5, "refine_prompt": "", "refine_upscale_method": "lanczos", "sequential_smooth": True, "sequential_custom_camera_order": "", "sequential_factor": 0.699999988079071, "sequential_factor_smooth": 0.15000000596046448, "sequential_factor_smooth_2": 1.0, "sequential_ipadapter": False, "sequential_ipadapter_mode": "first", "sequential_desaturate_factor": 0.0, "sequential_contrast_factor": 0.0, "sequential_ipadapter_regenerate": False, "ipadapter_weight_type": "style", "ipadapter_strength": 1.0, "ipadapter_start": 0.0, "ipadapter_end": 1.0, "differential_diffusion": True, "differential_noise": True, "blur_mask": True, "blur_mask_radius": 1, "blur_mask_sigma": 1.0, "grow_mask_by": 3, "canny_threshold_low": 0, "canny_threshold_high": 80, "qwen_guidance_map_type": "depth", "qwen_use_external_style_image": False, "qwen_external_style_image": "", "qwen_context_render_mode": "REPLACE_STYLE", "qwen_external_style_initial_only": False, "qwen_use_custom_prompts": False, "qwen_custom_prompt_initial": "Change the format of image 1 to '{main_prompt}'", "qwen_custom_prompt_seq_none": "Change and transfer the format of '{main_prompt}' in image 1 to the style from image 2", "qwen_custom_prompt_seq_replace": "Change and transfer the format of image 1 to '{main_prompt}'. Replace all solid magenta areas in image 2. Replace the background with solid gray. The style from image 2 should smoothly continue into the previously magenta areas.", "qwen_custom_prompt_seq_additional": "Change and transfer the format of image 1 to '{main_prompt}'. Replace all solid magenta areas in image 2. Replace the background with solid gray. The style from image 2 should smoothly continue into the previously magenta areas. Image 3 represents the overall style of the object.", "qwen_guidance_fallback_color": mathutils.Color((1.0, 0.0, 1.0)), "qwen_guidance_background_color": mathutils.Color((1.0, 0.0, 1.0)), "qwen_context_cleanup": False, "qwen_context_cleanup_hue_tolerance": 0.0, "qwen_context_cleanup_value_adjust": 0.0, "qwen_context_fallback_dilation": 1, "qwen_prompt_gray_background": True, "qwen_rescale_alignment": True, "pbr_decomposition": False, "lora_units": [{'model_name': 'Qwen-Image-Edit-2509-Lightning-4steps-V1.0-bf16.safetensors', 'model_strength': 1.0, 'clip_strength': 0.0}]},
     "QWEN PRECISE (NUNCHAKU)": {"description": "Precise detail using Nunchaku. Meant to be used with the Nunchaku model which has the 4-step Lightning LoRA included. Requires Nunchaku nodes.", "control_after_generate": "fixed", "model_architecture": "qwen_image_edit", "qwen_generation_method": "generate", "steps": 4, "cfg": 1.0, "sampler": "euler", "scheduler": "simple", "fallback_color": mathutils.Color((0.0, 0.0, 0.0)), "discard_factor": 70.0, "discard_factor_generation_only": True, "discard_factor_after_generation": 90.0, "weight_exponent": 3.0, "weight_exponent_generation_only": False, "weight_exponent_after_generation": 15.0, "qwen_voronoi_mode": False, "clip_skip": 1, "auto_rescale": True, "overwrite_material": True, "generation_method": "sequential", "refine_images": False, "refine_steps": 8, "refine_sampler": "dpmpp_2s_ancestral", "refine_scheduler": "sgm_uniform", "denoise": 0.8, "refine_cfg": 1.5, "refine_prompt": "", "refine_upscale_method": "lanczos", "sequential_smooth": True, "sequential_custom_camera_order": "", "sequential_factor": 0.699999988079071, "sequential_factor_smooth": 0.15000000596046448, "sequential_factor_smooth_2": 1.0, "sequential_ipadapter": False, "sequential_ipadapter_mode": "first", "sequential_desaturate_factor": 0.0, "sequential_contrast_factor": 0.0, "sequential_ipadapter_regenerate": False, "ipadapter_weight_type": "style", "ipadapter_strength": 1.0, "ipadapter_start": 0.0, "ipadapter_end": 1.0, "differential_diffusion": True, "differential_noise": True, "blur_mask": True, "blur_mask_radius": 1, "blur_mask_sigma": 1.0, "grow_mask_by": 3, "canny_threshold_low": 0, "canny_threshold_high": 80, "qwen_guidance_map_type": "depth", "qwen_use_external_style_image": False, "qwen_external_style_image": "", "qwen_context_render_mode": "REPLACE_STYLE", "qwen_external_style_initial_only": False, "qwen_use_custom_prompts": False, "qwen_custom_prompt_initial": "Change the format of image 1 to '{main_prompt}'", "qwen_custom_prompt_seq_none": "Change and transfer the format of '{main_prompt}' in image 1 to the style from image 2", "qwen_custom_prompt_seq_replace": "Change and transfer the format of image 1 to '{main_prompt}'. Replace all solid magenta areas in image 2. Replace the background with solid gray. The style from image 2 should smoothly continue into the previously magenta areas.", "qwen_custom_prompt_seq_additional": "Change and transfer the format of image 1 to '{main_prompt}'. Replace all solid magenta areas in image 2. Replace the background with solid gray. The style from image 2 should smoothly continue into the previously magenta areas. Image 3 represents the overall style of the object.", "qwen_guidance_fallback_color": mathutils.Color((1.0, 0.0, 1.0)), "qwen_guidance_background_color": mathutils.Color((1.0, 0.0, 1.0)), "qwen_context_cleanup": False, "qwen_context_cleanup_hue_tolerance": 0.0, "qwen_context_cleanup_value_adjust": 0.0, "qwen_context_fallback_dilation": 1, "qwen_prompt_gray_background": True, "qwen_rescale_alignment": True, "pbr_decomposition": False, "lora_units": []},
@@ -71,6 +71,119 @@ PRESETS["QWEN PRECISE+"] = {
     **EXPERIMENTAL_FEATURE_DEFAULTS,
 }
 
+# Qwen-Image 2.1 has its own architecture and native sampler presets. These
+# retain the evaluated StableGen view/context strategies and use the sampler
+# combination that performed best in the projection-oriented comparison.
+PRESETS["QWEN 2.1 PRECISE"] = {
+    **PRESETS["QWEN PRECISE"],
+    "weight_exponent": 7.0,
+    "description": (
+        "Qwen-Image 2.1 multi-view texturing using projected context renders "
+        "to preserve already textured regions and repair uncovered areas. "
+        "Uses the tested projection-oriented configuration of 20 steps, CFG 1, "
+        "DPM++ SDE and SGM Uniform with no Lightning LoRA. This combination "
+        "produced broad, coherent panels that followed the model silhouette and "
+        "continued well into later views. Best when adjacent cameras overlap "
+        "well; sparse coverage can still introduce artifacts. Qwen 2.1 is also "
+        "prompted to generate native RGBA views, independently of the sampler, "
+        "and transparent pixels are excluded from texture projection."
+    ),
+    "model_architecture": "qwen_image_21",
+    "steps": 20,
+    "cfg": 1.0,
+    "sampler": "dpmpp_sde",
+    "scheduler": "sgm_uniform",
+    "qwen_image_21_native_rgba": True,
+    "qwen_guidance_background_color": mathutils.Color((0.5, 0.5, 0.5)),
+    "lora_units": [],
+}
+
+PRESETS["QWEN 2.1 SAFE"] = {
+    **PRESETS["QWEN SAFE"],
+    "weight_exponent": 7.0,
+    "description": (
+        "Qwen-Image 2.1 multi-view texturing that supplies the initial generated "
+        "view as an appearance reference for every later camera. This was the "
+        "strongest evaluated reference strategy for retaining distinctive colors "
+        "and details around the object. Uses the tested projection-oriented "
+        "configuration of 20 steps, CFG 1, DPM++ SDE and SGM Uniform with no "
+        "Lightning LoRA. It favors broad, geometry-following texture regions. "
+        "Qwen 2.1 is prompted to generate native RGBA views independently of the "
+        "sampler, and transparent pixels are excluded from texture projection. "
+        "It is slower when the initial reference is tall or large."
+    ),
+    "model_architecture": "qwen_image_21",
+    "steps": 20,
+    "cfg": 1.0,
+    "sampler": "dpmpp_sde",
+    "scheduler": "sgm_uniform",
+    "qwen_image_21_native_rgba": True,
+    "sequential_ipadapter": True,
+    "sequential_ipadapter_mode": "first",
+    "qwen_context_render_mode": "NONE",
+    "qwen_guidance_background_color": mathutils.Color((0.5, 0.5, 0.5)),
+    "lora_units": [],
+}
+
+PRESETS["QWEN 2.1 CONTEXT + REFERENCE"] = {
+    **PRESETS["QWEN 2.1 PRECISE"],
+    "description": (
+        "Qwen-Image 2.1 sequential texturing combining the live projected context "
+        "with the first generated view as a persistent appearance reference. "
+        "Uses Additional Context and the Qwen 2.1 Default prompt template: the "
+        "model fills magenta regions while retaining existing texture, with a "
+        "depth guide for geometry and the initial view for overall appearance. "
+        "A 50-degree discard angle excludes grazing projections during generation, "
+        "then resets to 90 degrees for the final material; blending exponent is 7. "
+        "Uses 20 steps, CFG 1.0, DPM++ SDE, SGM Uniform, native RGBA output and no "
+        "LoRA. Transparent generated pixels are excluded from projection. "
+        "Confidence-Gated Context, Acquisition Quality Weighting and Depth/Part "
+        "Projection Guard are off; legacy fallback dilation is 1 px, cleanup is "
+        "off and backface projection is allowed. Captures the current manually "
+        "tuned setup; intended for comparing context coverage and appearance "
+        "consistency across overlapping views."
+    ),
+    "architecture_mode": "qwen_image_21",
+    "generation_mode": "standard",
+    "discard_factor": 50.0,
+    "sequential_ipadapter": True,
+    "sequential_ipadapter_mode": "first",
+    "qwen_context_render_mode": "ADDITIONAL",
+    "qwen_timestep_zero_ref": False,
+    "auto_rescale_target_mp": 1.0,
+    "early_priority": False,
+    "early_priority_strength": 0.5,
+    "view_blend_use_color_match": False,
+    "view_blend_color_match_method": "hm-mvgd-hm",
+    "view_blend_color_match_strength": 1.0,
+    "allow_modify_existing_textures": False,
+    "weight_exponent_mask": False,
+    "mask_blocky": False,
+    "sg_silhouette_margin": 3,
+    "sg_silhouette_depth": 0.05,
+    "sg_silhouette_rays": "4",
+    "qwen_use_trellis2_style": False,
+    **TEXTURING_DEFAULTS,
+}
+
+# Stock presets select their architecture's native guidance wording. Including
+# the enum makes applying one reset a previously selected comparison template.
+for _preset_values in PRESETS.values():
+    _preset_architecture = _preset_values.get("model_architecture")
+    if _preset_architecture == "qwen_image_edit":
+        _preset_values.setdefault("qwen_prompt_template", "QWEN_EDIT_LEGACY")
+    elif _preset_architecture == "qwen_image_21":
+        _preset_values.setdefault("qwen_prompt_template", "QWEN_21_DEFAULT")
+    if _preset_architecture in {"qwen_image_edit", "qwen_image_21"}:
+        # Prepared-template fields are derived live. Keeping stale copies in a
+        # stock preset would overwrite them after the template is selected.
+        for _prompt_field in (
+            "qwen_custom_prompt_initial",
+            "qwen_custom_prompt_seq_none",
+            "qwen_custom_prompt_seq_replace",
+            "qwen_custom_prompt_seq_additional",
+        ):
+            _preset_values.pop(_prompt_field, None)
 
 # Global list of all generation parameter names to check for a preset.
 GEN_PARAMETERS = [
@@ -146,6 +259,7 @@ GEN_PARAMETERS = [
     'qwen_context_render_mode',
     'qwen_external_style_initial_only',
     'qwen_use_custom_prompts',
+    'qwen_prompt_template',
     'qwen_custom_prompt_initial',
     'qwen_custom_prompt_seq_none',
     'qwen_custom_prompt_seq_replace',
@@ -169,6 +283,7 @@ GEN_PARAMETERS = [
     'qwen_residual_fallback_tolerance',
     'qwen_prompt_gray_background',
     'qwen_rescale_alignment',
+    'qwen_image_21_native_rgba',
     'qwen_generation_method',
     'qwen_refine_use_prev_ref',
     'qwen_refine_use_depth',
@@ -269,6 +384,7 @@ def get_preset_items(self, context):
     _ARCH_GROUP_ORDER = [
         ('sdxl',            'SDXL / FLUX.1'),
         ('qwen_image_edit', 'Qwen Image Edit'),
+        ('qwen_image_21',   'Qwen Image 2.1'),
         ('flux2_klein',     'FLUX.2 Klein'),
         ('trellis2',        'TRELLIS.2 Pipeline'),
     ]
@@ -429,18 +545,35 @@ class ResetQwenPrompt(bpy.types.Operator):
         is_klein = getattr(context.scene, 'model_architecture', '') == 'flux2_klein'
         get_defaults = wm._get_klein_default_prompts if is_klein else wm._get_qwen_default_prompts
 
+        def built_in_prompt(is_initial, context_mode=None):
+            if is_klein:
+                return get_defaults(context, is_initial_image=is_initial)
+            selected = context.scene.qwen_prompt_template
+            if selected == 'CUSTOM':
+                selected = (
+                    'QWEN_21_DEFAULT'
+                    if context.scene.model_architecture == 'qwen_image_21'
+                    else 'QWEN_EDIT_LEGACY'
+                )
+            return get_defaults(
+                context,
+                is_initial_image=is_initial,
+                template_id=selected,
+                context_mode_override=context_mode,
+            )
+
         # Determine which prompt to reset
         if self.prompt_type == 'initial':
-            default_prompt = get_defaults(context, is_initial_image=True)
+            default_prompt = built_in_prompt(True)
             context.scene.qwen_custom_prompt_initial = default_prompt
         elif self.prompt_type == 'seq_none':
-            default_prompt = get_defaults(context, is_initial_image=False)
+            default_prompt = built_in_prompt(False, 'NONE')
             context.scene.qwen_custom_prompt_seq_none = default_prompt
         elif self.prompt_type == 'seq_replace':
-            default_prompt = get_defaults(context, is_initial_image=False)
+            default_prompt = built_in_prompt(False, 'REPLACE_STYLE')
             context.scene.qwen_custom_prompt_seq_replace = default_prompt
         elif self.prompt_type == 'seq_additional':
-            default_prompt = get_defaults(context, is_initial_image=False)
+            default_prompt = built_in_prompt(False, 'ADDITIONAL')
             context.scene.qwen_custom_prompt_seq_additional = default_prompt
         
         self.report({'INFO'}, "Prompt reset to default.")
@@ -566,7 +699,7 @@ class ApplyPreset(bpy.types.Operator):
             # include architecture_mode, update the visible dropdown to match.
             if "architecture_mode" not in values:
                 arch = context.scene.model_architecture
-                if arch in ('sdxl', 'flux1', 'qwen_image_edit', 'flux2_klein'):
+                if arch in ('sdxl', 'flux1', 'qwen_image_edit', 'qwen_image_21', 'flux2_klein'):
                     context.scene.architecture_mode = arch
 
             if skipped:

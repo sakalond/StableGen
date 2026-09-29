@@ -17,9 +17,13 @@ from .callbacks import (
     update_trellis2_texture_mode,
     update_print_preset,
     update_print_dithered,
+    update_qwen_prompt_dependencies,
+    update_qwen_prompt_field,
+    update_qwen_prompt_template,
 )
 from . import ADDON_PKG
 from ..feature_flags import TEXTURING_DEFAULTS
+from ..texturing.qwen_models import QWEN_PROMPT_TEMPLATE_ITEMS
 
 
 # ── Helper(s) used by properties ───────────────────────────────────────────
@@ -318,7 +322,7 @@ def register_properties(update_model_list, ControlNetUnit, LoRAUnit,
     )
     bpy.types.Scene.model_name = bpy.props.EnumProperty(
         name="Model Name",
-        description="Select the SDXL checkpoint",
+        description="Select a checkpoint or diffusion model compatible with the selected architecture",
         items=update_model_list,
         update=update_parameters
     )
@@ -326,6 +330,18 @@ def register_properties(update_model_list, ControlNetUnit, LoRAUnit,
         name="Model Name Backup",
         description="Internal: stores the last known-good model_name identifier",
         default="",
+        options={'HIDDEN'},
+    )
+    bpy.types.Scene.sg_qwen_21_architecture_migrated = bpy.props.BoolProperty(
+        name="Qwen 2.1 Architecture Migration Complete",
+        description="Internal: prevents compatibility migration from affecting later architecture changes",
+        default=False,
+        options={'HIDDEN'},
+    )
+    bpy.types.Scene.sg_qwen_prompt_template_migrated = bpy.props.BoolProperty(
+        name="Qwen Prompt Template Migration Complete",
+        description="Internal: records migration from the former custom prompt toggle",
+        default=False,
         options={'HIDDEN'},
     )
     bpy.types.Scene.seed = bpy.props.IntProperty(
@@ -400,13 +416,21 @@ def register_properties(update_model_list, ControlNetUnit, LoRAUnit,
         default=True, update=update_parameters
     )
     bpy.types.Scene.qwen_rescale_alignment = bpy.props.BoolProperty(
-        name="Qwen VL-Aligned Rescale",
-        description="Round resolution to multiples of 112 instead of 8 when auto-rescaling. "
-                    "112 is the window size used by the Qwen2.5-VL vision encoder "
-                    "(LCM of VAE factor 8, ViT patch 14, spatial merge 28). "
-                    "The official diffusers pipeline rounds to 32; using 112 is stricter "
-                    "and may reduce subtle zoom / pixel-shift artifacts in some cases",
+        name="Qwen Image Edit VL-Aligned Rescale",
+        description="For Qwen Image Edit, align auto-rescaled dimensions to the "
+                    "112px Qwen2.5-VL vision window instead of 8px. Qwen Image "
+                    "2.1 always uses its separate 32px alignment",
         default=True, update=update_parameters
+    )
+    bpy.types.Scene.qwen_image_21_native_rgba = bpy.props.BoolProperty(
+        name="Native RGBA Output",
+        description=(
+            "Wrap Qwen-Image 2.1 prompts with the native transparency instruction. "
+            "When enabled, transparent generated pixels are excluded from texture "
+            "projection. Disable it to let the prompt and model choose the background"
+        ),
+        default=True,
+        update=update_parameters,
     )
     bpy.types.Scene.auto_rescale_target_mp = bpy.props.FloatProperty(
         name="Target Megapixels",
@@ -471,7 +495,7 @@ def register_properties(update_model_list, ControlNetUnit, LoRAUnit,
     bpy.types.Scene.sequential_ipadapter = bpy.props.BoolProperty(
         name="Use IPAdapter",
         description="Uses IPAdapter to improve consistency between images.\n\n - Applicable for Separate, Sequential and Refine modes.\n - Uses either the first generated image or the most recent one as a reference for the rest of the images.\n - If 'Regenerate IPAdapter' is enabled, the first viewpoint will be regenerated with IPAdapter to match the rest of the images.\n - If 'Use IPAdapter (External Image)' is enabled, this setting is effectively overriden.",
-        default=False, update=update_parameters
+        default=False, update=update_qwen_prompt_dependencies
     )
     bpy.types.Scene.sequential_ipadapter_mode = bpy.props.EnumProperty(
         name="IPAdapter Mode",
@@ -931,7 +955,8 @@ def register_properties(update_model_list, ControlNetUnit, LoRAUnit,
         items=[
             ('sdxl', 'SDXL', ''),
             ('flux1', 'FLUX.1', ''),
-            ('qwen_image_edit', 'Qwen Image Edit', ''),
+            ('qwen_image_edit', 'Qwen Image Edit', 'Qwen-Image-Edit checkpoints'),
+            ('qwen_image_21', 'Qwen Image 2.1', 'Qwen-Image 2.1 checkpoints'),
             ('flux2_klein', 'FLUX.2 Klein', '')
         ],
         default='sdxl',
@@ -943,7 +968,8 @@ def register_properties(update_model_list, ControlNetUnit, LoRAUnit,
         items=[
             ('sdxl', 'SDXL', 'Stable Diffusion XL'),
             ('flux1', 'FLUX.1', 'FLUX.1 architecture'),
-            ('qwen_image_edit', 'Qwen Image Edit', 'Qwen Image Edit architecture'),
+            ('qwen_image_edit', 'Qwen Image Edit', 'Qwen-Image-Edit checkpoints'),
+            ('qwen_image_21', 'Qwen Image 2.1', 'Qwen-Image 2.1 checkpoints'),
             ('flux2_klein', 'FLUX.2 Klein', 'FLUX.2 Klein multi-reference edit model (Apache 2.0)'),
             ('trellis2', 'TRELLIS.2', 'Image to 3D mesh generation with TRELLIS.2'),
         ],
@@ -967,7 +993,8 @@ def register_properties(update_model_list, ControlNetUnit, LoRAUnit,
             ('native', 'Native (TRELLIS.2)', 'Use TRELLIS.2 built-in texture generation'),
             ('sdxl', 'SDXL', 'Use SDXL for camera-based texture projection'),
             ('flux1', 'FLUX.1', 'Use FLUX.1 for camera-based texture projection'),
-            ('qwen_image_edit', 'Qwen Image Edit', 'Use Qwen for camera-based texture projection'),
+            ('qwen_image_edit', 'Qwen Image Edit', 'Use Qwen-Image-Edit for camera-based texture projection'),
+            ('qwen_image_21', 'Qwen Image 2.1', 'Use Qwen-Image 2.1 for camera-based texture projection'),
             ('flux2_klein', 'FLUX.2 Klein', 'Use FLUX.2 Klein for camera-based texture projection'),
         ],
         default='native', update=update_trellis2_texture_mode
@@ -978,7 +1005,8 @@ def register_properties(update_model_list, ControlNetUnit, LoRAUnit,
         items=[
             ('sdxl', 'SDXL', 'Stable Diffusion XL'),
             ('flux1', 'FLUX.1', 'FLUX.1 architecture'),
-            ('qwen_image_edit', 'Qwen Image Edit', 'Qwen Image Edit architecture'),
+            ('qwen_image_edit', 'Qwen Image Edit', 'Qwen-Image-Edit'),
+            ('qwen_image_21', 'Qwen Image 2.1', 'Qwen-Image 2.1'),
             ('flux2_klein', 'FLUX.2 Klein', 'FLUX.2 Klein multi-reference edit'),
         ],
         default='sdxl', update=update_trellis2_initial_image_arch
@@ -1118,7 +1146,7 @@ def register_properties(update_model_list, ControlNetUnit, LoRAUnit,
     bpy.types.Scene.qwen_use_external_style_image = bpy.props.BoolProperty(
         name="Use External Style Image",
         description="Use a separate, external image as the style reference for all viewpoints",
-        default=False, update=update_parameters
+        default=False, update=update_qwen_prompt_dependencies
     )
     bpy.types.Scene.qwen_external_style_image = bpy.props.StringProperty(
         name="Style Reference Image", description="Path to the external style reference image",
@@ -1127,36 +1155,43 @@ def register_properties(update_model_list, ControlNetUnit, LoRAUnit,
     bpy.types.Scene.qwen_external_style_initial_only = bpy.props.BoolProperty(
         name="External for Initial Only",
         description="Use the external style image for the first image, then use the previously generated image for subsequent images",
-        default=False, update=update_parameters
+        default=False, update=update_qwen_prompt_dependencies
     )
     bpy.types.Scene.qwen_use_custom_prompts = bpy.props.BoolProperty(
         name="Use Custom Qwen Prompts",
-        description="Enable to override the default guidance prompts for the Qwen Image Edit workflow",
+        description="Legacy custom prompt control retained for saved files and FLUX.2 Klein",
         default=False, update=update_parameters
+    )
+    bpy.types.Scene.qwen_prompt_template = bpy.props.EnumProperty(
+        name="Prompt Template",
+        description="Prepared guidance wording used by Qwen Image Edit and Qwen Image 2.1",
+        items=QWEN_PROMPT_TEMPLATE_ITEMS,
+        default='QWEN_EDIT_LEGACY',
+        update=update_qwen_prompt_template,
     )
     bpy.types.Scene.qwen_custom_prompt_initial = bpy.props.StringProperty(
         name="Initial Image Prompt",
         description="Custom prompt for the first generated image. Use {main_prompt} to insert the main prompt text.",
         default="Change and transfer the format of '{main_prompt}' in image 1 to the style from image 2",
-        update=update_parameters
+        update=update_qwen_prompt_field
     )
     bpy.types.Scene.qwen_custom_prompt_seq_none = bpy.props.StringProperty(
         name="Sequential Prompt (No Context)",
         description="Custom prompt for subsequent images when Context Render is 'Disabled'. Use {main_prompt} to insert the main prompt text.",
         default="Change and transfer the format of '{main_prompt}' in image 1 to the style from image 2",
-        update=update_parameters
+        update=update_qwen_prompt_field
     )
     bpy.types.Scene.qwen_custom_prompt_seq_replace = bpy.props.StringProperty(
         name="Sequential Prompt (Replace Style)",
         description="Custom prompt for subsequent images when Context Render is 'Replace Style'. Use {main_prompt} to insert the main prompt text.",
         default="Change and transfer the format of image 1 to '{main_prompt}'. Replace all solid magenta areas in image 2. Replace the background with solid gray. The style from image 2 should smoothly continue into the previously magenta areas.",
-        update=update_parameters
+        update=update_qwen_prompt_field
     )
     bpy.types.Scene.qwen_custom_prompt_seq_additional = bpy.props.StringProperty(
         name="Sequential Prompt (Additional Context)",
         description="Custom prompt for subsequent images when Context Render is 'Additional Context'. Use {main_prompt} to insert the main prompt text.",
         default="Change and transfer the format of image 1 to '{main_prompt}'. Replace all solid magenta areas in image 2. Replace the background with solid gray. The style from image 2 should smoothly continue into the previously magenta areas. Image 3 represents the overall style of the object.",
-        update=update_parameters
+        update=update_qwen_prompt_field
     )
     bpy.types.Scene.qwen_guidance_fallback_color = bpy.props.FloatVectorProperty(
         name="Guidance Fallback Color", description="Color used for fallback regions in the Qwen context render",
@@ -1243,7 +1278,7 @@ def register_properties(update_model_list, ControlNetUnit, LoRAUnit,
     bpy.types.Scene.qwen_prompt_gray_background = bpy.props.BoolProperty(
         name="Gray Background Prompt",
         description="Include 'Replace the background with solid gray' in the default context-render prompt. Disable to let the model choose the background freely",
-        default=True, update=update_parameters
+        default=True, update=update_qwen_prompt_dependencies
     )
 
     # ── Misc ───────────────────────────────────────────────────────────
@@ -1419,12 +1454,12 @@ def register_properties(update_model_list, ControlNetUnit, LoRAUnit,
     bpy.types.Scene.qwen_use_trellis2_style = bpy.props.BoolProperty(
         name="Use TRELLIS.2 Input as Style",
         description="Use the TRELLIS.2 input image as the Qwen style reference",
-        default=False, update=update_parameters
+        default=False, update=update_qwen_prompt_dependencies
     )
     bpy.types.Scene.qwen_trellis2_style_initial_only = bpy.props.BoolProperty(
         name="TRELLIS.2 Style for Initial Only",
         description="Use the TRELLIS.2 input image only for the first image, then fall back to sequential style for subsequent images",
-        default=False, update=update_parameters
+        default=False, update=update_qwen_prompt_dependencies
     )
     bpy.types.Scene.trellis2_pipeline_active = bpy.props.BoolProperty(
         name="TRELLIS.2 Pipeline Active",

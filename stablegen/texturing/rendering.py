@@ -174,6 +174,10 @@ class _RenderStateTransaction:
             "material_override": getattr(self.context.view_layer, "material_override", None),
             "shading_light": scene.display.shading.light,
             "shading_color_type": scene.display.shading.color_type,
+            "shading_background_type": scene.display.shading.background_type,
+            "shading_background_color": tuple(
+                scene.display.shading.background_color
+            ),
         }
         self.pass_state = {
             name: getattr(self.context.view_layer, name)
@@ -267,6 +271,8 @@ class _RenderStateTransaction:
             self.context.view_layer.material_override = state["material_override"]
         scene.display.shading.light = state["shading_light"]
         scene.display.shading.color_type = state["shading_color_type"]
+        scene.display.shading.background_type = state["shading_background_type"]
+        scene.display.shading.background_color = state["shading_background_color"]
         for name, value in self.pass_state.items():
             setattr(self.context.view_layer, name, value)
         scene.frame_set(state["frame"])
@@ -1136,7 +1142,10 @@ def export_emit_image(context, to_export, camera_id=None, bg_color=(0.5, 0.5, 0.
             )
 
 
-def _export_render_impl(context, camera_id=None, output_dir=None, filename=None):
+def _export_render_impl(
+    context, camera_id=None, output_dir=None, filename=None,
+    background_color=None,
+):
     """
     Renders the scene from a camera's perspective using Workbench.
     Creates temporary materials for consistent rendering.
@@ -1163,7 +1172,11 @@ def _export_render_impl(context, camera_id=None, output_dir=None, filename=None)
     original_engine = context.scene.render.engine
     original_workbench_settings = {
         'lighting': context.scene.display.shading.light,
-        'color_type': context.scene.display.shading.color_type
+        'color_type': context.scene.display.shading.color_type,
+        'background_type': context.scene.display.shading.background_type,
+        'background_color': tuple(
+            context.scene.display.shading.background_color
+        ),
     }
     original_render_filepath = context.scene.render.filepath
     original_image_settings = context.scene.render.image_settings.file_format
@@ -1175,6 +1188,14 @@ def _export_render_impl(context, camera_id=None, output_dir=None, filename=None)
     # Configure Workbench for a flat, consistent look if needed
     context.scene.display.shading.light = 'STUDIO'
     context.scene.display.shading.color_type = 'SINGLE'
+    if background_color is not None:
+        context.scene.display.shading.background_type = 'VIEWPORT'
+        context.scene.display.shading.background_color = background_color
+        # Camera Workbench renders use World.color even when the viewport
+        # background mode says VIEWPORT. The transaction around this export
+        # restores the user's world color afterwards.
+        if context.scene.world is not None:
+            context.scene.world.color = background_color
 
     render_layer = context.view_layer
     original_combined = render_layer.use_pass_combined
@@ -1208,20 +1229,29 @@ def _export_render_impl(context, camera_id=None, output_dir=None, filename=None)
         context.scene.render.engine = original_engine
     context.scene.display.shading.light = original_workbench_settings['lighting']
     context.scene.display.shading.color_type = original_workbench_settings['color_type']
+    context.scene.display.shading.background_type = original_workbench_settings['background_type']
+    context.scene.display.shading.background_color = original_workbench_settings['background_color']
     context.scene.render.filepath = original_render_filepath
     context.scene.render.image_settings.file_format = original_image_settings
     context.scene.render.use_compositing = original_use_compositing
 
 
-def export_render(context, camera_id=None, output_dir=None, filename=None):
+def export_render(
+    context, camera_id=None, output_dir=None, filename=None,
+    background_color=None,
+):
     objects = [obj for obj in context.view_layer.objects if obj.type == 'MESH']
     with _RenderStateTransaction(context, objects):
         return _export_render_impl(
-            context, camera_id=camera_id, output_dir=output_dir, filename=filename
+            context, camera_id=camera_id, output_dir=output_dir,
+            filename=filename, background_color=background_color,
         )
 
 
-def _export_viewport_impl(context, camera_id=None, output_dir=None, filename=None):
+def _export_viewport_impl(
+    context, camera_id=None, output_dir=None, filename=None,
+    background_color=None,
+):
     """
     Renders the scene using viewport OpenGL render to include overlays.
     :param context: Blender context.
@@ -1281,11 +1311,20 @@ def _export_viewport_impl(context, camera_id=None, output_dir=None, filename=Non
     # Store viewport settings
     original_view_perspective = viewport_region_3d.view_perspective
     original_shading_type = viewport_space.shading.type
+    original_background_type = viewport_space.shading.background_type
+    original_background_color = tuple(viewport_space.shading.background_color)
     original_overlay_show = viewport_space.overlay.show_overlays
 
     # Configure viewport for camera render with overlays
     viewport_region_3d.view_perspective = 'CAMERA'
     viewport_space.shading.type = 'RENDERED'
+    if background_color is not None:
+        viewport_space.shading.background_type = 'VIEWPORT'
+        viewport_space.shading.background_color = background_color
+        context.scene.display.shading.background_type = 'VIEWPORT'
+        context.scene.display.shading.background_color = background_color
+        if context.scene.world is not None:
+            context.scene.world.color = background_color
     viewport_space.overlay.show_overlays = True
 
     # Configure output filepath
@@ -1307,6 +1346,8 @@ def _export_viewport_impl(context, camera_id=None, output_dir=None, filename=Non
     # Restore viewport settings
     viewport_region_3d.view_perspective = original_view_perspective
     viewport_space.shading.type = original_shading_type
+    viewport_space.shading.background_type = original_background_type
+    viewport_space.shading.background_color = original_background_color
     viewport_space.overlay.show_overlays = original_overlay_show
 
     # Restore original render settings
@@ -1318,12 +1359,16 @@ def _export_viewport_impl(context, camera_id=None, output_dir=None, filename=Non
     print(f"[StableGen] Viewport render saved to: {os.path.join(output_dir, output_file)}.png")
 
 
-def export_viewport(context, camera_id=None, output_dir=None, filename=None):
+def export_viewport(
+    context, camera_id=None, output_dir=None, filename=None,
+    background_color=None,
+):
     """Viewport export with full scene-state restoration on every exit path."""
     objects = [obj for obj in context.view_layer.objects if obj.type == 'MESH']
     with _RenderStateTransaction(context, objects):
         return _export_viewport_impl(
-            context, camera_id=camera_id, output_dir=output_dir, filename=filename
+            context, camera_id=camera_id, output_dir=output_dir,
+            filename=filename, background_color=background_color,
         )
 
 def export_canny(context, camera_id=None, low_threshold=0, high_threshold=80):

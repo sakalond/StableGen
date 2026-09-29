@@ -26,7 +26,7 @@ from gpu_extras.batch import batch_for_shader  # pylint: disable=import-error
 
 from ..util.workflow_templates import prompt_text, prompt_text_img2img, prompt_text_qwen_image_edit
 from .rendering import export_emit_image, export_visibility, export_canny, bake_texture, prepare_baking, unwrap, export_render, export_viewport, render_edge_feather_mask, apply_uv_inpaint_texture, flatten_projection_material_for_refine, _RenderStateTransaction, _legacy_render_dither, _prepare_compositor_render, _finish_compositor_render
-from ..cameras.geometry import _SGCameraResolution, _get_camera_resolution
+from ..cameras.geometry import _SGCameraResolution, _get_camera_resolution, _get_resolution_align
 from ..cameras.overlays import _sg_restore_square_display, _sg_remove_crop_overlay, _sg_ensure_crop_overlay, _sg_hide_label_overlay, _sg_restore_label_overlay
 from .projection import project_image, reinstate_compare_nodes, _bake_visibility_weights, reset_projection_material_nodes, _is_projection_mesh
 from ..utils import get_last_material_index, get_generation_dirs, get_file_path, get_dir_path, remove_empty_dirs, get_compositor_node_tree, configure_output_node_paths, get_eevee_engine_id, sg_modal_active
@@ -471,6 +471,11 @@ class ComfyUIGenerate(_PBRMixin, bpy.types.Operator):
         if context.scene.qwen_context_render_mode in {'REPLACE_STYLE', 'ADDITIONAL'}:
             fallback = tuple(context.scene.qwen_guidance_fallback_color)
             background = tuple(context.scene.qwen_guidance_background_color)
+            if context.scene.model_architecture == 'qwen_image_21':
+                # Qwen 2.1 VAE-encodes projected context as its edit target and
+                # otherwise preserves a magenta canvas. Keep magenta only for
+                # unknown surface regions and make the outer background neutral.
+                background = (0.5, 0.5, 0.5)
         return fallback, background
 
     def _apply_qwen_binary_context_mask(self, context, camera_id, fallback_color):
@@ -796,7 +801,7 @@ class ComfyUIGenerate(_PBRMixin, bpy.types.Operator):
         else:
             print("[StableGen] Standard texturing; no research options active")
 
-        if context.scene.model_architecture in ('qwen_image_edit', 'flux2_klein') and not context.scene.generation_mode == 'project_only':
+        if context.scene.model_architecture in ('qwen_image_edit', 'qwen_image_21', 'flux2_klein') and not context.scene.generation_mode == 'project_only':
             context.scene.generation_method = 'sequential' # Force sequential for edit models
 
         render = bpy.context.scene.render
@@ -815,16 +820,11 @@ class ComfyUIGenerate(_PBRMixin, bpy.types.Operator):
         resolution_y = render.resolution_y
         total_pixels = resolution_x * resolution_y
 
-        # Qwen Image Edit benefits from 112-aligned resolution (LCM of VAE=8,
-        # ViT patch=14, spatial merge=2×14=28, ViT window=112) to avoid
-        # subtle pixel shifts between the latent, VAE and CLIP grids.
-        # FLUX.2 Klein uses 16x latent downscale, so 16-aligned is needed.
-        use_qwen_alignment = (
-            context.scene.model_architecture.startswith('qwen')
-            and getattr(context.scene, 'qwen_rescale_alignment', False)
-        )
-        if use_qwen_alignment:
-            align_step = 112
+        # Qwen Image Edit's optional 112px grid follows Qwen2.5-VL; Qwen
+        # Image 2.1 uses Qwen3-VL and ComfyUI's native 32px image grid.
+        # FLUX.2 Klein uses 16x latent downscale.
+        if context.scene.model_architecture.startswith('qwen'):
+            align_step = _get_resolution_align(context)
         elif context.scene.model_architecture == 'flux2_klein':
             align_step = 16
         else:
@@ -1363,7 +1363,7 @@ class ComfyUIGenerate(_PBRMixin, bpy.types.Operator):
 
         applicable = (
             getattr(self, '_generation_method_on_start', None) == 'sequential'
-            or context.scene.model_architecture in ('qwen_image_edit', 'flux2_klein')
+            or context.scene.model_architecture in ('qwen_image_edit', 'qwen_image_21', 'flux2_klein')
         )
         reset_angle = (
             context.scene.discard_factor_after_generation
@@ -1560,7 +1560,7 @@ class ComfyUIGenerate(_PBRMixin, bpy.types.Operator):
             need_depth = (
                 any(u["unit_type"] == "depth" for u in controlnet_units)
                 or (context.scene.use_flux_lora and context.scene.model_architecture == 'flux1')
-                or (context.scene.model_architecture in ('qwen_image_edit', 'flux2_klein')
+                or (context.scene.model_architecture in ('qwen_image_edit', 'qwen_image_21', 'flux2_klein')
                     and context.scene.qwen_guidance_map_type == 'depth')
                 or (context.scene.model_architecture.startswith('qwen')
                     and context.scene.qwen_generation_method in ('refine', 'local_edit')
@@ -1609,7 +1609,7 @@ class ComfyUIGenerate(_PBRMixin, bpy.types.Operator):
 
             need_normal = (
                 any(u["unit_type"] == "normal" for u in controlnet_units)
-                or (context.scene.model_architecture in ('qwen_image_edit', 'flux2_klein')
+                or (context.scene.model_architecture in ('qwen_image_edit', 'qwen_image_21', 'flux2_klein')
                     and context.scene.qwen_guidance_map_type == 'normal')
             )
             if need_normal and context.scene.generation_method != 'uv_inpaint':
@@ -1630,10 +1630,15 @@ class ComfyUIGenerate(_PBRMixin, bpy.types.Operator):
                         return
 
             # Qwen guidance using Workbench
-            if (context.scene.model_architecture in ('qwen_image_edit', 'flux2_klein')
+            if (context.scene.model_architecture in ('qwen_image_edit', 'qwen_image_21', 'flux2_klein')
                     and context.scene.qwen_guidance_map_type == 'workbench'
                     and context.scene.generation_method != 'uv_inpaint'):
                 workbench_dir = get_dir_path(context, "controlnet")["workbench"]
+                guide_background = (
+                    (0.5, 0.5, 0.5)
+                    if context.scene.model_architecture == 'qwen_image_21'
+                    else None
+                )
                 for i, camera in enumerate(cameras):
                     self._stage = f"Rendering Workbench ({i+1}/{len(cameras)})"
                     _i, _cam = i, camera
@@ -1641,7 +1646,8 @@ class ComfyUIGenerate(_PBRMixin, bpy.types.Operator):
                         self._activate_view(context, _i)
                         with _SGCameraResolution(context, _cam):
                             export_render(context, camera_id=_i,
-                                          output_dir=workbench_dir, filename=f"render{_i}")
+                                          output_dir=workbench_dir, filename=f"render{_i}",
+                                          background_color=guide_background)
                     self._run_on_main_thread(_render_wb)
                     if self._error:
                         return
@@ -1652,10 +1658,15 @@ class ComfyUIGenerate(_PBRMixin, bpy.types.Operator):
                         return
 
             # Qwen guidance using Viewport
-            elif (context.scene.model_architecture in ('qwen_image_edit', 'flux2_klein')
+            elif (context.scene.model_architecture in ('qwen_image_edit', 'qwen_image_21', 'flux2_klein')
                   and context.scene.qwen_guidance_map_type == 'viewport'
                   and context.scene.generation_method != 'uv_inpaint'):
                 viewport_dir = get_dir_path(context, "controlnet")["viewport"]
+                guide_background = (
+                    (0.5, 0.5, 0.5)
+                    if context.scene.model_architecture == 'qwen_image_21'
+                    else None
+                )
                 for i, camera in enumerate(cameras):
                     self._stage = f"Rendering Viewport ({i+1}/{len(cameras)})"
                     _i, _cam = i, camera
@@ -1663,7 +1674,8 @@ class ComfyUIGenerate(_PBRMixin, bpy.types.Operator):
                         self._activate_view(context, _i)
                         with _SGCameraResolution(context, _cam):
                             export_viewport(context, camera_id=_i,
-                                            output_dir=viewport_dir, filename=f"viewport{_i}")
+                                            output_dir=viewport_dir, filename=f"viewport{_i}",
+                                            background_color=guide_background)
                     self._run_on_main_thread(_render_vp)
                     if self._error:
                         return
@@ -1847,7 +1859,7 @@ class ComfyUIGenerate(_PBRMixin, bpy.types.Operator):
                         if self._current_image == 0:
                             if context.scene.model_architecture == 'flux1':
                                 image = self.workflow_manager.generate_flux(context, controlnet_info=controlnet_info, ipadapter_ref_info=ipadapter_ref_info)
-                            elif context.scene.model_architecture == 'qwen_image_edit':
+                            elif context.scene.model_architecture in ('qwen_image_edit', 'qwen_image_21'):
                                 image = self.workflow_manager.generate_qwen_edit(context, camera_id=camera_id)
                             elif context.scene.model_architecture == 'flux2_klein':
                                 image = self.workflow_manager.generate_flux2_klein(context, camera_id=camera_id)
@@ -1880,7 +1892,7 @@ class ComfyUIGenerate(_PBRMixin, bpy.types.Operator):
                                         )
                                     _emit_cam = _cur_cam
                                     with _SGCameraResolution(context, _emit_cam):
-                                        if context.scene.model_architecture in ('qwen_image_edit', 'flux2_klein'): # export custom bg and fallback for Qwen/Klein image edit
+                                        if context.scene.model_architecture in ('qwen_image_edit', 'qwen_image_21', 'flux2_klein'): # export custom bg and fallback for Qwen/Klein image edit
                                             fallback_color, background_color = self._get_qwen_context_colors(context)
                                             export_emit_image(context, self._to_texture, camera_id=self._current_image, bg_color=background_color, fallback_color=fallback_color) # Export render for next view
                                             if getattr(context.scene, 'qwen_use_confidence_context', False):
@@ -1915,7 +1927,7 @@ class ComfyUIGenerate(_PBRMixin, bpy.types.Operator):
 
                             if context.scene.model_architecture == 'flux1':
                                 image = self.workflow_manager.refine_flux(context, controlnet_info=controlnet_info, render_info=render_info, mask_info=mask_info, ipadapter_ref_info=ipadapter_ref_info)
-                            elif context.scene.model_architecture == 'qwen_image_edit':
+                            elif context.scene.model_architecture in ('qwen_image_edit', 'qwen_image_21'):
                                 image = self.workflow_manager.generate_qwen_edit(context, camera_id=camera_id)
                             elif context.scene.model_architecture == 'flux2_klein':
                                 image = self.workflow_manager.generate_flux2_klein(context, camera_id=camera_id)
@@ -1924,7 +1936,7 @@ class ComfyUIGenerate(_PBRMixin, bpy.types.Operator):
                     else: # Grid or Separate
                         if context.scene.model_architecture == 'flux1':
                             image = self.workflow_manager.generate_flux(context, controlnet_info=controlnet_info, ipadapter_ref_info=ipadapter_ref_info)
-                        elif context.scene.model_architecture == 'qwen_image_edit':
+                        elif context.scene.model_architecture in ('qwen_image_edit', 'qwen_image_21'):
                             image = self.workflow_manager.generate_qwen_edit(context, camera_id=camera_id)
                         elif context.scene.model_architecture == 'flux2_klein':
                             image = self.workflow_manager.generate_flux2_klein(context, camera_id=camera_id)
@@ -1936,7 +1948,7 @@ class ComfyUIGenerate(_PBRMixin, bpy.types.Operator):
                             self._error = "Connection to ComfyUI server failed."
                         return # Error message set
 
-                    if (context.scene.model_architecture in ('qwen_image_edit', 'flux2_klein')
+                    if (context.scene.model_architecture in ('qwen_image_edit', 'qwen_image_21', 'flux2_klein')
                             and context.scene.generation_method == 'sequential'
                             and self._current_image > 0
                             and not getattr(context.scene, 'qwen_use_confidence_context', False)
@@ -1955,7 +1967,7 @@ class ComfyUIGenerate(_PBRMixin, bpy.types.Operator):
                     with open(image_path, 'wb') as f:
                         f.write(image)
 
-                    if (context.scene.model_architecture == 'qwen_image_edit'
+                    if (context.scene.model_architecture.startswith('qwen')
                             and context.scene.generation_method == 'sequential'
                             and self._current_image > 0):
                         fallback_color, _ = self._get_qwen_context_colors(context)
@@ -2704,7 +2716,7 @@ class ComfyUIGenerate(_PBRMixin, bpy.types.Operator):
         is_recent_mode_ref = (
             file_type == "generated" and
             context.scene.sequential_ipadapter_mode == 'recent' and
-            (context.scene.sequential_ipadapter or context.scene.model_architecture in ('qwen_image_edit', 'flux2_klein'))
+            (context.scene.sequential_ipadapter or context.scene.model_architecture in ('qwen_image_edit', 'qwen_image_21', 'flux2_klein'))
         )
 
         temp_image_path = None

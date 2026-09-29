@@ -791,9 +791,11 @@ def _resolution_from_aspect(aspect, total_px, align=8):
 
 
 def _get_resolution_align(context):
-    """Return the resolution alignment step: 112 for Qwen with alignment
-    enabled, 8 otherwise."""
-    if (context.scene.model_architecture.startswith('qwen')
+    """Use each Qwen encoder's image grid for camera resolution planning."""
+    architecture = context.scene.model_architecture
+    if architecture == 'qwen_image_21':
+        return 32
+    if (architecture == 'qwen_image_edit'
             and getattr(context.scene, 'qwen_rescale_alignment', False)):
         return 112
     return 8

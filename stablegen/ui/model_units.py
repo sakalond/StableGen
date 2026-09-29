@@ -14,7 +14,8 @@ import bpy  # pylint: disable=import-error
 from .presets import update_parameters
 from ..utils import sg_modal_active
 from ..core import ADDON_PKG
-from ..core.server_api import _fetch_api_list
+from ..core.server_api import _fetch_api_list, fetch_diffusion_models
+from ..texturing.qwen_models import is_qwen_image_21_model
 from ..core.state import (
     _cached_checkpoint_list,
     _cached_checkpoint_architecture,
@@ -208,13 +209,19 @@ class RefreshCheckpointList(bpy.types.Operator):
             if architecture == 'sdxl':
                 model_list = _fetch_api_list(server_address, "/models/checkpoints")
                 model_type_desc = "Checkpoint"
-            elif architecture in ('flux1', 'qwen_image_edit'):
-                model_list = _fetch_api_list(server_address, "/models/unet_gguf")
-                if model_list is not None:
-                    extra = _fetch_api_list(server_address, "/models/diffusion_models")
-                    if extra:
-                        model_list.extend(extra)
-                model_type_desc = "UNET" if architecture == 'flux1' else "UNET (GGUF/Safetensors)"
+            elif architecture in ('flux1', 'qwen_image_edit', 'qwen_image_21'):
+                model_list = fetch_diffusion_models(server_address)
+                if model_list is not None and architecture == 'qwen_image_21':
+                    model_list = [name for name in model_list
+                                  if is_qwen_image_21_model(name)]
+                elif model_list is not None and architecture == 'qwen_image_edit':
+                    model_list = [name for name in model_list
+                                  if not is_qwen_image_21_model(name)]
+                model_type_desc = (
+                    "UNET" if architecture == 'flux1'
+                    else "Qwen-Image 2.1 model" if architecture == 'qwen_image_21'
+                    else "Qwen-Image-Edit model"
+                )
             elif architecture == 'flux2_klein':
                 model_list = _fetch_api_list(server_address, "/models/diffusion_models")
                 model_type_desc = "Diffusion Model"

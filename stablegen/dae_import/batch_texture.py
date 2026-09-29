@@ -491,7 +491,7 @@ def _do_set_ref_image():
         if arch == 'sdxl':
             scene.use_ipadapter = True
             scene.ipadapter_image = ref
-        elif arch in ('qwen_image_edit', 'flux2_klein'):
+        elif arch in ('qwen_image_edit', 'qwen_image_21', 'flux2_klein'):
             scene.qwen_use_external_style_image = True
             scene.qwen_external_style_image = ref
         elif arch == 'flux1':

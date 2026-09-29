@@ -36,11 +36,15 @@ def validate_workflow_graph(prompt: Mapping, semantic_node_ids=()) -> list[str]:
             issues.append(f"semantic text encoder node {node_id} is missing")
             continue
         inputs = node.get("inputs", {})
-        slots = {
-            key: tuple(inputs[key])
-            for key in ("image1", "image2", "image3")
-            if key in inputs and _is_node_reference(inputs[key])
-        }
+        slot_names = ("image1", "image2", "image3")
+        # Qwen-Image-Edit exposes fixed image1/image2/image3 sockets. Qwen
+        # Image 2.1 uses ComfyUI's dynamic images.image_N sockets instead.
+        slots = {}
+        for index, legacy_name in enumerate(slot_names, 1):
+            dynamic_name = f"images.image_{index}"
+            key = dynamic_name if dynamic_name in inputs else legacy_name
+            if key in inputs and _is_node_reference(inputs[key]):
+                slots[legacy_name] = tuple(inputs[key])
         reverse = {}
         for slot, reference in slots.items():
             reverse.setdefault(reference, []).append(slot)

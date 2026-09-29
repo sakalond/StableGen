@@ -1338,7 +1338,7 @@ class Trellis2Generate(bpy.types.Operator):
 
         # 3-tier progress init
         has_txt2img = (gen_from == 'prompt')
-        has_texturing = (tex_mode in ('sdxl', 'flux1', 'qwen_image_edit', 'flux2_klein'))
+        has_texturing = (tex_mode in ('sdxl', 'flux1', 'qwen_image_edit', 'qwen_image_21', 'flux2_klein'))
         has_autorig = bool(getattr(scene, 'trellis2_autorig_enabled', False))
         if has_txt2img and has_autorig and has_texturing:
             self._total_phases = 4
@@ -1754,7 +1754,7 @@ class Trellis2Generate(bpy.types.Operator):
                 self._setup_studio_lighting(context, target_bu)
 
             # --- Phase 3: If diffusion texturing, auto-place cameras + start generation ---
-            if tex_mode in ('sdxl', 'flux1', 'qwen_image_edit', 'flux2_klein'):
+            if tex_mode in ('sdxl', 'flux1', 'qwen_image_edit', 'qwen_image_21', 'flux2_klein'):
                 # Place cameras NOW (while operator context is still valid)
                 camera_count = getattr(context.scene, 'trellis2_camera_count', 8)
                 imported_objects = [obj for obj in context.selected_objects]
