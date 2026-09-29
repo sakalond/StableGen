@@ -10,6 +10,8 @@ import colorsys
 import math
 import os
 import random
+import re
+import shutil
 import zipfile
 import xml.etree.ElementTree as ET
 
@@ -1971,10 +1973,138 @@ def _collect_face_visibility(mesh):
     return face_vis
 
 
+def _canonical_face_cycle(vertex_ids):
+    """Return a rotation-stable, winding-sensitive face identifier."""
+    ids = tuple(int(vertex_id) for vertex_id in vertex_ids)
+    if not ids:
+        return ids
+    minimum = min(ids)
+    return min(
+        ids[index:] + ids[:index]
+        for index, vertex_id in enumerate(ids)
+        if vertex_id == minimum
+    )
+
+
+def _capture_source_face_windings(bm):
+    """Tag source vertices and capture every source face's directed cycle.
+
+    BMesh operations may delete/reindex elements, and a fill can recreate the
+    exact same triangle with the opposite winding.  A temporary vertex layer
+    gives surviving/reused vertices stable source identities so that matching
+    output faces can be restored without relying on mutable BMesh indices.
+    """
+    layer_name = ".sg_source_vertex_id"
+    suffix = 0
+    while bm.verts.layers.int.get(layer_name) is not None:
+        suffix += 1
+        layer_name = f".sg_source_vertex_id_{suffix}"
+    source_vertex_layer = bm.verts.layers.int.new(layer_name)
+
+    bm.verts.ensure_lookup_table()
+    bm.verts.index_update()
+    for vertex in bm.verts:
+        # Zero remains reserved for vertices created after this snapshot.
+        vertex[source_vertex_layer] = vertex.index + 1
+
+    source_windings = {
+        _canonical_face_cycle(
+            vertex[source_vertex_layer] for vertex in face.verts
+        )
+        for face in bm.faces
+    }
+    return source_vertex_layer, source_windings
+
+
+def _restore_matching_source_face_windings(
+        bm, source_vertex_layer, source_windings):
+    """Restore source winding on output faces with identical source vertices.
+
+    Returns ``(matching_faces, flipped_faces)``.  Genuinely new faces and
+    faces whose vertices were changed by welding/remeshing are left alone.
+    """
+    matching_faces = 0
+    flipped_faces = 0
+    for face in bm.faces:
+        vertex_ids = [
+            int(vertex[source_vertex_layer]) for vertex in face.verts
+        ]
+        if not vertex_ids or any(vertex_id <= 0 for vertex_id in vertex_ids):
+            continue
+
+        winding = _canonical_face_cycle(vertex_ids)
+        if winding in source_windings:
+            matching_faces += 1
+            continue
+
+        reverse_winding = _canonical_face_cycle(reversed(vertex_ids))
+        if reverse_winding in source_windings:
+            face.normal_flip()
+            matching_faces += 1
+            flipped_faces += 1
+
+    return matching_faces, flipped_faces
+
+
+def _mesh_topology_counts(mesh):
+    """Return the print-relevant topology defects in *mesh*.
+
+    The counts use geometric mesh vertex indices, not render-loop vertices, so
+    UV seams do not appear as cracks.  A printable surface must have exactly
+    two faces per edge, no loose edges, and no zero-area faces.
+    """
+    face_counts = {
+        tuple(sorted(edge.vertices[:])): 0
+        for edge in mesh.edges
+    }
+    for polygon in mesh.polygons:
+        for edge_key in polygon.edge_keys:
+            key = tuple(sorted(edge_key))
+            face_counts[key] = face_counts.get(key, 0) + 1
+
+    counts = tuple(face_counts.values())
+    return {
+        "boundary": sum(count == 1 for count in counts),
+        "non_manifold": sum(count > 2 for count in counts),
+        "loose": sum(count == 0 for count in counts),
+        "degenerate": sum(
+            len(set(polygon.vertices[:])) < 3
+            or polygon.area <= 1.0e-12
+            for polygon in mesh.polygons
+        ),
+    }
+
+
+def _require_printable_mesh(mesh, *, label="Mesh", require_closed=True):
+    """Raise with actionable counts when *mesh* is unsafe for a slicer."""
+    topology = _mesh_topology_counts(mesh)
+    blocking = {
+        "non-manifold edges": topology["non_manifold"],
+        "loose edges": topology["loose"],
+        "degenerate faces": topology["degenerate"],
+    }
+    if require_closed:
+        blocking = {
+            "open boundary edges": topology["boundary"],
+            **blocking,
+        }
+    problems = [
+        f"{count} {name}"
+        for name, count in blocking.items()
+        if count
+    ]
+    if problems:
+        raise RuntimeError(
+            f"{label} is not print-safe: " + ", ".join(problems) + ". "
+            "StableGen stopped before writing a broken slicer file."
+        )
+    return topology
+
+
 def _make_solid_mesh_object(
         obj, fill_gaps=True, visible_faces=None, keep_largest_island=False,
         face_visibility=None, *, use_evaluated_mesh=True, raycast_count=None,
-        weld_distance=0.0001, robust_fill=False, smooth_caps=False):
+        weld_distance=0.0, robust_fill=True, smooth_caps=True):
     import bmesh
     from mathutils.bvhtree import BVHTree
     import numpy as np
@@ -1998,6 +2128,9 @@ def _make_solid_mesh_object(
     try:
         bm = bmesh.new()
         bm.from_mesh(temp)
+        source_vertex_layer, source_face_windings = (
+            _capture_source_face_windings(bm)
+        )
         
         # The 3D-print export historically welds coincident evaluated geometry.
         # General post-processing must not globally weld detached character
@@ -2422,6 +2555,18 @@ def _make_solid_mesh_object(
                             loop[color_lay] = best_color
             print(f"[StableGen Make Solid] Mapped colors in {time.perf_counter() - t0:.4f}s")
                             
+        matching_faces, flipped_faces = _restore_matching_source_face_windings(
+            bm,
+            source_vertex_layer,
+            source_face_windings,
+        )
+        bm.verts.layers.int.remove(source_vertex_layer)
+        if flipped_faces:
+            print(
+                "[StableGen Make Solid] Restored source winding on "
+                f"{flipped_faces}/{matching_faces} matching faces"
+            )
+
         # Update normals in BMesh
         try:
             bm.normal_update()
@@ -2465,6 +2610,15 @@ def _make_solid_mesh_object(
             print(f"[StableGen Make Solid] Stored _SG_FaceVisibility on {n_faces} faces")
 
         solid_mesh.calc_loop_triangles()
+        try:
+            _require_printable_mesh(
+                solid_mesh,
+                label=f"Make Solid result for {obj.name}",
+                require_closed=bool(fill_gaps),
+            )
+        except Exception:
+            bpy.data.meshes.remove(solid_mesh)
+            raise
         print(f"[StableGen Make Solid] Total execution time: {time.perf_counter() - t_start:.4f}s")
         return solid_mesh
     finally:
@@ -2499,6 +2653,11 @@ def _extract_mesh_data(obj, apply_transforms, palette_rgbs, image):
         temp, eval_obj = _get_triangulated_mesh(obj, apply_transforms)
 
     try:
+        _require_printable_mesh(
+            temp,
+            label=obj.name,
+            require_closed=True,
+        )
         n_verts = len(temp.vertices)
         verts = np.empty(n_verts * 3, dtype=np.float32)
         temp.vertices.foreach_get("co", verts)
@@ -2611,6 +2770,342 @@ def _poll_common(context):
     return None
 
 
+# ── Textured OBJ for image-map slicers ──────────────────────────────────
+
+def _safe_export_name(value):
+    value = re.sub(r"[^A-Za-z0-9_.-]+", "_", str(value)).strip("._")
+    return value or "mesh"
+
+
+def _base_color_texture_binding(obj):
+    """Return ``(image, uv_name)`` for the best baked colour texture."""
+    if not obj.data.materials:
+        return None, None
+
+    fallback = None
+    for material in reversed(obj.data.materials):
+        if not material or not material.use_nodes:
+            continue
+        nodes = material.node_tree.nodes
+        candidates = []
+        for node in nodes:
+            if node.type != 'BSDF_PRINCIPLED':
+                continue
+            base_color = node.inputs.get("Base Color")
+            if base_color and base_color.links:
+                image_node = base_color.links[0].from_node
+                if image_node.type == 'TEX_IMAGE' and image_node.image:
+                    candidates.append(image_node)
+        candidates.extend(
+            node for node in nodes
+            if node.type == 'TEX_IMAGE' and node.image
+            and node not in candidates
+        )
+
+        for image_node in candidates:
+            uv_name = None
+            vector = image_node.inputs.get("Vector")
+            if vector and vector.links:
+                vector_node = vector.links[0].from_node
+                if vector_node.type == 'UVMAP':
+                    uv_name = vector_node.uv_map or None
+            binding = (image_node.image, uv_name)
+            if image_node in candidates[:1]:
+                return binding
+            if fallback is None:
+                fallback = binding
+    return fallback or (None, None)
+
+
+def _textured_print_uv_layer(mesh, requested_name=None):
+    if requested_name and mesh.uv_layers.get(requested_name):
+        return mesh.uv_layers.get(requested_name)
+    if mesh.uv_layers.get("BakeUV"):
+        return mesh.uv_layers.get("BakeUV")
+    render_layer = next(
+        (
+            layer for layer in mesh.uv_layers
+            if getattr(layer, "active_render", False)
+        ),
+        None,
+    )
+    return render_layer or mesh.uv_layers.active
+
+
+def _collect_textured_print_record(
+        obj, *, apply_transforms=True, make_solid=False,
+        raycast_count=12, keep_largest_island=False):
+    """Extract shared positions and per-corner UVs for a slicer-safe OBJ."""
+    import numpy as np
+
+    image, requested_uv = _base_color_texture_binding(obj)
+    if image is None:
+        raise RuntimeError(
+            f"{obj.name} has no baked Base Color image. Run Bake Textures "
+            "before textured print export."
+        )
+
+    eval_obj = None
+    owns_mesh = False
+    if make_solid:
+        mesh = _make_solid_mesh_object(
+            obj,
+            fill_gaps=True,
+            keep_largest_island=keep_largest_island,
+            use_evaluated_mesh=True,
+            raycast_count=raycast_count,
+            weld_distance=0.0,
+            robust_fill=True,
+            smooth_caps=True,
+        )
+        owns_mesh = True
+        if apply_transforms:
+            mesh.transform(obj.matrix_world)
+    else:
+        mesh, eval_obj = _get_triangulated_mesh(obj, apply_transforms)
+
+    try:
+        mesh.calc_loop_triangles()
+        _require_printable_mesh(mesh, label=obj.name, require_closed=True)
+        uv_layer = _textured_print_uv_layer(mesh, requested_uv)
+        if uv_layer is None:
+            raise RuntimeError(
+                f"{obj.name} has no UV map for its baked texture."
+            )
+
+        vertices = np.empty(len(mesh.vertices) * 3, dtype=np.float64)
+        mesh.vertices.foreach_get("co", vertices)
+        vertices = vertices.reshape((-1, 3))
+
+        triangle_vertices = np.empty(
+            len(mesh.loop_triangles) * 3,
+            dtype=np.int64,
+        )
+        mesh.loop_triangles.foreach_get("vertices", triangle_vertices)
+        triangle_vertices = triangle_vertices.reshape((-1, 3))
+
+        triangle_loops = np.empty(
+            len(mesh.loop_triangles) * 3,
+            dtype=np.int64,
+        )
+        mesh.loop_triangles.foreach_get("loops", triangle_loops)
+        triangle_loops = triangle_loops.reshape((-1, 3))
+
+        loop_uvs = np.empty(len(uv_layer.data) * 2, dtype=np.float64)
+        uv_layer.data.foreach_get("uv", loop_uvs)
+        loop_uvs = loop_uvs.reshape((-1, 2))
+
+        return {
+            "name": obj.name,
+            "vertices": vertices,
+            "triangle_vertices": triangle_vertices,
+            "triangle_uvs": loop_uvs[triangle_loops],
+            "image": image,
+            "uv_name": uv_layer.name,
+        }
+    finally:
+        if eval_obj is not None:
+            eval_obj.to_mesh_clear()
+        elif owns_mesh and mesh.name in bpy.data.meshes:
+            bpy.data.meshes.remove(mesh)
+
+
+def _copy_print_texture(image, output_dir, stem):
+    """Copy or losslessly save *image* beside the OBJ and return its name."""
+    source_path = ""
+    try:
+        source_path = bpy.path.abspath(image.filepath_from_user())
+    except Exception:
+        source_path = bpy.path.abspath(image.filepath or "")
+
+    can_copy = (
+        image.source == 'FILE'
+        and not image.packed_file
+        and not image.is_dirty
+        and source_path
+        and os.path.isfile(source_path)
+    )
+    if can_copy:
+        extension = os.path.splitext(source_path)[1].lower() or ".png"
+        texture_name = f"{stem}_texture{extension}"
+        destination = os.path.join(output_dir, texture_name)
+        if os.path.normcase(os.path.abspath(source_path)) != os.path.normcase(
+                os.path.abspath(destination)):
+            shutil.copy2(source_path, destination)
+        return texture_name
+
+    texture_name = f"{stem}_texture.png"
+    destination = os.path.join(output_dir, texture_name)
+    image.save_render(destination, scene=bpy.context.scene)
+    if not os.path.isfile(destination):
+        raise RuntimeError(f"Could not save baked texture {image.name}")
+    return texture_name
+
+
+def _write_textured_print_obj(filepath, records):
+    """Write OBJ with shared geometry indices and independent UV indices.
+
+    GLTF must split vertices at UV seams. OBJ has independent ``v`` and ``vt``
+    indices, which lets image-map slicers see one connected geometric shell.
+    """
+    output_dir = os.path.dirname(filepath)
+    os.makedirs(output_dir, exist_ok=True)
+    stem = _safe_export_name(os.path.splitext(os.path.basename(filepath))[0])
+    mtl_name = f"{stem}.mtl"
+    mtl_path = os.path.join(output_dir, mtl_name)
+
+    material_records = []
+    for index, record in enumerate(records):
+        item_stem = f"{stem}_{index + 1}"
+        texture_name = _copy_print_texture(
+            record["image"], output_dir, item_stem)
+        material_records.append((f"SG_Print_{index + 1}", texture_name))
+
+    with open(mtl_path, "w", encoding="utf-8", newline="\n") as stream:
+        stream.write("# StableGen textured print material\n")
+        for material_name, texture_name in material_records:
+            stream.write(f"newmtl {material_name}\n")
+            stream.write("Ka 1.000000 1.000000 1.000000\n")
+            stream.write("Kd 1.000000 1.000000 1.000000\n")
+            stream.write("d 1.000000\nillum 1\n")
+            stream.write(f"map_Kd {texture_name}\n\n")
+
+    vertex_offset = 0
+    uv_offset = 0
+    total_triangles = 0
+    with open(filepath, "w", encoding="utf-8", newline="\n") as stream:
+        stream.write("# StableGen textured print OBJ\n")
+        stream.write(f"mtllib {mtl_name}\n")
+        for record, material_record in zip(records, material_records):
+            stream.write(f"o {_safe_export_name(record['name'])}\n")
+            for x, y, z in record["vertices"]:
+                stream.write(f"v {x:.9g} {y:.9g} {z:.9g}\n")
+
+            # Deliberately keep one texture coordinate per triangle corner.
+            # Geometry still references the original shared position indices.
+            for triangle_uvs in record["triangle_uvs"]:
+                for u, v in triangle_uvs:
+                    stream.write(f"vt {u:.9g} {v:.9g}\n")
+
+            stream.write(f"usemtl {material_record[0]}\n")
+            for triangle_index, triangle in enumerate(
+                    record["triangle_vertices"]):
+                vertex_indices = triangle + vertex_offset + 1
+                first_uv = uv_offset + triangle_index * 3 + 1
+                stream.write(
+                    "f "
+                    f"{vertex_indices[0]}/{first_uv} "
+                    f"{vertex_indices[1]}/{first_uv + 1} "
+                    f"{vertex_indices[2]}/{first_uv + 2}\n"
+                )
+
+            vertex_offset += len(record["vertices"])
+            uv_offset += len(record["triangle_uvs"]) * 3
+            total_triangles += len(record["triangle_vertices"])
+
+    return {
+        "filepath": filepath,
+        "mtl_path": mtl_path,
+        "vertices": vertex_offset,
+        "triangles": total_triangles,
+    }
+
+
+class ExportTexturedPrintOBJ(bpy.types.Operator):
+    """Export a watertight UV-textured OBJ for image-map slicers."""
+    bl_idname = "object.export_textured_print_obj"
+    bl_label = "Export Textured OBJ"
+    bl_description = (
+        "Export baked texture and shared-position OBJ for image-map slicers; "
+        "refuses open or non-manifold geometry"
+    )
+    bl_options = {'REGISTER'}
+
+    export_scope: bpy.props.EnumProperty(
+        name="Objects",
+        items=[
+            ('SELECTED', 'Selected', 'Export selected mesh objects'),
+            ('ALL_MESH', 'All Mesh', 'Export all visible mesh objects'),
+        ],
+        default='SELECTED',
+    )
+    apply_transforms: bpy.props.BoolProperty(
+        name="Apply Transforms",
+        description=(
+            "Write world-space position, rotation and scale without changing "
+            "the Blender objects"
+        ),
+        default=True,
+    )
+
+    @classmethod
+    def poll(cls, context):
+        message = _poll_common(context)
+        if message:
+            cls.poll_message_set(message)
+            return False
+        return True
+
+    def draw(self, context):
+        self.layout.prop(self, "export_scope")
+        self.layout.prop(self, "apply_transforms")
+        if getattr(context.scene, "stablegen_print_make_solid", False):
+            self.layout.label(
+                text="Make Solid will run on a temporary export copy",
+                icon='MOD_REMESH',
+            )
+        else:
+            self.layout.label(
+                text="Existing mesh must already be watertight",
+                icon='INFO',
+            )
+
+    def invoke(self, context, event):
+        return context.window_manager.invoke_props_dialog(self)
+
+    def execute(self, context):
+        meshes = _get_mesh_objects(context, self.export_scope)
+        if not meshes:
+            self.report({'ERROR'}, "No mesh objects to export.")
+            return {'CANCELLED'}
+
+        scene = context.scene
+        make_solid = getattr(scene, "stablegen_print_make_solid", False)
+        records = []
+        try:
+            for obj in meshes:
+                records.append(_collect_textured_print_record(
+                    obj,
+                    apply_transforms=self.apply_transforms,
+                    make_solid=make_solid,
+                    raycast_count=getattr(
+                        scene, "stablegen_print_raycast_count", 12),
+                    keep_largest_island=getattr(
+                        scene,
+                        "stablegen_print_keep_largest_island",
+                        False,
+                    ),
+                ))
+
+            output_dir = get_dir_path(context, "baked")
+            base_name = _safe_export_name(meshes[0].name)
+            filepath = os.path.join(
+                output_dir, f"{base_name}_textured_print.obj")
+            result = _write_textured_print_obj(filepath, records)
+        except Exception as error:
+            self.report({'ERROR'}, f"Textured print export failed: {error}")
+            import traceback
+            traceback.print_exc()
+            return {'CANCELLED'}
+
+        self.report(
+            {'INFO'},
+            f"Textured print OBJ exported to {result['filepath']} "
+            f"({result['triangles']} triangles)",
+        )
+        return {'FINISHED'}
+
+
 # ── ExportSTL ────────────────────────────────────────────────────────────
 
 class ExportSTL(bpy.types.Operator):
@@ -2661,6 +3156,22 @@ class ExportSTL(bpy.types.Operator):
                 if not o.data.color_attributes.get("SG_PrintPreview"):
                     self.report({'ERROR'}, f"Make Solid requires the 'SG_PrintPreview' color attribute. Run 'Preview Colors' first on {o.name}.")
                     return {'CANCELLED'}
+        else:
+            try:
+                for obj in meshes:
+                    mesh, eval_obj = _get_triangulated_mesh(
+                        obj, apply_transforms=False)
+                    try:
+                        _require_printable_mesh(
+                            mesh,
+                            label=obj.name,
+                            require_closed=True,
+                        )
+                    finally:
+                        eval_obj.to_mesh_clear()
+            except Exception as error:
+                self.report({'ERROR'}, f"STL export stopped: {error}")
+                return {'CANCELLED'}
 
         snap = _SelectionSnapshot(context)
         output_dir = get_dir_path(context, "baked")
@@ -2720,7 +3231,9 @@ def _prepare_mesh_for_raycasting(obj):
     temp, eval_obj = _get_triangulated_mesh(obj, apply_transforms=False)
     bm = bmesh.new()
     bm.from_mesh(temp)
-    bmesh.ops.remove_doubles(bm, verts=bm.verts, dist=0.0001)
+    # Keep vertex and face indices identical to the later Make Solid pass.
+    # A tolerance weld here used to create branching boundaries and also made
+    # the worker's visible-face indices refer to different geometry.
     
     bm.verts.ensure_lookup_table()
     bm.faces.ensure_lookup_table()
@@ -3437,6 +3950,11 @@ class Export3MF(bpy.types.Operator):
                     temp, eval_obj = _get_triangulated_mesh(obj, apply_transforms=False)
                         
                     try:
+                        _require_printable_mesh(
+                            temp,
+                            label=obj.name,
+                            require_closed=True,
+                        )
                         n_v = len(temp.vertices)
                         v_co = np.empty(n_v * 3, dtype=np.float32)
                         temp.vertices.foreach_get("co", v_co)

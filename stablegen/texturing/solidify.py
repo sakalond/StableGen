@@ -7,7 +7,11 @@ preserves the rig and live projection-material inputs.
 import bpy  # pylint: disable=import-error
 
 from ..utils import sg_modal_active
-from .print_export import _make_solid_mesh_object
+from .print_export import (
+    _make_solid_mesh_object,
+    _mesh_topology_counts,
+    _require_printable_mesh,
+)
 
 
 def _weighted_membership_count(obj):
@@ -22,24 +26,6 @@ def _projection_attribute_names(mesh):
             attribute.name.startswith("ProjectionUV_")
             or attribute.name.startswith("_SG_")
         )
-    }
-
-
-def _mesh_topology_counts(mesh):
-    """Return boundary/non-manifold edge counts without changing mesh state."""
-    face_counts = {
-        tuple(sorted(edge.vertices[:])): 0
-        for edge in mesh.edges
-    }
-    for polygon in mesh.polygons:
-        for edge_key in polygon.edge_keys:
-            key = tuple(sorted(edge_key))
-            face_counts[key] = face_counts.get(key, 0) + 1
-    counts = tuple(face_counts.values())
-    return {
-        "boundary": sum(count == 1 for count in counts),
-        "non_manifold": sum(count > 2 for count in counts),
-        "loose": sum(count == 0 for count in counts),
     }
 
 
@@ -78,7 +64,7 @@ def _restore_vertex_group_names(obj, names):
 
 def _validate_solid_result(
         obj, source, target, weighted_before, *, fill_gaps):
-    """Reject a replacement that would damage rig or projection state."""
+    """Reject state loss or a result that remains unsafe for slicing."""
     if len(target.vertices) == 0 or len(target.polygons) == 0:
         raise RuntimeError("solidification produced an empty mesh")
 
@@ -124,26 +110,11 @@ def _validate_solid_result(
         if any(polygon.area <= 1.0e-12 for polygon in cap_faces):
             raise RuntimeError("solidification produced a degenerate cap face")
 
-    source_topology = _mesh_topology_counts(source)
-    target_topology = _mesh_topology_counts(target)
-    if (
-        target_topology["non_manifold"]
-        > source_topology["non_manifold"]
-    ):
-        raise RuntimeError(
-            "solidification increased non-manifold edges "
-            f"({source_topology['non_manifold']} -> "
-            f"{target_topology['non_manifold']})"
-        )
-    if (
-        fill_gaps
-        and target_topology["boundary"] > source_topology["boundary"]
-    ):
-        raise RuntimeError(
-            "solidification increased open boundary edges "
-            f"({source_topology['boundary']} -> "
-            f"{target_topology['boundary']})"
-        )
+    _require_printable_mesh(
+        target,
+        label=f"Make Solid result for {obj.name}",
+        require_closed=bool(fill_gaps),
+    )
 
     weighted_after = _weighted_membership_count(obj)
     if weighted_before and not weighted_after:

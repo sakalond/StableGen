@@ -2523,4 +2523,11 @@ class StableGenPrintPanel(bpy.types.Panel):
         row.operator("object.export_stl", text="Export STL", icon="EXPORT")
         row.operator("object.export_3mf", text="Export 3MF", icon="EXPORT")
 
+        row = box.row(align=True)
+        row.operator(
+            "object.export_textured_print_obj",
+            text="Export Textured OBJ (Image Map)",
+            icon="EXPORT",
+        )
+
           

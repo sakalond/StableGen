@@ -40,7 +40,7 @@ from .texturing.print_export import (
     StableGenPaletteColor, StableGenAddPaletteColor, StableGenRemovePaletteColor,
     StableGenPreviewQuantization, StableGenClearQuantizationPreview,
     StableGenPreviewSliced, StableGenPreviewSlicedCancel,
-    ExportSTL, Export3MF, Export3MFCancel,
+    ExportTexturedPrintOBJ, ExportSTL, Export3MF, Export3MFCancel,
 )
 from .cameras import (
     AddCameras, ApplyAutoAspect, CloneCamera, MirrorCamera, ToggleCameraLabels,
@@ -155,6 +155,7 @@ classes = [
     StableGenClearQuantizationPreview,
     StableGenPreviewSliced,
     StableGenPreviewSlicedCancel,
+    ExportTexturedPrintOBJ,
     ExportSTL,
     Export3MF,
     Export3MFCancel,
