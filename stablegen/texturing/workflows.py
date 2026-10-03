@@ -57,12 +57,13 @@ def _texturing_prompt(scene):
     """Return the texturing portion of the prompt.
 
     Priority order:
-    1. Dedicated ``texture_prompt`` field (if the separate-prompt toggle is on
-       and the field is non-empty).
+    1. Dedicated TRELLIS.2 ``texture_prompt`` field (if the separate-prompt
+       toggle is on and the field is non-empty).
     2. Legacy ``||`` separator in the main prompt (text after ``||``).
     3. The full main prompt as-is.
     """
-    if getattr(scene, 'use_separate_texture_prompt', False):
+    if (getattr(scene, 'architecture_mode', None) == 'trellis2'
+            and getattr(scene, 'use_separate_texture_prompt', False)):
         tex = getattr(scene, 'texture_prompt', '').strip()
         if tex:
             return tex
@@ -75,12 +76,13 @@ def _texturing_prompt(scene):
 def _generation_prompt(scene):
     """Return the generation / mesh-creation portion of the prompt.
 
-    When the separate-texture-prompt toggle is on the entire main prompt is
-    treated as the generation prompt (no ``||`` splitting).  Otherwise the
-    legacy ``||`` separator is respected.
+    In TRELLIS.2, when the separate-texture-prompt toggle is on, the entire
+    main prompt is used for mesh image generation (no ``||`` splitting).
+    Otherwise the legacy ``||`` separator is respected.
     """
     raw = scene.comfyui_prompt
-    if getattr(scene, 'use_separate_texture_prompt', False):
+    if (getattr(scene, 'architecture_mode', None) == 'trellis2'
+            and getattr(scene, 'use_separate_texture_prompt', False)):
         return raw.strip()
     if '||' in raw:
         return raw.split('||', 1)[0].strip()

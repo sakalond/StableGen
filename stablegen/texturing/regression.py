@@ -485,12 +485,13 @@ class SG_OT_TexturingRegression(bpy.types.Operator):
             self.scene.model_name = model
         if not self.scene.model_name or self.scene.model_name.startswith(('NO_', 'NONE_')):
             raise RuntimeError('No usable model selected')
+        from .workflows import _texturing_prompt
         self.entry['passes'].append({'preset': self.preset, 'model': self.scene.model_name,
                                      'method': self.scene.generation_method,
                                      'qwen_method': self.scene.qwen_generation_method,
                                      'cameras': [obj.name for obj in cameras],
                                      'camera_scope': self.scene['_sg_regression_camera_scope'],
-                                     'prompt': self.scene.texture_prompt if self.scene.use_separate_texture_prompt else self.scene.comfyui_prompt})
+                                     'prompt': _texturing_prompt(self.scene)})
         self.scene.sg_last_gen_error = False
         self.phase = 'generation'
         self.write_report('running')

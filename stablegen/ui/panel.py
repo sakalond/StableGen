@@ -8,6 +8,9 @@ from ..utils import sg_modal_active
 from ..core import get_addon_prefs
 from .presets import PRESETS, GEN_PARAMETERS
 from ..feature_flags import experiments_enabled, active_experiments
+from ..architecture_options import (
+    active_deprecated_architectures, deprecated_architectures_enabled,
+)
 from . import queue as _queue_mod
 
 _ADDON_PKG = __package__.rsplit('.', 1)[0]
@@ -172,6 +175,21 @@ class StableGenPanel(bpy.types.Panel):
         
 
         addon_prefs = context.preferences.addons[_ADDON_PKG].preferences
+        deprecated = active_deprecated_architectures(scene)
+        if deprecated:
+            box = layout.box()
+            box.label(text="Deprecated architecture: no further support", icon='INFO')
+            if not deprecated_architectures_enabled(context):
+                box.label(text="Enable deprecated architectures in add-on preferences.")
+                box.prop(scene, "architecture_mode")
+                if scene.architecture_mode == 'trellis2':
+                    box.prop(scene, "trellis2_texture_mode")
+                    if (scene.trellis2_texture_mode in ('none', 'native')
+                            and scene.trellis2_generate_from == 'prompt'):
+                        box.prop(scene, "trellis2_initial_image_arch")
+                # Saved FLUX scenes remain intact, but their settings and actions
+                # are hidden until the user opts in or chooses a supported model.
+                return
         config_error_message = None
 
         if not os.path.exists(addon_prefs.output_dir):
@@ -720,12 +738,12 @@ class StableGenPanel(bpy.types.Panel):
             split.label(text="Prompt:")
             prompt_row = split.row(align=True)
             prompt_row.prop(scene, "comfyui_prompt", text="")
-            # Hide texture prompt toggle when texture mode is none/native (no separate texture pipeline)
-            if not (is_trellis2 and trellis2_tex_mode in ('none', 'native')):
+            # Only TRELLIS.2 has distinct mesh-image and texturing prompts.
+            if trellis2_diffusion_texturing:
                 prompt_row.prop(scene, "use_separate_texture_prompt", text="",
                                icon='BRUSH_DATA',
                                icon_only=True)
-            if scene.use_separate_texture_prompt and not (is_trellis2 and trellis2_tex_mode in ('none', 'native')):
+            if trellis2_diffusion_texturing and scene.use_separate_texture_prompt:
                 split = params_container.split(factor=0.25)
                 split.label(text="Texture Prompt:")
                 split.prop(scene, "texture_prompt", text="")

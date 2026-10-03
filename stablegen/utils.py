@@ -30,7 +30,7 @@ def sg_modal_active(context):
         return False
     for window in context.window_manager.windows:
         for op in window.modal_operators:
-            if op.bl_idname in _SG_BLOCKED_MODALS:
+            if getattr(op, 'bl_idname', None) in _SG_BLOCKED_MODALS:
                 return True
     return False
 

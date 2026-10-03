@@ -10,6 +10,7 @@ Contains:
 
 import bpy  # pylint: disable=import-error
 
+from ..architecture_options import redraw_architecture_menus
 from ..ui.presets import update_parameters
 from ..utils import sg_modal_active
 from . import ADDON_PKG
@@ -57,6 +58,13 @@ class ControlNetModelMappingItem(bpy.types.PropertyGroup):
 class StableGenAddonPreferences(bpy.types.AddonPreferences):
     """Preferences for the StableGen addon."""
     bl_idname = ADDON_PKG
+
+    enable_deprecated_architectures: bpy.props.BoolProperty(
+        name="Enable Deprecated Architectures",
+        description="Show FLUX.1 and FLUX.2 Klein architectures and their settings; these architectures no longer receive further support",
+        default=False,
+        update=redraw_architecture_menus,
+    )  # type: ignore
 
     enable_texturing_experiments: bpy.props.BoolProperty(
         name="Enable Experimental Texturing Features",
@@ -194,6 +202,9 @@ class StableGenAddonPreferences(bpy.types.AddonPreferences):
         layout.prop(self, "save_blend_file")
         layout.prop(self, "enable_print_tab")
         layout.prop(self, "enable_texturing_experiments")
+        layout.prop(self, "enable_deprecated_architectures")
+        if self.enable_deprecated_architectures:
+            layout.label(text="FLUX.1 and FLUX.2 Klein no longer receive support.", icon='INFO')
         layout.prop(self, "enable_scene_queue")
 
         layout.separator()
@@ -246,9 +257,13 @@ class CheckServerStatus(bpy.types.Operator):
     bl_idname = "stablegen.check_server_status"
     bl_label = "Check Server Status"
     bl_description = "Ping the ComfyUI server to check connectivity"
+    _checking = False
 
     @classmethod
     def poll(cls, context):
+        if cls._checking:
+            cls.poll_message_set("Checking server connection")
+            return False
         prefs = context.preferences.addons.get(ADDON_PKG)
         if not prefs or not prefs.preferences.server_address:
             cls.poll_message_set("Server address not configured (check addon preferences)")
@@ -280,6 +295,8 @@ class CheckServerStatus(bpy.types.Operator):
             return result
 
         def _on_done(result):
+            # Also release the button after an error or a superseded request.
+            type(self)._checking = False
             if result is None:
                 return
             _prefs = bpy.context.preferences.addons[ADDON_PKG].preferences
@@ -305,7 +322,12 @@ class CheckServerStatus(bpy.types.Operator):
             else:
                 print(f"[StableGen] ComfyUI server unreachable or timed out at {server_addr}.")
 
-        _run_async(_bg_work, _on_done, track_generation=True)
+        type(self)._checking = True
+        try:
+            _run_async(_bg_work, _on_done, track_generation=True)
+        except Exception:
+            type(self)._checking = False
+            raise
         self.report({'INFO'}, f"Checking server at {server_addr}...")
 
         return {'FINISHED'}

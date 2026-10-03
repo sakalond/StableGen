@@ -23,6 +23,10 @@ from .callbacks import (
 )
 from . import ADDON_PKG
 from ..feature_flags import TEXTURING_DEFAULTS
+from ..architecture_options import (
+    architecture_items, model_architecture_items,
+    trellis_texture_items, trellis_initial_image_items,
+)
 from ..texturing.qwen_models import QWEN_PROMPT_TEMPLATE_ITEMS
 
 
@@ -300,7 +304,7 @@ def register_properties(update_model_list, ControlNetUnit, LoRAUnit,
     )
     bpy.types.Scene.use_separate_texture_prompt = bpy.props.BoolProperty(
         name="Use Separate Texture Prompt",
-        description="Enable a dedicated prompt field for the texturing pass instead of reusing the main prompt",
+        description="Use a dedicated TRELLIS.2 texturing prompt instead of reusing the mesh image prompt",
         default=False,
         update=update_parameters
     )
@@ -436,6 +440,8 @@ def register_properties(update_model_list, ControlNetUnit, LoRAUnit,
         name="Target Megapixels",
         description=(
             "Target total megapixels when auto-rescaling the render resolution.\n\n"
+            "Qwen Image 2.1 automatically aligns the resulting width and height "
+            "to multiples of 32 pixels.\n\n"
             "Default: 1.0 MP (~1024\u00d71024). This is the native resolution for SDXL "
             "and the recommended default for Qwen Image Edit.\n\n"
             "For SDXL / Flux models 1.0 MP is a safe default that matches "
@@ -989,7 +995,7 @@ def register_properties(update_model_list, ControlNetUnit, LoRAUnit,
     # ── Presets ────────────────────────────────────────────────────────
     bpy.types.Scene.stablegen_preset = bpy.props.EnumProperty(
         name="Preset", description="Select a preset for easy mode",
-        items=get_preset_items, default=0
+        items=get_preset_items, default=1  # DEFAULT; index 0 is the section header.
     )
     bpy.types.Scene.active_preset = bpy.props.StringProperty(
         name="Active Preset", default="DEFAULT"
@@ -999,28 +1005,15 @@ def register_properties(update_model_list, ControlNetUnit, LoRAUnit,
     bpy.types.Scene.model_architecture = bpy.props.EnumProperty(
         name="Model Architecture",
         description="Select the model architecture to use for generation",
-        items=[
-            ('sdxl', 'SDXL', ''),
-            ('flux1', 'FLUX.1', ''),
-            ('qwen_image_edit', 'Qwen Image Edit', 'Qwen-Image-Edit checkpoints'),
-            ('qwen_image_21', 'Qwen Image 2.1', 'Qwen-Image 2.1 checkpoints'),
-            ('flux2_klein', 'FLUX.2 Klein', '')
-        ],
-        default='sdxl',
+        items=model_architecture_items,
+        default=0,
         update=update_combined
     )
     bpy.types.Scene.architecture_mode = bpy.props.EnumProperty(
         name="Architecture",
         description="Select the overall generation architecture",
-        items=[
-            ('sdxl', 'SDXL', 'Stable Diffusion XL'),
-            ('flux1', 'FLUX.1', 'FLUX.1 architecture'),
-            ('qwen_image_edit', 'Qwen Image Edit', 'Qwen-Image-Edit checkpoints'),
-            ('qwen_image_21', 'Qwen Image 2.1', 'Qwen-Image 2.1 checkpoints'),
-            ('flux2_klein', 'FLUX.2 Klein', 'FLUX.2 Klein multi-reference edit model (Apache 2.0)'),
-            ('trellis2', 'TRELLIS.2', 'Image to 3D mesh generation with TRELLIS.2'),
-        ],
-        default='sdxl',
+        items=architecture_items,
+        default=0,
         update=update_architecture_mode
     )
 
@@ -1035,28 +1028,14 @@ def register_properties(update_model_list, ControlNetUnit, LoRAUnit,
     )
     bpy.types.Scene.trellis2_texture_mode = bpy.props.EnumProperty(
         name="Texture Mode", description="How to generate textures for the 3D mesh",
-        items=[
-            ('none', 'None', 'Shape only, no texture generation'),
-            ('native', 'Native (TRELLIS.2)', 'Use TRELLIS.2 built-in texture generation'),
-            ('sdxl', 'SDXL', 'Use SDXL for camera-based texture projection'),
-            ('flux1', 'FLUX.1', 'Use FLUX.1 for camera-based texture projection'),
-            ('qwen_image_edit', 'Qwen Image Edit', 'Use Qwen-Image-Edit for camera-based texture projection'),
-            ('qwen_image_21', 'Qwen Image 2.1', 'Use Qwen-Image 2.1 for camera-based texture projection'),
-            ('flux2_klein', 'FLUX.2 Klein', 'Use FLUX.2 Klein for camera-based texture projection'),
-        ],
-        default='native', update=update_trellis2_texture_mode
+        items=trellis_texture_items,
+        default=1, update=update_trellis2_texture_mode
     )
     bpy.types.Scene.trellis2_initial_image_arch = bpy.props.EnumProperty(
         name="Initial Image Architecture",
         description="Diffusion architecture used to generate the initial image when Generate From is set to Prompt and Texture Mode is Native or None",
-        items=[
-            ('sdxl', 'SDXL', 'Stable Diffusion XL'),
-            ('flux1', 'FLUX.1', 'FLUX.1 architecture'),
-            ('qwen_image_edit', 'Qwen Image Edit', 'Qwen-Image-Edit'),
-            ('qwen_image_21', 'Qwen Image 2.1', 'Qwen-Image 2.1'),
-            ('flux2_klein', 'FLUX.2 Klein', 'FLUX.2 Klein multi-reference edit'),
-        ],
-        default='sdxl', update=update_trellis2_initial_image_arch
+        items=trellis_initial_image_items,
+        default=0, update=update_trellis2_initial_image_arch
     )
     bpy.types.Scene.trellis2_camera_count = bpy.props.IntProperty(
         name="Camera Count", description="Number of cameras to place around the generated mesh for texture projection",

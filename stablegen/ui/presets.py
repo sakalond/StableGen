@@ -5,6 +5,10 @@ import bpy  # pylint: disable=import-error
 import mathutils  # pylint: disable=import-error
 from ..utils import sg_modal_active
 from ..feature_flags import TEXTURING_DEFAULTS, EXPERIMENTAL_FEATURE_DEFAULTS, experiments_enabled
+from ..architecture_options import (
+    DEPRECATION_NOTICE, deprecated_architectures_enabled,
+    preset_uses_deprecated_architecture,
+)
 
 PRESETS = {
     "DEFAULT": {"description": "Default settings for general purpose generation", "control_after_generate": "fixed", "model_architecture": "sdxl", "steps": 8, "cfg": 1.5, "sampler": "dpmpp_2s_ancestral", "scheduler": "sgm_uniform", "fallback_color": mathutils.Color((0.0, 0.0, 0.0)),  "discard_factor": 90.0, "weight_exponent": 3.0, "weight_exponent_generation_only": False, "weight_exponent_after_generation": 15.0, "view_blend_use_color_match": False, "view_blend_color_match_method": "hm-mvgd-hm", "view_blend_color_match_strength": 1.0, "clip_skip": 1, "auto_rescale": True, "overwrite_material": True, "generation_method": "sequential", "refine_images": False, "refine_steps": 8, "refine_sampler": "dpmpp_2s_ancestral", "refine_scheduler": "sgm_uniform", "denoise": 0.8, "refine_cfg": 1.5, "refine_prompt": "", "refine_upscale_method": "lanczos", "sequential_smooth": True, "sequential_custom_camera_order": "", "sequential_factor": 0.7, "sequential_factor_smooth": 0.15, "sequential_factor_smooth_2": 1.0, "sequential_ipadapter": False, "sequential_ipadapter_mode": "first", "sequential_ipadapter_regenerate": False, "ipadapter_weight_type": "style", "ipadapter_strength": 1.0, "ipadapter_start": 0.0, "ipadapter_end": 1.0, "differential_diffusion": True, "differential_noise": True, "blur_mask": True, "blur_mask_radius": 1, "blur_mask_sigma": 1.0, "grow_mask_by": 3, "canny_threshold_low": 0, "canny_threshold_high": 80, "pbr_decomposition": False, "controlnet_units": [{'unit_type': 'depth', 'model_name': 'controlnet_depth_sdxl.safetensors', 'strength': 0.5, 'start_percent': 0.0, 'end_percent': 1.0, 'is_union': False, 'use_union_type': True}], "lora_units": [{'model_name': 'sdxl_lightning_8step_lora.safetensors', 'model_strength': 1.0, 'clip_strength': 1.0}]},
@@ -98,6 +102,34 @@ PRESETS["QWEN 2.1 PRECISE"] = {
     "lora_units": [],
 }
 
+PRESETS["QWEN 2.1 PRECISE+"] = {
+    **PRESETS["QWEN 2.1 PRECISE"],
+    "description": (
+        "Qwen-Image 2.1 Precise with Confidence-Gated Context (CGC), Acquisition "
+        "Quality Weighting (AQW) and Depth/Part Projection Guard (DPPG). CGC "
+        "retains reliable projected texture as context and marks low-confidence "
+        "regions for repair. AQW favors views with better projected detail when "
+        "blending textures. DPPG limits foreground silhouettes leaking onto "
+        "surfaces behind them at depth, object and material boundaries. "
+        "Uses a 0.50 context trust threshold, a 3 px silhouette margin and "
+        "backface projection. Retains Qwen 2.1 Precise's projected-context "
+        "strategy, 20 steps, CFG 1.0, DPM++ SDE, SGM Uniform, blending exponent "
+        "7 and native RGBA output, with no Lightning LoRA. Transparent pixels "
+        "are excluded from projection. Research options are off. Best suited "
+        "to overlapping camera views; fine patterns and material continuity "
+        "can still vary, and standard Precise can work better on some assets."
+    ),
+    "architecture_mode": "qwen_image_21",
+    "generation_mode": "standard",
+    "qwen_use_confidence_context": True,
+    "sg_rework_acquisition_quality": True,
+    "sg_rework_projection_guard": True,
+    "qwen_trust_threshold": 0.5,
+    "sg_silhouette_margin": 3,
+    "sg_allow_backface_projection": True,
+    **EXPERIMENTAL_FEATURE_DEFAULTS,
+}
+
 PRESETS["QWEN 2.1 SAFE"] = {
     **PRESETS["QWEN SAFE"],
     "weight_exponent": 7.0,
@@ -164,6 +196,58 @@ PRESETS["QWEN 2.1 CONTEXT + REFERENCE"] = {
     "sg_silhouette_rays": "4",
     "qwen_use_trellis2_style": False,
     **TEXTURING_DEFAULTS,
+}
+
+PRESETS["LOCAL EDIT (QWEN 2.1)"] = {
+    **PRESETS["LOCAL EDIT (QWEN)"],
+    "description": (
+        "Use Qwen-Image 2.1 to make targeted changes to an existing texture. "
+        "Point detail cameras at the area to edit and describe the desired "
+        "change, such as a new color, lettering, style or surface detail. "
+        "Preserves the original Local Edit camera coverage and edge-feathering "
+        "settings so the edited projections blend into the existing material. "
+        "Uses 20 steps, CFG 1.0, DPM++ SDE, SGM Uniform, blending exponent 7 "
+        "and native RGBA output, with no Lightning LoRA. Transparent generated "
+        "pixels do not contribute to projection. This edits camera-selected "
+        "areas; use Masked Edit generation mode for painted-mask selection."
+    ),
+    "architecture_mode": "qwen_image_21",
+    "model_architecture": "qwen_image_21",
+    "generation_mode": "standard",
+    "weight_exponent": 7.0,
+    "steps": 20,
+    "cfg": 1.0,
+    "sampler": "dpmpp_sde",
+    "scheduler": "sgm_uniform",
+    "qwen_image_21_native_rgba": True,
+    "qwen_guidance_background_color": mathutils.Color((0.5, 0.5, 0.5)),
+    "lora_units": [],
+}
+
+PRESETS["REFINE (QWEN 2.1)"] = {
+    **PRESETS["REFINE (QWEN)"],
+    "description": (
+        "Use Qwen-Image 2.1 to restyle or modify the existing texture across "
+        "the scene's camera views. Each view uses the current textured render "
+        "as its editing input, making this suitable for overall color, art "
+        "style or surface-appearance changes. Preserves the original Qwen "
+        "Refine workflow settings. Uses 20 steps, CFG 1.0, DPM++ SDE, SGM "
+        "Uniform, blending exponent 7 and native RGBA output, with no Lightning "
+        "LoRA. Transparent generated pixels are excluded from projection. "
+        "Use Local Edit for camera-targeted changes or Masked Edit generation "
+        "mode to select an area by painting."
+    ),
+    "architecture_mode": "qwen_image_21",
+    "model_architecture": "qwen_image_21",
+    "generation_mode": "standard",
+    "weight_exponent": 7.0,
+    "steps": 20,
+    "cfg": 1.0,
+    "sampler": "dpmpp_sde",
+    "scheduler": "sgm_uniform",
+    "qwen_image_21_native_rgba": True,
+    "qwen_guidance_background_color": mathutils.Color((0.5, 0.5, 0.5)),
+    "lora_units": [],
 }
 
 # Stock presets select their architecture's native guidance wording. Including
@@ -385,13 +469,13 @@ GEN_PARAMETERS = [
 # ── Preset diff preview helpers ──────────────────────────────────────────
 
 
-def get_preset_items(self, context):
+def _build_preset_items(context, include_deprecated, selected=None):
     # Group presets by architecture for easier navigation.
     _ARCH_GROUP_ORDER = [
-        ('sdxl',            'SDXL / FLUX.1'),
+        ('sdxl',            'SDXL'),
         ('qwen_image_edit', 'Qwen Image Edit'),
         ('qwen_image_21',   'Qwen Image 2.1'),
-        ('flux2_klein',     'FLUX.2 Klein'),
+        ('flux2_klein',     'FLUX.2 Klein (Deprecated)'),
         ('trellis2',        'TRELLIS.2 Pipeline'),
     ]
     _known_groups = {k for k, _ in _ARCH_GROUP_ORDER}
@@ -401,13 +485,26 @@ def get_preset_items(self, context):
     for key, preset in PRESETS.items():
         if '(EXPERIMENTAL)' in key and not experiments_enabled(context):
             continue
+        deprecated = preset_uses_deprecated_architecture(preset)
+        if deprecated and not include_deprecated and key != selected:
+            continue
         if preset.get('architecture_mode') == 'trellis2':
             grp = 'trellis2'
         else:
             grp = preset.get('model_architecture', 'sdxl')
         groups.setdefault(grp, []).append(
-            (key, key.title(), preset.get('description', f'Preset {key}'))
+            (key, key.title() + (' (Deprecated)' if deprecated else ''),
+             preset.get('description', f'Preset {key}')
+             + (f'. {DEPRECATION_NOTICE}' if deprecated else ''))
         )
+
+    qwen_edit_items = groups.get('qwen_image_edit', [])
+    qwen_edit_ids = [item[0] for item in qwen_edit_items]
+    if 'QWEN PRECISE' in qwen_edit_ids and 'QWEN PRECISE+' in qwen_edit_ids:
+        precise_plus = qwen_edit_items.pop(qwen_edit_ids.index('QWEN PRECISE+'))
+        precise_index = next(i for i, item in enumerate(qwen_edit_items)
+                             if item[0] == 'QWEN PRECISE')
+        qwen_edit_items.insert(precise_index + 1, precise_plus)
 
     items = []
     first_group = True
@@ -426,12 +523,44 @@ def get_preset_items(self, context):
     for grp_key, grp_items in groups.items():
         if grp_key not in _known_groups:
             items.append(('', '', ''))
-            items.append(('', grp_key.replace('_', ' ').title(), ''))
+            label = ('FLUX.1 (Deprecated)' if grp_key == 'flux1'
+                     else grp_key.replace('_', ' ').title())
+            items.append(('', label, ''))
             items.extend(grp_items)
 
     items.append(('', '', ''))                  # separator before Custom
     items.append(('CUSTOM', 'Custom', 'Custom configuration'))
     return items
+
+
+_PRESET_ENUM_CACHE = {}
+_READING_PRESET_SELECTION = False
+
+
+def get_preset_items(self, context):
+    global _READING_PRESET_SELECTION
+    # Keep the old, unfiltered menu's numeric values. Hiding Klein presets must
+    # not silently turn a saved TRELLIS preset (or Custom) into another preset.
+    full_items = _build_preset_items(context, include_deprecated=True)
+    numbers = {item[0]: index for index, item in enumerate(full_items) if item[0]}
+    if _READING_PRESET_SELECTION:
+        items = tuple(item + (numbers[item[0]],) if item[0] else item
+                      for item in full_items)
+        return _PRESET_ENUM_CACHE.setdefault(items, items)
+    # Reading through RNA is portable across Blender's old and new property
+    # storage. The nested items callback above temporarily supplies the full menu.
+    _READING_PRESET_SELECTION = True
+    try:
+        selected = getattr(self, 'stablegen_preset', None)
+    finally:
+        _READING_PRESET_SELECTION = False
+    visible_items = _build_preset_items(
+        context, deprecated_architectures_enabled(context), selected=selected,
+    )
+    items = tuple(item + (numbers[item[0]],) if item[0] else item
+                  for item in visible_items)
+    # Blender's dynamic enums borrow their strings; keep every returned variant.
+    return _PRESET_ENUM_CACHE.setdefault(items, items)
 
 def normalize_value(key, value):
     if key == "trellis2_remesh" and isinstance(value, bool):
@@ -446,6 +575,9 @@ def update_parameters(self, context):
     # Compare current values with every stock preset's stored values
     for name, preset in PRESETS.items():
         if '(EXPERIMENTAL)' in name and not experiments_enabled(context):
+            continue
+        if (preset_uses_deprecated_architecture(preset)
+                and not deprecated_architectures_enabled(context)):
             continue
         expected = preset if preset.get('custom', False) else {**TEXTURING_DEFAULTS, **preset}
         # First check regular parameters
@@ -618,6 +750,10 @@ class ApplyPreset(bpy.types.Operator):
             return {'CANCELLED'}
         if preset in PRESETS:
             values = PRESETS[preset]
+            if (preset_uses_deprecated_architecture(values)
+                    and not deprecated_architectures_enabled(context)):
+                self.report({'ERROR'}, "Enable deprecated architectures in add-on preferences first; these architectures no longer receive support")
+                return {'CANCELLED'}
 
             if not values.get("custom", False):
                 for key, value in TEXTURING_DEFAULTS.items():
