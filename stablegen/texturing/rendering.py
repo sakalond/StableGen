@@ -2068,6 +2068,17 @@ def _projection_bake_face_mask(obj, threshold=1.0e-8):
             & (max_v >= 0.0)
             & (min_v <= 1.0)
         )
+        # Corners behind a perspective camera carry mirrored UVs, so a face
+        # crossing the camera plane may cover the view despite its bounds.
+        homogeneous = mesh.attributes.get(
+            "ProjectionUVW_" + attribute.name[len("ProjectionUV_"):])
+        if homogeneous is not None and homogeneous.domain == 'CORNER':
+            homogeneous.data.foreach_get("vector", vectors)
+            in_front = vectors.reshape((-1, 3))[:, 2] > 0.0
+            covered_faces |= (
+                np.logical_or.reduceat(in_front, face_starts)
+                & ~np.logical_and.reduceat(in_front, face_starts)
+            )
     return covered_faces
 
 

@@ -115,6 +115,219 @@ def _copy_uv_to_attribute(obj, uv_layer_name, attr_name):
     obj.data.update()
 
 
+def _projection_uvw_name(camera_index, mat_id):
+    return f"ProjectionUVW_{camera_index}_{mat_id}"
+
+
+def _write_projection_uvw(obj, camera, uv_attr_name, uvw_attr_name):
+    """Store homogeneous projection coordinates ``(u*w, v*w, w)`` per corner.
+
+    ``ProjectionUV_*`` holds the UV Project modifier's per-vertex result, which
+    is already divided by depth.  Interpolating it linearly across a face is
+    not perspective-correct, so large faces (a 4 m floor quad) receive the
+    image visibly shifted.  ``u*w``, ``v*w`` and ``w`` are affine in position
+    and interpolate exactly; the material divides per shading point.
+
+    Only perspective cameras need this.  Returns True when the attribute was
+    written; otherwise any stale attribute is removed and the material falls
+    back to ``ProjectionUV_*``.
+    """
+    import numpy as np
+
+    mesh = obj.data
+    stale = mesh.attributes.get(uvw_attr_name)
+    if stale is not None:
+        mesh.attributes.remove(stale)
+    uv_attr = mesh.attributes.get(uv_attr_name)
+    if camera.data.type != 'PERSP' or uv_attr is None or not mesh.loops:
+        return False
+
+    positions = np.empty(len(mesh.vertices) * 3, dtype=np.float64)
+    mesh.vertices.foreach_get("co", positions)
+    positions = positions.reshape((-1, 3))
+    # The modifier projects through the normalized (unscaled) camera matrix.
+    to_camera = np.array(
+        camera.matrix_world.normalized().inverted() @ obj.matrix_world,
+        dtype=np.float64,
+    )
+    camera_space = positions @ to_camera[:3, :3].T + to_camera[:3, 3]
+
+    loop_vertices = np.empty(len(mesh.loops), dtype=np.int32)
+    mesh.loops.foreach_get("vertex_index", loop_vertices)
+    uv = np.empty(len(mesh.loops) * 3, dtype=np.float32)
+    uv_attr.data.foreach_get("vector", uv)
+    uv = uv.reshape((-1, 3))[:, :2].astype(np.float64)
+
+    corner_space = camera_space[loop_vertices]
+    w = -corner_space[:, 2]
+
+    # In front of the camera the modifier's UV is A * x / w + B per axis.
+    # Fit A and B there and emit A * x + B * w for every corner: the modifier
+    # mirrors corners behind the camera, while the homogeneous form stays
+    # exact for faces crossing the camera plane.  A poor fit means shape keys
+    # or skeletal parenting fed the modifier other positions than the base
+    # mesh, so the legacy path is safer.
+    usable = w > 1e-4
+    homogeneous = np.empty((len(w), 3), dtype=np.float64)
+    homogeneous[:, 2] = w
+    for axis in range(2):
+        ratio = corner_space[usable, axis] / w[usable]
+        if ratio.size < 2 or np.ptp(ratio) < 1e-6:
+            return False
+        basis = np.column_stack((ratio, np.ones_like(ratio)))
+        target = uv[usable, axis]
+        scale, offset = np.linalg.lstsq(basis, target, rcond=None)[0]
+        error = np.abs(basis @ (scale, offset) - target) / np.maximum(np.abs(target), 1.0)
+        if error.max() > 1e-4:
+            print(
+                f"[StableGen] Warning: projection depth for {obj.name} does not "
+                f"match its projection UVs (error {error.max():.2e}); keeping "
+                "per-vertex UV interpolation for this camera."
+            )
+            return False
+        homogeneous[:, axis] = scale * corner_space[:, axis] + offset * w
+
+    attr = mesh.attributes.new(name=uvw_attr_name, type='FLOAT_VECTOR', domain='CORNER')
+    attr.data.foreach_set("vector", homogeneous.astype(np.float32).ravel())
+    mesh.update()
+    return True
+
+
+def _create_projection_uv_nodes(nodes, links, camera_index, mat_id, location):
+    """Build the per-camera projection UV and return its output node.
+
+    The result's ``Vector`` output is ``(u, v, 0)``.  When the mesh carries
+    ``ProjectionUVW_*`` the divide happens per shading point, which keeps the
+    mapping exact on faces of any size.  Meshes without it (older
+    projections, orthographic cameras, joined objects) read zero ``w`` and
+    use the per-vertex ``ProjectionUV_*`` instead.
+    """
+    x, y = location
+
+    def new(node_type, label, offset_x, offset_y=0):
+        node = nodes.new(node_type)
+        node.label = f"{label}-{camera_index}-{mat_id}"
+        node.location = (x + offset_x, y + offset_y)
+        node['sg_layout_stage'] = 'Image and UV'
+        return node
+
+    legacy = new("ShaderNodeAttribute", "ProjectionUVLinear", -800, -150)
+    legacy.attribute_name = f"ProjectionUV_{camera_index}_{mat_id}"
+    legacy.attribute_type = 'GEOMETRY'
+
+    homogeneous = new("ShaderNodeAttribute", "ProjectionUVW", -800)
+    homogeneous.attribute_name = _projection_uvw_name(camera_index, mat_id)
+    homogeneous.attribute_type = 'GEOMETRY'
+
+    separate = new("ShaderNodeSeparateXYZ", "ProjectionW", -600)
+    links.new(homogeneous.outputs["Vector"], separate.inputs[0])
+
+    inverse_w = new("ShaderNodeMath", "PerspectiveDivide", -450)
+    inverse_w.operation = 'DIVIDE'
+    inverse_w.inputs[0].default_value = 1.0
+    links.new(separate.outputs["Z"], inverse_w.inputs[1])
+
+    divided = new("ShaderNodeVectorMath", "PerspectiveUV", -300)
+    divided.operation = 'SCALE'
+    links.new(homogeneous.outputs["Vector"], divided.inputs[0])
+    links.new(inverse_w.outputs[0], divided.inputs["Scale"])
+
+    missing = new("ShaderNodeMath", "ProjectionUVWMissing", -450, -150)
+    missing.operation = 'COMPARE'
+    missing.inputs[1].default_value = 0.0
+    missing.inputs[2].default_value = 0.0
+    links.new(separate.outputs["Z"], missing.inputs[0])
+
+    # divided + missing * (legacy - divided); plain vector math so graph
+    # walkers never mistake the selector for a colour mix.
+    difference = new("ShaderNodeVectorMath", "ProjectionUVFallbackDelta", -300, -150)
+    difference.operation = 'SUBTRACT'
+    links.new(legacy.outputs["Vector"], difference.inputs[0])
+    links.new(divided.outputs["Vector"], difference.inputs[1])
+
+    select = new("ShaderNodeVectorMath", "ProjectionUVSelect", -150)
+    select.operation = 'MULTIPLY_ADD'
+    links.new(difference.outputs["Vector"], select.inputs[0])
+    links.new(missing.outputs[0], select.inputs[1])
+    links.new(divided.outputs["Vector"], select.inputs[2])
+
+    flatten = new("ShaderNodeVectorMath", "ProjectionUV", 0)
+    flatten.operation = 'MULTIPLY'
+    flatten.inputs[1].default_value = (1.0, 1.0, 0.0)
+    links.new(select.outputs["Vector"], flatten.inputs[0])
+    return flatten
+
+
+_COARSE_FACE_FRACTION = 0.1
+
+
+def _warn_coarse_projection_faces(objects, cameras, mat_id, reason):
+    """Warn when per-vertex projection data cannot resolve large faces.
+
+    The UV itself is exact per pixel, but baked visibility weights and
+    Surface Blend sample visibility only at vertices, so occlusion inside a
+    face spanning a sizeable part of a view is smeared across it.  Returns
+    ``{object name: coarse face count}``.
+    """
+    import numpy as np
+
+    coarse = {}
+    for obj in objects:
+        mesh = obj.data
+        if not mesh.polygons:
+            continue
+        face_starts = np.empty(len(mesh.polygons), dtype=np.int32)
+        mesh.polygons.foreach_get("loop_start", face_starts)
+        flagged = np.zeros(len(mesh.polygons), dtype=bool)
+        for i, camera in enumerate(cameras):
+            uv_attr = mesh.attributes.get(f"ProjectionUV_{i}_{mat_id}")
+            if uv_attr is None:
+                continue
+            uv = np.empty(len(mesh.loops) * 3, dtype=np.float32)
+            uv_attr.data.foreach_get("vector", uv)
+            uv = uv.reshape((-1, 3))
+            in_front = np.ones(len(mesh.loops), dtype=bool)
+            uvw_attr = mesh.attributes.get(_projection_uvw_name(i, mat_id))
+            if uvw_attr is not None:
+                uvw = np.empty(len(mesh.loops) * 3, dtype=np.float32)
+                uvw_attr.data.foreach_get("vector", uvw)
+                in_front = uvw.reshape((-1, 3))[:, 2] > 0
+            elif camera.data.type != 'ORTHO':
+                continue
+            u, v = uv[:, 0], uv[:, 1]
+            min_u = np.minimum.reduceat(u, face_starts)
+            max_u = np.maximum.reduceat(u, face_starts)
+            min_v = np.minimum.reduceat(v, face_starts)
+            max_v = np.maximum.reduceat(v, face_starts)
+            all_front = np.logical_and.reduceat(in_front, face_starts)
+            visible = (
+                all_front
+                & (max_u >= 0.0) & (min_u <= 1.0)
+                & (max_v >= 0.0) & (min_v <= 1.0)
+            )
+            extent = np.maximum(max_u - min_u, max_v - min_v)
+            # Faces crossing the camera plane get zero weight at the corners
+            # behind it, however small their visible part is.
+            straddling = np.logical_or.reduceat(in_front, face_starts) & ~all_front
+            flagged |= (visible & (extent > _COARSE_FACE_FRACTION)) | straddling
+        if flagged.any():
+            coarse[obj.name] = int(flagged.sum())
+    if coarse:
+        listed = ", ".join(f"{name} ({count})" for name, count in sorted(coarse.items()))
+        print(
+            f"[StableGen] Warning: {reason} samples visibility per vertex, but "
+            f"some faces span more than {_COARSE_FACE_FRACTION:.0%} of a camera "
+            f"view: {listed}. Occlusion inside those faces will be smeared; "
+            "subdivide them for accurate projection."
+        )
+    return coarse
+
+
+def _projection_uv_output(node):
+    """UV socket of a projection UV node (attribute, UV map or built chain)."""
+    return node.outputs["Vector"] if "Vector" in node.outputs else node.outputs["UV"]
+
+
 def _bake_visibility_weights(
     context,
     objects,
@@ -1973,6 +2186,8 @@ def project_image(
                 # Copy buffer UV data to a named attribute (no UV slot limit)
                 attr_name = f"ProjectionUV_{i}_{mat_id}"
                 _copy_uv_to_attribute(obj, _SG_BUFFER_UV_NAME, attr_name)
+                _write_projection_uvw(obj, camera, attr_name,
+                                      _projection_uvw_name(i, mat_id))
 
                 # Restore active UV to the first non-buffer UV layer
                 original_uv_map = obj.data.uv_layers[0]
@@ -1986,6 +2201,8 @@ def project_image(
             buffer_uv = obj.data.uv_layers.get(_SG_BUFFER_UV_NAME)
             if buffer_uv:
                 obj.data.uv_layers.remove(buffer_uv)
+        if surface_blend:
+            _warn_coarse_projection_faces(to_project, cameras, mat_id, "Surface Blend")
 
     # ── Optional: bake per-vertex visibility weights ──────────────────
     use_baked_weights = (
@@ -2017,6 +2234,8 @@ def project_image(
             use_baked_weights = False
         if (not reuse_projection_uv
                 and (not is_sequential or stop_index == 0 or missing_bake)):
+            _warn_coarse_projection_faces(
+                to_project, cameras, mat_id, "Baked visibility weighting")
             _bake_visibility_weights(context, to_project, cameras, mat_id)
 
     # Switch to Cycles (needed for Raycast shader node on all versions)
@@ -2230,8 +2449,7 @@ def project_image(
 
             # Connect to the same camera UV attribute
             uv_node = uv_map_nodes[cam_index]
-            uv_out = "Vector" if uv_node.type == 'ATTRIBUTE' else "UV"
-            links.new(uv_node.outputs[uv_out], mask_tex.inputs["Vector"])
+            links.new(_projection_uv_output(uv_node), mask_tex.inputs["Vector"])
 
             # Color→Float conversion via a pass-through Math node
             to_float = nodes.new("ShaderNodeMath")
@@ -2273,8 +2491,7 @@ def project_image(
             mask_tex.location = (-500, -200 * cam_index - 300)
 
             uv_node = uv_map_nodes[cam_index]
-            uv_out = "Vector" if uv_node.type == 'ATTRIBUTE' else "UV"
-            links.new(uv_node.outputs[uv_out], mask_tex.inputs["Vector"])
+            links.new(_projection_uv_output(uv_node), mask_tex.inputs["Vector"])
 
             to_float = nodes.new("ShaderNodeMath")
             to_float.operation = 'MULTIPLY'
@@ -2306,8 +2523,7 @@ def project_image(
             guard_tex.interpolation = 'Linear'
             guard_tex.label = f"ProjectionGuard-{cam_index}-{mat_id_inner}"
             uv_node = uv_map_nodes[cam_index]
-            uv_out = "Vector" if uv_node.type == 'ATTRIBUTE' else "UV"
-            links.new(uv_node.outputs[uv_out], guard_tex.inputs["Vector"])
+            links.new(_projection_uv_output(uv_node), guard_tex.inputs["Vector"])
             guard_weight = nodes.new("ShaderNodeMath")
             guard_weight.operation = 'MULTIPLY'
             guard_weight.inputs[1].default_value = 1.0
@@ -2359,12 +2575,9 @@ def project_image(
             tex_image.label = f"{i}-{mat_id}"
             tex_image_nodes.append(tex_image)
 
-            # Add UV map / attribute node
-            # Use ShaderNodeAttribute to read from the corner-domain attribute
-            uv_map_node = nodes.new("ShaderNodeAttribute")
-            uv_map_node.attribute_name = f"ProjectionUV_{i}_{mat_id}"
-            uv_map_node.attribute_type = 'GEOMETRY'
-            uv_map_node.location = (-200, -200 * (i+1))
+            # Perspective-correct projection UV from the corner attributes
+            uv_map_node = _create_projection_uv_nodes(
+                nodes, links, i, mat_id, (-200, -200 * (i+1)))
             uv_map_nodes.append(uv_map_node)
             
             # Compute the dot product of the direction vector and geometry normal
@@ -2789,7 +3002,7 @@ def project_image(
                                 feather_tex.interpolation = 'Linear'
                                 feather_tex.label = f"ProjectionGuardFeather-{i}-{mat_id}"
                                 uv = uv_map_nodes[i]
-                                links.new(uv.outputs['Vector' if uv.type == 'ATTRIBUTE' else 'UV'],
+                                links.new(_projection_uv_output(uv),
                                           feather_tex.inputs['Vector'])
                                 feathered = nodes.new("ShaderNodeMath")
                                 feathered.operation = 'MULTIPLY'
@@ -2962,8 +3175,7 @@ def project_image(
             geometry = geometry_nodes[i]
 
             # Connect UV → Texture (needed for both paths)
-            uv_output = "Vector" if uv_map_node.type == 'ATTRIBUTE' else "UV"
-            links.new(uv_map_node.outputs[uv_output], tex_image.inputs["Vector"])
+            links.new(_projection_uv_output(uv_map_node), tex_image.inputs["Vector"])
 
             if use_baked_weights or use_native_raycast:
                 # Baked-weights path: all links already made during creation.

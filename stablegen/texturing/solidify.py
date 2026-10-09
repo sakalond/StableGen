@@ -23,8 +23,7 @@ def _projection_attribute_names(mesh):
         attribute.name
         for attribute in mesh.attributes
         if (
-            attribute.name.startswith("ProjectionUV_")
-            or attribute.name.startswith("_SG_")
+            attribute.name.startswith(("ProjectionUV_", "ProjectionUVW_", "_SG_"))
         )
     }
 

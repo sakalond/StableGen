@@ -33,6 +33,8 @@ from .texturing.projection import (
     create_native_feather,
     _SG_BUFFER_UV_NAME,
     _copy_uv_to_attribute,
+    _projection_uvw_name,
+    _write_projection_uvw,
 )
 from .texturing.rendering import export_emit_image, export_visibility
 from .cameras.geometry import _get_camera_resolution, _SGCameraResolution
@@ -494,6 +496,7 @@ def _apply_uv_projections(context, cameras, meshes, mat_id):
 
             attr_name = f"ProjectionUV_{i}_{mat_id}"
             _copy_uv_to_attribute(obj, _SG_BUFFER_UV_NAME, attr_name)
+            _write_projection_uvw(obj, camera, attr_name, _projection_uvw_name(i, mat_id))
 
             original_uv = obj.data.uv_layers[0]
             if original_uv.name == _SG_BUFFER_UV_NAME and len(obj.data.uv_layers) > 1:
