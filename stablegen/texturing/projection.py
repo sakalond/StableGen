@@ -7,9 +7,129 @@ from ..utils import get_last_material_index, get_file_path, get_dir_path
 from .rendering import prepare_baking, bake_texture, unwrap
 from ..cameras.geometry import _get_camera_resolution
 from mathutils import Matrix, Vector
+from .svm_budget import SVM_STACK_SIZE, estimate_svm_stack
 
 
 _SG_BUFFER_UV_NAME = "_SG_ProjectionBuffer"
+# The estimate matches Cycles; warn a little before the hard limit.
+_SVM_STACK_WARNING = SVM_STACK_SIZE - 16
+
+
+# Cycles compiles an SVM shader in sweeps over the (inlined) nodes, and a node
+# reading another socket type waits for a conversion node that Cycles creates
+# after all nodes, i.e. for the next sweep. Everything a camera computes before
+# such a wait stays on the 255-float SVM stack until the wait is over, for all
+# cameras at once. The raycast's direction is such a conversion, so projection
+# graphs keep the values that wait for it few, give masks explicit float
+# conversions and read the masks' UVs through the camera's raycast result.
+# svm_budget.estimate_svm_stack() replays the compiler to check the result.
+
+def _mask_value(nodes, links, texture):
+    """Grey mask texture as a float, without an implicit Cycles conversion."""
+    value = nodes.new('ShaderNodeRGBToBW')
+    value.label = texture.label + ' value'
+    value.hide = True
+    links.new(texture.outputs['Color'], value.inputs[0])
+    return value
+
+
+def _absorb_unused_raycast_outputs(nodes, links, raycast, visible):
+    """Return ``visible`` with the raycast's unused outputs read but ignored.
+
+    Cycles' Raycast node writes all five outputs to the SVM stack and frees an
+    output only after reading it, so unread outputs leak 7 floats per camera.
+    Each is read by a node of its exact type (no conversion) and folded in as
+    max(visible, min(..., 0)), which equals ``visible`` (>= 0) and ignores NaN.
+    """
+    position = nodes.new('ShaderNodeTexGradient')
+    position.label = 'Read hit position'
+    links.new(raycast.outputs['Hit Position'], position.inputs['Vector'])
+    normal = nodes.new('ShaderNodeFresnel')
+    normal.label = 'Read hit normal'
+    links.new(raycast.outputs['Hit Normal'], normal.inputs['Normal'])
+    hit = _projection_feather_math(nodes, links, 'MINIMUM', 'Unused raycast outputs',
+                                   raycast.outputs['Self Hit'], position.outputs['Fac'])
+    surface = _projection_feather_math(nodes, links, 'MINIMUM', 'Unused raycast outputs',
+                                       hit.outputs[0], normal.outputs['Fac'])
+    zero = _projection_feather_math(nodes, links, 'MINIMUM', 'Unused raycast outputs (zero)',
+                                    surface.outputs[0], 0.0)
+    absorbed = _projection_feather_math(nodes, links, 'MAXIMUM', 'Visible from camera',
+                                        visible, zero.outputs[0])
+    return absorbed, (position, normal, hit, surface, zero)
+
+
+def _late_projection_uv(nodes, links, uv_node, visible, camera_index, mat_id):
+    """Projection UV that Cycles reads only after the camera's raycast.
+
+    Masks and the generated image only depend on the UV, so Cycles would
+    sample them for every camera in the sweep before any raycast and keep all
+    those values on the stack. min(uv, max(visible, 1e30)) equals the UV but
+    depends on the raycast, so each camera's textures follow its raycast.
+    """
+    def new(node_type, label):
+        node = nodes.new(node_type)
+        node.label = f"{label}-{camera_index}-{mat_id}"
+        node.hide = True
+        node['sg_layout_stage'] = 'Image and UV'
+        return node
+
+    bound = new('ShaderNodeMath', 'ProjectionUVAfterRaycastBound')
+    bound.operation = 'MAXIMUM'
+    bound.inputs[1].default_value = 1e30
+    links.new(visible, bound.inputs[0])
+    bounds = new('ShaderNodeCombineXYZ', 'ProjectionUVAfterRaycastBounds')
+    for axis in range(3):
+        links.new(bound.outputs[0], bounds.inputs[axis])
+    late = new('ShaderNodeVectorMath', 'ProjectionUVAfterRaycast')
+    late.operation = 'MINIMUM'
+    links.new(_projection_uv_output(uv_node), late.inputs[0])
+    links.new(bounds.outputs[0], late.inputs[1])
+    return late
+
+
+# Materials whose estimated SVM stack use is near or past Cycles' limit,
+# reported by the generation operators once they finish.
+_svm_stack_warnings = {}
+
+
+def check_projection_svm_stack(material, estimates=None):
+    """Estimate the material's Cycles SVM stack use and warn when too big.
+
+    Cycles only logs an SVM stack overflow and renders the material black,
+    which also blanks every Qwen context render made from it. ``estimates``
+    caches results for materials with the same topology within one build.
+    """
+    tree = material.node_tree
+    key = (len(tree.nodes), len(tree.links))
+    if estimates is not None and key in estimates:
+        peak, details = estimates[key]
+    else:
+        peak, details = estimate_svm_stack(material)
+        if estimates is not None:
+            estimates[key] = (peak, details)
+    material['sg_svm_stack_estimate'] = peak
+    if peak >= _SVM_STACK_WARNING:
+        holders = ', '.join(f'{name} ({size})' for name, size in details.get('holders', ())[:4])
+        print(f"[StableGen] WARNING: projection material '{material.name}' needs about "
+              f"{peak} of Cycles' {SVM_STACK_SIZE} SVM stack slots and may render black "
+              f"in Cycles. Largest live values: {holders}")
+        _svm_stack_warnings[material.name] = peak
+    else:
+        _svm_stack_warnings.pop(material.name, None)
+    return peak
+
+
+def pop_svm_stack_warning():
+    """Return a one-line user warning for oversized materials, then reset."""
+    if not _svm_stack_warnings:
+        return None
+    names = sorted(_svm_stack_warnings)
+    peak = max(_svm_stack_warnings.values())
+    _svm_stack_warnings.clear()
+    shown = ', '.join(names[:3]) + (f' and {len(names) - 3} more' if len(names) > 3 else '')
+    return (f"Projection material {shown} is near Cycles' shader size limit "
+            f"(~{peak}/{SVM_STACK_SIZE}) and may render black. Use fewer cameras "
+            f"or disable some Precise+ features.")
 
 
 def _is_projection_mesh(obj):
@@ -219,13 +339,17 @@ def _create_projection_uv_nodes(nodes, links, camera_index, mat_id, location):
     homogeneous.attribute_name = _projection_uvw_name(camera_index, mat_id)
     homogeneous.attribute_type = 'GEOMETRY'
 
-    separate = new("ShaderNodeSeparateXYZ", "ProjectionW", -600)
-    links.new(homogeneous.outputs["Vector"], separate.inputs[0])
+    # w = dot(uvw, Z). Cycles' Separate XYZ would keep the unused X and Y on
+    # the SVM stack for the rest of the shader and reads through a conversion.
+    w = new("ShaderNodeVectorMath", "ProjectionW", -600)
+    w.operation = 'DOT_PRODUCT'
+    w.inputs[1].default_value = (0.0, 0.0, 1.0)
+    links.new(homogeneous.outputs["Vector"], w.inputs[0])
 
     inverse_w = new("ShaderNodeMath", "PerspectiveDivide", -450)
     inverse_w.operation = 'DIVIDE'
     inverse_w.inputs[0].default_value = 1.0
-    links.new(separate.outputs["Z"], inverse_w.inputs[1])
+    links.new(w.outputs["Value"], inverse_w.inputs[1])
 
     divided = new("ShaderNodeVectorMath", "PerspectiveUV", -300)
     divided.operation = 'SCALE'
@@ -236,7 +360,7 @@ def _create_projection_uv_nodes(nodes, links, camera_index, mat_id, location):
     missing.operation = 'COMPARE'
     missing.inputs[1].default_value = 0.0
     missing.inputs[2].default_value = 0.0
-    links.new(separate.outputs["Z"], missing.inputs[0])
+    links.new(w.outputs["Value"], missing.inputs[0])
 
     # divided + missing * (legacy - divided); plain vector math so graph
     # walkers never mistake the selector for a colour mix.
@@ -704,7 +828,8 @@ def _bake_visibility_weights(
         obj.data.update()
 
 
-def create_native_raycast_visibility(nodes, links, camera, geometry, context, i, mat_id, stop_index):
+def create_native_raycast_visibility(nodes, links, camera, geometry, context, i, mat_id, stop_index,
+                                     pre_factors=None, extra=None):
     """
     Creates a visibility weight node group using the native Raycast shader node (Blender 5.1+).
     Replicates the OSL raycast.osl shader logic:
@@ -712,7 +837,14 @@ def create_native_raycast_visibility(nodes, links, camera, geometry, context, i,
       2. Occlusion check (Raycast from camera, compare Hit Distance with expected distance)
       3. Angle check (surface normal vs ray direction)
       4. Weight = pow(orthogonality, Power)
-    
+
+    Cycles compiles the raycast one sweep after the camera math (its direction
+    is converted to a normal), so the raycast-free terms are multiplied first
+    and the occlusion test last: one float per camera waits for the raycast.
+    ``pre_factors(weight_socket, parts)`` may multiply further raycast-free
+    terms in. ``extra`` (a dict) receives the 'visible' socket and the
+    'view_depth' sockets (camera-axis depth = product of the two).
+
     Returns: (weight_output_node, subtract_node, normalize_node, length_node,
               camera_loc_node, camera_fov_node, camera_aspect_node, camera_dir_node, camera_up_node)
     """
@@ -959,6 +1091,8 @@ def create_native_raycast_visibility(nodes, links, camera, geometry, context, i,
     occlusion_ok.location = (x_base + 600, y_base + 50)
     links.new(raycast.outputs["Is Hit"], occlusion_ok.inputs[0])
     links.new(dist_check.outputs[0], occlusion_ok.inputs[1])
+    visible, raycast_sinks = _absorb_unused_raycast_outputs(
+        nodes, links, raycast, occlusion_ok.outputs[0])
 
     # ========================================
     # ANGLE CHECK + WEIGHT
@@ -1029,26 +1163,34 @@ def create_native_raycast_visibility(nodes, links, camera, geometry, context, i,
     links.new(facing_dot.outputs[0], power_node.inputs[0])
 
     # ========================================
-    # COMBINE ALL: frustum_ok * occlusion_ok * angle_ok * weight
+    # COMBINE ALL: frustum_ok * angle_ok * weight [* pre_factors] * occlusion_ok
     # ========================================
     combine1 = nodes.new("ShaderNodeMath")
     combine1.operation = 'MULTIPLY'
     combine1.location = (x_base + 800, y_base)
     links.new(frustum_ok.outputs[0], combine1.inputs[0])
-    links.new(occlusion_ok.outputs[0], combine1.inputs[1])
+    links.new(angle_check.outputs[0], combine1.inputs[1])
 
     combine2 = nodes.new("ShaderNodeMath")
     combine2.operation = 'MULTIPLY'
     combine2.location = (x_base + 900, y_base)
     links.new(combine1.outputs[0], combine2.inputs[0])
-    links.new(angle_check.outputs[0], combine2.inputs[1])
+    links.new(power_node.outputs[0], combine2.inputs[1])
+    weighted = combine2.outputs[0]
+    if pre_factors is not None:
+        weighted = pre_factors(weighted, dict(
+            normalize=normalize_node, length=length_node, fov=camera_fov_node,
+            aspect=camera_aspect_node, direction=camera_dir_node, up=camera_up_node))
 
     final_weight = nodes.new("ShaderNodeMath")
     final_weight.operation = 'MULTIPLY'
     final_weight.location = (x_base + 1000, y_base)
     final_weight.label = f"Angle-{i}-{mat_id}"
-    links.new(combine2.outputs[0], final_weight.inputs[0])
-    links.new(power_node.outputs[0], final_weight.inputs[1])
+    links.new(weighted, final_weight.inputs[0])
+    links.new(visible.outputs[0], final_weight.inputs[1])
+    if extra is not None:
+        extra['visible'] = visible.outputs[0]
+        extra['view_depth'] = (neg_cam_z.outputs[0], length_node.outputs["Value"])
 
     # Presentation metadata only: keep the native graph's large camera math
     # readable without changing any operation, input or connection.
@@ -1062,7 +1204,7 @@ def create_native_raycast_visibility(nodes, links, camera, geometry, context, i,
             shift_y_amount centered_y abs_x x_in_bounds abs_y y_in_bounds
             frustum_xy frustum_ok''',
         'Raycast visibility': '''
-            raycast threshold_plus hit_dist_plus dist_check occlusion_ok''',
+            raycast threshold_plus hit_dist_plus dist_check occlusion_ok visible''',
         'Facing and angle': '''
             dot_d_normal clamp_dot clamp_dot2 facing_raw facing_dot acos_node
             to_degrees angle_check power_node combine1 combine2 final_weight''',
@@ -1081,11 +1223,11 @@ def create_native_raycast_visibility(nodes, links, camera, geometry, context, i,
         'threshold_plus': 'Ray length tolerance',
         'hit_dist_plus': 'Hit distance tolerance',
         'dist_check': 'Target depth matches hit',
-        'occlusion_ok': 'Visible from camera',
+        'occlusion_ok': 'Hit is the surface',
         'dot_d_normal': 'View facing angle',
         'facing_raw': 'Apply backface setting',
-        'combine1': 'Frustum and occlusion',
-        'combine2': 'Apply discard angle',
+        'combine1': 'Frustum and discard angle',
+        'combine2': 'Apply facing weight',
     }
     available = locals()
     for stage, names in stage_names.items():
@@ -1094,6 +1236,12 @@ def create_native_raycast_visibility(nodes, links, camera, geometry, context, i,
             node['sg_layout_stage'] = stage
             if not node.label:
                 node.label = readable_names.get(name, name.replace('_', ' ').capitalize())
+    for node in raycast_sinks:
+        node['sg_layout_stage'] = 'Raycast visibility'
+    if pre_factors is not None:
+        # The final weight now follows the frame-edge and density terms; keep
+        # it in their frame so the graph still reads left to right.
+        final_weight['sg_layout_stage'] = 'Acquisition quality'
 
     return (final_weight, subtract, normalize_node, length_node,
             add_camera_loc, camera_fov_node, camera_aspect_node,
@@ -1288,13 +1436,22 @@ def create_native_feather(nodes, links, normalize_node, camera_fov_node, camera_
         map_range.inputs["To Min"].default_value = 1.0  # Invert: edge=low -> factor=1
         map_range.inputs["To Max"].default_value = 0.0  # edge=high -> factor=0
         links.new(edge.outputs[0], map_range.inputs["Value"])
+        # Clamp explicitly: Cycles turns the Map Range clamp option into a
+        # node created after all others, which delays the frame weight to the
+        # raycast's compile sweep and keeps its inputs on the SVM stack.
+        map_range.clamp = False
+        clamped = nodes.new("ShaderNodeClamp")
+        clamped.clamp_type = 'RANGE'
+        clamped.inputs["Min"].default_value = 1.0
+        clamped.inputs["Max"].default_value = 0.0
+        links.new(map_range.outputs[0], clamped.inputs["Value"])
 
         # edge_factor = pow(smoothstep_result, gamma)
         pow_node = nodes.new("ShaderNodeMath")
         pow_node.operation = 'POWER'
         pow_node.location = (x_base + 700, y_base - 150)
         pow_node.inputs[1].default_value = max(0.01, gamma_val)
-        links.new(map_range.outputs[0], pow_node.inputs[0])
+        links.new(clamped.outputs[0], pow_node.inputs[0])
 
         # Multiply by cam_z_check (0 if behind camera)
         final_feather = nodes.new("ShaderNodeMath")
@@ -2250,6 +2407,7 @@ def project_image(
             context.scene.cycles.use_osl = True
 
     processed_materials = set()
+    svm_estimates = {}
 
     for obj in to_project:
 
@@ -2457,7 +2615,7 @@ def project_image(
             to_float.inputs[1].default_value = 1.0
             to_float.location = (-300, -200 * cam_index - 150)
             to_float.label = f"EF_Weight-{cam_index}"
-            links.new(mask_tex.outputs[0], to_float.inputs[0])
+            links.new(_mask_value(nodes, links, mask_tex).outputs[0], to_float.inputs[0])
             return to_float
 
         def _create_write_mask_weight(
@@ -2498,7 +2656,7 @@ def project_image(
             to_float.inputs[1].default_value = 1.0
             to_float.location = (-300, -200 * cam_index - 300)
             to_float.label = f"{label_prefix}Weight-{cam_index}-{mat_id_inner}"
-            links.new(mask_tex.outputs[0], to_float.inputs[0])
+            links.new(_mask_value(nodes, links, mask_tex).outputs[0], to_float.inputs[0])
             return to_float
 
         def _create_projection_guard_weight(cam_index, mat_id_inner):
@@ -2528,8 +2686,37 @@ def project_image(
             guard_weight.operation = 'MULTIPLY'
             guard_weight.inputs[1].default_value = 1.0
             guard_weight.label = f"ProjectionGuardWeight-{cam_index}-{mat_id_inner}"
-            links.new(guard_tex.outputs[0], guard_weight.inputs[0])
+            links.new(_mask_value(nodes, links, guard_tex).outputs[0], guard_weight.inputs[0])
             return guard_weight
+
+        def _acquisition_quality(weight, length_node, camera, cam_index):
+            """Multiply a projection weight by the view's projected pixel density."""
+            cam_res_x, cam_res_y = _get_camera_resolution(camera, context.scene)
+            fov_for_density = camera.data.angle_x
+            if cam_res_y > cam_res_x:
+                fov_for_density = 2 * atan(
+                    tan(fov_for_density / 2) * cam_res_x / cam_res_y
+                )
+            focal_pixels = cam_res_x / max(2.0 * tan(fov_for_density / 2), 1e-7)
+            density_numerator = (
+                _scene_projection_scale(context) * focal_pixels
+                / max(0.5 * min(cam_res_x, cam_res_y), 1.0)
+            )
+            density = nodes.new("ShaderNodeMath")
+            density.operation = 'DIVIDE'
+            density.inputs[0].default_value = density_numerator
+            density.label = f"ProjectedDensity-{cam_index}-{mat_id}"
+            links.new(length_node.outputs["Value"], density.inputs[1])
+            clamp_density = nodes.new("ShaderNodeMath")
+            clamp_density.operation = 'MINIMUM'
+            clamp_density.inputs[1].default_value = 1.0
+            links.new(density.outputs[0], clamp_density.inputs[0])
+            acquisition = nodes.new("ShaderNodeMath")
+            acquisition.operation = 'MULTIPLY'
+            acquisition.label = f"AcquisitionQuality-{cam_index}-{mat_id}"
+            links.new(weight, acquisition.inputs[0])
+            links.new(clamp_density.outputs[0], acquisition.inputs[1])
+            return acquisition
 
         # Voronoi mode flag: keep natural weights for non-generated cameras
         voronoi_active = (context.scene.model_architecture in ('qwen_image_edit', 'qwen_image_21', 'flux2_klein')
@@ -2547,6 +2734,7 @@ def project_image(
         geometry_nodes = []
         for i, camera in enumerate(cameras):
             camera_node_start = {node.as_pointer() for node in nodes}
+            native_extra = {}
             # Geometry is evaluated at the current shading point. Keeping an
             # instance in each view avoids links spanning every camera row.
             geometry = nodes.new("ShaderNodeNewGeometry")
@@ -2634,17 +2822,40 @@ def project_image(
 
             elif use_native_raycast:
                 # ── Native Raycast path (Blender 5.1+) ──
+                is_local_edit_mode = (context.scene.generation_method == 'local_edit' or (context.scene.model_architecture.startswith('qwen') and context.scene.qwen_generation_method == 'local_edit'))
+                native_pre_factors = None
+                if (not is_local_edit_mode
+                        and getattr(context.scene, 'sg_rework_acquisition_quality', False)):
+                    # Frame-edge and density terms do not depend on the
+                    # raycast; they are combined before it (see there).
+                    def native_pre_factors(weight, parts, camera=camera, i=i):
+                        if (context.scene.generation_method == 'sequential'
+                                and context.scene.visibility_vignette):
+                            frame_weight = create_native_feather(
+                                nodes, links, parts['normalize'], parts['fov'],
+                                parts['aspect'], parts['direction'], parts['up'],
+                                camera, context, i, mat_id,
+                            )
+                            frame_quality = nodes.new("ShaderNodeMath")
+                            frame_quality.operation = 'MULTIPLY'
+                            frame_quality.label = f"FrameEdgeQuality-{i}-{mat_id}"
+                            links.new(weight, frame_quality.inputs[0])
+                            links.new(frame_weight.outputs[0], frame_quality.inputs[1])
+                            weight = frame_quality.outputs[0]
+                        return _acquisition_quality(weight, parts['length'], camera, i).outputs[0]
                 result = create_native_raycast_visibility(
-                    nodes, links, camera, geometry, context, i, mat_id, stop_index
+                    nodes, links, camera, geometry, context, i, mat_id, stop_index,
+                    pre_factors=native_pre_factors, extra=native_extra,
                 )
                 angle_weight = result[0]
                 # Destructure result for create_native_feather
                 _, _, normalize_node, length_node, camera_loc_node, camera_fov_node, camera_aspect_node, camera_dir_node, camera_up_node = result
+                uv_map_nodes[i] = _late_projection_uv(
+                    nodes, links, uv_map_node, native_extra['visible'], i, mat_id)
 
                 scripts_to_connect = []  # No OSL scripts to connect
                 final_weight_node = None
 
-                is_local_edit_mode = (context.scene.generation_method == 'local_edit' or (context.scene.model_architecture.startswith('qwen') and context.scene.qwen_generation_method == 'local_edit'))
                 if is_local_edit_mode:
                     feather_weight = create_native_feather(
                         nodes, links, normalize_node, camera_fov_node, camera_aspect_node,
@@ -2661,20 +2872,6 @@ def project_image(
                         final_weight_node = (angle_weight, feather_weight)
                 else:
                     final_weight_node = angle_weight
-                    if (getattr(context.scene, 'sg_rework_acquisition_quality', False)
-                            and context.scene.generation_method == 'sequential'
-                            and context.scene.visibility_vignette):
-                        frame_weight = create_native_feather(
-                            nodes, links, normalize_node, camera_fov_node,
-                            camera_aspect_node, camera_dir_node, camera_up_node,
-                            camera, context, i, mat_id,
-                        )
-                        frame_quality = nodes.new("ShaderNodeMath")
-                        frame_quality.operation = 'MULTIPLY'
-                        frame_quality.label = f"FrameEdgeQuality-{i}-{mat_id}"
-                        links.new(angle_weight.outputs[0], frame_quality.inputs[0])
-                        links.new(frame_weight.outputs[0], frame_quality.inputs[1])
-                        final_weight_node = frame_quality
 
                 script_nodes.append(scripts_to_connect)
 
@@ -2878,38 +3075,16 @@ def project_image(
                 length.location = (-400, 200 * (i+1))
                 length_nodes.append(length)
 
-            # Add projected pixel density to live native/OSL paths.  Baked
-            # acquisition attributes already contain this term.
+            # Add projected pixel density to live OSL paths (the native path
+            # adds it before its raycast).  Baked acquisition attributes
+            # already contain this term.
             if (getattr(context.scene, 'sg_rework_acquisition_quality', False)
-                    and not use_baked_weights and script_nodes_outputs
+                    and not use_baked_weights and not use_native_raycast
+                    and script_nodes_outputs
                     and not isinstance(script_nodes_outputs[-1], tuple)
                     and length_nodes[-1] is not None):
-                cam_res_x, cam_res_y = _get_camera_resolution(camera, context.scene)
-                fov_for_density = camera.data.angle_x
-                if cam_res_y > cam_res_x:
-                    fov_for_density = 2 * atan(
-                        tan(fov_for_density / 2) * cam_res_x / cam_res_y
-                    )
-                focal_pixels = cam_res_x / max(2.0 * tan(fov_for_density / 2), 1e-7)
-                density_numerator = (
-                    _scene_projection_scale(context) * focal_pixels
-                    / max(0.5 * min(cam_res_x, cam_res_y), 1.0)
-                )
-                density = nodes.new("ShaderNodeMath")
-                density.operation = 'DIVIDE'
-                density.inputs[0].default_value = density_numerator
-                density.label = f"ProjectedDensity-{i}-{mat_id}"
-                links.new(length_nodes[-1].outputs[0], density.inputs[1])
-                clamp_density = nodes.new("ShaderNodeMath")
-                clamp_density.operation = 'MINIMUM'
-                clamp_density.inputs[1].default_value = 1.0
-                links.new(density.outputs[0], clamp_density.inputs[0])
-                acquisition = nodes.new("ShaderNodeMath")
-                acquisition.operation = 'MULTIPLY'
-                acquisition.label = f"AcquisitionQuality-{i}-{mat_id}"
-                links.new(script_nodes_outputs[-1].outputs[0], acquisition.inputs[0])
-                links.new(clamp_density.outputs[0], acquisition.inputs[1])
-                script_nodes_outputs[-1] = acquisition
+                script_nodes_outputs[-1] = _acquisition_quality(
+                    script_nodes_outputs[-1].outputs[0], length_nodes[-1], camera, i)
 
             use_qwen_write_mask = (
                 i > 0
@@ -3000,15 +3175,20 @@ def project_image(
                                 feather_tex.image = feather_image
                                 feather_tex.extension = 'CLIP'
                                 feather_tex.interpolation = 'Linear'
-                                feather_tex.label = f"ProjectionGuardFeather-{i}-{mat_id}"
+                                feather_tex.label = f"ProjectionGuardFeatherMask-{i}-{mat_id}"
+                                feather_tex['sg_layout_stage'] = 'Guard feather'
                                 uv = uv_map_nodes[i]
                                 links.new(_projection_uv_output(uv),
                                           feather_tex.inputs['Vector'])
+                                # The float value carries the feather label that
+                                # graph controls and diagnostics look up.
+                                feather_value = _mask_value(nodes, links, feather_tex)
+                                feather_value.label = f"ProjectionGuardFeather-{i}-{mat_id}"
                                 feathered = nodes.new("ShaderNodeMath")
                                 feathered.operation = 'MULTIPLY'
                                 feathered.label = f"DepthPartFeathered-{i}-{mat_id}"
                                 links.new(guarded.outputs[0], feathered.inputs[0])
-                                links.new(feather_tex.outputs[0], feathered.inputs[1])
+                                links.new(feather_value.outputs[0], feathered.inputs[1])
                                 script_nodes_outputs[-1] = feathered
                                 occlusion_path = os.path.join(os.path.dirname(feather_path),
                                                               f"projection_occlusion_geometry{i}.png")
@@ -3035,6 +3215,15 @@ def project_image(
                                         receiver = nodes.new('ShaderNodeAttribute')
                                         receiver.attribute_name = f'_SG_ProjectionDepth_{i}_{mat_id}'
                                         depth_socket = receiver.outputs['Fac']
+                                        divisor = distance_scale
+                                    elif 'view_depth' in native_extra:
+                                        # (view direction . forward) * distance
+                                        # is the camera-axis depth; scalars
+                                        # keep the SVM stack small.
+                                        depth_socket = _projection_feather_math(
+                                            nodes, links, 'MULTIPLY',
+                                            f'OcclusionReceiverCameraDepth-{i}',
+                                            *native_extra['view_depth']).outputs[0]
                                         divisor = distance_scale
                                     else:
                                         coordinates = nodes.new('ShaderNodeTexCoord')
@@ -3067,13 +3256,15 @@ def project_image(
                                             influence_path, force_reload=context.scene.overwrite_material)
                                         influence_image.colorspace_settings.name = 'Non-Color'
                                         influence_tex = nodes.new("ShaderNodeTexImage")
-                                        influence_tex.name = f"SGFeatherInfluence-{i}-{mat_id}"
+                                        influence_tex.name = f"SGFeatherInfluenceMask-{i}-{mat_id}"
                                         influence_tex.label = f"ProjectionGuardInfluence-{i}-{mat_id}"
                                         influence_tex.image = influence_image
                                         influence_tex.extension = 'CLIP'
                                         influence_tex.interpolation = 'Linear'
                                         links.new(feather_tex.inputs['Vector'].links[0].from_socket,
                                                   influence_tex.inputs['Vector'])
+                                        _mask_value(nodes, links, influence_tex).name = (
+                                            f"SGFeatherInfluence-{i}-{mat_id}")
 
             # Confidence is deliberately independent from colour ownership.
             # Preserve the unnormalised source-camera quality before the mix
@@ -3239,6 +3430,7 @@ def project_image(
             layout_camera_nodes, cameras, stop_index, local_edit=is_local_edit,
             feather_method=getattr(context.scene, 'sg_guard_feather_method', 'ORIGINAL'),
         )
+        check_projection_svm_stack(mat, svm_estimates)
     return True
     
 
