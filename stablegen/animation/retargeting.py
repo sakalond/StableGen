@@ -37,6 +37,9 @@ _PROFILE_VERSION = 14
 _REFERENCE_POSE_VERSION = 2
 _COLLISION_PROXY_VERSION = 3
 _HAND_MATCH_ALGORITHM_VERSION = 4
+# 2: AUTO corrects from the upper arm when the arm chain starts at a clavicle. Reference poses
+# matched by version 1 carry a shrug in the clavicles, so they are re-matched.
+_ARM_CORRECTION_ALGORITHM_VERSION = 2
 _TWIST_CHAIN_VERSION = 1
 _LEGACY_REFERENCE_POSE_VERSION = 1
 _CONSTRAINT_PREFIX = "SG_Retarget_"
@@ -90,7 +93,8 @@ _ARM_CORRECTION_DRIVER_ITEMS = (
     (
         "AUTO",
         "Automatic (Recommended)",
-        "Use the upper arm only when a disconnected mechanical shoulder topology is detected",
+        "Use the upper arm when the first arm bone is a clavicle or a disconnected mechanical "
+        "shoulder, so corrections do not shrug the shoulder; otherwise the first arm bone",
     ),
     (
         "SHOULDER",
@@ -701,9 +705,12 @@ def _reference_provenance(
         filepath, source_profile, target_profile, source_frame,
         source_reference_mode, swap_target_sides=False,
         match_hand_orientation=False, hand_match_strength=1.0,
-        hand_roll_mode="FOREARM", hand_roll_limit=60.0):
+        hand_roll_mode="FOREARM", hand_roll_limit=60.0,
+        arm_correction_driver="AUTO"):
     return {
         "animation": _animation_file_identity(filepath),
+        "arm_correction_driver": arm_correction_driver,
+        "arm_correction_algorithm_version": _ARM_CORRECTION_ALGORITHM_VERSION,
         "source_frame": int(source_frame),
         "source_reference_mode": source_reference_mode,
         "source_profile_signature": _profile_signature(source_profile),
@@ -736,7 +743,8 @@ def _reference_provenance_matches(reference_pose, expected):
             "target_profile_signature", "swap_target_sides",
             "match_hand_orientation", "hand_match_strength",
             "hand_match_algorithm_version", "hand_roll_mode",
-            "hand_roll_limit"):
+            "hand_roll_limit", "arm_correction_driver",
+            "arm_correction_algorithm_version"):
         default = False if key == "match_hand_orientation" else None
         if actual.get(key, default) != expected.get(key):
             return False, f"target reference {key} does not match"
@@ -2735,6 +2743,11 @@ def _resolved_arm_correction_driver(
     upper_arm = armature.data.bones.get(chain[1])
     if not shoulder or not upper_arm:
         return "SHOULDER"
+    # A clavicle ahead of the upper arm (shoulder, upper arm, forearm, hand): aiming the wrist
+    # by rotating the short clavicle turns every direction or clearance correction into a
+    # shrug. Correct from the upper arm and let the clavicle keep the source's own motion.
+    if len(chain) >= 4 and float(shoulder.length) <= float(upper_arm.length) * 0.75:
+        return "UPPER_ARM"
     gap = (upper_arm.head_local - shoulder.tail_local).length
     target_height = _height_from_profile(armature, profile)
     disconnected_threshold = max(
@@ -5139,6 +5152,7 @@ class StableGenMatchSourceReferencePose(bpy.types.Operator):
                         hand_match_strength=self.hand_match_strength,
                         hand_roll_mode=self.hand_roll_mode,
                         hand_roll_limit=self.hand_roll_limit,
+                        arm_correction_driver=self.arm_correction_driver,
                     ),
                 )
                 if not reference_pose or not reference_pose.get("bones"):
@@ -5884,6 +5898,7 @@ class StableGenApplyAnimationToRig(bpy.types.Operator):
                     hand_match_strength=self.hand_match_strength,
                     hand_roll_mode=self.hand_roll_mode,
                     hand_roll_limit=self.hand_roll_limit,
+                    arm_correction_driver=self.arm_correction_driver,
                 )
                 reference_matches, mismatch_reason = _reference_provenance_matches(
                     target_reference_pose,
