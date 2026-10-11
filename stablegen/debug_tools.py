@@ -1143,7 +1143,7 @@ class SG_OT_DebugFeatherPreview(bpy.types.Operator):
                 feather_node = create_native_feather(
                     nodes, links, normalize_node, camera_fov_node,
                     camera_aspect_node, camera_dir_node, camera_up_node,
-                    context, idx, mat_id)
+                    cam, context, idx, mat_id)
             else:
                 feather_node = nodes.new("ShaderNodeValue")
                 feather_node.outputs[0].default_value = 1.0
