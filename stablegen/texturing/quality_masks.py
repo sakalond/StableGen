@@ -254,16 +254,21 @@ def residual_fallback_percentage(write_mask, generated_bgr, fallback_rgb, tolera
     return float(np.count_nonzero(editable & sentinel) * 100.0 / np.count_nonzero(editable))
 
 
-def feather_projection_guard(guard, width):
+def feather_projection_guard(guard, width, *, return_influence=False):
     """Fade into safe pixels without admitting any rejected silhouette pixels."""
     width = max(0.0, float(width))
     if width == 0:
-        return guard.copy()
+        return (guard.copy(), np.zeros_like(guard)) if return_influence else guard.copy()
     allowed = (guard > 0).astype(np.uint8)
     distance = cv2.distanceTransform(allowed, cv2.DIST_L2, cv2.DIST_MASK_PRECISE)
     ramp = np.clip(distance / width, 0.0, 1.0)
     ramp = ramp * ramp * (3.0 - 2.0 * ramp)
-    return np.rint(ramp * 255).astype(np.uint8)
+    feather = np.rint(ramp * 255).astype(np.uint8)
+    if not return_influence:
+        return feather
+    shoulder = np.clip((distance - width) / width, 0.0, 1.0)
+    shoulder = shoulder * shoulder * (3.0 - 2.0 * shoulder)
+    return feather, np.rint((1.0 - shoulder) * 255).astype(np.uint8)
 
 
 def projection_guard_feather_influence(guard, width):
@@ -277,7 +282,7 @@ def projection_guard_feather_influence(guard, width):
     return np.rint((1.0 - ramp) * 255).astype(np.uint8)
 
 
-def projection_occlusion_fields(depth, width, depth_threshold, object_ids=None, surface_distance=None):
+def projection_occlusion_fields(depth, width, depth_threshold, object_ids=None, surface_distance=None, *, include_legacy=False):
     """Fade only the far surface approaching a resolved depth discontinuity.
 
     Unlike a part/margin guard, this field must survive coverage rescue. Carry
@@ -285,15 +290,25 @@ def projection_occlusion_fields(depth, width, depth_threshold, object_ids=None, 
     near surface (e.g. from the neck onto the visible chin). Object boundaries
     with a resolved depth order catch thin nearby occluders below the general
     depth threshold. Flat ID seams and foreground margins do not seed it.
+
+    With surface distance and include_legacy, also return the two legacy
+    fields before the geometry fields, sharing the same boundary transforms.
     """
+    if include_legacy and surface_distance is None:
+        raise ValueError('Combined occlusion fields require surface distance')
     if depth.ndim == 3:
         depth = cv2.cvtColor(depth, cv2.COLOR_BGR2GRAY)
     depth = depth.astype(np.uint8)
     width = max(0.0, float(width))
     white = np.full(depth.shape, 255, dtype=np.uint8)
     empty = np.zeros_like(depth)
+    def empty_fields():
+        geometry = (white, empty, np.zeros(depth.shape, np.float32))
+        if surface_distance is None:
+            return white, empty
+        return (white, empty) + geometry if include_legacy else geometry
     if width == 0:
-        return (white, empty, np.zeros(depth.shape, np.float32)) if surface_distance is not None else (white, empty)
+        return empty_fields()
     threshold = max(0, int(depth_threshold))
     near = cv2.dilate(depth, np.ones((3, 3), np.uint8))
     seeds = near.astype(np.int16) - depth > threshold
@@ -306,20 +321,21 @@ def projection_occlusion_fields(depth, width, depth_threshold, object_ids=None, 
                                     interpolation=cv2.INTER_NEAREST)
         padded_depth = np.pad(depth, 1, mode='edge')
         padded_ids = np.pad(object_ids, 1, mode='edge')
+        depth_signed = depth.astype(np.int16)
         object_near = depth.copy()
         for dy, dx in ((dy, dx) for dy in range(3) for dx in range(3) if (dy, dx) != (1, 1)):
             neighbor = padded_depth[dy:dy+depth.shape[0], dx:dx+depth.shape[1]]
             ids = padded_ids[dy:dy+depth.shape[0], dx:dx+depth.shape[1]]
             # Ignore a single quantization step and never infer ordering from
             # IDs alone. Compare against the OTHER object's depth explicitly.
-            ordered = (ids != object_ids) & (neighbor.astype(np.int16) - depth > 1)
-            object_near = np.maximum(object_near, np.where(ordered, neighbor, 0))
+            ordered = (ids != object_ids) & (neighbor.astype(np.int16) - depth_signed > 1)
+            np.maximum(object_near, neighbor, out=object_near, where=ordered)
         object_seeds = object_near.astype(np.int16) - depth > 1
         near = np.where(object_seeds, object_near, near)
         seed_threshold[object_seeds] = 1
         seeds |= object_seeds
     if not np.any(seeds):
-        return (white, empty, np.zeros(depth.shape, np.float32)) if surface_distance is not None else (white, empty)
+        return empty_fields()
     allowed = (~seeds).astype(np.uint8)
     # Labels identify the occluder belonging to the nearest boundary pixel.
     # Use the precise transform separately for the continuous feather width.
@@ -344,8 +360,12 @@ def projection_occlusion_fields(depth, width, depth_threshold, object_ids=None, 
         midpoint = (nearest + surface_distance) * 0.5
         reference = np.zeros(int(labels.max()) + 1, dtype=np.float32)
         reference[labels[seeds]] = midpoint[seeds]
-        return (np.rint(fade * 255).astype(np.uint8),
-                np.rint(influence * 255).astype(np.uint8), reference[labels])
+        geometry = (np.rint(fade * 255).astype(np.uint8),
+                    np.rint(influence * 255).astype(np.uint8), reference[labels])
+        if not include_legacy:
+            return geometry
+        return (np.where(far_side, geometry[0], 255).astype(np.uint8),
+                np.where(far_side, geometry[1], 0).astype(np.uint8)) + geometry
     return (np.where(far_side, np.rint(fade * 255), 255).astype(np.uint8),
             np.where(far_side, np.rint(influence * 255), 0).astype(np.uint8))
 

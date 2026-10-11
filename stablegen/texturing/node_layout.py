@@ -6,6 +6,7 @@ construction order, including incremental sequential and appended edit passes.
 """
 
 from collections import defaultdict
+from .jobs import operation
 
 
 _VIEW_STAGES = (
@@ -191,11 +192,11 @@ def _arrange_group(nodes, links, items, title, parent, x, y):
     members = {node.as_pointer(): node for node in items}
     parents = defaultdict(list)
     children = defaultdict(list)
-    for link in links:
-        source, target = link.from_node.as_pointer(), link.to_node.as_pointer()
-        if source in members and target in members and source != target:
-            parents[target].append(source)
-            children[source].append(target)
+    for source in members:
+        for target in links.get(source, ()):
+            if target in members and source != target:
+                parents[target].append(source)
+                children[source].append(target)
 
     depth = {pointer: 0 for pointer in members}
     indegree = {pointer: len(set(parents[pointer])) for pointer in members}
@@ -231,6 +232,7 @@ def _arrange_group(nodes, links, items, title, parent, x, y):
     return width, height
 
 
+@operation
 def _arrange_crossfade(nodes, links, items, parent, x, y):
     """Separate the six threshold levels of the exact crossfade graph."""
     levels = defaultdict(list)
@@ -256,12 +258,14 @@ def _arrange_crossfade(nodes, links, items, parent, x, y):
         left_title, left_items = sections[offset]
         left_width, left_height = _arrange_group(
             nodes, links, left_items, left_title, frame, 35, top)
+        yield None
         row_width, row_height = left_width, left_height
         if offset + 1 < len(sections):
             right_title, right_items = sections[offset + 1]
             right_width, right_height = _arrange_group(
                 nodes, links, right_items, right_title,
                 frame, 35 + left_width + 55, top)
+            yield None
             row_width += 55 + right_width
             row_height = max(row_height, right_height)
         width = max(width, row_width)
@@ -271,6 +275,7 @@ def _arrange_crossfade(nodes, links, items, parent, x, y):
     return frame.width, frame.height
 
 
+@operation
 def organize_projection_material(material, new_nodes, camera_nodes, cameras, stop_index,
                                  local_edit=False, feather_method='ORIGINAL'):
     """Arrange only nodes made by this build, preserving earlier edit passes."""
@@ -278,7 +283,12 @@ def organize_projection_material(material, new_nodes, camera_nodes, cameras, sto
     if not items:
         return
     tree = material.node_tree
-    nodes, links = tree.nodes, tree.links
+    nodes = tree.nodes
+    # Index once for the whole layout pass. Feature frames only need edges
+    # leaving their own members, rather than rescanning the complete graph.
+    links = defaultdict(list)
+    for link in tree.links:
+        links[link.from_node.as_pointer()].append(link.to_node.as_pointer())
     view_items = defaultdict(list)
     global_items = []
     for node in items:
@@ -351,6 +361,7 @@ def organize_projection_material(material, new_nodes, camera_nodes, cameras, sto
                 continue
             width, height = _arrange_group(nodes, links, members, stage,
                                             view_frame, section_x, -70)
+            yield None
             section_x += width + 45
             section_height = max(section_height, height)
         view_frame.width = section_x + 10
@@ -368,13 +379,14 @@ def organize_projection_material(material, new_nodes, camera_nodes, cameras, sto
         if not members:
             continue
         if stage == 'Boundary crossfade':
-            width, height = _arrange_crossfade(
-                nodes, links, members, pass_frame, blend_x, -70)
+            width, height = yield from _arrange_crossfade(
+                nodes, links, members, pass_frame, blend_x, -70, _steps=True)
         else:
             width, height = _arrange_group(
                 nodes, links, members, stage, pass_frame, blend_x, -70)
         blend_x += width + 60
         blend_height = max(blend_height, height)
+        yield None
     if output:
         width, height = _arrange_group(nodes, links, output, 'Material output',
                                         pass_frame, blend_x, -70)

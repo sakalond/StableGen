@@ -16,6 +16,7 @@ import threading
 import traceback
 import io
 import colorsys
+from types import GeneratorType
 from datetime import datetime
 import math
 from PIL import Image, ImageEnhance
@@ -29,6 +30,7 @@ from .rendering import export_emit_image, export_visibility, export_canny, bake_
 from ..cameras.geometry import _SGCameraResolution, _get_camera_resolution, _get_resolution_align
 from ..cameras.overlays import _sg_restore_square_display, _sg_remove_crop_overlay, _sg_ensure_crop_overlay, _sg_hide_label_overlay, _sg_restore_label_overlay
 from .projection import project_image, reinstate_compare_nodes, _bake_visibility_weights, reset_projection_material_nodes, _is_projection_mesh, pop_svm_stack_warning
+from .jobs import operation, RenderRequest, MainThreadOperation, run_sync
 from ..utils import get_last_material_index, get_generation_dirs, get_file_path, get_dir_path, remove_empty_dirs, get_compositor_node_tree, configure_output_node_paths, get_eevee_engine_id, sg_modal_active
 from ..util.mirror_color import MirrorReproject, _get_viewport_ref_np, _apply_color_match_to_file
 from ..timeout_config import get_timeout
@@ -459,12 +461,32 @@ class ComfyUIGenerate(_PBRMixin, bpy.types.Operator):
         elif hasattr(self, '_original_texturing_frame'):
             context.scene.frame_set(self._original_texturing_frame)
 
-    def _run_on_main_thread(self, func):
+    def _run_on_main_thread(self, func, finish_on_cancel=False):
         """Execute *func* on Blender's main thread via a timer callback and
         block until it completes.  Sets ``self._error`` on failure."""
         def _callback():
             try:
-                func()
+                if not ComfyUIGenerate._is_running:
+                    raise RuntimeError('Generation cancelled')
+                result = func()
+                if isinstance(result, GeneratorType):
+                    if bpy.app.background:
+                        run_sync(result)
+                    else:
+                        def done(error):
+                            if error is None and not ComfyUIGenerate._is_running:
+                                error = RuntimeError('Generation cancelled')
+                            if error is not None:
+                                self._error = str(error)
+                            self._main_operation = None
+                            self._wait_event.set()
+                        self._main_operation = MainThreadOperation(
+                            result, done,
+                            cancelled=lambda: (not finish_on_cancel
+                                               and not ComfyUIGenerate._is_running),
+                        )
+                        bpy.app.timers.register(self._main_operation.tick)
+                        return None
             except Exception as exc:
                 self._error = str(exc)
                 traceback.print_exc()
@@ -1254,6 +1276,8 @@ class ComfyUIGenerate(_PBRMixin, bpy.types.Operator):
         # Add modal timer
         context.window_manager.modal_handler_add(self)
         self._timer = context.window_manager.event_timer_add(0.5, window=context.window)
+        self._projection_cache = {}
+        self._main_operation = None
         print("[StableGen] Starting thread")
         if context.scene.generation_method == 'grid':
             self._thread = threading.Thread(target=self.async_generate, args=(context,))
@@ -1395,8 +1419,12 @@ class ComfyUIGenerate(_PBRMixin, bpy.types.Operator):
             else context.scene.weight_exponent
         )
 
+        materials = set()
         for obj in getattr(self, '_to_texture', ()):
             material = getattr(obj, 'active_material', None)
+            if material is None or material.as_pointer() in materials:
+                continue
+            materials.add(material.as_pointer())
             reset_projection_material_nodes(material, reset_angle, reset_exponent)
 
         # Material state is diagnostic state, not generation configuration.
@@ -1580,15 +1608,8 @@ class ComfyUIGenerate(_PBRMixin, bpy.types.Operator):
             # depth threshold and geometry, including runs that never had one.
             # Other guidance maps and model inference are not needed here.
             if getattr(context.scene, 'sg_rework_projection_guard', False):
-                for i, camera in enumerate(cameras):
-                    self._stage = f"Rebuilding Projection Guards ({i+1}/{len(cameras)})"
-                    def _render_guard(_i=i, _cam=camera):
-                        self._activate_view(context, _i)
-                        with _SGCameraResolution(context, _cam):
-                            self.export_depthmap(context, camera_id=_i)
-                    self._run_on_main_thread(_render_guard)
-                    if self._error:
-                        return
+                self._run_on_main_thread(lambda: self.export_depthmaps(
+                    context, cameras, stage='Rebuilding Projection Guards', _steps=True))
             return
 
         if context.scene.generation_mode in ('standard', 'regenerate_selected'):
@@ -1606,16 +1627,9 @@ class ComfyUIGenerate(_PBRMixin, bpy.types.Operator):
                     and context.scene.generation_method == 'sequential')
             )
             if need_depth and context.scene.generation_method != 'uv_inpaint':
-                for i, camera in enumerate(cameras):
-                    self._stage = f"Rendering Depth Maps ({i+1}/{len(cameras)})"
-                    _i, _cam = i, camera
-                    def _render_depth(_i=_i, _cam=_cam):
-                        self._activate_view(context, _i)
-                        with _SGCameraResolution(context, _cam):
-                            self.export_depthmap(context, camera_id=_i)
-                    self._run_on_main_thread(_render_depth)
-                    if self._error:
-                        return
+                self._run_on_main_thread(lambda: self.export_depthmaps(context, cameras, _steps=True))
+                if self._error:
+                    return
                 if context.scene.generation_method == 'grid':
                     self._run_on_main_thread(
                         lambda: self.combine_maps(context, cameras, type="depth"))
@@ -1630,9 +1644,9 @@ class ComfyUIGenerate(_PBRMixin, bpy.types.Operator):
                     def _render_canny(_i=_i, _cam=_cam):
                         self._activate_view(context, _i)
                         with _SGCameraResolution(context, _cam):
-                            export_canny(context, camera_id=_i,
+                            yield from export_canny(context, camera_id=_i,
                                          low_threshold=context.scene.canny_threshold_low,
-                                         high_threshold=context.scene.canny_threshold_high)
+                                         high_threshold=context.scene.canny_threshold_high, _steps=True)
                     self._run_on_main_thread(_render_canny)
                     if self._error:
                         return
@@ -1654,7 +1668,7 @@ class ComfyUIGenerate(_PBRMixin, bpy.types.Operator):
                     def _render_normal(_i=_i, _cam=_cam):
                         self._activate_view(context, _i)
                         with _SGCameraResolution(context, _cam):
-                            self.export_normal(context, camera_id=_i)
+                            yield from self.export_normal(context, camera_id=_i, _steps=True)
                     self._run_on_main_thread(_render_normal)
                     if self._error:
                         return
@@ -1680,9 +1694,9 @@ class ComfyUIGenerate(_PBRMixin, bpy.types.Operator):
                     def _render_wb(_i=_i, _cam=_cam):
                         self._activate_view(context, _i)
                         with _SGCameraResolution(context, _cam):
-                            export_render(context, camera_id=_i,
+                            yield from export_render(context, camera_id=_i,
                                           output_dir=workbench_dir, filename=f"render{_i}",
-                                          background_color=guide_background)
+                                          background_color=guide_background, _steps=True)
                     self._run_on_main_thread(_render_wb)
                     if self._error:
                         return
@@ -1739,7 +1753,7 @@ class ComfyUIGenerate(_PBRMixin, bpy.types.Operator):
                 def _render_refine(_i=_i, _cam=_cam):
                     self._activate_view(context, _i)
                     with _SGCameraResolution(context, _cam):
-                        export_emit_image(context, self._to_texture, camera_id=_i)
+                        yield from export_emit_image(context, self._to_texture, camera_id=_i, _steps=True)
                         if need_feather:
                             render_edge_feather_mask(
                                 context, self._to_texture, _cam, _i,
@@ -1803,20 +1817,18 @@ class ComfyUIGenerate(_PBRMixin, bpy.types.Operator):
                     def image_reproject_callback():
                         try:
                             redraw_ui(context)
-                            project_image(
+                            yield from project_image(
                                 context, self._to_texture, self._material_id,
                                 stop_index=self._current_image,
                                 cameras=self._cameras,
                                 view_plan=self._view_plan,
+                                _steps=True,
                             )
                         except Exception as e:
                             self._error = str(e)
                             traceback.print_exc()
-                        self._wait_event.set()
                         return None
-                    bpy.app.timers.register(image_reproject_callback)
-                    self._wait_event.wait()
-                    self._wait_event.clear()
+                    self._run_on_main_thread(image_reproject_callback, finish_on_cancel=True)
                     if self._error:
                         return
 
@@ -1918,18 +1930,19 @@ class ComfyUIGenerate(_PBRMixin, bpy.types.Operator):
                                         # export_visibility's alphabetical
                                         # rediscovery assigns custom-order
                                         # renders to the wrong camera.
-                                        export_visibility(
+                                        yield from export_visibility(
                                             context,
                                             self._to_texture,
                                             camera_visibility=_vis_cam,
                                             camera_render=_cur_cam,
                                             camera_id=self._current_image,
+                                            _steps=True,
                                         )
                                     _emit_cam = _cur_cam
                                     with _SGCameraResolution(context, _emit_cam):
                                         if context.scene.model_architecture in ('qwen_image_edit', 'qwen_image_21', 'flux2_klein'): # export custom bg and fallback for Qwen/Klein image edit
                                             fallback_color, background_color = self._get_qwen_context_colors(context)
-                                            export_emit_image(context, self._to_texture, camera_id=self._current_image, bg_color=background_color, fallback_color=fallback_color) # Export render for next view
+                                            yield from export_emit_image(context, self._to_texture, camera_id=self._current_image, bg_color=background_color, fallback_color=fallback_color, _steps=True)
                                             if getattr(context.scene, 'qwen_use_confidence_context', False):
                                                 self._apply_qwen_binary_context_mask(
                                                     context,
@@ -1944,15 +1957,12 @@ class ComfyUIGenerate(_PBRMixin, bpy.types.Operator):
                                                 )
                                         else:
                                             # Use a gray (neutral) background and fallback for other architectures
-                                            export_emit_image(context, self._to_texture, camera_id=self._current_image, bg_color=(0.5, 0.5, 0.5), fallback_color=(0.5, 0.5, 0.5))
+                                            yield from export_emit_image(context, self._to_texture, camera_id=self._current_image, bg_color=(0.5, 0.5, 0.5), fallback_color=(0.5, 0.5, 0.5), _steps=True)
                                 except Exception as e:
                                     self._error = str(e)
                                     traceback.print_exc()
-                                self._wait_event.set()
                                 return None
-                            bpy.app.timers.register(context_callback)
-                            self._wait_event.wait()
-                            self._wait_event.clear()
+                            self._run_on_main_thread(context_callback)
                             if self._error:
                                 return
                             self._stage = "Uploading to Server"
@@ -2049,22 +2059,24 @@ class ComfyUIGenerate(_PBRMixin, bpy.types.Operator):
                         def image_project_callback():
                             try:
                                 redraw_ui(context)
-                                project_image(
+                                if not hasattr(self, '_projection_cache'):
+                                    self._projection_cache = {}
+                                yield from project_image(
                                     context, self._to_texture, self._material_id,
                                     stop_index=self._current_image,
                                     cameras=self._cameras,
                                     view_plan=self._view_plan,
+                                    incremental_cache=self._projection_cache,
+                                    _steps=True,
                                 )
                             except Exception as e:
                                 self._error = str(e)
                                 traceback.print_exc()
-                            # Set the event to signal the end of the process
-                            self._wait_event.set()
                             return None
-                        bpy.app.timers.register(image_project_callback)
-                        # Wait for the event to be set
-                        self._wait_event.wait()
-                        self._wait_event.clear()
+                        # In-place shader construction must finish its topology
+                        # before honoring cancellation. It still yields to the
+                        # UI, and no next view starts after cancellation.
+                        self._run_on_main_thread(image_project_callback, finish_on_cancel=True)
                         if self._error:
                             return
                         # Update info for the next iteration (if any)
@@ -2191,12 +2203,13 @@ class ComfyUIGenerate(_PBRMixin, bpy.types.Operator):
                     original_method = context.scene.generation_method
                     try:
                         context.scene.generation_method = 'separate'
-                        project_image(
+                        yield from project_image(
                             context,
                             self._to_texture,
                             self._material_id,
                             cameras=self._cameras,
                             view_plan=self._view_plan,
+                            _steps=True,
                         )
                     finally:
                         context.scene.generation_method = original_method
@@ -2213,10 +2226,11 @@ class ComfyUIGenerate(_PBRMixin, bpy.types.Operator):
             self._stage = "Projecting Image"
             redraw_ui(context)
             if context.scene.generation_method != 'uv_inpaint':
-                project_image(
+                yield from project_image(
                     context, self._to_texture, self._material_id,
                     cameras=self._cameras,
                     view_plan=self._view_plan,
+                    _steps=True,
                 )
             else:
                 # Apply the UV inpainted textures to each mesh
@@ -2262,7 +2276,7 @@ class ComfyUIGenerate(_PBRMixin, bpy.types.Operator):
         # Keep the worker alive until projection finishes. Otherwise modal
         # cleanup can restore sequential mode before this callback executes,
         # causing it to skip the entire reproject (and hide projection errors).
-        self._run_on_main_thread(image_project_callback)
+        self._run_on_main_thread(image_project_callback, finish_on_cancel=True)
         if self._error:
             return
 
@@ -2300,6 +2314,7 @@ class ComfyUIGenerate(_PBRMixin, bpy.types.Operator):
         return self.execute(context)
 
 
+    @operation
     def _export_depthmap_impl(self, context, camera_id=None, guard_scale=1):
         """
         Exports the depth map of the scene.
@@ -2326,11 +2341,26 @@ class ComfyUIGenerate(_PBRMixin, bpy.types.Operator):
         # Get the active view layer
         view_layer = bpy.context.view_layer
 
-        # Cycles exposes depth plus object/material index passes. Workbench and
-        # Eevee in Blender 5 expose only Image/Alpha/Depth on Render Layers,
-        # silently disabling the hand/dress part guard.
-        bpy.context.scene.render.engine = 'CYCLES'
-        bpy.context.scene.cycles.samples = 1
+        use_projection_guard = getattr(
+            context.scene, 'sg_rework_projection_guard', False
+        )
+        use_part_ids = (
+            use_projection_guard
+            or experimental_enabled(context.scene, 'qwen_regularize_context_mask')
+        )
+        # Workbench retains the fast ordinary depth-guidance path. Cycles is
+        # required whenever a consumer needs categorical object/material IDs;
+        # Workbench/Eevee do not expose those passes in Blender 5.
+        depth_engine = 'CYCLES' if use_part_ids else 'BLENDER_WORKBENCH'
+        # Even assigning the current engine invalidates viewport buffers. The
+        # asynchronous render then locks drawing before they can be rebuilt.
+        if bpy.context.scene.render.engine != depth_engine:
+            bpy.context.scene.render.engine = depth_engine
+        if use_part_ids:
+            bpy.context.scene.cycles.samples = 1
+            # Denoising computes shaded RGB we never consume here. Z/index
+            # passes stay unchanged; the outer transaction restores this flag.
+            bpy.context.scene.cycles.use_denoising = False
 
         # Object/material indices are categorical data. Blender's default
         # output dithering introduces one-LSB checkerboard noise into these
@@ -2345,17 +2375,21 @@ class ComfyUIGenerate(_PBRMixin, bpy.types.Operator):
         original_pass_z = view_layer.use_pass_z
 
         # Enable depth pass in the render settings
+        for name in _RenderStateTransaction._PASS_NAMES:
+            if hasattr(view_layer, name):
+                setattr(view_layer, name, name == 'use_pass_z' or (
+                    use_part_ids and name in {'use_pass_object_index', 'use_pass_material_index'}))
         view_layer.use_pass_z = True
         if hasattr(view_layer, 'use_pass_object_index'):
-            view_layer.use_pass_object_index = True
+            view_layer.use_pass_object_index = use_part_ids
         if hasattr(view_layer, 'use_pass_material_index'):
-            view_layer.use_pass_material_index = True
+            view_layer.use_pass_material_index = use_part_ids
 
         material_indices = {}
         next_material_index = 1
         for object_index, render_object in enumerate(
                 (obj for obj in context.view_layer.objects
-                 if obj.type == 'MESH' and not obj.hide_render), start=1):
+                 if use_part_ids and obj.type == 'MESH' and not obj.hide_render), start=1):
             render_object.pass_index = min(object_index, 255)
             for slot in render_object.material_slots:
                 material = slot.material
@@ -2423,9 +2457,6 @@ class ComfyUIGenerate(_PBRMixin, bpy.types.Operator):
             links.new(divide.outputs[0], index_output.inputs[0])
             return True
 
-        use_projection_guard = getattr(
-            context.scene, 'sg_rework_projection_guard', False
-        )
         # Preserve calibrated camera distance for receiver-aware occlusion
         # feathering. The model's existing normalized depth input is unchanged.
         distance_scale = None
@@ -2445,10 +2476,6 @@ class ComfyUIGenerate(_PBRMixin, bpy.types.Operator):
             distance_output.format.color_depth = '16'
             distance_output.format.color_mode = 'RGB'
             links.new(distance_node.outputs[0], distance_output.inputs[0])
-        use_part_ids = (
-            use_projection_guard
-            or experimental_enabled(context.scene, 'qwen_regularize_context_mask')
-        )
         has_object_ids = use_part_ids and _add_index_output(
             "IndexOB", f"object_id{camera_id}", -200
         )
@@ -2458,7 +2485,7 @@ class ComfyUIGenerate(_PBRMixin, bpy.types.Operator):
 
         # Render the scene
         try:
-            bpy.ops.render.render(write_still=True)
+            yield RenderRequest(write_still=False)
         finally:
             _finish_compositor_render(node_tree, compositor_state)
 
@@ -2466,7 +2493,7 @@ class ComfyUIGenerate(_PBRMixin, bpy.types.Operator):
         depth_path = os.path.join(output_dir, f"{output_file}{frame_suffix}.png")
         object_path = os.path.join(output_dir, f"object_id{camera_id}{frame_suffix}.png")
         material_path = os.path.join(output_dir, f"material_id{camera_id}{frame_suffix}.png")
-        depth_image = cv2.imread(depth_path, cv2.IMREAD_GRAYSCALE)
+        depth_image = cv2.imread(depth_path, cv2.IMREAD_GRAYSCALE) if use_projection_guard else None
         if use_projection_guard and depth_image is not None:
             object_image = (
                 cv2.imread(object_path, cv2.IMREAD_GRAYSCALE)
@@ -2512,28 +2539,26 @@ class ComfyUIGenerate(_PBRMixin, bpy.types.Operator):
             )
             cv2.imwrite(guard_path, guard)
             feather_width = getattr(context.scene, 'sg_silhouette_feather', 0)
-            feather = feather_projection_guard(guard, feather_width * guard_scale)
+            feather, guard_influence = feather_projection_guard(
+                guard, feather_width * guard_scale, return_influence=True)
             # Keep this field continuous through the rejected band. A white
             # core creates a second edge under bilinear sampling and a halo.
             # A constant shader floor preserves last-source coverage without
             # introducing another mask boundary.
             feather_path = os.path.join(guard_dir, f"projection_guard_feather{camera_id}.png")
             cv2.imwrite(feather_path, feather)
-            occlusion, occlusion_influence = projection_occlusion_fields(
-                depth_image, feather_width * guard_scale,
-                max(1, round(float(getattr(context.scene, 'sg_silhouette_depth', 0.01)) * 255)),
-                object_ids=object_image if not guard_diagnostics['fallback_triggered'] else None)
             distance_path = os.path.join(output_dir, f'projection_distance{camera_id}{frame_suffix}.png')
             distance_image = cv2.imread(distance_path, cv2.IMREAD_UNCHANGED)
             if distance_image is None or distance_image.dtype != np.uint16:
                 raise RuntimeError('Projection occlusion distance pass is missing or not 16-bit')
             if distance_image.ndim == 3:
                 distance_image = distance_image[:, :, 0]
-            ramp, influence, reference = projection_occlusion_fields(
+            occlusion, occlusion_influence, ramp, influence, reference = projection_occlusion_fields(
                 depth_image, feather_width * guard_scale,
                 max(1, round(float(getattr(context.scene, 'sg_silhouette_depth', 0.01)) * 255)),
                 object_ids=object_image if not guard_diagnostics['fallback_triggered'] else None,
-                surface_distance=distance_image.astype(np.float32) / 65535.0)
+                surface_distance=distance_image.astype(np.float32) / 65535.0,
+                include_legacy=True)
             # PNG channels R/G/B: continuous ramp, sharpening influence,
             # midpoint distance separating the occluder and receiving surface.
             geometry_path = os.path.join(guard_dir, f'projection_occlusion_geometry{camera_id}.png')
@@ -2545,8 +2570,7 @@ class ComfyUIGenerate(_PBRMixin, bpy.types.Operator):
             occlusion_path = os.path.join(guard_dir, f"projection_occlusion_feather{camera_id}.png")
             cv2.imwrite(occlusion_path, occlusion)
             cv2.imwrite(os.path.join(guard_dir, f"projection_guard_influence{camera_id}.png"),
-                        np.maximum(projection_guard_feather_influence(guard, feather_width * guard_scale),
-                                   occlusion_influence))
+                        np.maximum(guard_influence, occlusion_influence))
             self._record_confidence_artifacts(
                 context,
                 camera_id,
@@ -2589,22 +2613,46 @@ class ComfyUIGenerate(_PBRMixin, bpy.types.Operator):
         print(f"[StableGen] Depth map saved to: {os.path.join(output_dir, output_file)}.png")
 
         # Restore original settings
-        bpy.context.scene.render.engine = original_engine
+        if bpy.context.scene.render.engine != original_engine:
+            bpy.context.scene.render.engine = original_engine
         bpy.context.scene.view_settings.view_transform = original_view_transform
         bpy.context.scene.render.film_transparent = original_film_transparent
         bpy.context.scene.render.use_compositing = original_use_compositing
         bpy.context.scene.render.filepath = original_filepath
         view_layer.use_pass_z = original_pass_z
 
+    @operation
+    def export_depthmaps(self, context, cameras, stage='Rendering Depth Maps'):
+        """Keep the renderer stable across guidance views, with one job dispatch.
+
+        Each view still has its own render suspension and transaction. The
+        outer transaction restores the original engine on success, failure or
+        cancellation; native job teardown remains managed by jobs.py.
+        """
+        with _RenderStateTransaction(context):
+            use_part_ids = (getattr(context.scene, 'sg_rework_projection_guard', False)
+                            or experimental_enabled(context.scene, 'qwen_regularize_context_mask'))
+            engine = 'CYCLES' if use_part_ids else 'BLENDER_WORKBENCH'
+            if context.scene.render.engine != engine:
+                context.scene.render.engine = engine
+            for i, camera in enumerate(cameras):
+                self._stage = f'{stage} ({i+1}/{len(cameras)})'
+                self._activate_view(context, i)
+                with _SGCameraResolution(context, camera):
+                    yield from self.export_depthmap(context, camera_id=i, _steps=True)
+
+    @operation
     def export_depthmap(self, context, camera_id=None):
-        meshes = [obj for obj in context.view_layer.objects if obj.type == 'MESH']
-        with _RenderStateTransaction(context, meshes):
+        # Depth/index exports never edit slots or polygon assignments. Avoid
+        # clearing/restoring them: that invalidates every material/viewport.
+        with _RenderStateTransaction(context):
             scale = (int(getattr(context.scene, 'sg_projection_guard_scale', '1'))
                      if getattr(context.scene, 'sg_rework_projection_guard', False) else 1)
             context.scene.render.resolution_x *= scale
             context.scene.render.resolution_y *= scale
-            return self._export_depthmap_impl(context, camera_id=camera_id, guard_scale=scale)
+            return (yield from self._export_depthmap_impl(context, camera_id=camera_id, guard_scale=scale, _steps=True))
 
+    @operation
     def export_normal(self, context, camera_id=None):
         """
         Exports the normal map of the scene.
@@ -2615,8 +2663,9 @@ class ComfyUIGenerate(_PBRMixin, bpy.types.Operator):
         """
         meshes = [obj for obj in context.view_layer.objects if obj.type == 'MESH']
         with _RenderStateTransaction(context, meshes):
-            return self._export_normal_impl(context, camera_id=camera_id)
+            return (yield from self._export_normal_impl(context, camera_id=camera_id, _steps=True))
 
+    @operation
     def _export_normal_impl(self, context, camera_id=None):
         """Render the evaluated normal pass without mutating production state."""
         print("[StableGen] Exporting normal map")
@@ -2675,7 +2724,7 @@ class ComfyUIGenerate(_PBRMixin, bpy.types.Operator):
         links.new(render_layers_node.outputs["Alpha"], alpha_over_node.inputs[0])
 
         try:
-            bpy.ops.render.render(write_still=True)
+            yield RenderRequest()
         finally:
             _finish_compositor_render(node_tree, compositor_state)
 

@@ -7,6 +7,8 @@ from ..utils import get_last_material_index, get_file_path, get_dir_path
 from .rendering import prepare_baking, bake_texture, unwrap
 from ..cameras.geometry import _get_camera_resolution
 from mathutils import Matrix, Vector
+from .jobs import operation
+from .projection_cache import eligible as _cache_eligible, configuration as _cache_configuration, graph_state as _graph_state, asset_state as _asset_state
 from .svm_budget import SVM_STACK_SIZE, estimate_svm_stack
 
 
@@ -1588,6 +1590,7 @@ def _apply_guard_coverage_rescue(nodes, links, guarded, raw, guards, feathers, t
     return outputs, protect_occlusions(fades)
 
 
+@operation
 def _crossfade_projection_feathers(nodes, links, weights, feathers, bases):
     """Integrate normalized camera combinations over feather thresholds.
 
@@ -1637,10 +1640,12 @@ def _crossfade_projection_feathers(nodes, links, weights, feathers, bases):
             share = math('DIVIDE', f'CrossfadeShare-{i}-{j}', power, total)
             result[j] = math('ADD', f'CrossfadeAccumulated-{i}-{j}', result[j],
                              math('MULTIPLY', f'CrossfadeContribution-{i}-{j}', interval, share))
+        yield None
     return [_projection_feather_math(nodes, links, 'MULTIPLY', f'PostExponentFeather-{i}', value, 1.0)
             for i, value in enumerate(result)]
 
 
+@operation
 def _apply_projection_feathers(nodes, links, weights, feathers, bases, influences, method):
     """Apply a continuous, post-exponent fade without replacing view preference.
 
@@ -1650,7 +1655,7 @@ def _apply_projection_feathers(nodes, links, weights, feathers, bases, influence
     if not any(feather is not None for feather in feathers):
         return weights
     if method == 'BOUNDARY_CROSSFADE':
-        return _crossfade_projection_feathers(nodes, links, weights, feathers, bases)
+        return (yield from _crossfade_projection_feathers(nodes, links, weights, feathers, bases, _steps=True))
     if method == 'LOCAL_UNSHARPEN':
         def math(op, label, a, b):
             return _projection_feather_math(nodes, links, op, label, a, b).outputs[0]
@@ -1686,6 +1691,7 @@ def _apply_projection_feathers(nodes, links, weights, feathers, bases, influence
     return result
 
 
+@operation
 def project_image(
     context,
     to_project,
@@ -1695,6 +1701,7 @@ def project_image(
     view_plan=None,
     force_rebuild=False,
     reuse_projection_uv=False,
+    incremental_cache=None,
 ):
     """     
     Projects an image onto all mesh objects using UV Project Modifier.     
@@ -1710,6 +1717,7 @@ def project_image(
         # A newly generated view changes the joint solution. Do not reuse a
         # sequential material containing the previous camera set's field.
         force_rebuild = True
+    @operation
     def build_mix_tree(shaders, weight_nodes, nodes_collection, links, last_node=None, level=0, stop_index=1000000):
         """
         Recursively builds a binary tree of mix shader nodes.
@@ -1750,8 +1758,8 @@ def project_image(
                                                  f'SurfaceBlendVisible-{idx}', raw.outputs[0], 0.)
                 solved.append(_projection_feather_math(nodes_collection, links, 'MULTIPLY',
                               f'SurfaceBlendFinal-{idx}', field.outputs['Fac'], valid.outputs[0]))
-            return build_mix_tree(shaders, solved, nodes_collection, links, last_node, level=1,
-                                  stop_index=stop_index)
+            return (yield from build_mix_tree(shaders, solved, nodes_collection, links, last_node, level=1,
+                                  stop_index=stop_index, _steps=True))
 
         def _combine_angle_feather(nodes_col, lnk, cr_angle_out, cr_feather_out, loc):
             """Combine angle-ramp and feather-ramp outputs into a single
@@ -2124,10 +2132,10 @@ def project_image(
                 normalized_outputs.append(div.outputs[0])
 
             # Replace weight_nodes with sharpened-normalised nodes
-            weight_nodes = _apply_projection_feathers(
+            weight_nodes = yield from _apply_projection_feathers(
                 nodes_collection, links, powered_nodes, feather_outputs,
                 normalized_outputs, influence_outputs,
-                getattr(context.scene, 'sg_guard_feather_method', 'ORIGINAL'))
+                getattr(context.scene, 'sg_guard_feather_method', 'ORIGINAL'), _steps=True)
 
         new_shaders = []
         new_weight_nodes = []
@@ -2237,7 +2245,7 @@ def project_image(
                 new_shaders.append(shaders[i])
                 new_weight_nodes.append(weight_nodes[i])
                 i += 1
-        return build_mix_tree(new_shaders, new_weight_nodes, nodes_collection, links, last_node, level+1)
+        return (yield from build_mix_tree(new_shaders, new_weight_nodes, nodes_collection, links, last_node, level+1, _steps=True))
 
     if view_plan is not None:
         cameras = []
@@ -2256,6 +2264,15 @@ def project_image(
         )
     else:
         cameras = list(cameras)
+
+    stable_sequential = incremental_cache is not None and _cache_eligible(context.scene)
+    guard_dir = get_dir_path(context, 'inpaint')['visibility']
+    assets = [os.path.join(guard_dir, f'{prefix}{i}.png')
+              for i in range(len(cameras)) for prefix in
+               ('projection_guard', 'projection_guard_feather',
+               'projection_guard_influence', 'projection_occlusion_geometry')]
+    assets += [os.path.join(guard_dir, f'projection_occlusion_geometry{i}.json')
+               for i in range(len(cameras))]
 
     if surface_blend:
         from .surface_blend import validate
@@ -2351,6 +2368,8 @@ def project_image(
                 if original_uv_map.name == _SG_BUFFER_UV_NAME and len(obj.data.uv_layers) > 1:
                     original_uv_map = obj.data.uv_layers[1]
                 obj.data.uv_layers.active = original_uv_map
+        if not reuse_projection_uv and stop_index == 0:
+            yield None
 
     # Clean up the temporary buffer only when this call created projection UVs.
     if not reuse_projection_uv:
@@ -2408,6 +2427,8 @@ def project_image(
 
     processed_materials = set()
     svm_estimates = {}
+    cache_key = (_cache_configuration(context.scene, cameras, mat_id, assets, to_project)
+                 if stable_sequential else None)
 
     for obj in to_project:
 
@@ -2446,7 +2467,11 @@ def project_image(
                 if original_mat != mat:
                     obj.data.materials.append(original_mat)
 
-        if surface_blend and mat.name in processed_materials:
+        # UV and baked-visibility attributes were prepared on every mesh above.
+        # The shader reads those named attributes at the shading point, so its
+        # topology is independent of the representative object. Local edits
+        # retain their existing append/copy behavior.
+        if not is_local_edit and mat.name in processed_materials:
             continue
 
         # Enable use of nodes
@@ -2470,8 +2495,42 @@ def project_image(
             original_uv_map = obj.data.uv_layers[1]
 
 
+        cache_entry = (incremental_cache.get(mat.as_pointer())
+                       if stable_sequential else None)
+        if (not force_rebuild and cache_entry and cache_entry['key'] == cache_key
+                and stop_index == cache_entry['stop'] + 1
+                and cache_entry['assets'] == _asset_state(cache_entry['asset_paths'])
+                and cache_entry['state'] == _graph_state(mat)):
+            image_path = get_file_path(context, 'generated', camera_id=stop_index, material_id=mat_id)
+            image = get_or_load_image(image_path, force_reload=context.scene.overwrite_material)
+            if image:
+                nodes[cache_entry['images'][stop_index]].image = image
+                write = cache_entry['writes'].get(stop_index)
+                if write:
+                    texture_name, bypass_name, mask_path = write
+                    mask = (get_or_load_image(mask_path, force_reload=context.scene.overwrite_material)
+                            if os.path.isfile(mask_path) else None)
+                    if mask:
+                        mask.colorspace_settings.name = 'Non-Color'
+                    nodes[texture_name].image = mask
+                    nodes[bypass_name].inputs[1].default_value = 0.0 if mask else 1.0
+                nodes[cache_entry['gates'][stop_index]].inputs[1].default_value = 1.0
+                for frame in nodes:
+                    if frame.type == 'FRAME' and frame.label.startswith(f'View {stop_index + 1:02d} |'):
+                        frame.label = frame.label.removesuffix(' | pending')
+                cache_entry['stop'] = stop_index
+                cache_entry['asset_paths'].append(image_path)
+                if write:
+                    cache_entry['asset_paths'].append(mask_path)
+                cache_entry['assets'] = _asset_state(cache_entry['asset_paths'])
+                cache_entry['state'] = _graph_state(mat)
+                processed_materials.add(mat.name)
+                yield None
+                continue
+
         rework_requires_rebuild = any((
             force_rebuild,
+            stable_sequential,
             getattr(context.scene, 'sg_rework_projection_guard', False),
             getattr(context.scene, 'qwen_use_confidence_context', False),
             experimental_enabled(context.scene, 'qwen_use_projection_write_masks'),
@@ -2541,6 +2600,7 @@ def project_image(
                     if image:
                         node.image = image
                     break
+            processed_materials.add(mat.name)
             continue
         elif not is_local_edit:
             # Rebuild mode is required for per-view assets that only exist
@@ -2580,6 +2640,7 @@ def project_image(
         camera_aspect_ratio_nodes = []
         camera_direction_nodes = []
         camera_up_nodes = []
+        sequential_writes = {}
 
         def _create_edge_feather_weight(cam_index, mat_id_inner):
             """Load the edge-feathered visibility mask for camera *cam_index*
@@ -2631,15 +2692,16 @@ def project_image(
                 subtype="visibility",
                 camera_id=cam_index,
             )
-            if not os.path.exists(mask_path):
+            if not os.path.exists(mask_path) and not stable_sequential:
                 return None
             mask_image = get_or_load_image(
                 mask_path,
                 force_reload=context.scene.overwrite_material,
-            )
-            if mask_image is None:
+            ) if os.path.isfile(mask_path) and cam_index <= stop_index else None
+            if mask_image is None and not stable_sequential:
                 return None
-            mask_image.colorspace_settings.name = 'Non-Color'
+            if mask_image:
+                mask_image.colorspace_settings.name = 'Non-Color'
 
             mask_tex = nodes.new("ShaderNodeTexImage")
             mask_tex.image = mask_image
@@ -2657,6 +2719,16 @@ def project_image(
             to_float.location = (-300, -200 * cam_index - 300)
             to_float.label = f"{label_prefix}Weight-{cam_index}-{mat_id_inner}"
             links.new(_mask_value(nodes, links, mask_tex).outputs[0], to_float.inputs[0])
+            if stable_sequential:
+                # A missing mask is a neutral multiplier, matching a rebuild.
+                # Bind its resource before opening the camera's active gate.
+                bypass = nodes.new('ShaderNodeMath')
+                bypass.operation = 'MAXIMUM'
+                bypass.label = f'{label_prefix}Available-{cam_index}-{mat_id_inner}'
+                bypass.inputs[1].default_value = 0.0 if mask_image else 1.0
+                links.new(to_float.outputs[0], bypass.inputs[0])
+                sequential_writes[cam_index] = (mask_tex.name, bypass.name, mask_path)
+                return bypass
             return to_float
 
         def _create_projection_guard_weight(cam_index, mat_id_inner):
@@ -2800,7 +2872,7 @@ def project_image(
 
                 script_nodes.append(scripts_to_connect)
 
-                if i > stop_index and not voronoi_active:
+                if i > stop_index and not voronoi_active and not stable_sequential:
                     less_than = nodes.new("ShaderNodeMath")
                     less_than.operation = 'LESS_THAN'
                     less_than.label = f"StopGate-{i}-{mat_id}"
@@ -2875,7 +2947,7 @@ def project_image(
 
                 script_nodes.append(scripts_to_connect)
 
-                if i > stop_index and not voronoi_active:
+                if i > stop_index and not voronoi_active and not stable_sequential:
                     less_than = nodes.new("ShaderNodeMath")
                     less_than.operation = 'LESS_THAN'
                     less_than.label = f"StopGate-{i}-{mat_id}"
@@ -3011,7 +3083,7 @@ def project_image(
 
                 script_nodes.append(scripts_to_connect)
 
-                if i > stop_index and not voronoi_active:
+                if i > stop_index and not voronoi_active and not stable_sequential:
                     # Connect a temporary less than node to the script node
                     less_than = nodes.new("ShaderNodeMath")
                     less_than.operation = 'LESS_THAN'
@@ -3088,7 +3160,7 @@ def project_image(
 
             use_qwen_write_mask = (
                 i > 0
-                and i <= stop_index
+                and (i <= stop_index or stable_sequential)
                 and context.scene.model_architecture.startswith('qwen')
                 and context.scene.generation_method == 'sequential'
                 and context.scene.qwen_generation_method == 'generate'
@@ -3097,10 +3169,10 @@ def project_image(
             )
             qwen_write_weight = None
             use_sdxl_write_mask = (
-                i > 0 and i <= stop_index and (context.scene.model_architecture == 'sdxl') and (context.scene.generation_method == 'sequential')
+                i > 0 and (i <= stop_index or stable_sequential) and (context.scene.model_architecture == 'sdxl') and (context.scene.generation_method == 'sequential')
             )
             use_qwen21_generated_alpha = (
-                i <= stop_index
+                (i <= stop_index or stable_sequential)
                 and context.scene.model_architecture == 'qwen_image_21'
             )
             if (use_qwen_write_mask or use_sdxl_write_mask) and script_nodes_outputs:
@@ -3134,6 +3206,15 @@ def project_image(
                         else f"SDXLFeatherAlpha-{i}-{mat_id}"
                     ),
                 )
+
+            if stable_sequential:
+                # Keep validity/alpha before DPPG and normalization. A pending
+                # camera is exactly zero, including in coverage rescue and the
+                # crossfade subsets; it cannot become an untrusted competitor.
+                gate = _projection_feather_math(nodes, links, 'MULTIPLY',
+                    f'SequentialActive-{i}-{mat_id}', script_nodes_outputs[-1].outputs[0],
+                    float(i <= stop_index))
+                script_nodes_outputs[-1] = gate
 
             if script_nodes_outputs and not isinstance(script_nodes_outputs[-1], tuple):
                 guard_weight = _create_projection_guard_weight(i, mat_id)
@@ -3324,6 +3405,7 @@ def project_image(
                 pointer = camera_node.as_pointer()
                 if pointer not in camera_node_start:
                     layout_camera_nodes[pointer] = i
+            yield None
 
         # Expose a confidence-only max chain for context rendering.  This
         # node does not mix RGB. Continuous weighted blending retains a separate
@@ -3353,7 +3435,7 @@ def project_image(
             # The mix node is connected to the output node
             mix_node = output.inputs["Surface"].links[0].from_node
         else:
-            mix_node, _ = build_mix_tree(tex_image_nodes, script_nodes_outputs, nodes, links, previous_node, stop_index=stop_index)
+            mix_node, _ = yield from build_mix_tree(tex_image_nodes, script_nodes_outputs, nodes, links, previous_node, stop_index=stop_index, _steps=True)
             links.new(mix_node.outputs[0], output.inputs["Surface"])
             processed_materials.add(mat.name)
 
@@ -3425,12 +3507,25 @@ def project_image(
             # The output is reused by appended edit passes. Move its frame to
             # the latest pass so the visible graph still ends at the output.
             layout_nodes.append(output)
-        organize_projection_material(
+        yield from organize_projection_material(
             mat, layout_nodes,
             layout_camera_nodes, cameras, stop_index, local_edit=is_local_edit,
             feather_method=getattr(context.scene, 'sg_guard_feather_method', 'ORIGINAL'),
+            _steps=True,
         )
         check_projection_svm_stack(mat, svm_estimates)
+        if stable_sequential:
+            active_assets = [n.image.filepath for i, n in enumerate(tex_image_nodes)
+                             if i <= stop_index and n.image]
+            active_assets += [v[2] for i, v in sequential_writes.items() if i <= stop_index]
+            incremental_cache[mat.as_pointer()] = dict(
+                key=cache_key, stop=stop_index, state=_graph_state(mat),
+                writes=sequential_writes, asset_paths=active_assets, assets=_asset_state(active_assets),
+                images=[n.name for n in tex_image_nodes],
+                gates=[next(n.name for n in nodes if n.label == f'SequentialActive-{i}-{mat_id}')
+                       for i in range(len(cameras))],
+            )
+        yield None
     return True
     
 

@@ -9,6 +9,7 @@ import mathutils
 from ..utils import get_file_path, get_dir_path, get_compositor_node_tree, configure_output_node_paths, get_eevee_engine_id, sg_modal_active, remove_empty_dirs
 from ..mesh_gen.rig_display import configure_gltf_not_exported_visibility
 from .pose_lock import ensure_texturing_frame
+from .jobs import operation, RenderRequest
 from PIL import Image
 import cv2
 
@@ -168,6 +169,7 @@ class _RenderStateTransaction:
             "exposure": scene.view_settings.exposure,
             "gamma": scene.view_settings.gamma,
             "cycles_samples": getattr(scene.cycles, "samples", None),
+            "cycles_use_denoising": getattr(scene.cycles, "use_denoising", None),
             "cycles_device": getattr(scene.cycles, "device", None),
             "cycles_shading_system": getattr(scene.cycles, "shading_system", None),
             "cycles_use_osl": getattr(scene.cycles, "use_osl", None),
@@ -192,6 +194,10 @@ class _RenderStateTransaction:
         self.compositor_tree = node_tree
         self.compositor_ptrs = (
             {node.as_pointer() for node in node_tree.nodes} if node_tree else set()
+        )
+        self.compositor_mutes = (
+            {node.as_pointer(): bool(node.mute) for node in node_tree.nodes}
+            if node_tree else {}
         )
         return self
 
@@ -232,6 +238,10 @@ class _RenderStateTransaction:
             for node in list(compositor_tree.nodes):
                 if node.as_pointer() not in self.compositor_ptrs:
                     compositor_tree.nodes.remove(node)
+                else:
+                    # Setup can fail before the export enters its render
+                    # finally block; restore outputs muted during preparation.
+                    node.mute = self.compositor_mutes[node.as_pointer()]
 
         scene.world = self.world
         if self.world and self.world_state:
@@ -244,7 +254,8 @@ class _RenderStateTransaction:
                     node.inputs["Strength"].default_value = strength
 
         scene.camera = state["camera"]
-        scene.render.engine = state["engine"]
+        if scene.render.engine != state["engine"]:
+            scene.render.engine = state["engine"]
         scene.render.film_transparent = state["film_transparent"]
         scene.render.use_compositing = state["use_compositing"]
         scene.render.filepath = state["filepath"]
@@ -261,6 +272,8 @@ class _RenderStateTransaction:
         scene.view_settings.gamma = state["gamma"]
         if state["cycles_samples"] is not None:
             scene.cycles.samples = state["cycles_samples"]
+        if state["cycles_use_denoising"] is not None:
+            scene.cycles.use_denoising = state["cycles_use_denoising"]
         if state["cycles_device"] is not None:
             scene.cycles.device = state["cycles_device"]
         if state["cycles_shading_system"] is not None:
@@ -892,7 +905,8 @@ def flatten_projection_material_for_refine(context, obj, baked_image_path):
 
     print(f"[StableGen] Flattened ProjectionMaterial for '{obj.name}' to baked texture '{os.path.basename(baked_image_path)}'")
 
-def _export_emit_image_impl(context, to_export, camera_id=None, bg_color=(0.5, 0.5, 0.5), view_transform='Standard', fallback_color=(0,0,0)):
+@operation
+def _export_emit_image_impl(context, to_export, camera_id=None, bg_color=(0.5, 0.5, 0.5), view_transform='Standard', fallback_color=(0,0,0), restore_materials=True):
         """
         Exports a emit-only render of the scene from a camera's perspective.
         :param context: Blender context.
@@ -904,6 +918,7 @@ def _export_emit_image_impl(context, to_export, camera_id=None, bg_color=(0.5, 0
         # Store original materials and create temporary ones
         original_materials = {}
         temporary_materials = {}
+        emission_materials = {}
 
         # Check if there is BSDF applied
 
@@ -911,13 +926,21 @@ def _export_emit_image_impl(context, to_export, camera_id=None, bg_color=(0.5, 0
 
         for obj in to_export:
             # Store original materials
-            original_materials[obj] = _snapshot_material_state(obj)
+            if restore_materials:
+                original_materials[obj] = _snapshot_material_state(obj)
 
             # Copy active material and switch to it
             mat = obj.active_material
             if not mat:
                 continue
+            source_pointer = mat.as_pointer()
+            if source_pointer in emission_materials:
+                obj.data.materials.clear()
+                obj.data.materials.append(emission_materials[source_pointer])
+                yield None
+                continue
             mat_copy = mat.copy()
+            emission_materials[source_pointer] = mat_copy
 
             # Clear materials and assign temp material
             obj.data.materials.clear()
@@ -1030,15 +1053,17 @@ def _export_emit_image_impl(context, to_export, camera_id=None, bg_color=(0.5, 0
         bpy.context.scene.display_settings.display_device = 'sRGB'
         bpy.context.scene.view_settings.view_transform = view_transform
         context.scene.cycles.samples = 1  # Minimum samples for speed
-        # Configure view layer settings for diffuse-only
+        # Only Emit and Environment feed this export. Denoising the unused
+        # Combined image is expensive and does not change either consumed pass.
+        # The enclosing render transaction restores the user's denoising flag.
+        context.scene.cycles.use_denoising = False
+        # Request only the two passes consumed below. In particular, saved
+        # Combined, Z, normal or index passes must not add work to every
+        # context/visibility render. The transaction restores each flag.
         view_layer = context.view_layer
-        view_layer.use_pass_diffuse_color = False
-        view_layer.use_pass_diffuse_direct = False
-        view_layer.use_pass_diffuse_indirect = False
-
-        # Disable all other passes
-        view_layer.use_pass_ambient_occlusion = False
-        view_layer.use_pass_shadow = False
+        for name in _RenderStateTransaction._PASS_NAMES:
+            if hasattr(view_layer, name):
+                setattr(view_layer, name, name in {'use_pass_emit', 'use_pass_environment'})
         view_layer.use_pass_emit = True
         view_layer.use_pass_environment = True
 
@@ -1073,8 +1098,9 @@ def _export_emit_image_impl(context, to_export, camera_id=None, bg_color=(0.5, 0
         links.new(mix_node.outputs[0], output_node.inputs[0])
 
         # Render
+        yield None
         try:
-            bpy.ops.render.render(write_still=True)
+            yield RenderRequest()
         finally:
             _finish_compositor_render(node_tree, compositor_state)
 
@@ -1129,19 +1155,25 @@ def _export_emit_image_impl(context, to_export, camera_id=None, bg_color=(0.5, 0
         print(f"[StableGen] Emmision render saved to: {os.path.join(output_dir, output_file)}.png")
 
 
+@operation
 def export_emit_image(context, to_export, camera_id=None, bg_color=(0.5, 0.5, 0.5), view_transform='Standard', fallback_color=(0,0,0)):
-    with _RenderStateTransaction(context, to_export):
+    # All material/mesh edits happen on isolated copies, so production slots
+    # must not be cleared and restored at the end of the transaction.
+    with _RenderStateTransaction(context):
         with _temporary_render_copies(context, to_export) as (copies, _mapping):
-            return _export_emit_image_impl(
+            return (yield from _export_emit_image_impl(
                 context,
                 copies,
                 camera_id=camera_id,
                 bg_color=bg_color,
                 view_transform=view_transform,
                 fallback_color=fallback_color,
-            )
+                restore_materials=False,
+                _steps=True,
+            ))
 
 
+@operation
 def _export_render_impl(
     context, camera_id=None, output_dir=None, filename=None,
     background_color=None,
@@ -1217,7 +1249,7 @@ def _export_render_impl(
 
     # Render
     try:
-        bpy.ops.render.render(write_still=True)
+        yield RenderRequest()
     finally:
         _finish_compositor_render(node_tree, compositor_state)
 
@@ -1236,16 +1268,17 @@ def _export_render_impl(
     context.scene.render.use_compositing = original_use_compositing
 
 
+@operation
 def export_render(
     context, camera_id=None, output_dir=None, filename=None,
     background_color=None,
 ):
     objects = [obj for obj in context.view_layer.objects if obj.type == 'MESH']
     with _RenderStateTransaction(context, objects):
-        return _export_render_impl(
+        return (yield from _export_render_impl(
             context, camera_id=camera_id, output_dir=output_dir,
-            filename=filename, background_color=background_color,
-        )
+            filename=filename, background_color=background_color, _steps=True,
+        ))
 
 
 def _export_viewport_impl(
@@ -1371,6 +1404,7 @@ def export_viewport(
             filename=filename, background_color=background_color,
         )
 
+@operation
 def export_canny(context, camera_id=None, low_threshold=0, high_threshold=80):
     """
     Uses export_render and openCV to generate a Canny edge detection image.
@@ -1381,7 +1415,7 @@ def export_canny(context, camera_id=None, low_threshold=0, high_threshold=80):
     :return: None
     """
     # Render the scene
-    export_render(context, camera_id)
+    yield from export_render(context, camera_id, _steps=True)
 
     # Load the rendered image
     output_dir_render = get_dir_path(context, "misc")
@@ -1482,9 +1516,10 @@ def expand_mask_to_blocks(mask_file_path, block_size=8):
         return None
 
 
+@operation
 def _export_visibility_impl(context, to_export, obj=None, camera_visibility=None,
                             prepare_only=False, camera_render=None, camera_id=None,
-                            output_object_name=None):
+                            output_object_name=None, restore_materials=True):
     """     
     Exports the visibility of the mesh by temporarily altering the shading nodes.
     :param context: Blender context.
@@ -1499,11 +1534,12 @@ def _export_visibility_impl(context, to_export, obj=None, camera_visibility=None
     # Store original materials and create temporary ones
     original_materials = {}
     temporary_materials = {}
+    prepared_materials = {}
 
     def restore_prepared_materials():
         for prepared_obj, material_state in original_materials.items():
             _restore_material_state(prepared_obj, material_state)
-        for temp_mat in temporary_materials.values():
+        for temp_mat in set(temporary_materials.values()):
             if temp_mat and temp_mat.name in bpy.data.materials:
                 bpy.data.materials.remove(temp_mat)
 
@@ -1513,7 +1549,14 @@ def _export_visibility_impl(context, to_export, obj=None, camera_visibility=None
             return False
 
         # Store original materials
-        original_materials[obj] = _snapshot_material_state(obj)
+            if restore_materials:
+                original_materials[obj] = _snapshot_material_state(obj)
+        source_pointer = mat.as_pointer()
+        if not prepare_only and source_pointer in prepared_materials:
+            obj.data.materials.clear()
+            obj.data.materials.append(prepared_materials[source_pointer])
+            temporary_materials[obj] = prepared_materials[source_pointer]
+            return True
 
         # Store original active mat
 
@@ -1574,6 +1617,7 @@ def _export_visibility_impl(context, to_export, obj=None, camera_visibility=None
             obj.data.materials.clear()
             obj.data.materials.append(mat_copy)
             temporary_materials[obj] = mat_copy
+            prepared_materials[source_pointer] = mat_copy
             return True
         
         # Determine which input to used based on existence of BSDF node before the output
@@ -1595,6 +1639,7 @@ def _export_visibility_impl(context, to_export, obj=None, camera_visibility=None
         obj.data.materials.clear()
         obj.data.materials.append(mat_copy)
         temporary_materials[obj] = mat_copy
+        prepared_materials[source_pointer] = mat_copy
         # Add equal node between color mix and bsdf
         equal = nodes.new("ShaderNodeMath")
         
@@ -1756,6 +1801,7 @@ def _export_visibility_impl(context, to_export, obj=None, camera_visibility=None
         if not prepare_material(obj):
             restore_prepared_materials()
             return False
+        yield None
         
     if prepare_only:
         # Debug mode: leave the visibility material applied for viewport inspection
@@ -1801,7 +1847,7 @@ def _export_visibility_impl(context, to_export, obj=None, camera_visibility=None
         else:
             camera_render_index = camera_id
         context.scene.camera = camera_render
-        _export_emit_image_impl(context, to_export, camera_id=f"{camera_render_index}_visibility", bg_color=(1, 1, 1), view_transform='Raw', fallback_color=(1,1,1))
+        yield from _export_emit_image_impl(context, to_export, camera_id=f"{camera_render_index}_visibility", bg_color=(1, 1, 1), view_transform='Raw', fallback_color=(1,1,1), restore_materials=restore_materials, _steps=True)
 
     # Restore original materials
     restore_prepared_materials()
@@ -1809,24 +1855,28 @@ def _export_visibility_impl(context, to_export, obj=None, camera_visibility=None
     return True
 
 
+@operation
 def export_visibility(context, to_export, obj=None, camera_visibility=None,
                       prepare_only=False, camera_render=None, camera_id=None):
     objects = [obj] if obj is not None else list(to_export or ())
     if prepare_only:
-        return _export_visibility_impl(
+        return (yield from _export_visibility_impl(
             context, to_export, obj=obj, camera_visibility=camera_visibility,
             prepare_only=True, camera_render=camera_render, camera_id=camera_id,
-        )
-    with _RenderStateTransaction(context, objects):
+            _steps=True,
+        ))
+    with _RenderStateTransaction(context):
         with _temporary_render_copies(context, objects) as (copies, mapping):
             mapped_obj = mapping.get(obj) if obj is not None else None
-            return _export_visibility_impl(
+            return (yield from _export_visibility_impl(
                 context, copies, obj=mapped_obj,
                 camera_visibility=camera_visibility,
                 prepare_only=False, camera_render=camera_render,
                 camera_id=camera_id,
                 output_object_name=obj.name if obj is not None else None,
-            )
+                restore_materials=False,
+                _steps=True,
+            ))
 
 
 # =========================================================
