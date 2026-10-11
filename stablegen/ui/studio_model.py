@@ -139,44 +139,6 @@ def action(document, *names):
 
 
 def projected_images(context):
-    """Read actual projection textures, honoring the saved view plan if present.
-
-    No render, file recovery, image loading or material change is performed here.
-    """
-    from ..texturing.view_plan import generation_cameras, order_cameras, order_cameras_from_manifest
-    scene = context.scene
-    objects = context.selected_objects if scene.texture_objects == 'selected' else context.view_layer.objects
-    textures = {}
-    latest = -1
-    for obj in objects:
-        if obj.type != 'MESH' or obj.hide_get():
-            continue
-        for slot in obj.material_slots:
-            if not slot.material or not slot.material.use_nodes:
-                continue
-            for node in slot.material.node_tree.nodes:
-                if node.type != 'TEX_IMAGE' or node.image is None:
-                    continue
-                parts = node.label.split('-')
-                if len(parts) != 2 or not all(part.isdigit() for part in parts):
-                    continue
-                index, material = map(int, parts)
-                if material > latest:
-                    latest, textures = material, {}
-                if material == latest:
-                    textures.setdefault(index, node.image)
-    if not textures:
-        return {}
-    custom = [item.name for item in scene.sg_camera_order] if scene.sg_use_custom_camera_order else ()
-    cameras = order_cameras(generation_cameras(scene), custom)
-    for image in textures.values():
-        folder = Path(bpy.path.abspath(image.filepath, library=image.library)).parent
-        if folder.name.lower() != 'generated':
-            continue
-        try:
-            manifest = json.loads((folder.parent / 'view_plan.json').read_text(encoding='utf8'))
-            cameras = order_cameras_from_manifest(cameras, manifest)
-            break
-        except (OSError, ValueError, TypeError):
-            continue
-    return {camera.name: textures[i] for i, camera in enumerate(cameras) if i in textures}
+    """Read existing projection textures using their saved camera identities."""
+    from ..cameras.images import projected_images as resolve
+    return resolve(context)

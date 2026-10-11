@@ -275,10 +275,10 @@ class MirrorCamera(bpy.types.Operator):
 
 
 class ToggleCameraLabels(bpy.types.Operator):
-    """Toggle floating camera prompt labels in the 3D viewport.
+    """Toggle numbered camera labels in the 3D viewport.
 
-    Shows or hides the per-camera prompt text (from Collect Camera Prompts
-    or auto-generated view labels) next to each camera in the viewport."""
+    Draws short camera names and their generation-order numbers.
+    Full prompts remain in the camera prompt editor."""
     bl_idname = "object.toggle_camera_labels"
     bl_label = "Toggle Camera Labels"
     bl_options = {'REGISTER'}
@@ -288,12 +288,12 @@ class ToggleCameraLabels(bpy.types.Operator):
         return any(o.type == 'CAMERA' for o in context.scene.objects) and not sg_modal_active(context)
 
     def execute(self, context):
-        if _overlays._sg_label_draw_handle is not None:
+        if context.scene.sg_camera_display.labels != 'NONE':
+            context.scene.sg_camera_display.labels = 'NONE'
             _sg_remove_label_overlay()
             self.report({'INFO'}, "Camera labels hidden")
         else:
+            context.scene.sg_camera_display.labels = 'ALL'
             _sg_ensure_label_overlay()
             self.report({'INFO'}, "Camera labels visible")
         return {'FINISHED'}
-
-        

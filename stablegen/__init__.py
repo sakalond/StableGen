@@ -53,6 +53,7 @@ from .cameras import (
     MoveCameraOrder, ApplyCameraOrderPreset,
 )
 from .debug_tools import debug_classes as _debug_classes
+from .cameras import display as camera_display
 from .core import server_monitor
 from .texturing.regression import REGRESSION_CLASSES
 from .texturing import masked_edit
@@ -204,6 +205,7 @@ classes.extend(REGRESSION_CLASSES)
 classes.extend(masked_edit.MASKED_EDIT_CLASSES)
 classes.extend(VARIANT_UI_CLASSES)
 classes.extend(STUDIO_UI_CLASSES)
+classes.extend(camera_display.CLASSES)
 
 
 def register():
@@ -223,11 +225,13 @@ def register():
     )
     register_variant_properties()
     register_studio_ui()
+    camera_display.register()
     server_monitor.register()
 
 
 def unregister():
     server_monitor.unregister()
+    camera_display.unregister()
     unregister_studio_ui()
     unregister_variant_properties()
     masked_edit.unregister_properties()

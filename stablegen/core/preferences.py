@@ -118,7 +118,7 @@ class StableGenAddonPreferences(bpy.types.AddonPreferences):
 
     overlay_color: bpy.props.FloatVectorProperty(
         name="Overlay Color",
-        description="Color used for the camera aspect-ratio crop rectangle and floating view labels in the viewport",
+        description="Color of the scene-camera indicator. Camera selection follows Blender’s theme; diagnostic camera colors take precedence",
         subtype='COLOR',
         size=3,
         min=0.0, max=1.0,
