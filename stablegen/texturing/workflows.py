@@ -2062,6 +2062,165 @@ class _TexturingWorkflowMixin:
         # StableDelight returns a single image
         return delight_images[0] if delight_images else {"error": "StableDelight returned empty"}
 
+    # Marigold V2 (huawei-bayerlab, Apache-2.0): single-step LoRAs on Qwen-Image-Edit-2509, run by
+    # ComfyUI core. File names follow the Comfy-Org repack; they may sit in subfolders.
+    MARIGOLD_V2_REPO = "https://huggingface.co/Comfy-Org/marigold-v2-0"
+    MARIGOLD_V2_BASE = "qwen_image_edit_2509_int8_convrot.safetensors"
+
+    def _resolve_comfy_model(self, server_address, folder, basename=None, match=None):
+        """Return the server-side name of a model file in a ComfyUI model folder.
+
+        Looks for an exact *basename* (in any subfolder) or, failing that, the
+        first file whose lower-cased name passes *match*. Returns ``None``
+        when nothing fits or the folder cannot be listed.
+        """
+        try:
+            resp = urllib.request.urlopen(
+                f"http://{server_address}/models/{folder}", timeout=get_timeout('api'))
+            names = json.loads(resp.read())
+        except Exception:
+            return None
+        flat = lambda n: n.replace('\\', '/').rsplit('/', 1)[-1].lower()
+        if basename:
+            for name in names:
+                if flat(name) == basename.lower():
+                    return name
+        if match:
+            for name in names:
+                if match(flat(name)):
+                    return name
+        return None
+
+    def generate_marigold_v2_map(self, context, input_image_path, task):
+        """Run Marigold V2 on a generated image and return the map as PNG bytes.
+
+        *task* is ``'albedo'`` (sRGB albedo) or ``'normals'`` (camera-space
+        normals, X right / Y up / Z toward the camera, encoded as (N + 1) / 2,
+        the same convention as Marigold v1). The image is processed at its own
+        size, rounded to a multiple of 16 and kept between 1024 px and
+        ``pbr_v2_max_resolution`` on the longest edge; the result is resized
+        back to the input size.
+
+        Returns ``bytes`` on success or ``{"error": "..."}``.
+        """
+        server_address = context.preferences.addons[_ADDON_PKG].preferences.server_address
+        client_id = str(uuid.uuid4())
+        scene = context.scene
+        repo = self.MARIGOLD_V2_REPO
+
+        for node_class in ('MarigoldV2PostProcess', 'ConditioningLoader'):
+            try:
+                resp = urllib.request.urlopen(
+                    f"http://{server_address}/object_info/{node_class}",
+                    timeout=get_timeout('api'))
+                found = node_class in json.loads(resp.read())
+            except urllib.error.HTTPError as e:
+                if e.code != 404:
+                    return {"error": f"Marigold V2: failed to query ComfyUI for node "
+                                     f"'{node_class}' (HTTP {e.code}). Is ComfyUI running?"}
+                found = False
+            except Exception as e:
+                return {"error": f"Marigold V2: could not reach ComfyUI at '{server_address}' "
+                                 f"({type(e).__name__}: {e})."}
+            if not found:
+                return {"error": f"Marigold V2 needs ComfyUI's core node '{node_class}' "
+                                 f"(added in September 2026). Update ComfyUI and restart it."}
+
+        base = self._resolve_comfy_model(
+            server_address, 'diffusion_models', self.MARIGOLD_V2_BASE,
+            match=lambda n: (('qwen_image_edit_2509' in n or 'qwen-image-edit-2509' in n)
+                             and 'lightning' not in n and n.endswith('.safetensors')))
+        lora = self._resolve_comfy_model(server_address, 'loras', f"marigold_v2_{task}.safetensors")
+        vae = self._resolve_comfy_model(server_address, 'vae', f"marigold_v2_{task}_vae.safetensors")
+        cond = self._resolve_comfy_model(
+            server_address, 'embeddings', f"marigold_v2_{task}_conditioning.safetensors")
+        missing = [label for label, name in (
+            (f"diffusion_models/{self.MARIGOLD_V2_BASE}", base),
+            (f"loras/marigold_v2_{task}.safetensors", lora),
+            (f"vae/marigold_v2_{task}_vae.safetensors", vae),
+            (f"embeddings/marigold_v2_{task}_conditioning.safetensors", cond)) if name is None]
+        if missing:
+            return {"error": f"Marigold V2 model files not found on the ComfyUI server: "
+                             f"{', '.join(missing)}. Download them from {repo} into the "
+                             f"matching ComfyUI/models/ folders, then restart ComfyUI."}
+
+        from .._generator_utils import upload_image_to_comfyui
+        image_info = upload_image_to_comfyui(server_address, input_image_path, operator=self.operator)
+        if image_info is None:
+            return {"error": f"Failed to upload image for Marigold V2: {input_image_path}"}
+        uploaded_name = image_info.get("name", os.path.basename(input_image_path))
+
+        with Image.open(input_image_path) as _img:
+            src_w, src_h = _img.size
+        max_res = int(getattr(scene, 'pbr_v2_max_resolution', 2048))
+        longest = min(max(max(src_w, src_h), 1024), max_res)
+        scale = longest / max(src_w, src_h)
+        proc_w = max(16, int(round(src_w * scale / 16)) * 16)
+        proc_h = max(16, int(round(src_h * scale / 16)) * 16)
+        print(f"[StableGen] Marigold V2 {task}: processing at {proc_w}×{proc_h} "
+              f"(input {src_w}×{src_h})")
+
+        # One deterministic step, as in the ComfyUI reference workflow: the encoded image is the
+        # starting latent (img_to_img_velocity), no noise, sigma 0.5 -> 0.
+        prompt = {
+            "1": {"class_type": "LoadImage", "inputs": {"image": uploaded_name}},
+            "2": {"class_type": "ImageScale",
+                  "inputs": {"image": ["1", 0], "upscale_method": "lanczos",
+                             "width": proc_w, "height": proc_h, "crop": "disabled"}},
+            "3": {"class_type": "UNETLoader",
+                  "inputs": {"unet_name": base, "weight_dtype": "default"}},
+            "4": {"class_type": "LoraLoaderModelOnly",
+                  "inputs": {"model": ["3", 0], "lora_name": lora, "strength_model": 1.0}},
+            "5": {"class_type": "ModelSamplingAuraFlow",
+                  "inputs": {"model": ["4", 0], "shift": 1.73, "sampling": "img_to_img_velocity"}},
+            "6": {"class_type": "ConditioningLoader", "inputs": {"conditioning_name": cond}},
+            "7": {"class_type": "VAELoader", "inputs": {"vae_name": vae}},
+            "8": {"class_type": "VAEEncode", "inputs": {"pixels": ["2", 0], "vae": ["7", 0]}},
+            "9": {"class_type": "DisableNoise", "inputs": {}},
+            "10": {"class_type": "KSamplerSelect", "inputs": {"sampler_name": "euler"}},
+            "11": {"class_type": "ManualSigmas", "inputs": {"sigmas": "0.5, 0"}},
+            "12": {"class_type": "BasicGuider",
+                   "inputs": {"model": ["5", 0], "conditioning": ["6", 0]}},
+            "13": {"class_type": "SamplerCustomAdvanced",
+                   "inputs": {"noise": ["9", 0], "guider": ["12", 0], "sampler": ["10", 0],
+                              "sigmas": ["11", 0], "latent_image": ["8", 0]}},
+            "14": {"class_type": "VAEDecode", "inputs": {"samples": ["13", 0], "vae": ["7", 0]}},
+            "15": {"class_type": "MarigoldV2PostProcess",
+                   "inputs": {"image": ["14", 0], "prediction": task}},
+            "16": {"class_type": "SaveImageWebsocket", "inputs": {"images": ["15", 0]}},
+        }
+        NODES = {"save_image": "16"}
+
+        ws = self._connect_to_websocket(server_address, client_id)
+        if ws is None:
+            return {"error": "WebSocket connection failed for Marigold V2"}
+        if hasattr(self.operator, '_active_ws'):
+            self.operator._active_ws = ws
+            type(self.operator)._active_ws = ws
+        try:
+            images = self._execute_prompt_and_get_images(
+                ws, prompt, client_id, server_address, NODES)
+        finally:
+            if hasattr(self.operator, '_active_ws'):
+                self.operator._active_ws = None
+                type(self.operator)._active_ws = None
+            try:
+                ws.close()
+            except Exception:
+                pass
+
+        if not isinstance(images, dict) or not images.get(NODES['save_image']):
+            return {"error": f"Marigold V2 {task} failed — no output received"}
+        data = images[NODES['save_image']][0]
+
+        out = Image.open(BytesIO(data)).convert('RGB')
+        if out.size != (src_w, src_h):
+            out = out.resize((src_w, src_h), Image.LANCZOS)
+            buf = BytesIO()
+            out.save(buf, format='PNG')
+            data = buf.getvalue()
+        return data
+
     def _build_klein_txt2img(self, context):
         """Return (prompt_dict, save_node_id) for a minimal FLUX.2 Klein txt2img.
 

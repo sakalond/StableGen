@@ -1534,6 +1534,8 @@ class StableGenPanel(bpy.types.Panel):
                     # ── Per-map adjustment controls ──
                     if scene.pbr_map_normal:
                         adj_row = sub.row()
+                        adj_row.prop(scene, "pbr_normal_model", text="Normal Model")
+                        adj_row = sub.row()
                         adj_row.prop(scene, "pbr_normal_strength", text="Normal Strength", slider=True)
                     if scene.pbr_map_height:
                         adj_row = sub.row()
@@ -1589,6 +1591,10 @@ class StableGenPanel(bpy.types.Panel):
                             scene.pbr_tiling != 'off' and scene.pbr_tile_inference == 'MODEL'):
                         row = sub.row()
                         row.prop(scene, "pbr_processing_resolution", text="Inference resolution (px)")
+                    if ((scene.pbr_map_albedo and scene.pbr_albedo_source == 'marigold_v2')
+                            or (scene.pbr_map_normal and scene.pbr_normal_model == 'marigold_v2')):
+                        row = sub.row()
+                        row.prop(scene, "pbr_v2_max_resolution", text="Marigold V2 resolution (px)")
                     row = sub.row(align=True)
                     row.prop(scene, "pbr_denoise_steps", text="Inference steps")
                     row.prop(scene, "pbr_ensemble_size", text="Predictions per map")

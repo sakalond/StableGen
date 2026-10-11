@@ -1832,8 +1832,22 @@ def register_properties(update_model_list, ControlNetUnit, LoRAUnit,
             ('marigold', "Marigold IID (Flat Albedo)", "True albedo from Marigold IID-Appearance \u2014 removes all lighting but may lose texture detail"),
             ('delight', "StableDelight (Delighted)", "Specular-removed image via StableDelight \u2014 preserves diffuse shading and texture detail, only strips highlights"),
             ('lighting', "Marigold IID-Lighting (Vibrant)", "Albedo from Marigold IID-Lighting \u2014 tends to produce more vibrant, saturated colours than IID-Appearance"),
+            ('marigold_v2', "Marigold V2 (Sharp Albedo)", "Albedo from Marigold V2 at up to the Marigold V2 resolution \u2014 removes lighting while keeping fine texture detail and colour. Needs the Marigold V2 models (about 24 GB with normals) and a September 2026 or newer ComfyUI. Roughness and metallic still come from Marigold IID-Appearance"),
         ],
         default='marigold', update=update_parameters,
+    )
+    bpy.types.Scene.pbr_normal_model = bpy.props.EnumProperty(
+        name="Normal Model", description="Model used to estimate the normal map",
+        items=[
+            ('marigold', "Marigold Normals", "Marigold normals (LCM), processed at the Inference resolution"),
+            ('marigold_v2', "Marigold V2", "Marigold V2 normals at up to the Marigold V2 resolution \u2014 sharper surface detail. Needs the Marigold V2 models and a September 2026 or newer ComfyUI"),
+        ],
+        default='marigold', update=update_parameters,
+    )
+    bpy.types.Scene.pbr_v2_max_resolution = bpy.props.IntProperty(
+        name="Marigold V2 resolution (px)",
+        description="Longest edge Marigold V2 processes at. Images are processed at their own size within 1024 px and this limit. Higher values keep more detail but need more memory and time",
+        default=2048, min=1024, max=4096, step=64, update=update_parameters
     )
     bpy.types.Scene.pbr_map_albedo = bpy.props.BoolProperty(
         name="Albedo", description="Extract a lighting-reduced base-color map using the selected method. Enable Use as material base color separately to assign it to the projected material.",
@@ -2219,6 +2233,7 @@ def unregister_properties(load_handler, _sg_queue_load_handler):
         'pbr_emission_value_min', 'pbr_emission_bloom',
         'pbr_emission_strength',
         'pbr_normal_strength', 'pbr_delight_strength',
+        'pbr_normal_model', 'pbr_v2_max_resolution',
         'pbr_use_native_resolution', 'pbr_tiling',
         'pbr_tile_albedo', 'pbr_tile_material', 'pbr_tile_normal', 'pbr_tile_height',
         'pbr_tile_emission', 'pbr_tile_grid', 'pbr_tile_inference', 'pbr_tile_superres',

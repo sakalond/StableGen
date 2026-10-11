@@ -80,9 +80,12 @@ class _PBRMixin:
 
         settings = {}
 
+        # Marigold V2 ignores the v1 inference, step and tiling settings and has its own resolution.
+        v2_settings = {'model': 'marigold_v2',
+                       'v2_resolution': getattr(scene, 'pbr_v2_max_resolution', 2048)}
+
         settings['albedo'] = {
-            **common,
-            **tiling_dict(tile_albedo),
+            **(v2_settings if albedo_source == 'marigold_v2' else {**common, **tiling_dict(tile_albedo)}),
             'source': albedo_source,
             'delight_strength': getattr(scene, 'pbr_delight_strength', 1.0) if albedo_source == 'delight' else None,
             'auto_saturation': getattr(scene, 'pbr_albedo_auto_saturation', False),
@@ -96,10 +99,13 @@ class _PBRMixin:
             **common,
             **tiling_dict(tile_material),
         }
-        settings['normal'] = {
-            **common,
-            **tiling_dict(tile_normal),
-        }
+        if getattr(scene, 'pbr_normal_model', 'marigold') == 'marigold_v2':
+            settings['normal'] = dict(v2_settings)
+        else:
+            settings['normal'] = {
+                **common,
+                **tiling_dict(tile_normal),
+            }
         settings['height'] = {
             **common,
             **tiling_dict(tile_height),
@@ -854,6 +860,9 @@ class _PBRMixin:
 
         use_delight = (want_albedo and albedo_source == 'delight')
         use_lighting_albedo = (want_albedo and albedo_source == 'lighting')
+        use_v2_albedo = (want_albedo and albedo_source == 'marigold_v2')
+        use_v2_normals = (want_normal
+                          and getattr(scene, 'pbr_normal_model', 'marigold') == 'marigold_v2')
 
         # ── Determine which Marigold models to run ────────────────────
         # When all_missing is set (selective rerun), only models whose
@@ -863,7 +872,7 @@ class _PBRMixin:
             or want_roughness
             or want_metallic
         )
-        need_normals = want_normal
+        need_normals = want_normal and not use_v2_normals
         need_height = want_height
         # IID-Lighting is needed for 'residual' emission OR 'lighting' albedo
         need_iid_lighting = (
@@ -880,6 +889,12 @@ class _PBRMixin:
             need_iid_lighting = need_iid_lighting and bool(
                 all_missing & {'emission', 'albedo'})
             use_delight = use_delight and 'albedo' in all_missing
+            use_v2_albedo = use_v2_albedo and 'albedo' in all_missing
+            use_v2_normals = use_v2_normals and 'normal' in all_missing
+
+        # Albedo produced by a separate pass: IID-Appearance then only supplies
+        # roughness and metallic, and its albedo output is discarded.
+        external_albedo = (want_albedo and albedo_source in ('delight', 'marigold_v2'))
 
         models_to_run = []
         if need_appearance:
@@ -910,6 +925,8 @@ class _PBRMixin:
 
         total_model_steps = (len(models_to_run)
                              + (1 if use_delight else 0)
+                             + (1 if use_v2_albedo else 0)
+                             + (1 if use_v2_normals else 0)
                              + extra_emission_steps)
         if total_model_steps == 0:
             print("[StableGen] No PBR maps enabled, skipping decomposition")
@@ -939,7 +956,7 @@ class _PBRMixin:
         custom_tile_height = False
         custom_tile_emission = False
         # Whether IID-Appearance is the albedo provider
-        appearance_provides_albedo = (not use_delight
+        appearance_provides_albedo = (not external_albedo
                                       and not use_lighting_albedo)
 
         if tiling_mode == 'selective':
@@ -1055,6 +1072,56 @@ class _PBRMixin:
                     except Exception as err:
                         print(f"[StableGen]     Failed to save delight albedo: {err}")
 
+        # ── Marigold V2 passes (all cameras per map) ──────────────────
+        v2_tasks = ([('albedo', 'albedo')] if use_v2_albedo else []) + \
+                   ([('normals', 'normal')] if use_v2_normals else [])
+        for task, map_name in v2_tasks:
+            model_step += 1
+            self._pbr_step = model_step
+            print(f"[StableGen]   Model {model_step}/{total_model_steps}: Marigold V2 {task}")
+            for ci, cam_idx in enumerate(cam_ids):
+                if per_camera_missing and cam_idx in per_camera_missing:
+                    if map_name not in per_camera_missing[cam_idx]:
+                        print(f"[StableGen]     Camera {cam_idx}: {map_name} exists, skipping Marigold V2")
+                        continue
+                self._pbr_cam = ci
+                self._stage = f"PBR: Marigold V2 {task} (cam {ci+1}/{num_cams})"
+                self._progress = 0
+                print(f"[StableGen]     Camera {cam_idx} ({ci+1}/{num_cams})…")
+                result = self.workflow_manager.generate_marigold_v2_map(
+                    context, camera_images[cam_idx], task)
+                if isinstance(result, dict) and "error" in result:
+                    print(f"[StableGen]     Marigold V2 error: {result['error']}")
+                    self._error = f"Marigold V2 failed: {result['error']}"
+                    return
+                if map_name == 'normal':
+                    converted = self._convert_normals_cam_to_world(result, cam_idx)
+                    if converted is not None:
+                        result = converted
+                pbr_path = get_file_path(
+                    context, "pbr", subtype=map_name,
+                    camera_id=cam_idx, material_id=self._material_id)
+                try:
+                    if map_name == 'albedo':
+                        self._save_raw_copy(context, "albedo", cam_idx, result)
+                    with open(pbr_path, 'wb') as f:
+                        f.write(result)
+                    self._pbr_maps[cam_idx][map_name] = pbr_path
+                    print(f"[StableGen]     Saved {map_name} (Marigold V2) → "
+                          f"{os.path.basename(pbr_path)}")
+                except Exception as err:
+                    print(f"[StableGen]     Failed to save Marigold V2 {map_name}: {err}")
+        if v2_tasks and models_to_run:
+            # The Qwen-Image-Edit base stays cached in ComfyUI; the Marigold v1
+            # custom nodes load their own pipelines and need the memory back.
+            try:
+                server_address = context.preferences.addons[
+                    _ADDON_PKG].preferences.server_address
+                self.workflow_manager._flush_comfyui_vram(
+                    server_address, retries=1, label="after Marigold V2")
+            except Exception as e:
+                print(f"[StableGen] VRAM flush after Marigold V2 failed (non-fatal): {e}")
+
         # ── Marigold model passes (all cameras per model) ─────────────
         for model_name, map_names in models_to_run:
             model_step += 1
@@ -1094,7 +1161,7 @@ class _PBRMixin:
 
                 if tiling_mode == 'selective':
                     dual_run_iid = (
-                        should_tile and is_iid and not use_delight
+                        should_tile and is_iid and not external_albedo
                     )
                     dual_run_lighting = (
                         should_tile and is_iid_lighting
@@ -1215,7 +1282,7 @@ class _PBRMixin:
                     context, result, map_names, cam_idx,
                     want_roughness=want_roughness,
                     want_metallic=want_metallic,
-                    use_delight=use_delight,
+                    use_delight=external_albedo,
                     use_lighting_albedo=use_lighting_albedo)
 
         # ── Post-Marigold emission passes ─────────────────────────────
