@@ -1958,6 +1958,20 @@ def register_properties(update_model_list, ControlNetUnit, LoRAUnit,
         description="N×N tile grid: 2 creates 4 tiles, 3 creates 9, 4 creates 16. Processing time grows roughly with tile count; tile count is not a guaranteed detail multiplier.",
         default=2, min=2, max=4, update=update_parameters
     )
+    bpy.types.Scene.pbr_tile_inference = bpy.props.EnumProperty(
+        name="Tile inference size",
+        description="Resolution each tile is processed at",
+        items=[
+            ('SOURCE', "Tile Source Size",
+             "Process each tile at its own size, upscaled to the source image's longest edge. Marigold "
+             "is trained at 768 px, so map estimates degrade well above that"),
+            ('MODEL', "Inference Resolution",
+             "Process each tile at the Inference resolution (768 px, Marigold's training size), so the "
+             "grid adds detail at the scale the models expect: a 2×2 grid gives each region four times "
+             "the pixels of whole-image inference"),
+        ],
+        default='SOURCE', update=update_parameters
+    )
     bpy.types.Scene.pbr_tile_superres = bpy.props.BoolProperty(
         name="Keep tiled output resolution",
         description="Retain the higher-resolution tiled result instead of reducing maps back to the source dimensions. Uses more image memory.",
@@ -2207,7 +2221,7 @@ def unregister_properties(load_handler, _sg_queue_load_handler):
         'pbr_normal_strength', 'pbr_delight_strength',
         'pbr_use_native_resolution', 'pbr_tiling',
         'pbr_tile_albedo', 'pbr_tile_material', 'pbr_tile_normal', 'pbr_tile_height',
-        'pbr_tile_emission', 'pbr_tile_grid', 'pbr_tile_superres',
+        'pbr_tile_emission', 'pbr_tile_grid', 'pbr_tile_inference', 'pbr_tile_superres',
         'pbr_processing_resolution', 'pbr_denoise_steps', 'pbr_ensemble_size',
         'pbr_albedo_auto_saturation', 'pbr_albedo_saturation_mode',
         'pbr_replace_color_with_albedo', 'pbr_auto_lighting',

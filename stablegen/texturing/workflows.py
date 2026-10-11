@@ -1719,7 +1719,7 @@ class _TexturingWorkflowMixin:
 
     # ── PBR Decomposition (Marigold IID) ───────────────────────────────
     def generate_pbr_maps(self, context, input_image_path, model_name=None,
-                          force_native_resolution=False):
+                          force_native_resolution=False, processing_resolution=None):
         """Run a Marigold model on a generated texture and collect the output.
 
         Uploads *input_image_path* to the ComfyUI server, runs it through the
@@ -1742,6 +1742,9 @@ class _TexturingWorkflowMixin:
                 image's native longest edge (rounded to 64) regardless
                 of the user-configured resolution settings.  Used by
                 the tiling path so each tile gets full-detail processing.
+            processing_resolution: Process at exactly this resolution,
+                overriding both of the above. Used by the tiling path when
+                tiles run at the model's inference resolution.
 
         Returns:
             list[bytes] | dict: A list of raw-PNG byte buffers on success,
@@ -1799,7 +1802,9 @@ class _TexturingWorkflowMixin:
         # Otherwise fall back to the user-specified fixed resolution.
         use_native = force_native_resolution or getattr(
             scene, 'pbr_use_native_resolution', False)
-        if use_native:
+        if processing_resolution:
+            proc_res = int(processing_resolution)
+        elif use_native:
             try:
                 from PIL import Image as _PILImage
                 with _PILImage.open(input_image_path) as _img:

@@ -1576,6 +1576,8 @@ class StableGenPanel(bpy.types.Panel):
                         row = sub.row(align=True)
                         row.prop(scene, "pbr_tile_grid", text="Tile grid")
                         row.prop(scene, "pbr_tile_superres", text="Keep tiled output resolution", toggle=True, icon="IMAGE_PLANE")
+                        row = sub.row()
+                        row.prop(scene, "pbr_tile_inference", text="Tile inference")
                     if scene.pbr_tiling == 'custom':
                         row = sub.row(align=True)
                         row.prop(scene, "pbr_tile_albedo", text="Albedo", toggle=True)
@@ -1583,7 +1585,8 @@ class StableGenPanel(bpy.types.Panel):
                         row.prop(scene, "pbr_tile_normal", text="Normal", toggle=True)
                         row.prop(scene, "pbr_tile_height", text="Height", toggle=True)
                         row.prop(scene, "pbr_tile_emission", text="Emission", toggle=True)
-                    if not scene.pbr_use_native_resolution:
+                    if not scene.pbr_use_native_resolution or (
+                            scene.pbr_tiling != 'off' and scene.pbr_tile_inference == 'MODEL'):
                         row = sub.row()
                         row.prop(scene, "pbr_processing_resolution", text="Inference resolution (px)")
                     row = sub.row(align=True)

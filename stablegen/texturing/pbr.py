@@ -68,8 +68,14 @@ class _PBRMixin:
         def tiling_dict(is_tiled):
             """Return tiling sub-dict; grid/superres only matter when tiled."""
             if is_tiled:
-                return {'tiled': True, 'tile_grid': tile_grid,
-                        'tile_superres': tile_superres}
+                result = {'tiled': True, 'tile_grid': tile_grid,
+                          'tile_superres': tile_superres}
+                inference = getattr(scene, 'pbr_tile_inference', 'SOURCE')
+                if inference != 'SOURCE':
+                    # Only recorded when it differs from the old behaviour, so maps made
+                    # before this option existed still count as up to date.
+                    result['tile_inference'] = inference
+                return result
             return {'tiled': False}
 
         settings = {}
@@ -356,6 +362,14 @@ class _PBRMixin:
                 # Normalise to list[bytes] (StableDelight returns bytes)
                 if isinstance(result, bytes):
                     result = [result]
+            elif getattr(context.scene, 'pbr_tile_inference', 'SOURCE') == 'MODEL':
+                # Each tile at the model's inference resolution: the grid then adds
+                # detail at the scale Marigold was trained at, rather than feeding it
+                # tiles far larger than that.
+                result = self.workflow_manager.generate_pbr_maps(
+                    context, tile_path, model_name=model_name,
+                    processing_resolution=getattr(
+                        context.scene, 'pbr_processing_resolution', 768))
             else:
                 result = self.workflow_manager.generate_pbr_maps(
                     context, tile_path, model_name=model_name,

@@ -69,7 +69,7 @@ FAMILIES = {
     'pbr_map_albedo': ('pbr_albedo_source', 'pbr_albedo_auto_saturation'),
     'pbr_albedo_source': ('pbr_delight_strength',),
     'pbr_albedo_auto_saturation': ('pbr_albedo_saturation_mode',),
-    'pbr_tiling': ('pbr_tile_grid', 'pbr_tile_superres', 'pbr_tile_albedo',
+    'pbr_tiling': ('pbr_tile_grid', 'pbr_tile_inference', 'pbr_tile_superres', 'pbr_tile_albedo',
         'pbr_tile_material', 'pbr_tile_normal', 'pbr_tile_height', 'pbr_tile_emission'),
     'pbr_use_native_resolution': ('pbr_processing_resolution',),
     'trellis2_post_processing_enabled': ('trellis2_decimate_method', 'trellis2_decimation',
