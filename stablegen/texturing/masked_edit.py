@@ -16,7 +16,7 @@ import uuid
 import bpy
 import numpy as np
 
-from ..core import ADDON_PKG
+from ..core import ADDON_PKG, legacy_panel_enabled
 from ..utils import sg_modal_active, get_file_path
 from .rendering import _RenderStateTransaction
 
@@ -1139,6 +1139,11 @@ class SG_PT_MaskedEdit(bpy.types.Panel):
     bl_region_type = 'UI'
     bl_category = 'StableGen'
     bl_options = {'DEFAULT_CLOSED'}
+
+    @classmethod
+    def poll(cls, context):
+        # Studio shows these controls in its own mode settings.
+        return legacy_panel_enabled(context)
 
     def draw(self, context):
         draw_masked_edit_controls(self.layout, context)

@@ -13,9 +13,6 @@ from .ui.presets import (
     ResetQwenPrompt, ResetTexturingExperiments, SwitchToMeshGeneration,
 )
 from .ui.panel import StableGenPanel, StableGenPrintPanel
-from .ui.panel_variants import (
-    VARIANT_UI_CLASSES, register_variant_properties, unregister_variant_properties,
-)
 from .ui.studio import STUDIO_UI_CLASSES, register_studio_ui, unregister_studio_ui
 from .ui.queue import (
     SG_UL_SceneQueueList, SceneQueueAdd, SceneQueueRemove, SceneQueueClear,
@@ -203,7 +200,6 @@ classes = [
 classes.extend(_debug_classes)
 classes.extend(REGRESSION_CLASSES)
 classes.extend(masked_edit.MASKED_EDIT_CLASSES)
-classes.extend(VARIANT_UI_CLASSES)
 classes.extend(STUDIO_UI_CLASSES)
 classes.extend(camera_display.CLASSES)
 
@@ -223,7 +219,6 @@ def register():
         _sg_queue_load_handler=_sg_queue_load_handler,
         _sg_queue_load=_sg_queue_load,
     )
-    register_variant_properties()
     register_studio_ui()
     camera_display.register()
     server_monitor.register()
@@ -233,7 +228,6 @@ def unregister():
     server_monitor.unregister()
     camera_display.unregister()
     unregister_studio_ui()
-    unregister_variant_properties()
     masked_edit.unregister_properties()
     from .mesh_gen.batch import unregister_batch
     from .dae_import.batch_texture import unregister_batch_texture

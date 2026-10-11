@@ -16,6 +16,8 @@ from .studio_widgets import FONT_SIZE, CONTROL_HEIGHT, CONTROL_GAP
 
 GAP = 8
 PAD = 12
+# Content width at which cards and action rows sit side by side.
+SIDE_BY_SIDE_WIDTH = 440
 RESOLUTION_KEYS = {'auto_rescale', 'auto_rescale_target_mp', 'qwen_rescale_alignment'}
 
 
@@ -561,7 +563,7 @@ def draw(s, p, cards, section, x, y, width):
             index += 1
             continue
         row = [card]
-        if (width >= 440 and card.spec.beside and index + 1 < len(roots)
+        if (width >= SIDE_BY_SIDE_WIDTH and card.spec.beside and index + 1 < len(roots)
                 and roots[index + 1].spec.beside == card.spec.beside
                 and roots[index + 1].spec.key not in children):
             row.append(roots[index + 1])
@@ -644,8 +646,8 @@ ACTION_DESCRIPTIONS = {
 }
 
 
-def actions(s, p, rows, x, y, width):
-    columns = 2 if width >= 440 else 1
+def actions(s, p, rows, x, y, width, *, max_columns=2):
+    columns = min(max_columns, 2 if width >= SIDE_BY_SIDE_WIDTH else 1)
     cw = (width - GAP * (columns - 1)) / columns
     for first in range(0, len(rows), columns):
         p.begin_group()

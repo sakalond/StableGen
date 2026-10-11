@@ -6,7 +6,9 @@ import bpy
 import blf
 import gpu
 from gpu_extras.batch import batch_for_shader
+import numpy as np
 
+from . import brand
 from .studio_text import wrap
 
 FONT_SIZE = 11
@@ -14,6 +16,160 @@ CONTROL_HEIGHT = 22
 CONTROL_GAP = 5
 TEXT_LINE_HEIGHT = 17
 TEXT_PADDING = 8
+
+def _arc_arrow(cx, cy, radius, start, end, length=4.5, width=5.5):
+    """Arc from start to end degrees (clockwise on screen when end > start) and its filled head.
+
+    The arc stops at the head's base so a thin stroke never runs into the arrowhead.
+    """
+    steps = max(10, int(abs(end - start) / 8))
+    arc = [(cx + radius * math.cos(math.radians(start + (end - start) * i / steps)),
+            cy + radius * math.sin(math.radians(start + (end - start) * i / steps))) for i in range(steps + 1)]
+    a, sign = math.radians(end), 1 if end > start else -1
+    bx, by = cx + radius * math.cos(a), cy + radius * math.sin(a)
+    tx, ty, nx, ny = -math.sin(a) * sign, math.cos(a) * sign, math.cos(a), math.sin(a)
+    head = [(bx + tx * length, by + ty * length),
+            (bx + nx * width / 2, by + ny * width / 2), (bx - nx * width / 2, by - ny * width / 2)]
+    return arc, head
+
+
+_SYNC = (_arc_arrow(10.5, 10.5, 7, 200, 320), _arc_arrow(10.5, 10.5, 7, 20, 140))
+
+# Line icons on a 21-unit grid. Like Blender's SVG icons, they are rasterized
+# once per pixel size into anti-aliased coverage bitmaps and drawn as textures.
+ICON_PATHS = {
+    'camera': [[(2, 5), (6, 5), (8, 2), (13, 2), (15, 5), (19, 5), (19, 17), (2, 17), (2, 5)]],
+    'document': [[(13, 2), (4, 2), (4, 19), (17, 19), (17, 6), (13, 2), (13, 6), (17, 6)], [(7, 10), (14, 10)], [(7, 14), (12, 14)]],
+    'clone': [[(8, 7), (19, 7), (19, 18), (8, 18), (8, 7)], [(14, 4), (3, 4), (3, 14), (5, 14)]],
+    'mirror': [[(10, 2), (10, 19)], [(2, 6), (6, 6), (6, 15), (2, 15), (2, 6)], [(14, 6), (18, 6), (18, 15), (14, 15), (14, 6)]],
+    'expand': [[(12, 2), (19, 2), (19, 9)], [(19, 2), (12, 9)], [(8, 19), (2, 19), (2, 12)], [(2, 19), (9, 12)]],
+    'labels': [[(3, 3), (18, 3)], [(10, 3), (10, 18)], [(6, 18), (14, 18)]],
+    'down': [[(5, 8), (10, 13), (15, 8)]],
+    'up': [[(5, 13), (10, 8), (15, 13)]],
+    'right': [[(7, 5), (12, 10), (7, 15)]],
+    'reset': [arc for arc, _ in _SYNC],
+    'search': [[(14, 14), (19, 19)]],
+    'settings': [[(2, 5), (19, 5)], [(2, 10), (19, 10)], [(2, 15), (19, 15)], [(7, 3), (7, 7)], [(14, 8), (14, 12)], [(9, 13), (9, 17)]],
+    'play': [[(6, 3), (18, 10), (6, 18), (6, 3)]],
+    'stop': [[(5, 5), (16, 5), (16, 16), (5, 16), (5, 5)]],
+    'layers': [[(10, 2), (19, 7), (10, 12), (1, 7), (10, 2)], [(1, 11), (10, 16), (19, 11)], [(1, 15), (10, 20), (19, 15)]],
+    'grid': [[(3, 3), (18, 3), (18, 18), (3, 18), (3, 3)], [(3, 8), (18, 8)], [(3, 13), (18, 13)], [(8, 3), (8, 18)], [(13, 3), (13, 18)]],
+    'download': [[(10, 2), (10, 13)], [(5, 8), (10, 13), (15, 8)], [(2, 14), (2, 19), (18, 19), (18, 14)]],
+    'eye': [[(1, 10), (6, 5), (14, 5), (19, 10), (14, 15), (6, 15), (1, 10)]],
+    'x': [[(5, 5), (16, 16)], [(5, 16), (16, 5)]],
+    'plus': [[(10, 3), (10, 18)], [(3, 10), (18, 10)]],
+    'minus': [[(3, 10), (18, 10)]],
+    'check': [[(3, 10), (8, 15), (18, 5)]],
+    'arrow': [[(3, 10), (18, 10)], [(12, 4), (18, 10), (12, 16)]],
+    'widen': [[(3, 3), (3, 18)], [(18, 10.5), (7, 10.5)], [(11, 6.5), (7, 10.5), (11, 14.5)]],
+    'folder': [[(2, 6), (2, 18), (19, 18), (19, 6), (10, 6), (8, 3), (2, 3), (2, 6)]],
+    'light': [[(7, 15), (7, 18), (14, 18), (14, 15), (17, 11), (17, 6), (13, 2), (8, 2), (4, 6), (4, 11), (7, 15)], [(7, 15), (14, 15)]],
+    'modifier': [[(3, 3), (8, 3), (8, 8), (13, 8), (13, 13), (18, 13), (18, 18), (3, 18), (3, 3)]],
+    'curve': [[(2, 17), (5, 17), (8, 14), (10, 6), (13, 3), (19, 3)], [(2, 15), (2, 19)], [(19, 1), (19, 5)]],
+    'material': [[(10, 2), (18, 6), (18, 15), (10, 19), (2, 15), (2, 6), (10, 2)], [(2, 6), (10, 10), (18, 6)], [(10, 10), (10, 19)]],
+    'rig': [[(10, 2), (10, 9), (4, 6)], [(10, 9), (17, 5)], [(10, 9), (6, 19)], [(10, 9), (16, 18)]],
+    'graph': [[(2, 2), (2, 18), (19, 18)], [(4, 14), (8, 8), (12, 11), (18, 3)]],
+    'shield': [[(10, 2), (18, 5), (17, 13), (10, 19), (3, 13), (2, 5), (10, 2)]],
+}
+ICON_CIRCLES = {'camera': (10.5, 11, 4), 'eye': (10, 10, 2.5), 'search': (9, 9, 6)}
+# Filled convex shapes, such as arrowheads that would blur into a thin stroke.
+ICON_FILLS = {'reset': [head for _, head in _SYNC]}
+ICON_PAD = 2
+_icon_textures = {}
+
+
+def _hint(path, stroke):
+    """Put axis-aligned strokes on whole pixels, as Blender's pixel-grid icon designs are."""
+    odd = round(stroke) % 2 == 1
+    snap = (lambda v: math.floor(v) + .5) if odd else round
+    hinted = [list(point) for point in path]
+    for i, ((x1, y1), (x2, y2)) in enumerate(zip(path, path[1:])):
+        if abs(x1 - x2) < 1e-4:
+            hinted[i][0] = hinted[i + 1][0] = snap(x1)
+        if abs(y1 - y2) < 1e-4:
+            hinted[i][1] = hinted[i + 1][1] = snap(y1)
+    return hinted
+
+
+def _rasterize(paths, extent, half_width):
+    """Analytic per-pixel stroke coverage, the anti-aliasing nanosvg gives Blender's icons."""
+    ys, xs = np.mgrid[0:extent, 0:extent].astype(np.float32) + .5
+    coverage = np.zeros((extent, extent), np.float32)
+    for path in paths:
+        for (x1, y1), (x2, y2) in zip(path, path[1:]):
+            dx, dy = x2 - x1, y2 - y1
+            length = dx * dx + dy * dy
+            t = np.clip(((xs - x1) * dx + (ys - y1) * dy) / length, 0, 1) if length else 0
+            distance = np.hypot(xs - (x1 + t * dx), ys - (y1 + t * dy))
+            np.maximum(coverage, np.clip(half_width + .5 - distance, 0, 1), out=coverage)
+    return coverage
+
+
+def _fill(coverage, polygons):
+    """Add convex polygons, anti-aliased by their signed distance to the nearest edge."""
+    extent = coverage.shape[0]
+    ys, xs = np.mgrid[0:extent, 0:extent].astype(np.float32) + .5
+    for polygon in polygons:
+        # Wind counter-clockwise on screen so every edge normal points outward.
+        if sum(x1 * y2 - x2 * y1 for (x1, y1), (x2, y2) in zip(polygon, polygon[1:] + polygon[:1])) > 0:
+            polygon = polygon[::-1]
+        distance = np.full((extent, extent), -np.inf, np.float32)
+        for (x1, y1), (x2, y2) in zip(polygon, polygon[1:] + polygon[:1]):
+            length = math.hypot(x2 - x1, y2 - y1)
+            np.maximum(distance, ((xs - x1) * -(y2 - y1) + (ys - y1) * (x2 - x1)) / length, out=distance)
+        np.maximum(coverage, np.clip(.5 - distance, 0, 1), out=coverage)
+    return coverage
+
+
+def _icon_coverage(name, size, scale):
+    """Anti-aliased coverage of an icon at this device pixel size, top row first."""
+    stroke = scale  # one UI pixel, the stroke weight of Blender's own icon set
+    unit = size * scale / 21
+    to_pixels = lambda points: [(px * unit + ICON_PAD, py * unit + ICON_PAD) for px, py in points]
+    paths = [_hint(to_pixels(path), stroke) for path in ICON_PATHS.get(name, ICON_PATHS['settings'])]
+    if name in ICON_CIRCLES:
+        cx, cy, radius = ICON_CIRCLES[name]
+        paths.append(to_pixels([(cx + math.cos(i * math.pi / 12) * radius,
+                                 cy + math.sin(i * math.pi / 12) * radius) for i in range(25)]))
+    extent = math.ceil(size * scale) + ICON_PAD * 2
+    coverage = _rasterize(paths, extent, stroke / 2)
+    return _fill(coverage, [to_pixels(polygon) for polygon in ICON_FILLS.get(name, ())])
+
+
+def _icon_texture(name, size, scale):
+    """Return a cached (texture, extent) for an icon at this device pixel size."""
+    key = (name, round(size * scale, 3))
+    if key not in _icon_textures:
+        coverage = _icon_coverage(name, size, scale)
+        extent = coverage.shape[0]
+        rgba = np.ones((extent, extent, 4), np.float32)
+        rgba[..., 3] = coverage[::-1]  # GPU rows start at the bottom
+        data = gpu.types.Buffer('FLOAT', rgba.size, rgba.ravel().tolist())
+        _icon_textures[key] = gpu.types.GPUTexture((extent, extent), format='RGBA16F', data=data), extent
+    return _icon_textures[key]
+
+
+def _logo_texture(size, scale):
+    """Return a cached (texture, extent) for the full-colour logo at this device pixel size."""
+    extent = round(size * scale)
+    key = ('logo', extent)
+    if key not in _icon_textures:
+        rgba = brand.rasterize(brand.LOGO, extent, brand.LOGO_BOX)[::-1]  # GPU rows start at the bottom
+        data = gpu.types.Buffer('FLOAT', rgba.size, np.ascontiguousarray(rgba).ravel().tolist())
+        _icon_textures[key] = gpu.types.GPUTexture((extent, extent), format='RGBA16F', data=data), extent
+    return _icon_textures[key]
+
+
+def _text_shadow(scale):
+    """Blender's widget font-style shadow as (blf level, value, alpha, x, y), or None."""
+    styles = bpy.context.preferences.ui_styles
+    if not styles or styles[0].widget.shadow <= 0:
+        return None
+    style = styles[0].widget
+    # The text shader blurs types 1-4 with 3x3, 5 and 7+ with 5x5; 6 is an outline.
+    level = 3 if style.shadow <= 4 else 6 if style.shadow == 6 else 5
+    return (level, style.shadow_value, style.shadow_alpha,
+            int(style.shadow_offset_x * scale), int(style.shadow_offset_y * scale))
 
 
 def font_size(size=FONT_SIZE):
@@ -120,7 +276,7 @@ class Target:
         if not self.enabled:
             return 'DEFAULT'
         kind = self.action[0] if isinstance(self.action, tuple) else ''
-        return 'TEXT' if kind == 'edit' else 'MOVE_X' if kind == 'slider' else 'DEFAULT'
+        return 'TEXT' if kind in {'edit', 'menu-lora-search'} else 'MOVE_X' if kind == 'slider' else 'MOVE_Y' if kind == 'camera-drag' else 'DEFAULT'
 
     def contains(self, x, y):
         rx, ry, width, height = self.rect
@@ -135,6 +291,7 @@ class Painter:
     def __init__(self, region, scale=1, font=0):
         self.region, self.scale, self.font = region, scale, font
         self.colors = theme_colors(bpy.context)
+        self.text_shadow = _text_shadow(scale)
         self.width = region.width / scale - 28
         self.height = region.height / scale
         self.shader = gpu.shader.from_builtin('UNIFORM_COLOR')
@@ -291,7 +448,16 @@ class Painter:
         blf.size(self.font, size * self.scale)
         blf.color(self.font, *self.colors.get(tint, tint))
         blf.position(self.font, x * self.scale, (self.height - y - size) * self.scale, 0)
+        if self.text_shadow:
+            level, value, alpha, offset_x, offset_y = self.text_shadow
+            blf.enable(self.font, blf.SHADOW)
+            blf.shadow(self.font, level, value, value, value, alpha)
+            blf.shadow_offset(self.font, offset_x, offset_y)
         blf.draw(self.font, text)
+        if self.text_shadow:
+            blf.disable(self.font, blf.SHADOW)
+        # blf.draw leaves blending off; translucent shapes and icon edges need it.
+        gpu.state.blend_set('ALPHA')
 
     def image(self, image, rect):
         self.emit(self.draw_image, image, rect)
@@ -314,6 +480,15 @@ class Painter:
                          'texCoord': [(0,0), (1,0), (1,1), (0,1)]}).draw(shader)
 
     def icon(self, name, x, y, size=15, tint='secondary'):
+        if name == 'grip':
+            diameter = max(2, round(size * self.scale / 7)) / self.scale
+            gap = 2 * diameter
+            for row in range(3):
+                for column in range(2):
+                    self.rect(x + size / 2 + (column - .5) * gap - diameter / 2,
+                              y + size / 2 + (row - 1) * gap - diameter / 2,
+                              diameter, diameter, tint, diameter / 2)
+            return
         if name == 'more':
             diameter = max(2, round(size * self.scale / 4))
             gap = max(1, round(size * self.scale / 8))
@@ -323,43 +498,38 @@ class Painter:
                 self.rect((left + i * (diameter + gap)) / self.scale, top / self.scale,
                           diameter / self.scale, diameter / self.scale, tint, diameter / (2 * self.scale))
             return
-        paths = {
-            'camera': [[(2, 5), (6, 5), (8, 2), (13, 2), (15, 5), (19, 5), (19, 17), (2, 17), (2, 5)]],
-            'document': [[(13, 2), (4, 2), (4, 19), (17, 19), (17, 6), (13, 2), (13, 6), (17, 6)], [(7, 10), (14, 10)], [(7, 14), (12, 14)]],
-            'clone': [[(8, 7), (19, 7), (19, 18), (8, 18), (8, 7)], [(14, 4), (3, 4), (3, 14), (5, 14)]],
-            'mirror': [[(10, 2), (10, 19)], [(2, 6), (6, 6), (6, 15), (2, 15), (2, 6)], [(14, 6), (18, 6), (18, 15), (14, 15), (14, 6)]],
-            'expand': [[(12, 2), (19, 2), (19, 9)], [(19, 2), (12, 9)], [(8, 19), (2, 19), (2, 12)], [(2, 19), (9, 12)]],
-            'labels': [[(3, 3), (18, 3)], [(10, 3), (10, 18)], [(6, 18), (14, 18)]],
-            'down': [[(5, 8), (10, 13), (15, 8)]],
-            'right': [[(7, 5), (12, 10), (7, 15)]],
-            'reset': [[(4, 4), (4, 10), (10, 10)], [(4, 10), (7, 4), (14, 4), (18, 8), (18, 14), (14, 18), (7, 18), (4, 15)]],
-            'search': [[(14, 14), (19, 19)]],
-            'settings': [[(2, 5), (19, 5)], [(2, 10), (19, 10)], [(2, 15), (19, 15)], [(7, 3), (7, 7)], [(14, 8), (14, 12)], [(9, 13), (9, 17)]],
-            'play': [[(6, 3), (18, 10), (6, 18), (6, 3)]],
-            'stop': [[(5, 5), (16, 5), (16, 16), (5, 16), (5, 5)]],
-            'layers': [[(10, 2), (19, 7), (10, 12), (1, 7), (10, 2)], [(1, 11), (10, 16), (19, 11)], [(1, 15), (10, 20), (19, 15)]],
-            'grid': [[(3, 3), (18, 3), (18, 18), (3, 18), (3, 3)], [(3, 8), (18, 8)], [(3, 13), (18, 13)], [(8, 3), (8, 18)], [(13, 3), (13, 18)]],
-            'download': [[(10, 2), (10, 13)], [(5, 8), (10, 13), (15, 8)], [(2, 14), (2, 19), (18, 19), (18, 14)]],
-            'eye': [[(1, 10), (6, 5), (14, 5), (19, 10), (14, 15), (6, 15), (1, 10)]],
-            'x': [[(5, 5), (16, 16)], [(5, 16), (16, 5)]],
-            'plus': [[(10, 3), (10, 18)], [(3, 10), (18, 10)]],
-            'arrow': [[(3, 10), (18, 10)], [(12, 4), (18, 10), (12, 16)]],
-            'folder': [[(2, 6), (2, 18), (19, 18), (19, 6), (10, 6), (8, 3), (2, 3), (2, 6)]],
-            'light': [[(7, 15), (7, 18), (14, 18), (14, 15), (17, 11), (17, 6), (13, 2), (8, 2), (4, 6), (4, 11), (7, 15)], [(7, 15), (14, 15)]],
-            'modifier': [[(3, 3), (8, 3), (8, 8), (13, 8), (13, 13), (18, 13), (18, 18), (3, 18), (3, 3)]],
-            'curve': [[(2, 17), (5, 17), (8, 14), (10, 6), (13, 3), (19, 3)], [(2, 15), (2, 19)], [(19, 1), (19, 5)]],
-            'material': [[(10, 2), (18, 6), (18, 15), (10, 19), (2, 15), (2, 6), (10, 2)], [(2, 6), (10, 10), (18, 6)], [(10, 10), (10, 19)]],
-            'rig': [[(10, 2), (10, 9), (4, 6)], [(10, 9), (17, 5)], [(10, 9), (6, 19)], [(10, 9), (16, 18)]],
-            'graph': [[(2, 2), (2, 18), (19, 18)], [(4, 14), (8, 8), (12, 11), (18, 3)]],
-            'shield': [[(10, 2), (18, 5), (17, 13), (10, 19), (3, 13), (2, 5), (10, 2)]],
-        }
-        if name in {'camera', 'eye', 'search'}:
-            cx, cy, radius = {'camera': (10.5, 11, 4), 'eye': (10, 10, 2.5), 'search': (9, 9, 6)}[name]
-            self.line([(x + (cx + math.cos(i * math.pi / 12) * radius) * size / 21,
-                        y + (cy + math.sin(i * math.pi / 12) * radius) * size / 21)
-                       for i in range(25)], tint, 1)
-        for path in paths.get(name, paths['settings']):
-            self.line([(x + px * size / 21, y + py * size / 21) for px, py in path], tint, 1)
+        self.emit(self.draw_icon, name, x, y, size, tint)
+
+    def draw_icon(self, name, x, y, size, tint):
+        texture, extent = _icon_texture(name, size, self.scale)
+        r, g, b, a = self.colors.get(tint, tint)
+        a *= bpy.context.preferences.themes[0].user_interface.icon_alpha
+        # Whole device pixels, like Blender's widget icons at 1:1 zoom.
+        left = round(x * self.scale) - ICON_PAD
+        top = self.region.height - round(y * self.scale) + ICON_PAD
+        shader = gpu.shader.from_builtin('IMAGE_COLOR')
+        shader.bind()
+        shader.uniform_sampler('image', texture)
+        shader.uniform_float('color', (r, g, b, a))
+        batch_for_shader(shader, 'TRI_FAN', {
+            'pos': [(left, top - extent), (left + extent, top - extent), (left + extent, top), (left, top)],
+            'texCoord': [(0, 0), (1, 0), (1, 1), (0, 1)]}).draw(shader)
+
+    def logo(self, x, y, size):
+        self.emit(self.draw_logo, x, y, size)
+
+    def draw_logo(self, x, y, size):
+        texture, extent = _logo_texture(size, self.scale)
+        alpha = bpy.context.preferences.themes[0].user_interface.icon_alpha
+        left = round(x * self.scale)
+        top = self.region.height - round(y * self.scale)
+        shader = gpu.shader.from_builtin('IMAGE_COLOR')
+        shader.bind()
+        shader.uniform_sampler('image', texture)
+        shader.uniform_float('color', (1, 1, 1, alpha))
+        batch_for_shader(shader, 'TRI_FAN', {
+            'pos': [(left, top - extent), (left + extent, top - extent), (left + extent, top), (left, top)],
+            'texCoord': [(0, 0), (1, 0), (1, 1), (0, 1)]}).draw(shader)
 
     def target(self, key, rect, action, enabled=True, hint=''):
         target = Target(key, rect, action, enabled, hint, self.clip_rect)
@@ -400,6 +570,22 @@ class Painter:
         self.icon('right', x + width - 18, y + (height - 10) / 2, 10,
                   'accent' if hover else 'muted' if enabled else 'disabled')
         self.target(key, rect, action, enabled, hint)
+
+    def selection(self, key, rect, label, action, selected, *, enabled=True, hint='', accessory_width=0):
+        """A selected item is a row with a radio marker, separate from actions."""
+        x, y, width, height = rect
+        hover = enabled and key == self.hover_key
+        self.outline(x, y, width, height, 'selected' if selected else 'hover_soft' if hover else 'menu',
+                     'accent' if selected else 'hover_border' if hover else 'menu_border', 3)
+        tint = 'accent' if selected and enabled else 'secondary' if enabled else 'disabled'
+        self.rect(x + 10, y + (height - 12) / 2, 12, 12, tint, 6)
+        self.rect(x + 11, y + (height - 10) / 2, 10, 10,
+                  'selected' if selected else 'hover_soft' if hover else 'menu', 5)
+        if selected:
+            self.rect(x + 13, y + (height - 6) / 2, 6, 6, tint, 3)
+        self.text(label, x + 30, y + (height - font_size()) / 2 - 1,
+                  FONT_SIZE, 'text' if enabled else 'disabled', width - accessory_width - 38)
+        self.target(key, (x, y, width - accessory_width, height), action, enabled, hint)
 
     def switch(self, key, rect, label, checked, action, *, enabled=True, hint='', hover=False):
         hover = enabled and (hover or key == self.hover_key)

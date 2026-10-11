@@ -34,6 +34,27 @@ STRUCTURAL_PROPERTIES = {
     *SECTION_INFO, 'show_generation_params', 'show_advanced_params', 'sg_show_queue',
 }
 
+# Group utilities by the data they operate on within the Tools tab.
+# Studio cards and native alternate panels share these groups.
+TOOL_SECTIONS = {
+    'mesh_tools': ('Mesh & rig utilities', 'TOOLS', 'MESH_DATA', (
+        ('object.apply_all_mesh_modifiers', 'Apply all modifiers', 'modifier'),
+        ('object.curves_to_mesh', 'Convert curves to mesh', 'curve'),
+        ('object.stablegen_local_postprocess', 'Local post-processing', 'modifier'),
+        ('object.stablegen_make_solid', 'Make solid', 'modifier'),
+        ('object.stablegen_autorig_selected_mesh', 'Auto-rig selected character', 'rig'),
+    )),
+    'material_tools': ('Material utilities', 'TOOLS', 'MATERIAL', (
+        ('object.switch_material', 'Switch material', 'material'),
+    )),
+    'projection_tools': ('Projection utilities', 'TOOLS', 'MOD_MIRROR', (
+        ('object.stablegen_mirror_reproject', 'Mirror last projection', 'mirror'),
+    )),
+    'presentation_tools': ('Presentation export', 'TOOLS', 'RENDER_ANIMATION', (
+        ('object.export_orbit_gif', 'Export orbit GIF / MP4', 'camera'),
+    )),
+}
+
 
 class ExpandedData:
     """Override only presentation expansion flags; forward all real scene data."""
@@ -256,6 +277,34 @@ def _main_content(node):
     return node
 
 
+def _tool_sections(source):
+    """Split utility controls without losing inherited states or invoke context."""
+    moved = {name for _, _, _, commands in TOOL_SECTIONS.values()
+             for name, _, _ in commands}
+
+    def select(node, names, remaining=False):
+        result = Layout(node.method, node.args, dict(node.kwargs))
+        result.attributes.update(node.attributes)
+        for child in node.children:
+            if isinstance(child, Layout):
+                selected = select(child, names, remaining)
+                if selected.children:
+                    result.children.append(selected)
+            elif child.method == 'operator' and child.args[0] in names:
+                if not remaining:
+                    result.children.append(child)
+            elif remaining:
+                result.children.append(child)
+        return result
+
+    yield Section('tools', 'Tools', 'TOOLS', 'TOOL_SETTINGS',
+                  select(source, moved, remaining=True))
+    for key, (title, page, icon, commands) in TOOL_SECTIONS.items():
+        content = select(source, {name for name, _, _ in commands})
+        if list(content.controls()):
+            yield Section(key, title, page, icon, content)
+
+
 def capture_panel(context):
     root = Layout()
     StableGenPanel.draw(SimpleNamespace(layout=root), ExpandedContext(context))
@@ -282,7 +331,7 @@ def capture_panel(context):
         elif child.has_operator('stablegen.debug_solid_colors'):
             document.sections.append(Section('debug', 'Debug / Diagnostics', 'DEBUG', 'GHOST_ENABLED', child))
         elif child.has_operator('object.switch_material'):
-            document.sections.append(Section('tools', 'Tools', 'TOOLS', 'TOOL_SETTINGS', child))
+            document.sections.extend(_tool_sections(child))
         elif child.has_operator(*action_ops) or any(c.method == 'progress' for c in child.controls()):
             document.actions.append(child)
         elif child.has_operator('object.add_cameras', 'object.clone_camera', 'object.collect_camera_prompts',

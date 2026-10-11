@@ -18,15 +18,20 @@ from . import studio_model as model
 from . import studio_diagnostics as diagnostics
 from . import studio_hierarchy as hierarchy_model
 from . import studio_cards as cards
-from .presentation import Layout, Control, Section, STRUCTURAL_PROPERTIES
+from . import studio_help as help_text
+from . import studio_actions as action_style
+from . import studio_lora as lora
+from . import studio_tips as tips
+from .presentation import Layout, Control, Section, STRUCTURAL_PROPERTIES, TOOL_SECTIONS
 from .studio_text import TextBuffer, wrap
 from .studio_widgets import (Painter, FONT_SIZE, CONTROL_HEIGHT, CONTROL_GAP,
                              TEXT_LINE_HEIGHT, TEXT_PADDING, font_size)
 from .presets import PRESETS
 from ..utils import sg_modal_active
-from ..core import ADDON_PKG
+from ..core import ADDON_PKG, legacy_panel_enabled
+from ..generation_status import WAITING_STAGES
 
-TAB = 'SG Studio UI'
+TAB = 'StableGen'
 PAGES = [('GENERATE', 'Texture'), ('CAMERAS', 'Cameras'), ('BLEND', 'Blending')]
 MORE = [('TOOLS', 'Tools'), ('QUEUE', 'Scene queue'), ('DEBUG', 'Diagnostics'),
         ('MESH', 'Mesh & rig'), ('PRINT', '3D printing'), ('EXPERIMENTS', 'Experiments')]
@@ -96,6 +101,9 @@ class StudioSession:
         self.last_refresh = 0
         self.edit = None
         self.drag = None
+        self.camera_drag = None
+        self.camera_rows = []
+        self.camera_clip = None
         self.menu = None
         self.query = ''
         self.popup = False
@@ -112,10 +120,14 @@ class StudioSession:
         self.ctrl = False
         self.camera_images = {}
         self.card_bounds = {}
+        # Narrowest width while the widen callout was shown in this session.
+        self.callout_width = None
 
     def valid(self):
         try:
-            return (self.alive and self.window in bpy.context.window_manager.windows[:]
+            # Choosing the legacy panel in preferences ends every Studio session.
+            return (self.alive and not legacy_panel_enabled()
+                    and self.window in bpy.context.window_manager.windows[:]
                     and self.area in self.window.screen.areas[:] and self.area.type == 'VIEW_3D'
                     and self.region in self.area.regions[:])
         except ReferenceError:
@@ -189,10 +201,10 @@ class StudioSession:
             self.clear_hover(leave=True)
             return None
         inside = self.pointer_inside()
-        if self.drag or self.edit and self.edit['selecting']:
+        if self.camera_drag or self.drag or self.edit and self.edit['selecting']:
             self.clear_hover()
             if cursor:
-                self.set_cursor('MOVE_X' if self.drag else 'TEXT')
+                self.set_cursor('MOVE_Y' if self.camera_drag else 'MOVE_X' if self.drag else 'TEXT')
             return None
         if not inside:
             self.clear_hover()
@@ -214,7 +226,7 @@ class StudioSession:
         return target
 
     def tooltip_target(self, targets=None):
-        if (not bpy.context.preferences.view.show_tooltips or self.drag or self.popup
+        if (not bpy.context.preferences.view.show_tooltips or self.camera_drag or self.drag or self.popup
                 or self.notice and time.monotonic() < self.notice_until):
             return None
         target = self.hit_target(targets) if self.pointer_inside() else None
@@ -226,11 +238,18 @@ class StudioSession:
 
     def tick(self, now):
         if not self.active() or self.popup:
+            self.camera_drag = None
             self.clear_hover(leave=True)
             return
         if now - self.last_refresh >= .25:
             self.refresh()
         self.update_hover()
+        if self.camera_drag and self.camera_clip and self.pointer_inside():
+            _, top, _, height = self.camera_clip
+            dy = -10 if self.pointer[1] < top + 24 else 10 if self.pointer[1] > top + height - 24 else 0
+            if dy:
+                self.scroll['CAMERAS'] = max(0, min(getattr(self, 'max_scroll', 0), self.scroll.get('CAMERAS', 0) + dy))
+                self.area.tag_redraw()
         tooltip = self.tooltip_target()
         if (tooltip.key if tooltip else '') != self.tooltip_key:
             self.area.tag_redraw()
@@ -246,6 +265,7 @@ class StudioSession:
                     self.page = 'MESH' if self.architecture == 'trellis2' else 'GENERATE'
             if ctx.scene.as_pointer() != self.scene_pointer:
                 self.edit = self.drag = self.menu = None
+                self.camera_drag = None
                 self.scene_pointer = ctx.scene.as_pointer()
                 self.last_projection = None
                 self.dirty_projection = False
@@ -262,6 +282,13 @@ class StudioSession:
             self.last_projection = values
             if self.busy and self.edit:
                 self.edit = None
+            if (self.edit and 'lora_snapshot' in self.edit
+                    and self.edit['lora_snapshot'] != lora.snapshot(ctx.scene)):
+                self.edit = None
+            if self.menu and self.menu.get('kind') == 'lora' and not lora.valid_menu(self, self.menu):
+                self.menu = None
+            if self.camera_drag and (self.busy or self.camera_drag['names'] != tuple(c.name for c in self.ordered_cameras())):
+                self.camera_drag = None
         self.area.tag_redraw()
 
     def tell(self, message):
@@ -288,6 +315,9 @@ class StudioSession:
                 result = op(mode, **(properties or {}))
                 if name == 'stablegen.studio_diagnostic' and 'FINISHED' in result:
                     _undo('Change diagnostic display')
+                if name == 'stablegen.studio_lora' and 'FINISHED' in result:
+                    operation = (properties or {}).get('operation', 'REPLACE').title()
+                    _undo(operation + ' LoRA adapter')
                 if name in {'object.stablegen_reproject', 'object.test_stable', 'object.stablegen_regenerate'} and 'CANCELLED' not in result:
                     self.dirty_projection = False
             self.refresh()
@@ -314,6 +344,8 @@ class StudioSession:
             return
         try:
             with _context(self):
+                if 'lora_snapshot' in edit and edit['lora_snapshot'] != lora.snapshot(bpy.context.scene):
+                    raise ReferenceError('The adapter list changed while this value was being edited.')
                 binding, text = edit['binding'], edit['buffer'].text
                 prop = binding.rna(bpy.context)
                 value = float(text) if prop.type == 'FLOAT' else int(text) if prop.type == 'INT' else text
@@ -353,6 +385,8 @@ class StudioSession:
                      'rect': target.rect, 'lines': self.text_fields.get(target.key, ([],0))[0],
                      'scroll': self.text_scroll.get(target.key, 0), 'follow_caret': False,
                      'multiline': bool(target.action[2]), 'selecting': False}
+        if binding and binding.path.startswith('lora_units['):
+            self.edit['lora_snapshot'] = lora.snapshot(bpy.context.scene)
         self.menu = None
         self.area.tag_redraw()
 
@@ -376,6 +410,7 @@ class StudioSession:
 
     def navigate(self, page):
         self.commit()
+        self.camera_drag = None
         self.page, self.menu = page, None
         self.clear_hover()
         if page == 'SEARCH':
@@ -426,8 +461,13 @@ class StudioSession:
             self.drag = {'binding': action[1], 'min': action[2], 'max': action[3],
                          'rect': target.rect, 'before': before}
             self.slide(self.pointer[0])
+        elif action[0] == 'camera-drag':
+            self.commit()
+            self.camera_drag = {'name': action[1], 'names': tuple(c.name for c in self.ordered_cameras())}
         elif action[0] == 'menu-item':
             menu = self.menu
+            if action[1] in menu.get('disabled', ()):
+                return
             self.menu = None
             if menu.get('binding'):
                 self.set_value(menu['binding'], action[1])
@@ -437,6 +477,12 @@ class StudioSession:
                 menu['callback'](action[1])
             else:
                 self.navigate(action[1])
+        elif action[0] == 'menu-lora-close':
+            self.menu = None
+        elif action[0] == 'menu-lora-search':
+            lora.select_search(self)
+        elif action[0] == 'menu-lora-folder':
+            lora.folders(self)
         self.area.tag_redraw()
 
     def slide(self, x):
@@ -446,6 +492,41 @@ class StudioSession:
         left, _, width, _ = drag['rect']
         value = drag['min'] + max(0, min(1, (x - left) / width)) * (drag['max'] - drag['min'])
         self.set_value(drag['binding'], value, undo=False)
+
+    def ordered_cameras(self):
+        from ..texturing.view_plan import order_cameras
+        scene = bpy.context.scene
+        return order_cameras((o for o in scene.objects if o.type == 'CAMERA'),
+                             [item.name for item in scene.sg_camera_order] if scene.sg_use_custom_camera_order else ())
+
+    def camera_drop(self, y):
+        """Insertion boundary among the remaining rows; no scene edits during drag."""
+        rows = [(name, rect) for name, rect in self.camera_rows if name != self.camera_drag['name']]
+        for name, rect in rows:
+            if y < rect[1] + rect[3] / 2:
+                return name, rect[1] - 4
+        return '', rows[-1][1][1] + rows[-1][1][3] + 4 if rows else y
+
+    def finish_camera_drag(self, cancel=False):
+        drag = self.camera_drag
+        if not drag:
+            return
+        before, _ = self.camera_drop(self.pointer[1])
+        self.camera_drag = None
+        # Leaving the canvas cancels, as do scene edits while a drag is pending.
+        if (not cancel and not self.busy and self.pointer_inside() and self.camera_clip
+                and self.camera_clip[1] <= self.pointer[1] <= self.camera_clip[1] + self.camera_clip[3]
+                and drag['names'] == tuple(c.name for c in self.ordered_cameras())):
+            self.call('stablegen.studio_reorder_camera', {'camera_name': drag['name'], 'before_name': before}, mode='EXEC_DEFAULT')
+        self.update_hover()
+        self.area.tag_redraw()
+
+    def camera_order_menu(self, rect):
+        self.commit()
+        prop = model.operator('stablegen.apply_camera_order_preset').get_rna_type().properties['strategy']
+        self.menu = {'anchor': rect, 'items': [(i.identifier, i.name, i.description) for i in prop.enum_items],
+                     'query': '', 'binding': None, 'index': 0, 'scroll': 0,
+                     'callback': lambda strategy: self.call('stablegen.studio_sort_cameras', {'strategy': strategy}, mode='EXEC_DEFAULT')}
 
     def select_caret(self, x, y, extend=False):
         edit = self.edit
@@ -535,6 +616,7 @@ class StudioSession:
         mouse_event = event.type in {'MOUSEMOVE', 'INBETWEEN_MOUSEMOVE', 'LEFTMOUSE', 'RIGHTMOUSE',
                                     'MIDDLEMOUSE', 'WHEELUPMOUSE', 'WHEELDOWNMOUSE', 'TRACKPADPAN'}
         if event.type == 'WINDOW_DEACTIVATE':
+            self.camera_drag = None
             _window_mouse.pop(self.key[0], None)
             self.clear_hover(leave=True)
             return {'PASS_THROUGH'}
@@ -545,11 +627,26 @@ class StudioSession:
         inside = self.pointer_inside()
         x, y = self.pointer
         if not self.active() or self.popup:
+            self.camera_drag = None
             self.clear_hover(leave=True)
             if not self.active():
                 self.commit()
                 self.menu = None
             return {'PASS_THROUGH'}
+        if self.camera_drag:
+            if event.type in {'ESC', 'RIGHTMOUSE'} and event.value == 'PRESS':
+                self.finish_camera_drag(cancel=True)
+                return {'RUNNING_MODAL'}
+            if event.type == 'LEFTMOUSE' and event.value == 'RELEASE':
+                self.finish_camera_drag()
+                return {'RUNNING_MODAL'}
+            if event.type in {'MOUSEMOVE', 'INBETWEEN_MOUSEMOVE'}:
+                self.clear_hover()
+                self.set_cursor('MOVE_Y')
+                self.area.tag_redraw()
+                return {'RUNNING_MODAL'}
+            # Keep shortcuts and other commands from changing the scene mid-drag.
+            return {'RUNNING_MODAL'}
         if event.value == 'PRESS' and event.type == 'ESC' and self.drag:
             drag, self.drag = self.drag, None
             self.set_value(drag['binding'], drag['before'], undo=False)
@@ -571,7 +668,7 @@ class StudioSession:
                 self.area.tag_redraw()
                 return {'RUNNING_MODAL'}
             target = self.update_hover(moved=True)
-            if target and self.menu:
+            if target and target.enabled and self.menu and isinstance(target.action, tuple) and target.action[0] == 'menu-item':
                 self.menu['index'] = next((i for i, item in enumerate(self.menu_items())
                                            if item[0] == target.action[1]), self.menu['index'])
             # The GPU canvas covers native controls; do not let those steal hover.
@@ -605,16 +702,21 @@ class StudioSession:
                 self.area.tag_redraw()
                 self.update_hover()
                 return {'RUNNING_MODAL'}
+            if self.menu.get('kind') == 'lora' and lora.keyboard(self, event):
+                return {'RUNNING_MODAL'}
             if event.value == 'PRESS' and event.type in {'UP_ARROW', 'DOWN_ARROW', 'RET', 'NUMPAD_ENTER', 'BACK_SPACE'} or (event.value == 'PRESS' and getattr(event, 'unicode', '')):
-                self.clear_hover(leave=True)
+                self.clear_hover()
                 items = self.menu_items()
                 if event.type in {'UP_ARROW', 'DOWN_ARROW'}:
-                    self.menu['index'] = max(0, min(len(items) - 1, self.menu['index'] + (-1 if event.type == 'UP_ARROW' else 1)))
-                    self.menu['scroll'] = max(0, self.menu['index'] - 5)
+                    direction = -1 if event.type == 'UP_ARROW' else 1
+                    available = [i for i, item in enumerate(items) if item[0] not in self.menu.get('disabled', ())]
+                    choices = [i for i in available if (i - self.menu['index']) * direction > 0]
+                    self.menu['index'] = (min(choices) if direction > 0 else max(choices)) if choices else self.menu['index']
+                    self.menu['scroll'] = max(0, self.menu['index'] - self.menu.get('rows', 6) + 1)
                 elif event.type in {'RET', 'NUMPAD_ENTER'} and items:
                     item = items[min(self.menu['index'], len(items) - 1)]
                     from .studio_widgets import Target
-                    self.activate(Target('menu', (0, 0, 0, 0), ('menu-item', item[0])))
+                    self.activate(Target('menu', (0, 0, 0, 0), ('menu-item', item[0]), item[0] not in self.menu.get('disabled', ())))
                 elif event.type == 'BACK_SPACE':
                     self.menu['query'] = self.menu['query'][:-1]
                     self.menu['index'] = self.menu['scroll'] = 0
@@ -646,7 +748,7 @@ class StudioSession:
             return {'RUNNING_MODAL'}
         if event.type == 'LEFTMOUSE' and event.value in {'PRESS', 'DOUBLE_CLICK'}:
             target = self.hit_target()
-            if self.menu and (target is None or not isinstance(target.action, tuple) or target.action[0] != 'menu-item'):
+            if self.menu and (target is None or not isinstance(target.action, tuple) or not target.action[0].startswith('menu-')):
                 self.menu = None
                 self.area.tag_redraw()
                 return {'RUNNING_MODAL'}
@@ -668,6 +770,11 @@ class StudioSession:
         if event.value == 'PRESS' and (event.ctrl or event.oskey) and event.type == 'K':
             self.navigate('SEARCH')
             return {'RUNNING_MODAL'}
+        # Keep the canvas panel's covered header from collapsing (A, Enter)
+        # or being pinned to other tabs from its context menu.
+        if event.value == 'PRESS' and (event.type == 'RIGHTMOUSE' or event.type in {'A', 'RET', 'NUMPAD_ENTER'}
+                                       and not (event.ctrl or event.oskey or event.alt or event.shift)):
+            return {'RUNNING_MODAL'}
         if (event.value == 'PRESS' and not mouse_event and event.type not in
                 {'LEFT_SHIFT', 'RIGHT_SHIFT', 'LEFT_CTRL', 'RIGHT_CTRL', 'LEFT_ALT', 'RIGHT_ALT', 'OSKEY'}):
             # Native shortcuts can open dialogs that have their own cursor handling.
@@ -680,13 +787,15 @@ class StudioSession:
     def draw_binding(self, painter, binding, label, x, y, width, *, enabled=True, multiline=False, height=112, corners='ALL'):
         ctx = bpy.context
         prop, value = binding.rna(ctx), binding.value(ctx)
+        hint = help_text.property_hint(binding, ctx)
+        label_y = y
         key = _binding_key(binding)
         enabled = enabled and not self.busy and not prop.is_readonly
         if prop.type == 'BOOLEAN':
             lines = wrap(label, width - 40, painter.measure)
             height = max(CONTROL_HEIGHT, len(lines) * 16 + 6)
             painter.switch(key, (x, y, width, height), label, value, ('toggle', binding),
-                           enabled=enabled, hint=prop.description, hover=self.hovered(key))
+                           enabled=enabled, hint=hint, hover=self.hovered(key))
             return height + CONTROL_GAP
         inline = (prop.type in {'INT', 'FLOAT'} and not prop.is_array and width >= 210
                   and not multiline and painter.measure(label) <= width - 100)
@@ -709,7 +818,7 @@ class StudioSession:
             display = editing['buffer'].text if editing else value
             lines, scroll = painter.text_field(key, (x, y, width, height), display,
                                               ('edit', binding, True), enabled=enabled,
-                                              hint=prop.description, editing=editing['buffer'] if editing else None,
+                                              hint=hint, editing=editing['buffer'] if editing else None,
                                               scroll=editing['scroll'] if editing else self.text_scroll.get(key, 0), multiline=True,
                                               follow_caret=editing.get('follow_caret', True) if editing else False)
             self.text_scroll[key] = scroll
@@ -718,6 +827,8 @@ class StudioSession:
                 editing.update(rect=(x, y, width, height), lines=lines, scroll=scroll, follow_caret=False)
             painter.text(f'{len(str(display).split())} words', x + width - 55, y + height + 5, 10, 'muted')
             painter.text('Ctrl Enter to finish' if editing else 'Click to edit · Enter adds a line', x, y + height + 5, 10, 'muted', width - 68)
+            painter.target(key + ':label', (x, label_y, label_width, label_height),
+                           ('hint', None, False), False, hint)
             return height + label_height + 24
         if prop.type == 'ENUM':
             label_value = model.enum_label(binding, ctx)
@@ -725,14 +836,14 @@ class StudioSession:
                             border='hover_border' if enabled and self.hovered(key) else 'menu_border', corners=corners)
             painter.text(label_value, x + 8, y + 5, FONT_SIZE, 'menu_text' if enabled else 'disabled', width - 33)
             painter.icon('down', x + width - 16, y + 6, 10, 'menu_text' if enabled else 'disabled')
-            painter.target(key, (x, y, width, CONTROL_HEIGHT), ('enum', binding), enabled, prop.description)
+            painter.target(key, (x, y, width, CONTROL_HEIGHT), ('enum', binding), enabled, hint)
         elif prop.type in {'STRING', 'INT', 'FLOAT'} and not getattr(prop, 'is_array', False):
             display = editing['buffer'].text if editing else f'{value:.{prop.precision}f}'.rstrip('0').rstrip('.') if isinstance(value, float) and prop.precision > 0 else str(value)
             filepath = prop.type == 'STRING' and prop.subtype in {'FILE_PATH', 'DIR_PATH'}
             field_width = 90 if inline else width - 27 if filepath else width
             field_x = x + width - field_width if inline else x
             lines, scroll = painter.text_field(key, (field_x, y, field_width, CONTROL_HEIGHT), display,
-                                              ('edit', binding, False), enabled=enabled, hint=prop.description,
+                                              ('edit', binding, False), enabled=enabled, hint=hint,
                                               editing=editing['buffer'] if editing else None,
                                               kind='number' if prop.type in {'INT','FLOAT'} else 'field')
             if editing:
@@ -744,14 +855,19 @@ class StudioSession:
         else:
             color = getattr(prop, 'subtype', '') in {'COLOR', 'COLOR_GAMMA'} and prop.is_array
             painter.button(key, (x, y, width - 34 if color else width, CONTROL_HEIGHT), 'Open color picker' if color else 'Edit ' + label, lambda: self.native(binding=binding),
-                           icon='settings', style='outlined', enabled=enabled, hint=prop.description)
+                           icon='settings', style='outlined', enabled=enabled, hint=hint)
             if color:
                 rgb = [max(0, min(1, c)) for c in value[:3]]
                 if prop.subtype == 'COLOR':
                     rgb = [12.92*c if c <= .0031308 else 1.055*c**(1/2.4)-.055 for c in rgb]
                 painter.rect(x + width - 27, y + 2, 24, CONTROL_HEIGHT - 4, (*rgb, 1), 3)
                 painter.target(key + ':color', (x + width - 30, y, 30, CONTROL_HEIGHT),
-                               lambda: self.native(binding=binding), enabled, prop.description)
+                               lambda: self.native(binding=binding), enabled, hint)
+        # Help-only bounds are disjoint from editable fields. They do not start
+        # edits, join keyboard traversal, or capture prompt scrolling.
+        painter.target(key + ':label', (x, label_y, width - 100 if inline else label_width,
+                                       CONTROL_HEIGHT if inline else label_height),
+                       ('hint', None, False), False, hint)
         return label_height + CONTROL_HEIGHT + CONTROL_GAP
 
     def binding(self, name):
@@ -784,6 +900,8 @@ class StudioSession:
                'accent' if enabled else 'disabled', radius)
         p.target(key + ':slider', (x, track_y - 7, width, 17), ('slider', binding, minimum, maximum),
                  enabled, binding.rna(bpy.context).description)
+        p.target(key + ':label', (x, y, width if narrow else width - edit_width - 8, 16),
+                 ('hint', None, False), False, binding.rna(bpy.context).description)
         return 65 if narrow else 46
 
     def section_summary(self, key):
@@ -800,7 +918,12 @@ class StudioSession:
 
     def draw_section(self, p, section, x, y, width, force=False, omit=()):
         key = section.key
+        if key in TOOL_SECTIONS:
+            title, _page, _icon, commands = TOOL_SECTIONS[key]
+            return self.draw_actions(p, title, commands, x, y, width)
         expanded = force or key in self.open
+        if key == 'show_lora_settings' and expanded:
+            return lora.draw_section(self, p, section, x, y, width)
         summary = self.section_summary(key)
         h = 40 if summary and not expanded else 29
         if self.hovered('section:' + key):
@@ -871,7 +994,7 @@ class StudioSession:
                                card_body=card_body), child_anchors)
         return end
 
-    def draw_plain_control(self, p, live, x, y, width, section, index, label=None):
+    def draw_plain_control(self, p, live, x, y, width, section, index, label=None, *, corners='ALL'):
         control = live.control
         enabled = live.enabled
         if control.method == 'prop':
@@ -910,20 +1033,33 @@ class StudioSession:
                 label = 'Move earlier' if control.properties.get('direction') == 'UP' else 'Move later'
             with _viewport(self):
                 available = enabled and op.poll()
-            icon = {'object.bake_textures': 'grid', 'object.switch_material': 'layers',
-                    'object.export_game_engine': 'download', 'stablegen.prepare_mask_paint': 'settings'}.get(name, 'arrow')
-            p.button(f'op:{section}:{index}:{name}', (x, y, width, CONTROL_HEIGHT), label,
-                     ('operator', name, control.properties), icon=icon, style='quiet',
-                     enabled=available, hover=self.hovered(f'op:{section}:{index}:{name}'),
-                     hint=op.get_rna_type().description)
+                hint = help_text.operator_hint(name, bpy.context, available, busy=self.busy)
+            key = f'op:{section}:{index}:{name}'
+            selection = action_style.selection(control)
+            if selection:
+                prop, value, kind = selection
+                p.selection(key, (x, y, width, CONTROL_HEIGHT), f'{kind} {value + 1}',
+                            ('operator', name, control.properties), getattr(bpy.context.scene, prop) == value,
+                            enabled=available, hint=hint)
+            else:
+                if section == 'print' and name == 'object.export_textured_print_obj':
+                    label = 'Textured OBJ (Image Map)'
+                p.button(key, (x, y, width, CONTROL_HEIGHT), label,
+                         ('operator', name, control.properties), icon=action_style.icon(control), style='outlined',
+                         enabled=available, hover=self.hovered(key), hint=hint, corners=corners)
             return y + CONTROL_HEIGHT + CONTROL_GAP
         elif control.method == 'progress':
             factor = max(0, min(1, control.kwargs.get('factor', 0)))
             text = re.sub(r'\s*\(\s*\d+(?:\.\d+)?%\)\s*$', '', control.kwargs.get('text', ''))
             p.text(text, x, y, 11, 'secondary', width - 38)
-            p.text(f'{factor:.0%}', x + width - 34, y, 11, 'secondary')
+            waiting = any(text.startswith(stage + ' · ') for stage in WAITING_STAGES)
+            if not waiting or re.search(r'\(\s*\d+(?:\.\d+)?%\)\s*$', control.kwargs.get('text', '')):
+                p.text(f'{factor:.0%}', x + width - 34, y, 11, 'secondary')
             p.rect(x, y + 17, width, 3, 'line', 1)
             p.rect(x, y + 17, width * factor, 3, 'blue', 1)
+            if control.tooltip:
+                p.target(f'progress:{section}:{index}', (x, y, width, 22), None,
+                         enabled=False, hint=control.tooltip)
             return y + 28
         elif control.method == 'template_list' and len(control.args) >= 6:
             owner, name, index_owner, index_name = control.args[2:6]
@@ -940,11 +1076,61 @@ class StudioSession:
                 if status:
                     p.text(status.replace('_', ' ').capitalize(), x, y, 10, 'muted', width)
                     y += 17
-        label = label or control.kwargs.get('text') or {'template_list': 'Edit list', 'template_curve_mapping': 'Edit curve',
-                          'operator_menu_enum': 'Choose action'}.get(control.method, 'Open editor')
+        label, hint = help_text.native_help(control, label)
         p.button(f'native:{section}:{index}', (x, y, width, CONTROL_HEIGHT), label,
-                 ('native', section, index), icon='settings', style='outlined', enabled=enabled and not self.busy)
+                 ('native', section, index), icon='settings', style='outlined', enabled=enabled and not self.busy,
+                 hint=hint)
         return y + CONTROL_HEIGHT + CONTROL_GAP
+
+    def draw_operator_row(self, p, controls, x, y, width, section, enabled, alert):
+        """Join related native commands; reflow without truncating their labels."""
+        heading, captions = action_style.print_group(controls, section)
+        if heading:
+            p.text(heading, x, y, FONT_SIZE, 'secondary', width)
+            y += 19
+        labels = [captions.get(c.args[0]) or c.kwargs.get('text') or model.operator(c.args[0]).get_rna_type().name
+                  for c in controls]
+        columns = len(controls)
+        while columns > 1 and any(p.measure(label) + (35 if action_style.icon(c) else 20) > width / columns
+                                  for c, label in zip(controls, labels)):
+            columns -= 1
+        for first in range(0, len(controls), columns):
+            row = controls[first:first + columns]
+            cw = width / len(row)
+            for i, c in enumerate(row):
+                corners = 'ALL' if len(row) == 1 else 'LEFT' if i == 0 else 'RIGHT' if i == len(row) - 1 else 'NONE'
+                self.draw_plain_control(p, model.LiveControl(c, enabled, alert), x + i * cw, y, cw,
+                                        section, self.control_index(section, c), labels[first + i], corners=corners)
+            y += CONTROL_HEIGHT + CONTROL_GAP
+        return y
+
+    def draw_color_selection(self, p, selector, color, x, y, width, section, enabled, alert):
+        """Keep native filament selection and color editing in one clear row."""
+        prop, value, kind = action_style.selection(selector)
+        op = model.operator(selector.args[0])
+        with _viewport(self):
+            available = enabled and op.poll()
+            hint = help_text.operator_hint(selector.args[0], bpy.context, available, busy=self.busy)
+        key = f'op:{section}:{self.control_index(section, selector)}:{selector.args[0]}'
+        picker_width = min(112, width * .47)
+        p.selection(key, (x, y, width, 28), f'{kind} {value + 1}',
+                    ('operator', selector.args[0], selector.properties), getattr(bpy.context.scene, prop) == value,
+                    enabled=available, hint=hint, accessory_width=picker_width + 10)
+        binding = model.Binding.from_data(color.args[0], color.args[1])
+        key = _binding_key(binding)
+        field = binding.rna(bpy.context)
+        editable = enabled and not self.busy and not field.is_readonly
+        cx, cy = x + width - picker_width - 3, y + 3
+        p.outline(cx, cy, picker_width, CONTROL_HEIGHT, 'raised',
+                  'hover_border' if editable and self.hovered(key) else 'tool_border', 2)
+        p.text('Edit color', cx + 8, cy + 4, FONT_SIZE, 'text' if editable else 'disabled', picker_width - 39)
+        rgb = [max(0, min(1, c)) for c in binding.value(bpy.context)[:3]]
+        if field.subtype == 'COLOR':
+            rgb = [12.92*c if c <= .0031308 else 1.055*c**(1/2.4)-.055 for c in rgb]
+        p.outline(cx + picker_width - 26, cy + 2, 24, CONTROL_HEIGHT - 4, (*rgb, 1), 'tool_border', 2)
+        p.target(key, (cx, cy, picker_width, CONTROL_HEIGHT), lambda: self.native(binding=binding),
+                 editable, help_text.property_hint(binding, bpy.context))
+        return y + 28 + CONTROL_GAP
 
     def draw_node(self, p, node, x, y, width, section, enabled=True, alert=False, omit=None, hierarchy=None, anchors=None, card_body=False):
         omit = omit or set()
@@ -972,9 +1158,18 @@ class StudioSession:
                     continue
             children.append(child)
         flat = list(node.controls())
+        if node.method in {'row', 'split', 'column'} and len(children) >= 2 and all(
+                isinstance(c, Control) and c.method == 'operator' and not action_style.selection(c)
+                for c in children):
+            return self.draw_operator_row(p, children, x, y, width, section, enabled, alert)
         if node.method in {'row', 'split'}:
             labels = [c for c in flat if c.method == 'label' and c.kwargs.get('text') and not omitted(c)]
             fields = [c for c in flat if c.method in {'prop', 'operator'} and not omitted(c)]
+            selectors = [c for c in fields if action_style.selection(c)]
+            colors = [c for c in fields if c.method == 'prop'
+                      and c.args[0].bl_rna.properties[c.args[1]].subtype in {'COLOR', 'COLOR_GAMMA'}]
+            if len(fields) == 2 and len(selectors) == len(colors) == 1 and not labels:
+                return self.draw_color_selection(p, selectors[0], colors[0], x, y, width, section, enabled, alert)
             if (len(labels) == 1 and len(fields) == 1
                     and not labels[0].kwargs['text'].startswith('→')
                     and not (fields[0].method == 'operator'
@@ -996,7 +1191,7 @@ class StudioSession:
                         with _viewport(self):
                             available = enabled and not self.busy and op.poll()
                         p.button(key, (x + width - 46, y - 4, 22, CONTROL_HEIGHT), '',
-                                 ('operator',other.args[0],other.properties), icon='reset', enabled=available,
+                                 ('operator',other.args[0],other.properties), icon='reset', style='outlined', enabled=available,
                                  hover=self.hovered(key), hint=op.get_rna_type().description)
                         return self.draw_control(p, model.LiveControl(prompts[0],enabled,alert),x,y,width,section,
                                                  self.control_index(section,prompts[0]), hierarchy=hierarchy, anchors=anchors, card_body=card_body)
@@ -1011,7 +1206,21 @@ class StudioSession:
                     cw = (width - 10 * (columns - 1)) / columns
                     return max(self.draw_control(p, model.LiveControl(c, enabled, alert), x + i * (cw + 10), y, cw,
                                                  section, self.control_index(section, c), hierarchy=hierarchy, anchors=anchors, card_body=card_body) for i, c in enumerate(children))
+        grouped = set()
         for index, child in enumerate(children):
+            if index in grouped:
+                continue
+            if node.method == 'column':
+                commands = []
+                for following in children[index:]:
+                    if not (isinstance(following, Control) and following.method == 'operator'
+                            and not action_style.selection(following)):
+                        break
+                    commands.append(following)
+                if len(commands) > 1:
+                    y = self.draw_operator_row(p, commands, x, y, width, section, enabled, alert)
+                    grouped.update(range(index + 1, index + len(commands)))
+                    continue
             if isinstance(child, Control) and child.method == 'label' and index + 1 < len(children) and isinstance(children[index+1],Layout):
                 fields = [c for c in children[index+1].controls() if c.method == 'prop']
                 caption = child.kwargs.get('text','').rstrip(':').casefold()
@@ -1066,7 +1275,7 @@ class StudioSession:
                      'query': '', 'binding': None, 'index': 0, 'scroll': 0}
 
     def draw_header(self, p, x, width):
-        p.icon('layers', x, 12, 18, 'accent')
+        p.logo(x, 12, 18)
         p.text('StableGen', x + 26, 12, 13, 'text')
         p.button('search-button', (x + width - 50, 9, 22, CONTROL_HEIGHT), '', lambda: self.navigate('SEARCH'),
                  icon='search', hover=self.hovered('search-button'), hint='Find a setting · Ctrl K')
@@ -1087,18 +1296,19 @@ class StudioSession:
                     enabled = model.operator(name).poll() and not self.busy
                 key = 'toolbar:' + name
                 p.button(key, (x + i * width / 2 + 1, y + 1, width / 2 - 2, CONTROL_HEIGHT), text,
-                         ('operator', name, {}), icon=icon, enabled=enabled, hover=self.hovered(key), hint=model.operator(name).get_rna_type().description)
+                         ('operator', name, {}), icon=icon, enabled=enabled, hover=self.hovered(key),
+                         hint=help_text.operator_hint(name, bpy.context, enabled, busy=self.busy))
             p.rect(x + width / 2, y + 1, 1, CONTROL_HEIGHT, 'line')
             p.rect(x + 1, y + 24, width - 2, 1, 'divider')
             tools = [('object.clone_camera', 'Clone', 'clone'), ('object.mirror_camera', 'Mirror', 'mirror'),
-                     ('object.apply_auto_aspect', 'Auto aspect' if width >= 360 else 'Aspect', 'expand'), ('object.toggle_camera_labels', 'Labels', 'labels')]
+                     ('object.apply_auto_aspect', 'Auto aspect' if width >= 360 else 'Aspect', 'expand'), ('stablegen.camera_display', 'Display', 'labels')]
             for i, (name, text, icon) in enumerate(tools):
                 with _viewport(self):
-                    enabled = model.operator(name).poll() and not self.busy
+                    enabled = model.operator(name).poll() and (not self.busy or name == 'stablegen.camera_display')
                 key = 'toolbar:' + name
                 p.button(key, (x + i * width / 4 + 1, y + 25, width / 4 - 2, 20), text,
                          ('operator', name, {}), icon=icon, enabled=enabled, hover=self.hovered(key),
-                         hint=model.operator(name).get_rna_type().description)
+                         hint=help_text.operator_hint(name, bpy.context, enabled, busy=self.busy))
             y += 56
         cw = (width - 12) / 2
         left = self.draw_binding(p, self.binding('architecture_mode'), 'Architecture', x, y, cw)
@@ -1123,7 +1333,7 @@ class StudioSession:
             with _viewport(self):
                 op = model.operator(c.args[0])
                 enabled = item.enabled and not self.busy and op.poll()
-                hint = op.get_rna_type().description
+                hint = help_text.operator_hint(c.args[0], bpy.context, enabled, busy=self.busy)
             p.button('preset:' + c.args[0], (button_x, y + right - CONTROL_HEIGHT - CONTROL_GAP,
                                             button_width, CONTROL_HEIGHT), label,
                      ('operator', c.args[0], c.properties), icon=icon, style='outlined', enabled=enabled, hint=hint,
@@ -1168,6 +1378,43 @@ class StudioSession:
                 bpy.context.view_layer.objects.active = next((o for o in bpy.context.selected_objects if o.type == 'MESH'), None)
         self.refresh()
 
+    def dismiss_tip(self, name):
+        tips.dismiss(name)
+        self.area.tag_redraw()
+
+    def draw_widen_hint(self, p, x, width, bottom):
+        """One-line reminder above the footer while the sidebar is too narrow."""
+        y = bottom - 26
+        p.rect(1, y, p.width - 2, 1, 'divider')
+        p.icon('widen', x + 2, y + 6, 14, 'muted')
+        p.text('Drag the sidebar edge to widen', x + 24, y + 6, 10, 'muted', width - 50)
+        p.target('tip:widen-hint', (x, y, width - 24, 26), ('hint', None, False), False,
+                 'Drag the left edge of the sidebar outward. Wider panels place settings side by side.')
+        key = 'tip:widen-hint-dismiss'
+        p.button(key, (x + width - 20, y + 3, 20, 20), '', lambda: self.dismiss_tip(tips.WIDEN_HINT),
+                 icon='x', hover=self.hovered(key), hint="Don't show this tip again")
+        return y
+
+    def draw_widen_callout(self, p, top, width):
+        """First-run tip pointing at the sidebar edge; dismissal lasts across files."""
+        x, w, y = 16, min(width - 8, 240), top + 10
+        body = 'StableGen has more room for settings when the sidebar is wider. Drag this edge to the left.'
+        lines = wrap(body, w - 24, lambda s: p.measure(s, 10))
+        h = 34 + len(lines) * 15 + 40
+        p.rect(x - 1, y + 3, w + 2, h + 2, 'panel_shadow', 6)
+        p.outline(x, y, w, h, 'tooltip', 'tooltip_line', 5)
+        p.polygon([(x + 1, y + 16), (x - 9, y + 24), (x + 1, y + 32)], 'tooltip')
+        p.rect(0, y + 8, 3, 32, 'blue', 1)
+        p.icon('widen', x + 12, y + 10, 15, 'tooltip_text')
+        p.text('Widen the sidebar', x + 34, y + 10, 11, 'tooltip_text', w - 44)
+        for i, (_, _, line) in enumerate(lines):
+            p.text(line, x + 12, y + 32 + i * 15, 10, 'tooltip_text', w - 24)
+        # Keep clicks on the bubble from reaching the controls underneath.
+        p.target('tip:widen-callout', (x - 9, y, w + 9, h), ('hint', None, False), False)
+        key = 'tip:widen-callout-ok'
+        p.button(key, (x + w - 72, y + h - 30, 62, 22), 'Got it', lambda: self.dismiss_tip(tips.WIDEN_CALLOUT),
+                 style='primary', hover=self.hovered(key))
+
     def draw_footer(self, p, x, width):
         progress = [item for n in self.document.actions for item in model.controls(n) if item.control.method == 'progress']
         decision = [item for n in self.document.actions for item in model.controls(n)
@@ -1191,8 +1438,8 @@ class StudioSession:
             p.text('Choose a supported architecture to continue.', x, y, 11, 'muted', width)
             return top
         if progress:
-            for item in progress:
-                y = self.draw_control(p, item, x, y, width, 'actions', 0)
+            for index, item in enumerate(progress):
+                y = self.draw_control(p, item, x, y, width, 'actions', index)
             cancel = next((item for n in self.document.actions for item in model.controls(n)
                            if item.control.method == 'operator' and
                            (item.control.kwargs.get('icon') == 'CANCEL' or 'Cancel' in item.control.kwargs.get('text', '') or item.control.args[0] == 'stablegen.stop_masked_edit')), None)
@@ -1227,6 +1474,8 @@ class StudioSession:
             text = primary.control.kwargs.get('text', '')
             if any(word in text.lower() for word in ('cannot', 'enable online', 'select an image')):
                 disabled_reason = text.replace('Cannot generate: ', '').replace('Cannot edit: ', '')
+            if prefs.server_address and not prefs.server_online and not checking_server:
+                disabled_reason = 'ComfyUI offline · ' + prefs.server_address
         scope = 'TRELLIS.2 · Shape and texture' if native else f'{len(selected)} selected views' if selected else f'{count} views · ' + ('Selected objects' if scene.texture_objects == 'selected' else 'All visible objects')
         p.text('Checking server…' if checking_server else disabled_reason or ('Reproject changes before baking' if self.dirty_projection else scope), x, y, 10,
                'warning' if disabled_reason or self.dirty_projection else 'muted', width - 64)
@@ -1250,7 +1499,7 @@ class StudioSession:
             p.button('generate', (x, y, width - refresh_width, 28), label, ('operator', c.args[0], c.properties),
                      icon='play', style='primary', enabled=available and not self.busy and not checking_server,
                      corners='LEFT' if refresh_server else 'ALL',
-                     hint=disabled_reason or model.operator(c.args[0]).get_rna_type().description)
+                     hint=disabled_reason or help_text.operator_hint(c.args[0], bpy.context, available, busy=self.busy))
             if refresh_server:
                 with _viewport(self):
                     refresh_available = model.operator('stablegen.check_server_status').poll() and not self.busy
@@ -1275,7 +1524,7 @@ class StudioSession:
             key = 'footer:' + name
             p.button(key, (x + i * (cw + 8), y, cw, CONTROL_HEIGHT), label, ('operator', name, {}), icon=icon,
                      style='outlined', enabled=enabled, active=name == 'object.stablegen_reproject' and self.dirty_projection,
-                     hover=self.hovered(key), hint='Reproject changed settings before baking' if name == 'object.bake_textures' and self.dirty_projection else model.operator(name).get_rna_type().description)
+                     hover=self.hovered(key), hint='Reproject changed settings before baking' if name == 'object.bake_textures' and self.dirty_projection else help_text.operator_hint(name, bpy.context, enabled, busy=self.busy))
 
     def live_operator(self, name):
         return next((item for section in self.document.sections for item in model.controls(section.content)
@@ -1304,28 +1553,26 @@ class StudioSession:
             with _viewport(self):
                 op = model.operator(name)
                 enabled = item.enabled and op.poll()
-                hint = op.get_rna_type().description
+                hint = help_text.operator_hint(name, bpy.context, enabled, busy=self.busy)
             cancellation = name in {'stablegen.batch_texture_dae_cancel', 'stablegen.stop_texturing_regression',
                                     'stablegen.debug_force_generation_idle', 'stablegen.interactive_discard_cancel',
                                     'stablegen.interactive_discard_apply'}
             enabled = enabled and (not self.busy or cancellation)
+            if not enabled and self.busy and not cancellation:
+                hint = help_text.operator_hint(name, bpy.context, False, busy=True)
             rows.append((name, label, icon, item.control.properties, enabled, hint))
         if not rows:
             return y
-        return cards.actions(self, p, rows, x, y, width)
+        # Tool cards stay a single column at every width, also in search results;
+        # only Diagnostics may go side by side.
+        return cards.actions(self, p, rows, x, y, width, max_columns=2 if self.page == 'DEBUG' else 1)
 
     def draw_tools(self, p, x, y, width):
-        scene = bpy.context.scene
         y = self.draw_actions(p, 'Scene setup', [
-            ('object.add_hdri', 'Add HDRI lighting', 'light'),
-            ('object.apply_all_mesh_modifiers', 'Apply all modifiers', 'modifier'),
-            ('object.curves_to_mesh', 'Convert curves to mesh', 'curve')], x, y, width)
-        y = self.draw_actions(p, 'Texture utilities', [
-            ('object.switch_material', 'Switch material', 'material'),
-            ('object.stablegen_mirror_reproject', 'Mirror last projection', 'mirror'),
-            ('object.stablegen_local_postprocess', 'Local post-processing', 'settings')], x, y, width)
-        y = self.draw_actions(p, 'Presentation', [
-            ('object.export_orbit_gif', 'Export orbit GIF / MP4', 'camera')], x, y, width)
+            ('object.add_hdri', 'Add HDRI lighting', 'light')], x, y, width)
+        for section in self.document.sections:
+            if section.key in TOOL_SECTIONS:
+                y = self.draw_section(p, section, x, y, width)
         y = self.draw_actions(p, 'Import & batch', [
             ('stablegen.import_dae', 'Import DAE', 'download'),
             ('stablegen.batch_import_dae', 'Batch import DAE', 'folder'),
@@ -1340,10 +1587,6 @@ class StudioSession:
             y += 31
             y = self.draw_actions(p, 'Running batch', [
                 ('stablegen.batch_texture_dae_cancel', 'Stop batch', 'stop')], x, y, width)
-        if scene.architecture_mode != 'trellis2':
-            y = self.draw_actions(p, 'Mesh & rig', [
-                ('object.stablegen_make_solid', 'Make solid', 'material'),
-                ('object.stablegen_autorig_selected_mesh', 'Auto-rig selected character', 'rig')], x, y, width)
         return y
 
     def diagnostic_camera_menu(self, rect):
@@ -1367,7 +1610,7 @@ class StudioSession:
         with _viewport(self):
             available = model.operator('stablegen.studio_diagnostic').poll()
         y += self.draw_binding(p, model.Binding.from_data(state, 'mode'), 'Display', x + 8, y + 8, width - 16, enabled=available) + 8
-        description = next(item[2] for item in diagnostics.MODES if item[0] == state.mode)
+        description = diagnostics.DISPLAY_SUMMARIES[state.mode]
         for _, _, line in wrap(description, width - 16, p.measure):
             p.text(line, x + 8, y, 10, 'secondary')
             y += 15
@@ -1471,7 +1714,7 @@ class StudioSession:
             y += self.draw_binding(p, self.binding('model_name'), 'Checkpoint', x, y, width - 31)
             p.button('refresh-models', (x + width - 25, y - CONTROL_HEIGHT - CONTROL_GAP, 25, CONTROL_HEIGHT), '',
                      ('operator', 'stablegen.refresh_checkpoint_list', {}), icon='reset', enabled=not self.busy,
-                     hint='Refresh the real ComfyUI model list')
+                     hint='Refresh the available ComfyUI models after connecting the server or adding model files')
         masked = (scene.qwen_generation_method if scene.model_architecture.startswith('qwen') else scene.generation_method) == 'masked_edit' and scene.architecture_mode != 'trellis2'
         prompt = 'sg_masked_prompt' if masked else 'comfyui_prompt'
         if hasattr(scene, prompt) and not trellis:
@@ -1484,7 +1727,7 @@ class StudioSession:
         if not native:
             mode_key = 'qwen_generation_method' if scene.model_architecture.startswith('qwen') else 'generation_method'
             cw = (width - 12) / 2
-            left = self.draw_binding(p, self.binding(mode_key), 'Generation mode', x, y, cw)
+            left = self.draw_binding(p, self.binding(mode_key), 'Texture workflow', x, y, cw)
             right = self.draw_binding(p, self.binding('texture_objects'), 'Target objects', x + cw + 12, y, cw)
             y += max(left, right)
             if masked:
@@ -1569,26 +1812,29 @@ class StudioSession:
         for section in self.document.sections:
             if self.section_page(section) == 'MESH':
                 y = self.draw_section(p, section, x, y, width)
-        return self.draw_actions(p, 'Mesh & rig utilities', [
-            ('object.stablegen_make_solid', 'Make solid', 'material'),
-            ('object.stablegen_autorig_selected_mesh', 'Auto-rig selected character', 'rig')], x, y, width)
+        return y
 
     def draw_cameras(self, p, x, y, width):
         scene = bpy.context.scene
-        from ..texturing.view_plan import order_cameras
-        cameras = order_cameras((o for o in scene.objects if o.type == 'CAMERA'),
-                               [item.name for item in scene.sg_camera_order] if scene.sg_use_custom_camera_order else ())
+        cameras = self.ordered_cameras()
+        self.camera_rows = []
+        self.camera_clip = p.clip_rect
         p.text('Scene cameras', x, y, 13)
         p.text(f'{len(cameras)} views', x + width - 58, y + 2, 10, 'muted')
         y += 29
         def setup(cx, cy, cw):
-            cy += self.draw_binding(p, self.binding('use_camera_prompts'), 'Use camera descriptions', cx, cy, cw)
+            cy += self.draw_binding(p, self.binding('use_camera_prompts'), 'Use view prompts', cx, cy, cw)
             return cy + self.draw_binding(p, self.binding('sg_use_custom_camera_order'), 'Custom generation order', cx, cy, cw)
         y = cards.group(p, 'View setup', x, y, width, setup, 'camera')
-        camera_options = next((s for s in self.document.sections if s.key == 'show_camera_options'), None)
-        if camera_options and scene.sg_use_custom_camera_order:
-            y = cards.sections(self, p, camera_options, x, y, width,
-                               omit={'use_camera_prompts', 'sg_use_custom_camera_order'})
+        if cameras:
+            # The displayed camera cards are the order editor. Avoid a second,
+            # disconnected native list and its up/down-button cluster.
+            sort_rect = (x + width - 124, y, 124, CONTROL_HEIGHT)
+            p.text('Generation order', x, y + 5, FONT_SIZE)
+            p.button('camera-sort', sort_rect, 'Sort…', lambda: self.camera_order_menu(sort_rect),
+                     icon='down', style='outlined', enabled=not self.busy,
+                     hint='Choose an ordering preset. Enables custom generation order.')
+            y += CONTROL_HEIGHT + 8
         if not cameras:
             p.text('Add cameras using the toolbar above.', x, y, FONT_SIZE, 'muted', width)
             y += 27
@@ -1597,20 +1843,24 @@ class StudioSession:
             p.begin_group()
             selected = camera.select_get()
             hovered = self.hovered('camera:' + camera.name) and not self.busy
-            tx = x + 12 if selected else x + 85
+            tx = x + 32 if selected else x + 103
             p.text(f'{i + 1:02} · {camera.name}', tx, y + 16, FONT_SIZE, 'text', x + width - tx - 44)
             image = self.camera_images.get(camera.name)
             prompt = scene.camera_prompts.get(camera.name)
             if not selected:
                 title = prompt.prompt if prompt and prompt.prompt else 'Generated' if image else 'No generated image'
-                p.text(title, tx, y + 36, 10, 'secondary', width - 124)
-            p.target('camera:' + camera.name, (x + 1, y + 1, width - 43, 38 if selected else 82),
+                p.text(title, tx, y + 36, 10, 'secondary', width - 146)
+            p.target('camera:' + camera.name, (x + 25, y + 1, width - 67, 38 if selected else 82),
                      lambda name=camera.name: self.call('stablegen.studio_select_camera', {'camera_name': name, 'extend': self.ctrl}),
                      not self.busy, camera.name + ' · Ctrl click to add to selection')
+            grip = (x + 4, y + 5, 23, 28)
+            p.icon('grip', grip[0] + 4, grip[1] + 7, 14, 'disabled' if self.busy else 'accent' if self.hovered('camera-drag:' + camera.name) else 'secondary')
+            p.target('camera-drag:' + camera.name, grip, ('camera-drag', camera.name), not self.busy,
+                              'Drag to change generation order. Dropping enables custom order; Esc cancels.')
             p.button('look:' + camera.name, (x + width - 37, y + (10 if selected else 28), 25, CONTROL_HEIGHT), '',
                      ('operator', 'stablegen.panel_camera', {'camera_name': camera.name}), icon='eye', enabled=not self.busy,
                      hint='Look through ' + camera.name)
-            image_rect = (x + 12, y + 43, 70, 160) if selected else (x + 12, y + 12, 60, 60)
+            image_rect = (x + 12, y + 43, 70, 160) if selected else (x + 30, y + 12, 60, 60)
             p.outline(*image_rect, 'menu', 'menu_border', 2)
             if image:
                 p.image(image, image_rect)
@@ -1621,23 +1871,35 @@ class StudioSession:
                 y += 43
                 y += self.draw_binding(p, model.Binding.from_data(camera, 'name'), 'Camera name', x + 98, y, width - 110)
                 if prompt and scene.use_camera_prompts:
-                    y += self.draw_binding(p, model.Binding.from_data(prompt, 'prompt'), 'View description', x + 98, y, width - 110,
+                    y += self.draw_binding(p, model.Binding.from_data(prompt, 'prompt'), 'View prompt', x + 98, y, width - 110,
                                            multiline=True, height=93)
                 y = max(y, image_rect[1] + image_rect[3]) + 12
             else:
                 y += 84
+            self.camera_rows.append((camera.name, (x, start, width, y - start)))
             p.end_group((x, start, width, y - start), 'subbox', 'accent' if selected else 'hover_border' if hovered else 'section_border', 3)
             y += 8
+        if self.camera_drag and self.camera_rows:
+            _, line_y = self.camera_drop(self.pointer[1])
+            p.rect(x + 3, line_y - 1, width - 6, 2, 'accent')
+            source = next((rect for name, rect in self.camera_rows if name == self.camera_drag['name']), None)
+            if source:
+                sx, sy, sw, sh = source
+                p.line([(sx, sy), (sx + sw, sy), (sx + sw, sy + sh), (sx, sy + sh), (sx, sy)], 'accent')
         for section in self.document.sections:
             if section.page == 'CAMERAS' and section.key not in {'camera_tools', 'show_camera_options'}:
                 y = self.draw_section(p, section, x, y + 8, width, omit={'use_camera_prompts','sg_use_custom_camera_order'})
         return y
 
     def menu_items(self):
+        if self.menu.get('kind') == 'lora':
+            return lora.menu_items(self.menu)
         query = self.menu['query'].casefold()
         return [item for item in self.menu['items'] if query in item[1].casefold()]
 
     def draw_menu(self, p):
+        if self.menu.get('kind') == 'lora':
+            return lora.draw_menu(self, p)
         menu = self.menu
         items = self.menu_items()
         ax, ay, aw, ah = menu['anchor']
@@ -1681,6 +1943,17 @@ class StudioSession:
             return y + 30
         found = False
         for section in self.document.sections:
+            if section.key == 'show_lora_settings':
+                searchable = 'LoRA adapters add remove refresh models'
+                for item in model.controls(section.content):
+                    control = item.control
+                    if control.method == 'prop':
+                        prop = control.args[0].bl_rna.properties[control.args[1]]
+                        searchable += ' ' + prop.name + ' ' + prop.description
+                if query in searchable.casefold():
+                    found = True
+                    y = lora.draw_section(self, p, section, x, y, width) + 6
+                continue
             for i, item in enumerate(model.controls(section.content)):
                 control = item.control
                 if control.method not in {'prop', 'operator'}:
@@ -1708,7 +1981,7 @@ class StudioSession:
             return y
         binding, label, previous = self.prompt_editor
         p.button('close-editor', (x, y, width, CONTROL_HEIGHT), 'Back to ' + dict(self.pages() + MORE).get(previous, 'settings'),
-                 lambda: self.navigate(previous), icon='arrow', active=True)
+                 lambda: self.navigate(previous), style='outlined')
         y += 34
         return y + self.draw_binding(p, binding, label, x, y, width, multiline=True,
                                     height=max(100, bottom - y - 60))
@@ -1729,6 +2002,9 @@ class StudioSession:
             x, width = 12, p.width - 24
             top = self.draw_header(p, x, width)
             bottom = self.draw_footer(p, x, width)
+            narrow = width < cards.SIDE_BY_SIDE_WIDTH
+            if narrow and not tips.dismissed(tips.WIDEN_HINT):
+                bottom = self.draw_widen_hint(p, x, width, bottom)
             clip = (1, top + 1, p.width - 2, max(0, bottom - top - 2))
             p.clip(clip)
             offset = self.scroll.get(self.page, 0)
@@ -1753,10 +2029,6 @@ class StudioSession:
                 sections = [section for section in self.document.sections if self.section_page(section) == self.page]
                 for section in sections:
                     y = self.draw_section(p, section, x, y, width)
-                if self.page == 'MESH':
-                    y = self.draw_actions(p, 'Mesh & rig utilities', [
-                        ('object.stablegen_make_solid', 'Make solid', 'material'),
-                        ('object.stablegen_autorig_selected_mesh', 'Auto-rig selected character', 'rig')], x, y, width)
             self.max_scroll = max(0, y + offset + 20 - bottom)
             if offset > self.max_scroll:
                 self.scroll[self.page] = self.max_scroll
@@ -1766,6 +2038,13 @@ class StudioSession:
                 thumb = max(24, available * available / (available + self.max_scroll))
                 p.rect(p.width - 5, top + offset / self.max_scroll * max(0, available - thumb), 2, thumb, 'muted', 1)
             p.clip(None)
+            if not tips.dismissed(tips.WIDEN_CALLOUT):
+                if self.callout_width is not None and width > self.callout_width + 20:
+                    # Dragging the edge wider shows the tip has done its job.
+                    tips.dismiss(tips.WIDEN_CALLOUT)
+                elif narrow:
+                    self.callout_width = width if self.callout_width is None else min(self.callout_width, width)
+                    self.draw_widen_callout(p, top, width)
             if self.menu:
                 self.draw_menu(p)
             # Layout changes can put a different control under a stationary mouse.
@@ -1843,6 +2122,7 @@ class SG_OT_StudioSession(bpy.types.Operator):
             return session.event(event)
         except (ReferenceError, RuntimeError, ValueError, TypeError) as exc:
             session.edit = session.drag = session.menu = None
+            session.camera_drag = None
             session.clear_hover(leave=True)
             session.tell(str(exc).split('\n')[0])
             _log.exception('Studio input error')
@@ -1902,6 +2182,61 @@ class SG_OT_StudioNative(bpy.types.Operator):
 
     def cancel(self, context):
         self.finish()
+
+
+class SG_OT_StudioReorderCamera(bpy.types.Operator):
+    bl_idname = 'stablegen.studio_reorder_camera'
+    bl_label = 'Reorder Camera'
+    bl_description = 'Move this camera to the indicated position in generation order'
+    bl_options = {'UNDO', 'INTERNAL'}
+    camera_name: bpy.props.StringProperty()
+    before_name: bpy.props.StringProperty()
+
+    @classmethod
+    def poll(cls, context):
+        return not sg_modal_active(context)
+
+    def execute(self, context):
+        from ..texturing.view_plan import order_cameras
+        scene = context.scene
+        cameras = order_cameras((o for o in scene.objects if o.type == 'CAMERA'),
+                                [item.name for item in scene.sg_camera_order] if scene.sg_use_custom_camera_order else ())
+        names = [c.name for c in cameras]
+        if self.camera_name not in names or self.before_name == self.camera_name:
+            return {'CANCELLED'}
+        if self.before_name and self.before_name not in names:
+            return {'CANCELLED'}
+        ordered = [name for name in names if name != self.camera_name]
+        ordered.insert(ordered.index(self.before_name) if self.before_name else len(ordered), self.camera_name)
+        if ordered == names:
+            return {'CANCELLED'}
+        scene.sg_camera_order.clear()
+        for name in ordered:
+            scene.sg_camera_order.add().name = name
+        scene.sg_camera_order_index = ordered.index(self.camera_name)
+        scene.sg_use_custom_camera_order = True
+        return {'FINISHED'}
+
+
+class SG_OT_StudioSortCameras(bpy.types.Operator):
+    bl_idname = 'stablegen.studio_sort_cameras'
+    bl_label = 'Sort Cameras'
+    bl_description = 'Apply a generation-order preset and enable custom order'
+    bl_options = {'UNDO', 'INTERNAL'}
+    strategy: bpy.props.StringProperty()
+
+    @classmethod
+    def poll(cls, context):
+        return not sg_modal_active(context)
+
+    def execute(self, context):
+        prop = bpy.ops.stablegen.apply_camera_order_preset.get_rna_type().properties['strategy']
+        if self.strategy not in {item.identifier for item in prop.enum_items}:
+            return {'CANCELLED'}
+        result = bpy.ops.stablegen.apply_camera_order_preset('EXEC_DEFAULT', strategy=self.strategy)
+        if 'FINISHED' in result:
+            context.scene.sg_use_custom_camera_order = True
+        return result
 
 
 class SG_OT_StudioSelectCamera(bpy.types.Operator):
@@ -1968,15 +2303,21 @@ def _ensure_session(context):
 
 class SG_PT_StudioCanvas(bpy.types.Panel):
     bl_idname = 'SG_PT_StudioCanvas'
-    bl_label = 'StableGen Studio UI'
+    bl_label = 'StableGen'
     bl_space_type = 'VIEW_3D'
     bl_region_type = 'UI'
     bl_category = TAB
-    bl_options = {'HIDE_HEADER'}
+    # Keep the native header: Blender sorts header-less panels, and with them
+    # their tab, above its own sidebar tabs. Studio draws over the header.
+    bl_options = set()
 
     @classmethod
     def poll(cls, context):
-        return context.mode in {'OBJECT', 'PAINT_TEXTURE'}
+        return context.mode in {'OBJECT', 'PAINT_TEXTURE'} and not legacy_panel_enabled(context)
+
+    def draw_header(self, context):
+        # Blender skips draw() while the hidden panel is collapsed.
+        _ensure_session(context)
 
     def draw(self, context):
         _ensure_session(context)
@@ -2030,8 +2371,9 @@ def _load_pre(_):
     _pending.clear()
 
 
-STUDIO_UI_CLASSES = diagnostics.CLASSES + [SG_OT_StudioSession, SG_OT_StudioNative, SG_OT_StudioSelectCamera,
-                     SG_OT_StudioPreferences, SG_PT_StudioCanvas]
+STUDIO_UI_CLASSES = diagnostics.CLASSES + [lora.SG_OT_StudioLoRA, SG_OT_StudioSession, SG_OT_StudioNative, SG_OT_StudioSelectCamera,
+                     SG_OT_StudioReorderCamera, SG_OT_StudioSortCameras,
+                     SG_OT_StudioPreferences, tips.SG_OT_ResetTips, SG_PT_StudioCanvas]
 
 
 def register_studio_ui():

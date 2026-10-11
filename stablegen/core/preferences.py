@@ -55,6 +55,14 @@ class ControlNetModelMappingItem(bpy.types.PropertyGroup):
 
 # ── Addon Preferences ─────────────────────────────────────────────────────
 
+def _redraw_sidebars(self, context):
+    """Swap the Studio and legacy panels immediately in every 3D Viewport."""
+    for window in context.window_manager.windows:
+        for area in window.screen.areas:
+            if area.type == 'VIEW_3D':
+                area.tag_redraw()
+
+
 class StableGenAddonPreferences(bpy.types.AddonPreferences):
     """Preferences for the StableGen addon."""
     bl_idname = ADDON_PKG
@@ -99,9 +107,16 @@ class StableGenAddonPreferences(bpy.types.AddonPreferences):
         update=update_parameters
     )  # type: ignore
 
+    use_legacy_panel: bpy.props.BoolProperty(
+        name="Use Legacy Panel",
+        description="Show the original StableGen sidebar panel instead of the Studio panel",
+        default=False,
+        update=_redraw_sidebars
+    )  # type: ignore
+
     enable_print_tab: bpy.props.BoolProperty(
-        name="Enable 3D Print Tab",
-        description="Show 3D Printing Palette and Exporters in a separate Sidebar tab",
+        name="Enable 3D Printing",
+        description="Show the 3D printing palette and exporters; the legacy panel shows them in a separate Sidebar tab",
         default=False,
         update=update_parameters
     )  # type: ignore
@@ -199,6 +214,9 @@ class StableGenAddonPreferences(bpy.types.AddonPreferences):
         row.prop(self, "server_address")
         row.operator("stablegen.check_server_status", text="", icon='FILE_REFRESH')
 
+        row = layout.row()
+        row.prop(self, "use_legacy_panel")
+        row.operator("stablegen.reset_tips", icon='LOOP_BACK')
         layout.prop(self, "save_blend_file")
         layout.prop(self, "enable_print_tab")
         layout.prop(self, "enable_texturing_experiments")

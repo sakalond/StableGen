@@ -6,7 +6,7 @@ import mathutils  # pylint: disable=import-error
 from ..generation_status import draw_stage_progress, server_status_active
 import math
 from ..utils import sg_modal_active
-from ..core import get_addon_prefs
+from ..core import get_addon_prefs, legacy_panel_enabled
 from .presets import PRESETS, GEN_PARAMETERS
 from ..feature_flags import experiments_enabled, active_experiments
 from ..architecture_options import (
@@ -127,7 +127,9 @@ class StableGenPanel(bpy.types.Panel):
 
     @classmethod
     def poll(cls, context):
-        return context.mode in {'OBJECT', 'PAINT_TEXTURE'}
+        # The Studio panel replaces this one unless the legacy panel is chosen
+        # in preferences. Studio still captures draw() for its content.
+        return context.mode in {'OBJECT', 'PAINT_TEXTURE'} and legacy_panel_enabled(context)
 
     def draw_header(self, _):
         """     
@@ -2504,8 +2506,9 @@ class StableGenPrintPanel(bpy.types.Panel):
 
     @classmethod
     def poll(cls, context):
+        # Studio integrates 3D printing as one of its pages.
         prefs = get_addon_prefs(context)
-        return bool(prefs and prefs.enable_print_tab)
+        return bool(prefs and prefs.enable_print_tab and prefs.use_legacy_panel)
 
     def draw(self, context):
         layout = self.layout
