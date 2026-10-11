@@ -9,7 +9,6 @@ import os
 import json
 import io
 import math
-import colorsys
 import hashlib
 import traceback
 from statistics import median
@@ -521,35 +520,70 @@ class _PBRMixin:
     # ── PBR post-processing helpers ───────────────────────────────────
 
     @staticmethod
-    def _compute_image_mean_saturation(image_path_or_bytes, sample_limit=100_000):
+    def _compute_image_mean_saturation(image_path_or_bytes, sample_limit=100_000, mask=None):
         """Compute the mean HSV saturation for a single image.
 
         *image_path_or_bytes* can be a file path (str) or raw PNG bytes.
-        Skips very dark pixels whose saturation is unreliable.
+        Skips very dark pixels whose saturation is unreliable. *mask* is an
+        optional boolean array (any size; resized to the image) restricting
+        the measurement to the object.
         Returns a float in [0, 1], or 0.0 on error.
         """
-        import colorsys
-        from PIL import Image
-
         try:
-            if isinstance(image_path_or_bytes, (str, bytes)) and isinstance(image_path_or_bytes, str):
+            if isinstance(image_path_or_bytes, str):
                 img = Image.open(image_path_or_bytes).convert('RGB')
             else:
                 img = Image.open(io.BytesIO(image_path_or_bytes)).convert('RGB')
 
-            pixels = list(img.getdata())
-            step = max(1, len(pixels) // sample_limit)
-            total_s, n = 0.0, 0
-            for i in range(0, len(pixels), step):
-                r, g, b = pixels[i]
-                _, s, v = colorsys.rgb_to_hsv(r / 255, g / 255, b / 255)
-                if v > 0.05:
-                    total_s += s
-                    n += 1
-            return total_s / n if n > 0 else 0.0
+            rgb = np.asarray(img, dtype=np.float32) / 255.0
+            value = rgb.max(axis=-1)
+            saturation = (value - rgb.min(axis=-1)) / np.maximum(value, 1e-6)
+            keep = value > 0.05
+            if mask is not None:
+                mask_img = Image.fromarray(np.asarray(mask, dtype=np.uint8) * 255)
+                if mask_img.size != img.size:
+                    mask_img = mask_img.resize(img.size, Image.NEAREST)
+                keep &= np.asarray(mask_img) > 127
+            values = saturation[keep]
+            step = max(1, values.size // sample_limit)
+            values = values[::step]
+            return float(values.mean()) if values.size else 0.0
         except Exception as err:
             print(f"[StableGen]     Warning: saturation computation failed: {err}")
             return 0.0
+
+    @staticmethod
+    def _object_mask(image_path):
+        """Return the opaque region of a generated image as a boolean array.
+
+        Generated images keep their colour under transparent pixels (often a
+        saturated backdrop), which must not count towards the object's
+        saturation. Returns ``None`` when the image has no usable alpha.
+        """
+        try:
+            with Image.open(image_path) as img:
+                if 'A' not in img.getbands():
+                    return None
+                alpha = np.asarray(img.getchannel('A'))
+        except Exception:
+            return None
+        mask = alpha > 127
+        if mask.all() or not mask.any():
+            return None
+        return mask
+
+    def _albedo_saturation_ratio(self, original_path, raw_path):
+        """Saturation of the generated image over the raw albedo, measured on the object.
+
+        Returns the ratio clamped to [0.5, 3.0], or ``None`` when the albedo is
+        nearly grey and the ratio is meaningless.
+        """
+        mask = self._object_mask(original_path)
+        s_orig = self._compute_image_mean_saturation(original_path, mask=mask)
+        s_albedo = self._compute_image_mean_saturation(raw_path, mask=mask)
+        if s_albedo < 0.01:
+            return None
+        return max(0.5, min(s_orig / s_albedo, 3.0))
 
     def _compute_uniform_saturation(self, context, use_median=True):
         """Compute a uniform auto-saturation ratio across ALL cameras.
@@ -578,14 +612,9 @@ class _PBRMixin:
             if not os.path.exists(original_path) or not os.path.exists(raw_path):
                 continue
 
-            s_orig = self._compute_image_mean_saturation(original_path)
-            s_albedo = self._compute_image_mean_saturation(raw_path)
-
-            if s_albedo < 0.01:
+            ratio = self._albedo_saturation_ratio(original_path, raw_path)
+            if ratio is None:
                 continue  # skip grayscale albedos
-
-            ratio = s_orig / s_albedo
-            ratio = max(0.5, min(ratio, 3.0))
             ratios.append(ratio)
 
         if not ratios:
@@ -672,13 +701,9 @@ class _PBRMixin:
             if not os.path.exists(raw_path) or not os.path.exists(original_path):
                 continue
 
-            s_orig = self._compute_image_mean_saturation(original_path)
-            s_albedo = self._compute_image_mean_saturation(raw_path)
-
-            if s_albedo < 0.01:
+            ratio = self._albedo_saturation_ratio(original_path, raw_path)
+            if ratio is None:
                 continue
-
-            ratio = max(0.5, min(s_orig / s_albedo, 3.0))
 
             with open(raw_path, 'rb') as f:
                 raw_bytes = f.read()
