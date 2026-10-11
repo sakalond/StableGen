@@ -873,7 +873,7 @@ class SG_OT_MaskedEdit(bpy.types.Operator):
             if depth:
                 paths['depth'] = depth
             for key, path in paths.items():
-                uploaded = upload_image_to_comfyui(server, str(path))
+                uploaded = upload_image_to_comfyui(server, str(path), operator=self)
                 if not uploaded:
                     raise RuntimeError(f'Could not upload {key}')
                 subfolder = uploaded.get('subfolder', '')
@@ -965,7 +965,7 @@ class SG_OT_MaskedEdit(bpy.types.Operator):
                 args=(context, render, generation, overlay, depth, self.result),
                 daemon=True,
             )
-            self._stage = 'Uploading to Server'
+            self._stage = 'Preparing Workflow'
             self._progress = 0
             self.worker.start()
             self.phase = 'generate'

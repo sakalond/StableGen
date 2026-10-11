@@ -1786,7 +1786,7 @@ class _TexturingWorkflowMixin:
 
         # Upload the source image to ComfyUI's input folder
         from .._generator_utils import upload_image_to_comfyui
-        image_info = upload_image_to_comfyui(server_address, input_image_path)
+        image_info = upload_image_to_comfyui(server_address, input_image_path, operator=self.operator)
         if image_info is None:
             return {"error": f"Failed to upload image for PBR decomposition: {input_image_path}"}
 
@@ -1943,7 +1943,7 @@ class _TexturingWorkflowMixin:
 
         # Upload the source image to ComfyUI's input folder
         from .._generator_utils import upload_image_to_comfyui
-        image_info = upload_image_to_comfyui(server_address, input_image_path)
+        image_info = upload_image_to_comfyui(server_address, input_image_path, operator=self.operator)
         if image_info is None:
             return {"error": f"Failed to upload image for StableDelight: {input_image_path}"}
 

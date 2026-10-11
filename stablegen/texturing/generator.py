@@ -1886,7 +1886,7 @@ class ComfyUIGenerate(_PBRMixin, bpy.types.Operator):
                             for unit in context.scene.controlnet_units:
                                 unit.strength = 0.0
                     else:
-                        self._stage = "Uploading to Server"
+                        self._stage = "Preparing Workflow"
                     self._progress = 0
 
                     # Generate the image
@@ -1965,7 +1965,7 @@ class ComfyUIGenerate(_PBRMixin, bpy.types.Operator):
                             self._run_on_main_thread(context_callback)
                             if self._error:
                                 return
-                            self._stage = "Uploading to Server"
+                            self._stage = "Preparing Workflow"
                             # Get info for the previous render and mask
                             render_info = self._get_uploaded_image_info(context, "inpaint", subtype="render", camera_id=self._current_image)
                             mask_info = self._get_uploaded_image_info(context, "inpaint", subtype="visibility", camera_id=self._current_image)
@@ -2936,7 +2936,7 @@ class ComfyUIGenerate(_PBRMixin, bpy.types.Operator):
 
         # Not cached and file exists, try to upload it
         server_address = context.preferences.addons[_ADDON_PKG].preferences.server_address
-        uploaded_info = upload_image_to_comfyui(server_address, absolute_local_path)
+        uploaded_info = upload_image_to_comfyui(server_address, absolute_local_path, operator=self)
 
         # Store result (the info dict or None if upload failed) in cache
         self._uploaded_images_cache[absolute_local_path] = uploaded_info

@@ -87,6 +87,7 @@ class Control:
     args: tuple
     kwargs: dict
     properties: dict = field(default_factory=dict)
+    tooltip: str = ''
 
     def render(self, layout, *, narrow=False):
         if (narrow and self.method == 'prop' and self.args[1]
@@ -133,7 +134,9 @@ class Layout:
                 return child
             child = Control(name, args, kwargs)
             self.children.append(child)
-            return OperatorProperties(child) if name == 'operator' else None
+            if name == 'operator':
+                return OperatorProperties(child)
+            return child if name == 'progress' else None
         return record
 
     def controls(self):

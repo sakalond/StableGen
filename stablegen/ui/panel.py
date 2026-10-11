@@ -3,6 +3,7 @@
 import os
 import bpy  # pylint: disable=import-error
 import mathutils  # pylint: disable=import-error
+from ..generation_status import draw_stage_progress, server_status_active
 import math
 from ..utils import sg_modal_active
 from ..core import get_addon_prefs
@@ -300,7 +301,9 @@ class StableGenPanel(bpy.types.Panel):
                 # Bar 3 — Detail (only when there's actual sampler progress)
                 detail_pct = getattr(trellis2_op, '_detail_progress', 0)
                 detail_label = getattr(trellis2_op, '_detail_stage', '')
-                if detail_label and detail_pct > 0:
+                if server_status_active(trellis2_op):
+                    draw_stage_progress(progress_col, trellis2_op)
+                elif detail_label and detail_pct > 0:
                     progress_col.progress(
                         text=f"{detail_label} ({detail_pct:.0f}%)",
                         factor=max(0.0, min(detail_pct / 100.0, 1.0))
@@ -371,7 +374,10 @@ class StableGenPanel(bpy.types.Panel):
                         factor=max(0.0, min(overall_pct / 100.0, 1.0))
                     )
                     # Bar 2 — Current model (camera progress)
-                    progress_col.progress(text=stage_text, factor=max(0.0, min(cam_frac, 1.0)))
+                    if server_status_active(comfy_tex_op):
+                        draw_stage_progress(progress_col, comfy_tex_op)
+                    else:
+                        progress_col.progress(text=stage_text, factor=max(0.0, min(cam_frac, 1.0)))
                     # Bar 3 — PBR step N/M
                     progress_col.progress(text=f"PBR: Step {pbr_step}/{pbr_total}", factor=pbr_frac)
                 else:
@@ -397,12 +403,7 @@ class StableGenPanel(bpy.types.Panel):
                     )
 
                     # Bar 2 — Per-image (same as normal ComfyUI bar)
-                    stage = getattr(comfy_tex_op, '_stage', 'Generating')
-                    img_pct = getattr(comfy_tex_op, '_progress', 0)
-                    progress_col.progress(
-                        text=f"{stage} ({img_pct:.0f}%)",
-                        factor=max(0.0, min(img_pct / 100.0, 1.0))
-                    )
+                    draw_stage_progress(progress_col, comfy_tex_op)
 
                     # Bar 3 — Image N/M (same as normal ComfyUI overall bar)
                     if total_imgs > 1:
@@ -428,12 +429,14 @@ class StableGenPanel(bpy.types.Panel):
                     pbr_cam_total = max(getattr(comfy_tex_op, '_pbr_cam_total', 1), 1)
                     cam_frac = pbr_cam / pbr_cam_total
                     stage_text = getattr(comfy_tex_op, '_stage', 'PBR Decomposition')
-                    progress_col.progress(text=stage_text, factor=max(0.0, min(cam_frac, 1.0)))
+                    if server_status_active(comfy_tex_op):
+                        draw_stage_progress(progress_col, comfy_tex_op)
+                    else:
+                        progress_col.progress(text=stage_text, factor=max(0.0, min(cam_frac, 1.0)))
                     pbr_factor = max(0.0, min(((pbr_step - 1) + cam_frac) / pbr_total, 1.0))
                     progress_col.progress(text=f"PBR: Step {pbr_step}/{pbr_total}", factor=pbr_factor)
                 else:
-                    progress_text = f"{getattr(comfy_tex_op, '_stage', 'Generating')} ({getattr(comfy_tex_op, '_progress', 0):.0f}%)"
-                    progress_col.progress(text=progress_text, factor=max(0.0, min(raw_progress, 1.0)))
+                    draw_stage_progress(progress_col, comfy_tex_op)
                     total_images = getattr(comfy_tex_op, '_total_images', 0)
                     if total_images > 1:
                         current_image_idx = getattr(comfy_tex_op, '_current_image', 0)
@@ -482,11 +485,7 @@ class StableGenPanel(bpy.types.Panel):
                     action_row.operator('stablegen.stop_masked_edit', text='Stop After Current View', icon='CANCEL')
                     progress_col = layout.column()
                     stage_pct = max(0.0, min(getattr(masked_op, '_progress', 0.0), 100.0))
-                    stage = getattr(masked_op, '_stage', 'Preparing Masked Edit')
-                    progress_col.progress(
-                        text=f'{stage} ({stage_pct:.0f}%)',
-                        factor=stage_pct / 100.0,
-                    )
+                    draw_stage_progress(progress_col, masked_op, 'Preparing Masked Edit')
                     overall_pct = max(0.0, min(getattr(masked_op, '_overall_progress', 0.0), 100.0))
                     progress_col.progress(
                         text=getattr(masked_op, '_overall_label', 'Overall Masked Edit'),
@@ -555,10 +554,13 @@ class StableGenPanel(bpy.types.Panel):
                             # Top bar: camera X out of N within this step
                             cam_frac = pbr_cam / pbr_cam_total
                             stage_text = getattr(operator_instance, '_stage', 'PBR Decomposition')
-                            progress_col.progress(
-                                text=stage_text,
-                                factor=max(0.0, min(cam_frac, 1.0))
-                            )
+                            if server_status_active(operator_instance):
+                                draw_stage_progress(progress_col, operator_instance)
+                            else:
+                                progress_col.progress(
+                                    text=stage_text,
+                                    factor=max(0.0, min(cam_frac, 1.0))
+                                )
                             # Bottom bar: overall PBR progress
                             pbr_factor = max(0.0, min(
                                 ((pbr_step - 1) + cam_frac) / pbr_total, 1.0))
@@ -568,8 +570,7 @@ class StableGenPanel(bpy.types.Panel):
                             )
                         else:
                             # Normal generation progress
-                            progress_text = f"{getattr(operator_instance, '_stage', 'Generating')} ({getattr(operator_instance, '_progress', 0):.0f}%)"
-                            progress_col.progress(text=progress_text, factor=max(0.0, min(raw_progress, 1.0)))
+                            draw_stage_progress(progress_col, operator_instance)
 
                             total_images = getattr(operator_instance, '_total_images', 0)
                             if total_images > 1:

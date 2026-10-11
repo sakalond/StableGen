@@ -1211,7 +1211,7 @@ class _Trellis2WorkflowMixin:
                 rasterized_tmp = maybe_tmp
                 input_image_path = rasterized_tmp
 
-        image_info = upload_image_to_comfyui(server_address, input_image_path)
+        image_info = upload_image_to_comfyui(server_address, input_image_path, operator=self.operator)
 
         # Clean up the temp rasterized file after upload
         if rasterized_tmp:

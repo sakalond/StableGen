@@ -12,6 +12,7 @@ from datetime import datetime, timezone, timedelta
 
 from .timeout_config import get_timeout
 from .prompt_archive import archive_prompt
+from .generation_status import set_server_stage, node_stage
 
 from io import BytesIO
 import numpy as np
@@ -390,7 +391,14 @@ class _WorkflowBase:
             prompt, NODES.get('save_image', ''))
 
         # Send the prompt to the queue
+        self.operator._server_context_stage = (
+            getattr(self.operator, '_stage', '')
+            if getattr(self.operator, '_pbr_active', False) else ''
+        )
+        self.operator._progress = 0.0
+        set_server_stage(self.operator, 'Submitting Workflow')
         prompt_id = self._queue_prompt(prompt, client_id, server_address)
+        set_server_stage(self.operator, 'Queued on Server')
 
         # Make every texturing workflow cancellable while blocked in recv().
         # cancel_generate() closes this socket after interrupting ComfyUI.
@@ -425,6 +433,10 @@ class _WorkflowBase:
                 if state in {'running', 'queued'}:
                     unavailable_heartbeats = 0
                     unknown_heartbeats = 0
+                    if state == 'queued':
+                        set_server_stage(self.operator, 'Queued on Server')
+                    elif not current_node:
+                        set_server_stage(self.operator, 'Preparing Inputs')
                     print(f"[StableGen] No WebSocket event for {heartbeat}s; "
                           f"prompt is still {state} ({detail}). Continuing to wait.")
                     continue
@@ -461,31 +473,55 @@ class _WorkflowBase:
 
             if isinstance(out, str):
                 message = json.loads(out)
+                data = message.get('data', {})
+                # Progress and errors can be broadcast by another queued job.
+                # Older servers omit prompt_id on progress; use its node below.
+                if data.get('prompt_id') not in (None, prompt_id):
+                    continue
+
+                if message['type'] == 'execution_start':
+                    set_server_stage(self.operator, 'Preparing Inputs')
                 
-                if message['type'] == 'executing':
+                elif message['type'] == 'executing':
                     data = message['data']
                     if data['prompt_id'] == prompt_id:
                         if data['node'] is None:
                             break  # Execution is complete
                         else:
-                            current_node = data['node']
+                            current_node = str(data['node'])
                             node_info = prompt.get(current_node, {})
                             node_title = (node_info.get('_meta', {}).get('title')
                                           or node_info.get('class_type', current_node))
                             print(f"[StableGen] Executing node: {node_title} ({current_node})")
+                            set_server_stage(self.operator, node_stage(current_node, node_info, NODES), node_title)
                             
                 elif message['type'] == 'progress':
-                    progress = (message['data']['value'] / message['data']['max']) * 100
-                    if progress != 0:
-                        self.operator._progress = progress  # Update progress for UI
-                        # Transition stage from "Uploading" to "Generating" on
-                        # first actual sampler progress from the server.
-                        if self.operator._stage == "Uploading to Server":
-                            self.operator._stage = "Generating Image"
+                    event_node = data.get('node')
+                    if not current_node or (event_node is not None and str(event_node) != current_node):
+                        continue
+                    try:
+                        maximum = float(data.get('max', 0))
+                        progress = float(data['value']) / maximum * 100 if maximum > 0 else None
+                    except (KeyError, TypeError, ValueError):
+                        continue
+                    if progress is None or not 0 <= progress <= 100:
+                        continue
+                    node_info = prompt.get(current_node, {})
+                    phase = node_stage(current_node, node_info, NODES)
+                    sampling = phase == 'Starting Sampler'
+                    if sampling and progress > 0:
+                        phase = 'Generating Image'
+                    set_server_stage(self.operator, phase,
+                                     getattr(self.operator, '_server_stage_detail', ''), progress)
+                    if sampling:
+                        # Keep per-image/overall sampling progress separate
+                        # from encoder and other preprocessing progress.
+                        self.operator._progress = progress
+                        self.operator._server_step_text = f"Step {data['value']}/{data['max']}"
                         # Also update 3-tier detail when called from Trellis2Generate
                         if hasattr(self.operator, '_detail_progress'):
                             self.operator._detail_progress = progress
-                            self.operator._detail_stage = f"Step {message['data']['value']}/{message['data']['max']}"
+                            self.operator._detail_stage = f"Step {data['value']}/{data['max']}"
                             # Remap progress into a sub-range when gallery mode is active
                             remap = getattr(self.operator, '_progress_remap', None)
                             if remap:
@@ -495,7 +531,7 @@ class _WorkflowBase:
                                 self.operator._phase_progress = progress
                             if hasattr(self.operator, '_update_overall'):
                                 self.operator._update_overall()
-                        print(f"[StableGen] Progress: {progress:.1f}%")
+                    print(f"[StableGen] {phase}: {progress:.1f}%")
 
                 elif message['type'] == 'execution_error':
                     error_data = message.get('data', {})
@@ -535,6 +571,7 @@ class _WorkflowBase:
         )
 
         if needs_http and fallback_node_id:
+            set_server_stage(self.operator, 'Receiving Result', 'Downloading the generated image')
             reason = "missing" if not ws_images else "corrupt"
             print(f"[StableGen] WebSocket image data is {reason}. "
                   "Falling back to HTTP /history + /view download...")
@@ -579,8 +616,10 @@ class _WorkflowBase:
                     f"from output node {save_node!r}."
                 )
             print(f"[StableGen] {self.operator._error}")
+            self.operator._server_stage = None
             return {"error": "missing_output"}
 
+        self.operator._server_stage = None
         return output_images
 
     def _queue_prompt(self, prompt, client_id, server_address):

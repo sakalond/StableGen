@@ -14,6 +14,7 @@ import uuid
 import requests
 
 from .timeout_config import get_timeout
+from .generation_status import reporting_upload
 
 def redraw_ui(context):
     """Redraws the UI to reflect changes in the operator's progress and status."""
@@ -81,7 +82,7 @@ def _pbr_setup_studio_lights(context, to_texture):
     setup_studio_lighting(context, scale=max_dim)
 
 
-def upload_image_to_comfyui(server_address, image_path, image_type="input"):
+def upload_image_to_comfyui(server_address, image_path, image_type="input", *, operator=None):
     """
     Uploads an image file to the ComfyUI server's /upload/image endpoint.
 
@@ -89,6 +90,7 @@ def upload_image_to_comfyui(server_address, image_path, image_type="input"):
         server_address (str): The address:port of the ComfyUI server (e.g., "127.0.0.1:8188").
         image_path (str): The local path to the image file to upload.
         image_type (str): The type parameter for the upload (usually "input").
+        operator: Optional generation operator whose UI reports this transfer.
 
     Returns:
         dict: A dictionary containing the server's response (e.g., {'name': 'filename.png', 'subfolder': '', 'type': 'input'})
@@ -106,7 +108,7 @@ def upload_image_to_comfyui(server_address, image_path, image_type="input"):
     print(f"[StableGen] Uploading {os.path.basename(image_path)} to {upload_url}...")
 
     try:
-        with open(image_path, 'rb') as f:
+        with reporting_upload(operator, image_path), open(image_path, 'rb') as f:
             # Determine mime type based on extension
             mime_type = 'application/octet-stream' # Default fallback
             if image_path.lower().endswith('.png'):
