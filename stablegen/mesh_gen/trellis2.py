@@ -1305,6 +1305,10 @@ class Trellis2Generate(bpy.types.Operator):
             self.report({'WARNING'}, "TRELLIS.2 generation cancelled")
             return {'FINISHED'}
 
+        from ..core.server_api import confirm_server
+        if not confirm_server(self, context):
+            return {'CANCELLED'}
+
         scene = context.scene
         gen_from = getattr(scene, 'trellis2_generate_from', 'image')
         tex_mode = getattr(scene, 'trellis2_texture_mode', 'native')
@@ -2783,6 +2787,10 @@ class StableGenAutoRigSelectedMesh(bpy.types.Operator):
 
             self.report({'WARNING'}, "Auto-rigging cancelled")
             return {'FINISHED'}
+
+        from ..core.server_api import confirm_server
+        if not confirm_server(self, context):
+            return {'CANCELLED'}
 
         selected_objects = list(context.selected_objects)
         selected_meshes = self._collect_character_meshes(selected_objects)

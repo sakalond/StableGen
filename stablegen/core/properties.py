@@ -276,19 +276,16 @@ def register_properties(update_model_list, ControlNetUnit, LoRAUnit,
     def initial_refresh():
         print("[StableGen] StableGen: Performing initial model list refresh...")
         try:
-            bpy.ops.stablegen.check_server_status('INVOKE_DEFAULT')
             prefs = bpy.context.preferences.addons.get(ADDON_PKG)
-            if not prefs or not prefs.preferences.server_online:
-                print("[StableGen] StableGen: Server not reachable during initial refresh.")
-                return None
+            if prefs:
+                # The saved value is from the last session; only a fresh check counts.
+                prefs.preferences.server_online = False
+            _sg_queue_load()
             if prefs and prefs.preferences.server_address:
-                bpy.ops.stablegen.refresh_checkpoint_list('INVOKE_DEFAULT')
-                bpy.ops.stablegen.refresh_lora_list('INVOKE_DEFAULT')
-                bpy.ops.stablegen.refresh_controlnet_mappings('INVOKE_DEFAULT')
+                # Once the server answers, the check refreshes model lists and nodes.
+                bpy.ops.stablegen.check_server_status('INVOKE_DEFAULT')
             else:
                 print("[StableGen] StableGen: Server address not set, skipping initial refresh.")
-            load_handler(None)
-            _sg_queue_load()
         except Exception as e:
             print(f"[StableGen] StableGen: Error during initial refresh: {e}")
         return None

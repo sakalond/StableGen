@@ -243,10 +243,9 @@ def update_combined(self, context):
 
     if not server_address:
         prefs.server_online = False
-        # Must mutate the lists in-place to keep existing references valid
-        import stablegen.core.state as _state
-        _state._cached_checkpoint_list = [("NO_SERVER", "Set Server Address", "...")]
-        _state._cached_lora_list = [("NO_SERVER", "Set Server Address", "...")]
+        from . import state as _state
+        _state._cached_checkpoint_list = [_state.no_server_item("")]
+        _state._cached_lora_list = [_state.no_server_item("")]
         return None
 
     print("[StableGen] Server address changed, checking asynchronously...")
@@ -277,6 +276,8 @@ def update_combined(self, context):
 
         if not result.get('online', False):
             print("[StableGen] ComfyUI server is not reachable.")
+            from . import state as _state
+            _state.show_offline_lists(server_address)
             return
 
         update_parameters(None, bpy.context)

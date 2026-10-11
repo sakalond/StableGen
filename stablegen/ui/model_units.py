@@ -240,7 +240,7 @@ class RefreshCheckpointList(bpy.types.Operator):
             desc = result.get('model_type_desc', 'Model')
 
             if model_list is None:
-                _state._cached_checkpoint_list = [("NO_SERVER", "Set Server Address", "Cannot fetch")]
+                _state._cached_checkpoint_list = [_state.no_server_item(server_address)]
                 _state._cached_checkpoint_architecture = None
                 print("[StableGen] Checkpoint refresh: cannot reach server.")
             elif not model_list:
@@ -318,7 +318,7 @@ class RefreshLoRAList(bpy.types.Operator):
             lora_list = result.get('lora_list')
 
             if lora_list is None:
-                _state._cached_lora_list = [("NO_SERVER", "Set Server Address", "Cannot fetch")]
+                _state._cached_lora_list = [_state.no_server_item(server_address)]
                 print("[StableGen] LoRA refresh: cannot reach server.")
             elif not lora_list:
                 _state._cached_lora_list = [("NONE_FOUND", "No LoRAs Found", "Server list is empty")]

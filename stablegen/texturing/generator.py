@@ -805,6 +805,10 @@ class ComfyUIGenerate(_PBRMixin, bpy.types.Operator):
         if is_masked_edit_mode(context.scene):
             return bpy.ops.stablegen.masked_edit()
 
+        from ..core.server_api import confirm_server
+        if not confirm_server(self, context):
+            return {'CANCELLED'}
+
         self._generation_method_on_start = context.scene.generation_method
 
         # Clear the upload cache at the start of a new generation

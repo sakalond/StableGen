@@ -53,6 +53,7 @@ from .cameras import (
     MoveCameraOrder, ApplyCameraOrderPreset,
 )
 from .debug_tools import debug_classes as _debug_classes
+from .core import server_monitor
 from .texturing.regression import REGRESSION_CLASSES
 from .texturing import masked_edit
 from .utils import AddHDRI, ApplyModifiers, CurvesToMesh
@@ -222,9 +223,11 @@ def register():
     )
     register_variant_properties()
     register_studio_ui()
+    server_monitor.register()
 
 
 def unregister():
+    server_monitor.unregister()
     unregister_studio_ui()
     unregister_variant_properties()
     masked_edit.unregister_properties()

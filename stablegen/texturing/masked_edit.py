@@ -743,6 +743,9 @@ class SG_OT_MaskedEdit(bpy.types.Operator):
     def execute(self, context):
         self.timer = None
         self.objects = []
+        from ..core.server_api import confirm_server
+        if not confirm_server(self, context):
+            return {'CANCELLED'}
         try:
             finish_paint(context)
             if context.object and context.object.mode != 'OBJECT':

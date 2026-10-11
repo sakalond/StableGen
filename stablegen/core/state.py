@@ -20,6 +20,22 @@ _pending_checkpoint_refresh_architecture = None
 _updating_print_preset = False
 
 
+def no_server_item(server_address):
+    """Model-list placeholder that says why the list is empty."""
+    if not server_address:
+        return ("NO_SERVER", "Set Server Address", "No ComfyUI server address is configured")
+    return ("NO_SERVER", "No connection to ComfyUI", f"ComfyUI isn't reachable at {server_address}")
+
+
+def show_offline_lists(server_address):
+    """Replace empty placeholders with the offline one; keep lists fetched earlier."""
+    global _cached_checkpoint_list, _cached_lora_list
+    if _cached_checkpoint_list[0][0] in {"NONE_AVAILABLE", "NO_SERVER"}:
+        _cached_checkpoint_list = [no_server_item(server_address)]
+    if _cached_lora_list[0][0] in {"NONE_AVAILABLE", "NO_SERVER"}:
+        _cached_lora_list = [no_server_item(server_address)]
+
+
 # ── In-flight refresh counter ─────────────────────────────────────────────
 _pending_refreshes = 0
 _refresh_started_at = 0.0   # monotonic timestamp of first in-flight refresh

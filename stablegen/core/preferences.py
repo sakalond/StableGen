@@ -321,6 +321,8 @@ class CheckServerStatus(bpy.types.Operator):
                 bpy.app.timers.register(_deferred_refresh, first_interval=0.1)
             else:
                 print(f"[StableGen] ComfyUI server unreachable or timed out at {server_addr}.")
+                from . import state as _state
+                _state.show_offline_lists(server_addr)
 
         type(self)._checking = True
         try:

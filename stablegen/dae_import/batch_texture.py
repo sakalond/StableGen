@@ -11,6 +11,7 @@ import os
 from datetime import datetime
 import bpy  # pylint: disable=import-error
 
+from ..core import ADDON_PKG
 from ..utils import sg_modal_active
 from .batch_manifest import (
     discover_model_files,
@@ -1160,7 +1161,7 @@ class BatchTextureDAE(bpy.types.Operator):
             return False
         if sg_modal_active(context):
             return False
-        addon_prefs = context.preferences.addons.get('stablegen')
+        addon_prefs = context.preferences.addons.get(ADDON_PKG)
         if addon_prefs:
             prefs = addon_prefs.preferences
             if not getattr(prefs, 'server_online', False):
@@ -1220,6 +1221,9 @@ class BatchTextureDAE(bpy.types.Operator):
         box.prop(self, "continue_on_error")
 
     def execute(self, context):
+        from ..core.server_api import confirm_server
+        if not confirm_server(self, context):
+            return {'CANCELLED'}
         manifest_path = bpy.path.abspath(self.manifest_path).strip()
         if manifest_path:
             try:

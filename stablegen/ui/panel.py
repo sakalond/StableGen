@@ -198,7 +198,7 @@ class StableGenPanel(bpy.types.Panel):
         elif not addon_prefs.server_address:
             config_error_message = "Server Address Missing"
         elif not addon_prefs.server_online:
-            config_error_message = "Cannot reach server"
+            config_error_message = "ComfyUI offline"
 
         # Determine if we are in TRELLIS.2 mode (used by generate button & later sections)
         _arch_mode = getattr(scene, 'architecture_mode', 'sdxl')
@@ -255,7 +255,7 @@ class StableGenPanel(bpy.types.Panel):
             ) if not trellis2_op and not comfy_tex_op else None
 
             if config_error_message:
-                if config_error_message == "Cannot reach server":
+                if config_error_message == "ComfyUI offline":
                     split = action_row.split(factor=0.85, align=True)
                     split.operator("object.trellis2_generate", text="Cannot generate: " + config_error_message, icon="ERROR")
                     split.operator("stablegen.check_server_status", text="", icon='FILE_REFRESH')
@@ -510,7 +510,7 @@ class StableGenPanel(bpy.types.Panel):
                     status_row.label(text=scene.sg_masked_status)
             elif config_error_message:
                 # Split the row to have the error message/disabled button and the refresh button
-                if config_error_message == "Cannot reach server":
+                if config_error_message == "ComfyUI offline":
                     split = action_row.split(factor=0.85, align=True) # Adjust factor as needed
                     split.operator("object.test_stable", text="Cannot generate: " + config_error_message, icon="ERROR") # Use ERROR icon
                     # Use the operator from __init__.py

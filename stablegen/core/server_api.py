@@ -40,6 +40,36 @@ def check_server_availability(server_address, timeout=0.5):
     except requests.exceptions.ConnectionError:
         print("[StableGen]   Initial server check failed: Connection Error.")
         return False
+    except (requests.exceptions.RequestException, ValueError) as exc:
+        # An HTTP error or malformed address is offline too; letting it escape
+        # would leave the previous online state in place.
+        print(f"[StableGen]   Initial server check failed: {type(exc).__name__}: {exc}")
+        return False
+
+
+def confirm_server(operator, context):
+    """Ping ComfyUI right before starting work, since the saved status can be stale.
+
+    Main thread only. Reports the problem on *operator* and marks the server
+    offline when it is unreachable. Returns True when the work may start.
+    """
+    import bpy  # pylint: disable=import-error
+    if not bpy.app.online_access:
+        operator.report({'ERROR'}, "Blender's online access is disabled (Preferences → System)")
+        return False
+    prefs = context.preferences.addons[ADDON_PKG].preferences
+    if check_server_availability(prefs.server_address, timeout=get_timeout('ping')):
+        prefs.server_online = True
+        return True
+    prefs.server_online = False
+    operator.report({'ERROR'}, offline_message(prefs.server_address))
+    return False
+
+
+def offline_message(server_address):
+    if not server_address:
+        return "Set the ComfyUI server address in StableGen preferences"
+    return f"ComfyUI isn't reachable at {server_address}. Start ComfyUI or check the server address."
 
 
 def check_trellis2_available(server_address, timeout=1.0):
