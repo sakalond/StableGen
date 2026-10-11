@@ -123,19 +123,19 @@ class ControlNetUnit(bpy.types.PropertyGroup):
     )  # type: ignore
     strength: bpy.props.FloatProperty(
         name="Strength",
-        description="Strength of the ControlNet effect",
+        description="Multiplier for ControlNet conditioning: 0 disables its contribution, 1 uses nominal strength. Higher values can enforce guidance more strongly but may overconstrain the result",
         default=0.5, min=0.0, max=3.0,
         update=update_parameters
     )  # type: ignore
     start_percent: bpy.props.FloatProperty(
-        name="Start",
-        description="Start percentage (/100)",
+        name="Start fraction",
+        description="Denoising fraction when conditioning begins: 0 is the start, 1 the end; 0.2 means 20% of the schedule. Keep Start at or below End.",
         default=0.0, min=0.0, max=1.0,
         update=update_parameters
     )  # type: ignore
     end_percent: bpy.props.FloatProperty(
-        name="End",
-        description="End percentage (/100)",
+        name="End fraction",
+        description="Denoising fraction when conditioning ends: 0 is the start, 1 the end; 0.8 means 80% of the schedule. Keep End at or above Start.",
         default=1.0, min=0.0, max=1.0,
         update=update_parameters
     )  # type: ignore
@@ -147,7 +147,7 @@ class ControlNetUnit(bpy.types.PropertyGroup):
     )  # type: ignore
     use_union_type: bpy.props.BoolProperty(
         name="Use Union Type",
-        description="Use union type for ControlNet",
+        description="Explicitly select the guidance kind for a compatible union ControlNet, such as depth or edges. Requires a union-capable model",
         default=True,
         update=update_parameters
     )  # type: ignore
@@ -162,13 +162,13 @@ class LoRAUnit(bpy.types.PropertyGroup):
     )  # type: ignore
     model_strength: bpy.props.FloatProperty(
         name="Model Strength",
-        description="Strength of the LoRA's effect on the model's weights",
+        description="Multiplier for the LoRA’s effect on model weights: 0 disables it, 1 uses nominal strength. Useful values depend on the LoRA; excessive strength can distort the result",
         default=1.0, min=0.0, max=100.0,
         update=update_parameters
     )  # type: ignore
     clip_strength: bpy.props.FloatProperty(
         name="CLIP Strength",
-        description="Strength of the LoRA's effect on the CLIP/text conditioning",
+        description="Multiplier for the LoRA’s text-encoder contribution: 0 disables it, 1 uses nominal strength. Separate from model strength; architectures with model-only LoRAs hide this control",
         default=1.0, min=0.0, max=100.0,
         update=update_parameters
     )  # type: ignore

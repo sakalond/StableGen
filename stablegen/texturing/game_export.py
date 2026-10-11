@@ -102,6 +102,7 @@ class ExportForGameEngine(bpy.types.Operator):
     and auto-saves to the StableGen output directory."""
     bl_idname = "object.export_game_engine"
     bl_label = "Export for Game Engine"
+    bl_description = "Open glTF / FBX export options for textured meshes and their rigs. Save the exported asset and material textures to the StableGen output directory"
     bl_options = {'REGISTER'}
 
     export_format: bpy.props.EnumProperty(

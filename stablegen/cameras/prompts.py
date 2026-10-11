@@ -14,8 +14,8 @@ class CameraPromptItem(bpy.types.PropertyGroup):
         description="Name of the camera object"
     ) # type: ignore
     prompt: bpy.props.StringProperty(
-        name="View Description",
-        description="Description of the view from this camera"
+        name="View Prompt",
+        description="View-specific wording included with the shared generation prompt. Describe direction or details belonging to this camera, such as 'front view' or 'close-up on face'"
     ) # type: ignore
 
 # ── Camera Generation Order ──────────────────────────────────────────────────
@@ -278,8 +278,8 @@ class CollectCameraPrompts(bpy.types.Operator):
     bl_options = {'REGISTER', 'UNDO'}
 
     camera_prompt: bpy.props.StringProperty(
-        name="View Description",
-        description="Describe the view from this camera (e.g., 'front view', 'close-up on face', 'from above')",
+        name="View Prompt",
+        description="View-specific generation wording for this camera, such as 'front view', 'close-up on face', or 'from above'. This dialog steps through selected cameras, or all cameras if none are selected",
         default=""
     ) # type: ignore
 
@@ -361,4 +361,4 @@ class CollectCameraPrompts(bpy.types.Operator):
             _sg_ensure_label_overlay()
             self.report({'INFO'}, f"Collected prompts for {len(self._cameras)} cameras.")
             return {'FINISHED'}
-    
+

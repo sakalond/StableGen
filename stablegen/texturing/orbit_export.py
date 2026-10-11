@@ -5,6 +5,8 @@ import math
 import time
 import tempfile
 import shutil
+from ..core.property_help import ORBIT_HELP
+
 import bpy  # pylint: disable=import-error
 import numpy as np
 import mathutils
@@ -53,7 +55,7 @@ class ExportOrbitGIF(bpy.types.Operator):
     
     engine: bpy.props.EnumProperty(
         name="Render Engine",
-        description="Render engine to use",
+        description=ORBIT_HELP['engine'],
         items=[
             ('BLENDER_WORKBENCH', "Workbench", "Use Workbench render engine"),
             ('EEVEE', "Eevee", "Use Eevee render engine"),
@@ -64,7 +66,7 @@ class ExportOrbitGIF(bpy.types.Operator):
 
     interpolation: bpy.props.EnumProperty(
         name="Rotation Curve",
-        description="Keyframe interpolation for the orbit rotation",
+        description=ORBIT_HELP['interpolation'],
         items=[
             ('LINEAR', "Linear", "Constant speed throughout the orbit"),
             ('BEZIER', "Ease In/Out", "Smooth acceleration and deceleration"),
@@ -75,14 +77,13 @@ class ExportOrbitGIF(bpy.types.Operator):
     # ── PBR showcase settings ─────────────────────────────────────────
     use_hdri: bpy.props.BoolProperty(
         name="HDRI Environment",
-        description="Use the scene's existing HDRI world (set up via the "
-                    "Add HDRI operator) for realistic environment lighting",
+        description=ORBIT_HELP['use_hdri'],
         default=False
     ) # type: ignore
 
     hdri_rotation: bpy.props.FloatProperty(
         name="Environment Rotation",
-        description="Initial Z-rotation offset for the HDRI (degrees)",
+        description=ORBIT_HELP['hdri_rotation'],
         default=0.0,
         min=0.0,
         max=360.0,
@@ -91,7 +92,7 @@ class ExportOrbitGIF(bpy.types.Operator):
 
     env_mode: bpy.props.EnumProperty(
         name="Environment Mode",
-        description="How the environment lighting interacts with the orbit",
+        description=ORBIT_HELP['env_mode'],
         items=[
             ('FIXED', "Fixed",
              "Camera orbits, HDRI stays fixed — reflections shift naturally"),
@@ -108,8 +109,7 @@ class ExportOrbitGIF(bpy.types.Operator):
 
     use_denoiser: bpy.props.BoolProperty(
         name="Denoise",
-        description="Enable Cycles denoising for cleaner specular "
-                    "highlights with fewer samples",
+        description=ORBIT_HELP['use_denoiser'],
         default=True
     ) # type: ignore
 

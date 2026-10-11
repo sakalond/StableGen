@@ -14,14 +14,23 @@ MODES = [
     ('TEXTURES', 'Projected textures', 'Return to the original mesh and materials'),
     ('SOLID', 'View colors', 'One solid color per camera, through the real projection pipeline'),
     ('GRID', 'Projection grid', 'Check projected image alignment and distortion'),
-    ('COVERAGE', 'Coverage', 'Inspect how well the cameras cover the surface'),
+    ('COVERAGE', 'Coverage', 'Average or strongest camera visibility, shown on a logarithmic heatmap to reveal weak coverage; not normalized RGB contributions'),
     ('VISIBILITY', 'Visibility', 'Inspect which surfaces the cameras can see'),
-    ('WEIGHT', 'Camera weight', 'Inspect the selected camera’s contribution'),
-    ('FEATHER', 'Camera feather', 'Inspect the selected camera’s image-edge fade'),
+    ('WEIGHT', 'Camera visibility weight', 'Unnormalized visibility weight for the chosen camera: black is zero, white is full; not its relative share of the final RGB mixture'),
+    ('FEATHER', 'Image-frame fade', 'Chosen camera’s image-frame fade: white is full strength, black is faded out. This is not DPPG guard feathering'),
     ('CONFIDENCE', 'Confidence', 'Inspect the actual projection confidence graph'),
     ('SEAMS', 'UV seams', 'Inspect the mesh UV layout'),
-    ('DPPG', 'DPPG masks', 'Inspect guard rejection and feathering in the actual projection graph'),
+    ('DPPG', 'DPPG masks', 'Depth / part projection guard effects: red is guard attenuation, blue is feather attenuation, magenta is both, dark gray is unchanged. Only valid source footprints are counted'),
 ]
+# Keep the panel summary concise; detailed signal scales and legends belong in
+# enum/hover help, including for DPPG where the permanent legend was removed.
+DISPLAY_SUMMARIES = {
+    'TEXTURES': 'Original projected textures.', 'SOLID': 'One source color per camera.',
+    'GRID': 'Projected image alignment and distortion.', 'COVERAGE': 'Surface observation across cameras.',
+    'VISIBILITY': 'Surfaces visible to the chosen camera.', 'WEIGHT': 'Chosen camera’s visibility weight.',
+    'FEATHER': 'Chosen camera’s image-frame fade.', 'CONFIDENCE': 'Source quality and context masks.',
+    'SEAMS': 'Mesh UV layout.', 'DPPG': 'Guard rejection and boundary feathering.',
+}
 OPERATORS = {
     'SOLID': 'debug_solid_colors', 'GRID': 'debug_grid_pattern',
     'COVERAGE': 'debug_coverage_heatmap', 'VISIBILITY': 'debug_visibility_material',
@@ -53,25 +62,31 @@ class SGStudioPreviewCamera(bpy.types.PropertyGroup):
 
 
 class SGStudioDiagnostics(bpy.types.PropertyGroup):
-    mode: bpy.props.EnumProperty(name='Viewport display', items=MODES, default='TEXTURES')
+    mode: bpy.props.EnumProperty(name='Viewport display', items=MODES, default='TEXTURES',
+                                description='Choose the diagnostic material to inspect. Projected textures restores the original meshes, materials and render settings')
     camera: bpy.props.PointerProperty(name='Camera', type=bpy.types.Object,
+                                      description='Camera whose diagnostic signal is displayed; this choice is separate from viewport object selection',
                                       poll=lambda _self, obj: obj.type == 'CAMERA')
     grid_size: bpy.props.IntProperty(name='Grid cell size', default=64, min=8, max=512,
                                     description='Checkerboard cell size in pixels')
-    coverage: bpy.props.EnumProperty(name='Coverage measure', default='AVERAGE', items=[
-        ('AVERAGE', 'Average', 'Mean coverage across all cameras'),
-        ('MAX', 'Best camera', 'Strongest available camera weight')])
-    confidence: bpy.props.EnumProperty(name='Confidence signal', default='QUALITY', items=[
-        ('QUALITY', 'Best source quality', 'Quality of accepted sources'),
-        ('ACQUISITION', 'Camera quality', 'Raw acquisition quality of the selected camera'),
-        ('TRUSTED', 'Trusted context', 'Areas accepted as trustworthy context'),
-        ('REPAIR', 'Repair mask', 'Areas which must be regenerated'),
-        ('WRITE', 'Write mask', 'Generated-pixel write mask'),
-        ('GUARD', 'Depth / part guard', 'Rear-surface rejection for the selected camera')])
-    scope: bpy.props.EnumProperty(name='Cameras', default='ALL', items=[
+    coverage: bpy.props.EnumProperty(name='Coverage metric', default='AVERAGE',
+                                    description='Average divides summed camera visibility by camera count; Best camera uses the strongest visibility weight. The heatmap stretches low values logarithmically', items=[
+        ('AVERAGE', 'Average', 'Mean visibility weight across all cameras; improves only when more cameras support the surface'),
+        ('MAX', 'Best camera', 'Strongest camera visibility weight, regardless of how many other views cover it')])
+    confidence: bpy.props.EnumProperty(name='Confidence signal', default='QUALITY',
+                                      description='Choose the geometric quality or context mask from the projection graph. Black is 0 and white is 1; meanings depend on the selected signal', items=[
+        ('QUALITY', 'Best source quality', 'Best accepted source quality, independent of which view dominates RGB; brighter means better observed'),
+        ('ACQUISITION', 'Camera quality', 'Chosen camera’s raw geometric acquisition quality; brighter means better observed'),
+        ('TRUSTED', 'Trusted context', 'White means source quality exceeds the current trusted-quality threshold'),
+        ('REPAIR', 'Repair mask', 'White means source quality does not exceed the trusted-quality threshold and needs repair'),
+        ('WRITE', 'Write mask', 'White permits this camera’s generated pixels to contribute; black excludes them'),
+        ('GUARD', 'Depth / part guard', 'Chosen camera’s guard acceptance: brighter permits more projection')])
+    scope: bpy.props.EnumProperty(name='Camera scope', default='ALL',
+                                 description='Inspect the strongest guard/feather effect across all valid cameras, or only the camera chosen in this inspector', items=[
         ('ALL', 'All cameras', 'Strongest effect from any valid camera'),
-        ('ACTIVE', 'Selected camera', 'Inspect the camera chosen below')])
-    stage: bpy.props.EnumProperty(name='Mask stage', default='CURRENT', items=[
+        ('ACTIVE', 'Chosen camera', 'Inspect only the camera chosen below, independently of viewport selection')])
+    stage: bpy.props.EnumProperty(name='Guard stage', default='CURRENT',
+                                 description='Compare original guard/feather fields before rescue with effective fields after coverage rescue and visibility limits', items=[
         ('CURRENT', 'Effective masks', 'After coverage rescue and occlusion limits'),
         ('BEFORE_RESCUE', 'Before coverage rescue', 'Original guard and feather fields')])
     # Persistent RNA references keep the baseline alive, including after undo or

@@ -5,6 +5,8 @@ were previously defined inside the monolithic ``register()`` function are
 collected here in ``register_properties()`` and ``unregister_properties()``.
 """
 
+from .property_help import ORBIT_HELP
+
 import bpy  # pylint: disable=import-error
 
 from ..ui.presets import update_parameters, get_preset_items
@@ -121,13 +123,13 @@ def register_properties(update_model_list, ControlNetUnit, LoRAUnit,
         default=50.0, min=0.1, max=1000.0, step=10, precision=1,
     )
     bpy.types.Scene.stablegen_print_smoothing = bpy.props.IntProperty(
-        name="Smoothing Passes",
-        description="Number of majority-vote island cleanup passes to apply to the quantization",
+        name="Island cleanup passes",
+        description="Number of majority-vote cleanup passes on small quantized color islands. More passes can remove noise but also small color details.",
         default=2, min=0, max=10
     )
     bpy.types.Scene.stablegen_print_chroma_threshold = bpy.props.FloatProperty(
-        name="Chromatic Threshold",
-        description="Saturation above which a colour is treated as chromatic for hue-matching",
+        name="Saturation cutoff",
+        description="Saturation cutoff above which hue matching is used. Higher values classify fewer colors as chromatic.",
         default=0.35, min=0.0, max=1.0, step=1, precision=2,
     )
     bpy.types.Scene.stablegen_print_make_solid = bpy.props.BoolProperty(
@@ -146,8 +148,8 @@ def register_properties(update_model_list, ControlNetUnit, LoRAUnit,
         default=True,
     )
     bpy.types.Scene.stablegen_print_single_filament_internal = bpy.props.BoolProperty(
-        name="Single Filament Internal",
-        description="Use a single filament for faces that were not seen by any texturing projection camera (low visibility weight). Reduces tool changes on FDM toolchangers for non-visible areas. Requires visibility weights to be baked (Bake Visibility option in texturing pipeline)",
+        name="Single filament for unseen faces",
+        description="Use one filament for faces classified as unseen by baked projection visibility. This reduces tool changes but does not prove the faces are physically inside the mesh.",
         default=True,
     )
     bpy.types.Scene.stablegen_print_internal_visibility_threshold = bpy.props.FloatProperty(
@@ -161,8 +163,8 @@ def register_properties(update_model_list, ControlNetUnit, LoRAUnit,
         default=False,
     )
     bpy.types.Scene.stablegen_print_solver_init = bpy.props.EnumProperty(
-        name="Initialization Method",
-        description="Select the starting state for the solver optimization loop",
+        name="Solver initialization",
+        description="Starting state for filament-mixture optimization. This changes the solver’s starting point, not the target colors.",
         items=[
             ('EQUAL', 'Equal Fractions', 'Initialize all filaments with equal fractions (1/N)'),
             ('CLOSEST', 'Closest Filament', 'Initialize with 100% of the single closest filament')
@@ -170,13 +172,13 @@ def register_properties(update_model_list, ControlNetUnit, LoRAUnit,
         default='CLOSEST',
     )
     bpy.types.Scene.stablegen_print_solver_steps = bpy.props.IntProperty(
-        name="Convergence Steps",
-        description="Number of iterations for the Frank-Wolfe optimization loop",
+        name="Solver iterations",
+        description="Iterations used to fit filament mixtures to target colors. More iterations cost time and can improve convergence.",
         default=80, min=10, max=500,
     )
     bpy.types.Scene.stablegen_print_solver_formula = bpy.props.EnumProperty(
-        name="Mixing Model",
-        description="Algorithm used to simulate physical filament color mixing",
+        name="Color mixing model",
+        description="Model used to predict the physical color of mixed filaments. This is separate from the image-generation model.",
         items=[
             ('ADDITIVE', 'Linear Additive', 'Standard linear additive color mixing'),
             ('SUBTRACTIVE', 'Linear Subtractive', 'Simple linear complement subtractive color mixing'),
@@ -217,6 +219,7 @@ def register_properties(update_model_list, ControlNetUnit, LoRAUnit,
         description="Render samples per frame"
     )
     bpy.types.WindowManager.sg_queue_gif_engine = bpy.props.EnumProperty(
+        description=ORBIT_HELP['engine'],
         name="Engine",
         items=[
             ('BLENDER_WORKBENCH', "Workbench", "Fast preview renderer — no lighting, flat shading"),
@@ -226,6 +229,7 @@ def register_properties(update_model_list, ControlNetUnit, LoRAUnit,
         default='CYCLES'
     )
     bpy.types.WindowManager.sg_queue_gif_interpolation = bpy.props.EnumProperty(
+        description=ORBIT_HELP['interpolation'],
         name="Rotation Curve",
         items=[
             ('LINEAR', "Linear", "Constant rotation speed throughout the orbit"),
@@ -234,6 +238,7 @@ def register_properties(update_model_list, ControlNetUnit, LoRAUnit,
         default='LINEAR'
     )
     bpy.types.WindowManager.sg_queue_gif_use_hdri = bpy.props.BoolProperty(
+        description=ORBIT_HELP['use_hdri'],
         name="HDRI Environment", default=False
     )
     bpy.types.WindowManager.sg_queue_gif_hdri_path = bpy.props.StringProperty(
@@ -248,19 +253,22 @@ def register_properties(update_model_list, ControlNetUnit, LoRAUnit,
         default=1.0, min=0.01, max=10.0,
     )
     bpy.types.WindowManager.sg_queue_gif_hdri_rotation = bpy.props.FloatProperty(
+        description=ORBIT_HELP['hdri_rotation'],
         name="HDRI Rotation", default=0.0, min=0.0, max=360.0, subtype='ANGLE'
     )
     bpy.types.WindowManager.sg_queue_gif_env_mode = bpy.props.EnumProperty(
+        description=ORBIT_HELP['env_mode'],
         name="Environment Mode",
         items=[
             ('FIXED', "Fixed", "HDRI stays in place while the camera orbits"),
             ('LOCKED', "Locked", "HDRI rotates with the camera to keep lighting consistent"),
             ('COUNTER', "Counter-Rotate", "HDRI rotates opposite to the camera for dynamic lighting"),
-            ('ENV_ONLY', "Environment Only", "Render only the HDRI environment without the object"),
+            ('ENV_ONLY', "Environment Only", "Camera stays fixed while the HDRI rotates around the model"),
         ],
         default='FIXED'
     )
     bpy.types.WindowManager.sg_queue_gif_denoiser = bpy.props.BoolProperty(
+        description=ORBIT_HELP['use_denoiser'],
         name="Denoise", default=True
     )
     bpy.types.WindowManager.sg_queue_gif_use_gpu = bpy.props.BoolProperty(
@@ -295,23 +303,19 @@ def register_properties(update_model_list, ControlNetUnit, LoRAUnit,
     # ── Core generation properties ─────────────────────────────────────
     bpy.types.Scene.comfyui_prompt = bpy.props.StringProperty(
         name="ComfyUI Prompt",
-        description="Text prompt for generation (also used for texturing unless a separate texture prompt is provided)",
+        description="Describe the intended appearance. TRELLIS.2 Prompt input first generates a mesh-guidance image; diffusion textures reuse this prompt unless Separate texture prompt is enabled. With Image input, mesh shape follows the selected image.",
         default="gold cube",
         update=update_parameters
     )
     bpy.types.Scene.use_separate_texture_prompt = bpy.props.BoolProperty(
         name="Use Separate Texture Prompt",
-        description="Use a dedicated TRELLIS.2 texturing prompt instead of reusing the mesh image prompt",
+        description="Use a dedicated TRELLIS.2 diffusion-texturing prompt instead of the shared mesh image prompt. This does not change the prompt used to generate the mesh-guidance image.",
         default=False,
         update=update_parameters
     )
     bpy.types.Scene.texture_prompt = bpy.props.StringProperty(
         name="Texture Prompt",
-        description="Prompt used for the per-camera texturing step. "
-                    "Avoid view-specific details here (e.g. 'logo on the front') — "
-                    "this prompt is applied from every camera angle. "
-                    "Describe side-specific features in the main prompt or in per-camera prompts instead. "
-                    "When empty, the main prompt is used",
+        description="Prompt for per-camera diffusion textures in TRELLIS.2. Empty reuses the mesh/shared prompt. Put view-specific instructions in each camera’s view prompt; native textures follow the input image.",
         default="",
         update=update_parameters
     )
@@ -323,7 +327,7 @@ def register_properties(update_model_list, ControlNetUnit, LoRAUnit,
     )
     bpy.types.Scene.model_name = bpy.props.EnumProperty(
         name="Model Name",
-        description="Select a checkpoint or diffusion model compatible with the selected architecture",
+        description="Select a model compatible with the chosen generation architecture. Refresh the list after connecting ComfyUI or adding model files.",
         items=update_model_list,
         update=update_parameters
     )
@@ -364,20 +368,20 @@ def register_properties(update_model_list, ControlNetUnit, LoRAUnit,
         update=update_parameters
     )
     bpy.types.Scene.steps = bpy.props.IntProperty(
-        name="Steps",
-        description="Number of denoising steps. Higher values improve detail and coherence but take longer",
+        name="Sampling steps",
+        description="Number of denoising iterations. More steps cost time and do not guarantee better results; suitable values depend on the model.",
         default=8, min=0, max=200,
         update=update_parameters
     )
     bpy.types.Scene.cfg = bpy.props.FloatProperty(
-        name="CFG",
-        description="Classifier-Free Guidance scale. Higher values follow the prompt more strictly but may reduce quality; lower values give more creative freedom",
+        name="Prompt guidance (CFG)",
+        description="Strength of prompt guidance (Classifier-Free Guidance). Higher values usually enforce the prompt more strongly; excessive values can distort colors or detail. Suitable values depend on the model.",
         default=1.5, min=0.0, max=100.0,
         update=update_parameters
     )
     bpy.types.Scene.sampler = bpy.props.EnumProperty(
         name="Sampler",
-        description="Sampler for generation",
+        description="Algorithm used to denoise the image. Results depend on the model, noise schedule and step count; use an architecture-compatible preset as a starting point.",
         items=[
             ('euler', 'Euler', ''),
             ('euler_ancestral', 'Euler A', ''),
@@ -389,8 +393,8 @@ def register_properties(update_model_list, ControlNetUnit, LoRAUnit,
         update=update_parameters
     )
     bpy.types.Scene.scheduler = bpy.props.EnumProperty(
-        name="Scheduler",
-        description="Scheduler for generation",
+        name="Noise schedule",
+        description="Distribution of noise levels across sampling steps. This controls the schedule, while Sampler controls the denoising algorithm.",
         items=[
             ('sgm_uniform', 'SGM Uniform', ''),
             ('karras', 'Karras', ''),
@@ -412,15 +416,13 @@ def register_properties(update_model_list, ControlNetUnit, LoRAUnit,
         default=True, update=update_parameters
     )
     bpy.types.Scene.auto_rescale = bpy.props.BoolProperty(
-        name="Auto Rescale Resolution",
-        description="Automatically rescale resolution to appropriate size for the selected model",
+        name="Fit camera resolution",
+        description="Fit each camera’s generation resolution to the target pixel budget while preserving its aspect ratio and required model alignment.",
         default=True, update=update_parameters
     )
     bpy.types.Scene.qwen_rescale_alignment = bpy.props.BoolProperty(
         name="Qwen Image Edit VL-Aligned Rescale",
-        description="For Qwen Image Edit, align auto-rescaled dimensions to the "
-                    "112px Qwen2.5-VL vision window instead of 8px. Qwen Image "
-                    "2.1 always uses its separate 32px alignment",
+        description="For Qwen Image Edit, align fitted dimensions to the 112-pixel vision window instead of 8 pixels. Qwen Image 2.1 always uses separate 32-pixel alignment.",
         default=True, update=update_parameters
     )
     bpy.types.Scene.qwen_image_21_native_rgba = bpy.props.BoolProperty(
@@ -434,21 +436,9 @@ def register_properties(update_model_list, ControlNetUnit, LoRAUnit,
         update=update_parameters,
     )
     bpy.types.Scene.auto_rescale_target_mp = bpy.props.FloatProperty(
-        name="Target Megapixels",
+        name="Target megapixels",
         description=(
-            "Target total megapixels when auto-rescaling the render resolution.\n\n"
-            "Qwen Image 2.1 automatically aligns the resulting width and height "
-            "to multiples of 32 pixels.\n\n"
-            "Default: 1.0 MP (~1024\u00d71024). This is the native resolution for SDXL "
-            "and the recommended default for Qwen Image Edit.\n\n"
-            "For SDXL / Flux models 1.0 MP is a safe default that matches "
-            "the training resolution. Higher values are possible if your "
-            "model and hardware support it, but may reduce quality or cause "
-            "out-of-memory issues.\n\n"
-            "For Qwen Image Edit the vision encoder becomes unreliable above "
-            "~1.4 MP and the model often fails to follow the prompt above "
-            "~1.2 MP. Values below ~0.3 MP also cause failures.\n\n"
-            "Adjust with care \u2013 staying close to 1.0 MP works best for most setups"
+            "Target pixel budget per camera; 1 MP is about one million pixels. Aspect ratio and model alignment may change the exact total. Higher budgets cost generation time and memory."
         ),
         default=1.0, min=0.1, max=4.0, step=10, precision=2,
         update=update_parameters
@@ -473,14 +463,14 @@ def register_properties(update_model_list, ControlNetUnit, LoRAUnit,
         update=update_parameters
     )
     bpy.types.Scene.ipadapter_start = bpy.props.FloatProperty(
-        name="IPAdapter Start",
-        description="Start percentage for IPAdapter (/100)",
+        name="Start fraction",
+        description="Denoising fraction when conditioning begins: 0 is the start, 1 the end; 0.2 means 20% of the schedule. Keep Start at or below End.",
         default=0.0, min=0.0, max=1.0,
         update=update_parameters
     )
     bpy.types.Scene.ipadapter_end = bpy.props.FloatProperty(
-        name="IPAdapter End",
-        description="End percentage for IPAdapter (/100)",
+        name="End fraction",
+        description="Denoising fraction when conditioning ends: 0 is the start, 1 the end; 0.8 means 80% of the schedule. Keep End at or above Start.",
         default=1.0, min=0.0, max=1.0,
         update=update_parameters
     )
@@ -496,97 +486,95 @@ def register_properties(update_model_list, ControlNetUnit, LoRAUnit,
         update=update_parameters
     )
     bpy.types.Scene.sequential_ipadapter = bpy.props.BoolProperty(
-        name="Use IPAdapter",
-        description="Uses IPAdapter to improve consistency between images.\n\n - Applicable for Separate, Sequential and Refine modes.\n - Uses either the first generated image or the most recent one as a reference for the rest of the images.\n - If 'Regenerate IPAdapter' is enabled, the first viewpoint will be regenerated with IPAdapter to match the rest of the images.\n - If 'Use IPAdapter (External Image)' is enabled, this setting is effectively overriden.",
+        name="Use previous view as reference",
+        description="Use a generated view as a reference to help maintain style across views. SDXL uses IPAdapter; Qwen-family workflows use image-reference conditioning. An external reference can take precedence.",
         default=False, update=update_qwen_prompt_dependencies
     )
     bpy.types.Scene.sequential_ipadapter_mode = bpy.props.EnumProperty(
-        name="IPAdapter Mode",
-        description="Mode for IPAdapter in sequential generation",
+        name="Reference source",
+        description="First uses a stable initial-view anchor; Most recent follows local view continuity but can accumulate color changes.",
         items=_get_ipadapter_mode_items,
         update=update_parameters
     )
     bpy.types.Scene.sequential_desaturate_factor = bpy.props.FloatProperty(
-        name="Desaturate Recent Image",
-        description="Desaturation factor for the 'most recent' image to prevent color stacking. 0.0 is no change, 1.0 is fully desaturated",
+        name="Reference desaturation",
+        description="Reduce saturation before uploading the most recent view as the next reference. 0 preserves saturation; 1 removes it. Saved generated textures are unchanged.",
         default=0.0, min=0.0, max=1.0,
         update=update_parameters
     )
     bpy.types.Scene.sequential_contrast_factor = bpy.props.FloatProperty(
-        name="Reduce Contrast of Recent Image",
-        description="Contrast reduction factor for the 'most recent' image to prevent contrast stacking. 0.0 is no change, 1.0 is maximum reduction (grey)",
+        name="Reference contrast reduction",
+        description="Reduce contrast before uploading the most recent view as the next reference. 0 preserves contrast; 1 gives maximum reduction. Saved generated textures are unchanged.",
         default=0.0, min=0.0, max=1.0,
         update=update_parameters
     )
     bpy.types.Scene.sequential_ipadapter_regenerate = bpy.props.BoolProperty(
         name="Regenerate IPAdapter",
-        description="IPAdapter generations may differ from the original image. This option regenerates the first viewpoint with IPAdapter to match the rest of the images.",
+        description="Regenerate the first view with IPAdapter so its appearance matches the later IPAdapter-conditioned views.",
         default=False, update=update_parameters
     )
     bpy.types.Scene.sequential_ipadapter_regenerate_wo_controlnet = bpy.props.BoolProperty(
         name="Generate IPAdapter reference without ControlNet",
-        description="Generate the first viewpoint with IPAdapter without ControlNet. This is useful for generating a reference image that is not affected by ControlNet. Can possibly generate higher quality reference.",
+        description="Generate the initial IPAdapter reference without ControlNet conditioning. This can change its appearance and weaken geometry adherence.",
         default=False, update=update_parameters
     )
 
     # ── Generation method ──────────────────────────────────────────────
     bpy.types.Scene.generation_method = bpy.props.EnumProperty(
-        name="Generation Mode",
-        description="Choose the mode for generating images",
+        name="Texture workflow",
+        description="Choose how to create or update textures. Generate new views, refine existing outputs, blend local edits, edit painted selections, or inpaint UV textures using the available workflows.",
         items=[
-            ('separate', 'Generate Separately', 'Generates images one by one for each viewpoint. Each image is generated independently using only its own control signals (e.g., depth map) without context from other views. All images are applied at the end.'),
-            ('sequential', 'Generate Sequentially', 'Generates images viewpoint by viewpoint. After the first view, each subsequent view is generated using inpainting, guided by a visibility mask and an RGB render of the texture projected from previous viewpoints to maintain consistency.'),
-            ('grid', 'Generate Using Grid', 'Combines control signals from all viewpoints into a single grid, generates a single image, then splits it back into individual viewpoint textures. Faster but lower resolution per view. Includes an optional second pass to refine each split image individually at full resolution for improved quality.'),
-            ('refine', 'Refine/Restyle Texture (Img2Img)', 'Uses the current rendered texture appearance as input for an img2img generation pass. Replaces the previous material with the new result. Good for restyling or globally changing the look of an existing texture. Works on any existing material setup.'),
-            ('local_edit', 'Local Edit', 'Make localized changes to an existing texture. Point cameras at areas you want to modify — the new generation blends over the original using angle and vignette-based feathering, preserving untouched areas. Works only with StableGen generated textures.'),
-            ('masked_edit', 'Masked Edit', 'Paint a selection directly on the 3D model, edit it through existing cameras, then Apply or Discard the projected result.'),
-            ('uv_inpaint', 'UV Inpaint Missing Areas', 'Identifies untextured areas on a standard UV map using a visibility calculation. Performs baking if not baked already. Performs diffusion inpainting directly on the UV texture map to fill only these missing regions, using the surrounding texture as context.'),
+            ('separate', 'Generate Separately', "Generate camera images independently rather than using earlier projected views as context"),
+            ('sequential', 'Generate Sequentially', "Generate one camera at a time, using earlier views as projected context for later views"),
+            ('grid', 'Generate Using Grid', "Generate views together as a grid, then split the result into camera images; an optional refinement pass can process each view"),
+            ('refine', 'Refine/Restyle Texture (Img2Img)', "Modify existing generated camera images with the current prompt and refinement settings"),
+            ('local_edit', 'Local Edit', "Generate modifications from existing views and blend them over the existing projection"),
+            ('masked_edit', 'Masked Edit', "Paint a selection in camera views, then generate changes within its prepared edit mask"),
+            ('uv_inpaint', 'UV Inpaint Missing Areas', "Bake and inpaint texture images in UV space rather than generating ordinary camera projections"),
         ],
         default='sequential',
         update=update_parameters
     )
     bpy.types.Scene.qwen_generation_method = bpy.props.EnumProperty(
-        name="Generation Mode",
-        description="Choose the mode for generating images with Qwen",
+        name="Texture workflow",
+        description="Choose how to create or update textures. Generate new views, refine existing outputs, blend local edits, edit painted selections, or inpaint UV textures using the available workflows.",
         items=[
-            ('generate', 'Generate', 'Standard generation mode'),
-            ('refine', 'Refine', 'Refine/restyle the entire texture using Qwen Image Edit. Replaces the existing material with the new result. Describe the desired look in the prompt — you can completely change the style, color scheme, or overall appearance.'),
-            ('local_edit', 'Local Edit', 'Make targeted changes to specific areas of the texture. Point cameras at what you want to change and describe the edit — you can change colors, add details, sharpen, alter text, or restyle selected parts. Untouched areas are preserved.'),
-            ('masked_edit', 'Masked Edit', 'Paint a selection directly on the 3D model, edit it through existing cameras, then Apply or Discard the projected result.'),
+            ('generate', 'Generate', "Generate new per-camera images using the selected guidance and context settings"),
+            ('refine', 'Refine', "Modify existing generated camera images with the current prompt and refinement settings"),
+            ('local_edit', 'Local Edit', "Generate modifications from existing views and blend them over the existing projection"),
+            ('masked_edit', 'Masked Edit', "Paint a selection in camera views, then generate changes within its prepared edit mask"),
         ],
         default='generate',
         update=update_parameters
     )
     bpy.types.Scene.qwen_refine_use_prev_ref = bpy.props.BoolProperty(
         name="Use Previous Refined View",
-        description="Use the previous modified/refined view output as a second image for reference (Image 2)",
+        description="Include the previously modified view as a style/continuity reference. Reference-image slots depend on the architecture and enabled inputs.",
         default=False, update=update_parameters
     )
     bpy.types.Scene.qwen_refine_use_depth = bpy.props.BoolProperty(
         name="Use Depth Map",
-        description="Include depth map as an additional reference image (Image 3)",
+        description="Include the current view’s depth map as structural guidance. It can help retain shape but may weaken material changes; reference slots depend on the workflow.",
         default=False, update=update_parameters
     )
     bpy.types.Scene.qwen_timestep_zero_ref = bpy.props.BoolProperty(
         name="Timestep-Zero References",
-        description="Tell the model that reference images are fully clean (timestep 0) instead of noisy. "
-                    "Reduces color shift and over-saturation, especially with Qwen 2511. "
-                    "Requires the FluxKontextMultiReferenceLatentMethod node in ComfyUI",
+        description="Treat compatible reference latents as clean rather than noisy to reduce repeated color changes. Requires the corresponding ComfyUI reference-latent node; applicability depends on the architecture.",
         default=False, update=update_parameters
     )
 
     # ── Refine settings ────────────────────────────────────────────────
     bpy.types.Scene.refine_images = bpy.props.BoolProperty(
-        name="Refine Images",
-        description="Refine images after generation",
+        name="Refine generated views",
+        description="Run a second refinement pass on generated views using the settings below. Adds generation time.",
         default=False, update=update_parameters
     )
     bpy.types.Scene.refine_steps = bpy.props.IntProperty(
-        name="Refine Steps", description="Number of steps for refining",
+        name="Sampling steps", description="Number of denoising iterations. More steps cost time and do not guarantee better results; suitable values depend on the model.",
         default=8, min=0, max=200, update=update_parameters
     )
     bpy.types.Scene.refine_sampler = bpy.props.EnumProperty(
-        name="Refine Sampler", description="Sampler for refining",
+        name="Refine Sampler", description="Algorithm used to denoise the image. Results depend on the model, noise schedule and step count; use an architecture-compatible preset as a starting point.",
         items=[
             ('euler', 'Euler', ''),
             ('euler_ancestral', 'Euler A', ''),
@@ -597,7 +585,7 @@ def register_properties(update_model_list, ControlNetUnit, LoRAUnit,
         default='dpmpp_2s_ancestral', update=update_parameters
     )
     bpy.types.Scene.refine_scheduler = bpy.props.EnumProperty(
-        name="Refine Scheduler", description="Scheduler for refining",
+        name="Noise schedule", description="Distribution of noise levels across sampling steps. This controls the schedule, while Sampler controls the denoising algorithm.",
         items=[
             ('sgm_uniform', 'SGM Uniform', ''),
             ('karras', 'Karras', ''),
@@ -608,20 +596,20 @@ def register_properties(update_model_list, ControlNetUnit, LoRAUnit,
         default='sgm_uniform', update=update_parameters
     )
     bpy.types.Scene.denoise = bpy.props.FloatProperty(
-        name="Denoise", description="Denoise level for refining",
+        name="Edit strength", description="Amount of denoising applied to the existing image. Lower values preserve more of its appearance; higher values allow larger changes.",
         default=0.8, min=0.0, max=1.0, update=update_parameters
     )
     bpy.types.Scene.refine_cfg = bpy.props.FloatProperty(
-        name="Refine CFG", description="Classifier-Free Guidance scale for refining",
+        name="Prompt guidance (CFG)", description="Strength of prompt guidance (Classifier-Free Guidance). Higher values usually enforce the prompt more strongly; excessive values can distort colors or detail. Suitable values depend on the model.",
         default=1.5, min=0.0, max=100.0, update=update_parameters
     )
     bpy.types.Scene.refine_prompt = bpy.props.StringProperty(
         name="Refine Prompt",
-        description="Prompt for refining (leave empty to use same prompt as generation)",
+        description="Prompt for the additional refinement pass. Empty reuses the main generation prompt.",
         default="", update=update_parameters
     )
     bpy.types.Scene.refine_upscale_method = bpy.props.EnumProperty(
-        name="Refine Upscale Method", description="Upscale method for refining",
+        name="Refine Upscale Method", description="Resampling method when resizing images for the additional refinement pass.",
         items=[
             ('nearest-exact', 'Nearest Exact', ''),
             ('bilinear', 'Bilinear', ''),
@@ -679,23 +667,23 @@ def register_properties(update_model_list, ControlNetUnit, LoRAUnit,
         default=90.0, min=0.0, max=180.0, update=update_parameters
     )
     bpy.types.Scene.discard_factor_generation_only = bpy.props.BoolProperty(
-        name="Reset Discard Angle After Generation",
-        description="If enabled, the 'Discard Factor' will be reset to a specified value after generation completes. Useful for sequential/Qwen modes where a low discard angle is needed during generation but not for final blending",
+        name="Resets",
+        description="Reset the projected material’s discard angle after generation using the value below. Generation keeps using the main angle; generated image pixels are unchanged.",
         default=False, update=update_parameters
     )
     bpy.types.Scene.discard_factor_after_generation = bpy.props.FloatProperty(
-        name="Discard Factor After Generation",
-        description="The value to set the 'Discard Factor' to after generation is complete",
+        name="Reset angle (°)",
+        description="Discard angle applied to the material when the angle reset is enabled. This controls the post-generation projection, not the generated image pixels.",
         default=90.0, min=0.0, max=180.0, update=update_parameters
     )
     bpy.types.Scene.weight_exponent_generation_only = bpy.props.BoolProperty(
-        name="Reset Exponent After Generation",
-        description="If enabled, the Weight Exponent will be reset to a specified value after generation completes. Useful for Voronoi projection mode where a high exponent produces sharp segmentation during generation but softer blending is preferred for the final result",
+        name="Resets",
+        description="Reset the projected material’s view exponent after generation using the value below. Generation keeps using the main exponent; generated image pixels are unchanged.",
         default=False, update=update_parameters
     )
     bpy.types.Scene.weight_exponent_after_generation = bpy.props.FloatProperty(
-        name="Exponent After Generation",
-        description="The value to set the Weight Exponent to after generation is complete",
+        name="Reset exponent",
+        description="View-weight exponent applied to the material when the exponent reset is enabled. Higher values favor the dominant view more sharply.",
         default=15.0, min=0.01, max=1000.0, update=update_parameters
     )
     bpy.types.Scene.view_blend_use_color_match = bpy.props.BoolProperty(
@@ -722,15 +710,13 @@ def register_properties(update_model_list, ControlNetUnit, LoRAUnit,
         default=1.0, min=0.0, max=2.0, update=update_parameters,
     )
     bpy.types.Scene.weight_exponent = bpy.props.FloatProperty(
-        name="Weight Exponent",
-        description="Controls the falloff curve for viewpoint weighting based on the angle to the surface normal (\u03b8). "
-                    "Weight = |cos(\u03b8)|^Exponent. Higher values prioritize straight-on views more strongly, creating sharper transitions. "
-                    "1.0 = standard |cos(\u03b8)| weighting.",
+        name="View weight exponent",
+        description="Sharpen view preference: higher values favor stronger camera weights more sharply; lower values blend views more evenly. Guard feather interaction depends on Feather method.",
         default=3.0, min=0.1, max=1000.0, update=update_parameters
     )
     bpy.types.Scene.allow_modify_existing_textures = bpy.props.BoolProperty(
-        name="Allow modifying existing textures",
-        description="Disconnect compare node in export_visibility so that smooth output is not pure 1 areas",
+        name="Allow updating textured areas",
+        description="Allow UV inpainting to update partly covered texture areas rather than restricting edits to the strict uncovered-area mask. Existing texture may change.",
         default=False, update=update_parameters
     )
     bpy.types.Scene.ask_object_prompts = bpy.props.BoolProperty(
@@ -747,13 +733,13 @@ def register_properties(update_model_list, ControlNetUnit, LoRAUnit,
 
     # ── Sequential / masking / inpainting ──────────────────────────────
     bpy.types.Scene.sequential_smooth = bpy.props.BoolProperty(
-        name="Sequential Smooth",
-        description="Use smooth visibility map for sequential generation mode. Disabling this uses a binary visibility map and may need more mask blurring to reduce artifacts.\n\n - Visibility map is a mask that indicates which pixels have textures already projected from previous viewpoints.\n - Both methods are using weights which are calculated based on the angle between the surface normal and the camera view direction.\n - 'Smooth' uses these calculated weights directly (0.0-1.0 range, giving gradual transitions). The transition point can be further tuned by the 'Smooth Factor' parameters.\n - Disabling 'Smooth' thresholds these weights to create a hard-edged binary mask (0.0 or 1.0).",
+        name="Smooth previous-view coverage",
+        description="Use a gradual previous-view coverage mask instead of binary coverage. Low and high points control its transition. The downstream repair mask may invert this signal.",
         default=True, update=update_parameters
     )
     bpy.types.Scene.weight_exponent_mask = bpy.props.BoolProperty(
-        name="Weight Exponent Mask",
-        description="Use weight exponent for visibility map generation. Uses 1.0 if disabled.",
+        name="Apply view exponent to visibility mask",
+        description="Use the view-weight exponent when estimating previous-view coverage for the visibility mask. Disable to use exponent 1 for this mask; RGB blending keeps its own exponent.",
         default=False, update=update_parameters
     )
     bpy.types.Scene.canny_threshold_low = bpy.props.IntProperty(
@@ -765,59 +751,57 @@ def register_properties(update_model_list, ControlNetUnit, LoRAUnit,
         default=80, min=0, max=255, update=update_parameters
     )
     bpy.types.Scene.sequential_factor_smooth = bpy.props.FloatProperty(
-        name="Smooth Visibility Black Point",
-        description="Controls the black point (start) of the Color Ramp used for the smooth visibility mask in sequential mode. Defines the weight threshold below which areas are considered fully invisible/untextured from previous views. Higher values create a sharper transition start.",
+        name="Coverage low point",
+        description="Coverage weights at or below this value map to 0 before repair-mask inversion. Keep this below Coverage high point; increasing it reduces the fully covered region.",
         default=0.15, min=0.0, max=1.0, update=update_parameters
     )
     bpy.types.Scene.sequential_factor_smooth_2 = bpy.props.FloatProperty(
-        name="Smooth Visibility White Point",
-        description="Controls the white point (end) of the Color Ramp used for the smooth visibility mask in sequential mode. Defines the weight threshold above which areas are considered fully visible/textured from previous views. Lower values create a sharper transition end.",
+        name="Coverage high point",
+        description="Coverage weights at or above this value map to 1 before repair-mask inversion. Keep this above Coverage low point; lowering it classifies more pixels as fully covered.",
         default=1.0, min=0.0, max=1.0, update=update_parameters
     )
     bpy.types.Scene.sequential_factor = bpy.props.FloatProperty(
-        name="Binary Visibility Threshold",
-        description="Threshold value used when 'Sequential Smooth' is OFF. Calculated visibility weights below this value are treated as 0 (invisible), and those above as 1 (visible), creating a hard-edged binary mask.",
+        name="Full-visibility tolerance",
+        description="Tolerance around full visibility (weight 1), used when Smooth Visibility Map is off. Larger values accept more partially covered pixels as fully covered.",
         default=0.7, min=0.0, max=1.0, update=update_parameters
     )
     bpy.types.Scene.differential_noise = bpy.props.BoolProperty(
-        name="Differential Noise",
-        description="Adds latent noise mask to the image before inpainting. This must be used with low factor smooth mask or with a high blur mask radius. Disabling this effectively discrads the mask and only uses the inapaint conditioning.",
+        name="Use latent noise mask",
+        description="Apply a latent noise mask to restrict where sampling introduces noise. Disable to keep inpaint conditioning without that additional noise restriction.",
         default=True, update=update_parameters
     )
     bpy.types.Scene.grow_mask_by = bpy.props.IntProperty(
-        name="Grow Mask By", description="Grow mask by this amount (ComfyUI)",
+        name="Mask expansion (px)", description="Expand the editable mask outward by this many image pixels before sampling.",
         default=3, min=0, update=update_parameters
     )
     bpy.types.Scene.mask_blocky = bpy.props.BoolProperty(
-        name="Blocky Visibility Map",
-        description="Uses a blocky visibility map. This will downscale the visibility map according to the 8x8 grid which Stable Diffusion uses in latent space. Highly experimental.",
+        name="Align mask to latent grid",
+        description="Align the visibility mask to the 8×8 latent grid used by this Stable Diffusion workflow. Experimental; it does not describe every architecture’s latent layout.",
         default=False, update=update_parameters
     )
     bpy.types.Scene.visibility_vignette = bpy.props.BoolProperty(
-        name="Feather Visibility Edges",
-        description="Blend refinement edges using a vignette mask to reduce seams",
+        name="Image-frame fade",
+        description="Fade refinement near the camera’s image-frame edges. This is separate from geometry-silhouette and DPPG guard feathering; the visibility-mask path also softens mask transitions.",
         default=True, update=update_parameters,
     )
     bpy.types.Scene.visibility_vignette_width = bpy.props.FloatProperty(
-        name="Vignette Width",
-        description="Fraction of the image radius used as a feather band (0 = no feather, 0.5 = very soft edges)",
+        name="Frame fade width",
+        description="Width of the normalized rectangular image-frame fade band. 0 disables the band; larger values reduce the full-strength interior. The visibility-mask path uses this setting for mask blur as well.",
         default=0.15, min=0.0, max=0.5, update=update_parameters,
     )
     bpy.types.Scene.visibility_vignette_softness = bpy.props.FloatProperty(
-        name="Vignette Softness",
-        description="Exponent shaping feather falloff (<1 = sharper transition, >1 = softer/wider transition)",
+        name="Frame fade exponent",
+        description="Shape the image-frame fade: 1 keeps the base curve, above 1 suppresses this view more within the band, below 1 retains more contribution. Fade width sets the band size separately.",
         default=1.0, min=0.1, max=5.0, update=update_parameters,
     )
     bpy.types.Scene.visibility_vignette_blur = bpy.props.BoolProperty(
-        name="Blur Vignette Mask",
-        description="Apply a Gaussian blur to the vignette mask to soften edges",
+        name="Blur frame mask",
+        description="Blur the frame/visibility fade mask to soften its transitions. Does not change the DPPG guard mask.",
         default=False, update=update_parameters,
     )
     bpy.types.Scene.sg_silhouette_margin = bpy.props.IntProperty(
         name="Silhouette Margin",
-        description="Pixel margin around occluder silhouettes where projection is suppressed. "
-                    "With Depth-Aware Margins, controls the farther/background side (e.g. dress behind a hand), not the image backdrop. "
-                    "Also controls the separate baked-visibility silhouette rays. 0 disables this margin; Foreground Margin is separate. Reproject to apply",
+        description="Suppression width on the farther/background surface with Depth-aware margins, such as a dress behind a hand; otherwise protection is symmetric. Generation-image pixels; 0 disables this margin. Reproject to apply.",
         default=3, min=0, max=20, update=update_parameters,
     )
     bpy.types.Scene.sg_allow_backface_projection = bpy.props.BoolProperty(
@@ -826,14 +810,14 @@ def register_properties(update_model_list, ControlNetUnit, LoRAUnit,
         default=TEXTURING_DEFAULTS["sg_allow_backface_projection"], update=update_parameters,
     )
     bpy.types.Scene.sg_silhouette_feather = bpy.props.IntProperty(
-        name="Silhouette Feather",
-        description="DPPG transition width beyond the rejected margin, in generation-image pixels. Feather Method controls interaction with the blending exponent. 0 restores the hard guard. Reproject to update",
+        name="Guard feather width (px)",
+        description="Transition width beside a DPPG rejection boundary, in generation-image pixels. 0 gives a hard guard; the method controls interaction with view sharpening. Reproject to update.",
         default=TEXTURING_DEFAULTS['sg_silhouette_feather'], min=0, max=128,
         update=update_parameters,
     )
     bpy.types.Scene.sg_projection_guard_scale = bpy.props.EnumProperty(
-        name="Guard Resolution",
-        description="Render DPPG masks at higher resolution to reduce jagged edges. Margin and feather retain their size in generation-image pixels; guidance images keep their original dimensions. Reproject to update",
+        name="Guard render scale",
+        description="Render guard masks at higher resolution to reduce raster jaggedness. Margins and feather stay in generation-image pixels. Higher scales cost render time and memory. Reproject to update.",
         items=[('1', '1\u00d7', 'Generation resolution'),
                ('2', '2\u00d7', 'Double width and height'),
                ('4', '4\u00d7', 'Quadruple width and height; uses more memory')],
@@ -841,22 +825,22 @@ def register_properties(update_model_list, ControlNetUnit, LoRAUnit,
     )
     bpy.types.Scene.sg_guard_directional = bpy.props.BoolProperty(
         name="Depth-Aware Margins",
-        description="Reject farther surfaces behind depth boundaries more strongly than the visible foreground. Boundaries with no clear depth order retain symmetric part protection. Reproject to apply",
+        description="Apply separate margins to nearer and farther surfaces where depth order is clear. Boundaries without clear depth ordering retain symmetric protection. Reproject to apply.",
         default=TEXTURING_DEFAULTS['sg_guard_directional'], update=update_parameters,
     )
     bpy.types.Scene.sg_guard_foreground_margin = bpy.props.IntProperty(
-        name="Foreground Margin",
-        description="Rejection margin on the nearer side of a depth boundary, in generation-image pixels. 0 preserves visible foreground such as the chin or a hand. Silhouette Margin controls the farther side. Reproject to apply",
+        name="Foreground margin (px)",
+        description="Suppression width on the nearer side of a depth boundary, in generation-image pixels. 0 preserves visible foreground, such as a chin or hand. Background margin controls the farther side. Reproject to apply.",
         default=TEXTURING_DEFAULTS['sg_guard_foreground_margin'], min=0, max=128, update=update_parameters,
     )
     bpy.types.Scene.sg_guard_coverage_rescue = bpy.props.FloatProperty(
         name="Coverage Rescue",
-        description="Ease DPPG rejection when the best remaining trusted view falls below this fraction of the original best view quality. 0 keeps legacy rejection; 0.25 requires at least 25% quality for full rejection. Visibility and image alpha remain enforced. Reproject to apply",
+        description="Relax guard rejection when only much weaker views remain. 0 disables rescue; larger values trigger it more readily. The value is the remaining-to-original best-view quality ratio needed for full rejection. Visibility and image alpha remain enforced. Reproject to apply.",
         default=TEXTURING_DEFAULTS['sg_guard_coverage_rescue'], min=0, max=1, update=update_parameters,
     )
     bpy.types.Scene.sg_guard_feather_method = bpy.props.EnumProperty(
-        name="Feather Method",
-        description="How DPPG feathering interacts with camera-weight sharpening. Reproject to apply",
+        name="Guard feather method",
+        description="How guard-boundary feathering interacts with view sharpening. Does not blur every camera transition. Surface Blend is a mesh-density-dependent preview for base projection only. Reproject to apply.",
         items=[('ORIGINAL', 'Original', 'Multiply sharpened weights by the feather; the exponent still affects the final transition'),
                ('LOCAL_UNSHARPEN', 'Local Unsharpen', 'Use unsharpened weights throughout the feather band, smoothly restoring the exponent farther inside safe regions'),
                ('BOUNDARY_CROSSFADE', 'Boundary Crossfade', 'Crossfade between normalized camera combinations as masks fade; the exponent controls each combination, not the crossfade curve'),
@@ -867,23 +851,23 @@ def register_properties(update_model_list, ControlNetUnit, LoRAUnit,
     # Scene values remain serializable. Research switches are gated at runtime
     # by the addon preference; CGC/AQW/DPPG are ordinary controls.
     bpy.types.Scene.sg_rework_aligned_resolution = bpy.props.BoolProperty(
-        name="Improved Aligned Resolution",
-        description="Use the new joint aspect/megapixel/alignment resolution search instead of legacy proportional rounding",
+        name="Joint resolution fitting",
+        description="Choose camera dimensions jointly for aspect ratio, pixel budget and model alignment instead of proportionally rounding each dimension.",
         default=TEXTURING_DEFAULTS["sg_rework_aligned_resolution"], update=update_parameters,
     )
     bpy.types.Scene.sg_rework_full_resolution_scale = bpy.props.BoolProperty(
-        name="Force 100% Guide Resolution",
-        description="Temporarily force Blender resolution percentage to 100 so guides and Qwen inputs match the configured pixel dimensions",
+        name="Use full guide resolution",
+        description="Temporarily set Blender’s render resolution percentage to 100 so guidance images use the configured pixel dimensions.",
         default=TEXTURING_DEFAULTS["sg_rework_full_resolution_scale"], update=update_parameters,
     )
     bpy.types.Scene.sg_rework_acquisition_quality = bpy.props.BoolProperty(
-        name="Acquisition Quality Weighting",
-        description="Weight views using projected density and source-camera acquisition quality in addition to legacy visibility/frontality",
+        name="Weight by view quality",
+        description="Prefer views that observe the surface more directly and with more projected detail. Estimates geometric observation quality, not the artistic quality of generated images.",
         default=TEXTURING_DEFAULTS["sg_rework_acquisition_quality"], update=update_parameters,
     )
     bpy.types.Scene.sg_rework_projection_guard = bpy.props.BoolProperty(
         name="Depth/Part Projection Guard",
-        description="Reject projection near depth, object-ID, and material-ID discontinuities to reduce foreground silhouettes on rear surfaces",
+        description="Reduce projection near depth and object/material boundaries to prevent foreground colors spilling onto surfaces behind them. DPPG controls source acceptance separately from ordinary view weighting.",
         default=TEXTURING_DEFAULTS["sg_rework_projection_guard"], update=update_parameters,
     )
     bpy.types.Scene.qwen_global_style_vlm_only = bpy.props.BoolProperty(
@@ -897,8 +881,8 @@ def register_properties(update_model_list, ControlNetUnit, LoRAUnit,
         default=TEXTURING_DEFAULTS["qwen_context_vlm_only"], update=update_parameters,
     )
     bpy.types.Scene.qwen_latent_locked_context = bpy.props.BoolProperty(
-        name="Latent-Locked Context Inpainting",
-        description="For later sequential Qwen views, initialize the sampler from the RGB context render and use the exported visibility repair mask as a latent noise mask. White/repair pixels denoise; black/trusted pixels are restored after every sampling step",
+        name="Lock reliable context during sampling",
+        description="Keep reliable context fixed during later sequential Qwen sampling. Repair pixels receive denoising; trusted pixels are restored after each sampling step. Experimental.",
         default=TEXTURING_DEFAULTS["qwen_latent_locked_context"], update=update_parameters,
     )
     bpy.types.Scene.qwen_latent_lock_neutral_fill = bpy.props.BoolProperty(
@@ -907,13 +891,13 @@ def register_properties(update_model_list, ControlNetUnit, LoRAUnit,
         default=TEXTURING_DEFAULTS["qwen_latent_lock_neutral_fill"], update=update_parameters,
     )
     bpy.types.Scene.sg_rework_final_display = bpy.props.BoolProperty(
-        name="Continuous Final Display Rebuild",
-        description="After sequential generation, rebuild the final material without generation-only binary Qwen write masks so it matches Reproject",
+        name="Rebuild final projection",
+        description="Rebuild the material after sequential generation without generation-only binary write masks, so the final display matches Reproject.",
         default=TEXTURING_DEFAULTS["sg_rework_final_display"], update=update_parameters,
     )
     bpy.types.Scene.sg_silhouette_depth = bpy.props.FloatProperty(
         name="Silhouette Depth",
-        description="Legacy Blender-unit depth threshold unless Projection Geometry Corrections is enabled, where it is interpreted relative to model scale",
+        description="Minimum depth change used to separate foreground from background. Higher values ignore smaller depth changes. Image masks use normalized depth; baked visibility uses a model-scale-relative tolerance. Reproject to update.",
         default=0.05, min=0.001, max=1.0, step=1, precision=3, update=update_parameters,
     )
     bpy.types.Scene.sg_silhouette_rays = bpy.props.EnumProperty(
@@ -928,43 +912,43 @@ def register_properties(update_model_list, ControlNetUnit, LoRAUnit,
 
     # ── Refine mode ramp controls ──────────────────────────────────────
     bpy.types.Scene.refine_angle_ramp_active = bpy.props.BoolProperty(
-        name="Use Angle Ramp", description="Blend refinement based on surface angle",
+        name="Use Angle Ramp", description="Control how much the edited projection contributes at different surface-view angles. The low/high points shape this contribution ramp.",
         default=True, update=update_parameters
     )
     bpy.types.Scene.refine_angle_ramp_pos_0 = bpy.props.FloatProperty(
-        name="Angle Ramp Black Point", description="Position of the black point (Invisible) for the angle ramp",
+        name="Angle ramp low point", description="Lower end of the angle contribution ramp, mapped to zero contribution. Keep below the high point.",
         default=0.0, min=0.0, max=1.0, update=update_parameters
     )
     bpy.types.Scene.refine_angle_ramp_pos_1 = bpy.props.FloatProperty(
-        name="Angle Ramp White Point", description="Position of the white point (Visible) for the angle ramp",
+        name="Angle ramp high point", description="Upper end of the angle contribution ramp, mapped to full contribution. Keep above the low point.",
         default=0.05, min=0.0, max=1.0, update=update_parameters
     )
     bpy.types.Scene.refine_feather_ramp_pos_0 = bpy.props.FloatProperty(
-        name="Feather Ramp Black Point", description="Position of the black point (Invisible) for the feather ramp",
+        name="Frame ramp low point", description="Frame-fade values at or below this point give zero contribution. Keep below the high point.",
         default=0.0, min=0.0, max=1.0, update=update_parameters
     )
     bpy.types.Scene.refine_feather_ramp_pos_1 = bpy.props.FloatProperty(
-        name="Feather Ramp White Point", description="Position of the white point (Visible) for the feather ramp",
+        name="Frame ramp high point", description="Frame-fade values at or above this point give full contribution. Keep above the low point.",
         default=0.6, min=0.0, max=1.0, update=update_parameters
     )
     bpy.types.Scene.refine_edge_feather_projection = bpy.props.BoolProperty(
-        name="Edge Feather (Projection)",
-        description="Add a screen-space distance-transform ramp at the projection silhouette boundary as an additional multiplier on top of the angle\u00d7feather weight. Interior surfaces keep full strength; only the geometric edge is softened",
+        name="Projection silhouette fade",
+        description="Fade projection beside the projected geometry silhouette using a screen-space distance ramp. Interior surfaces keep full strength; image-frame fade and guard feather are separate.",
         default=True, update=update_parameters
     )
     bpy.types.Scene.refine_edge_feather_width = bpy.props.IntProperty(
-        name="Edge Feather Width",
-        description="Width in pixels of the transition band at projection boundaries. Larger values produce a wider blend zone",
+        name="Silhouette fade width (px)",
+        description="Width of the projection-silhouette transition in image pixels. Larger values soften a wider band.",
         default=30, min=1, max=200, update=update_parameters
     )
     bpy.types.Scene.refine_edge_feather_softness = bpy.props.FloatProperty(
-        name="Edge Feather Softness",
-        description="Rounds off the sharp corners at both ends of the linear feather ramp using a Gaussian blur. 0 = raw linear ramp (hard kinks at edge and interior boundary). 1 = moderate smoothing. Higher values give progressively gentler transitions without shifting the ramp position",
+        name="Silhouette ramp smoothing",
+        description="Smooth the corners of the silhouette fade ramp. 0 keeps the linear ramp; higher values soften its change in slope without shifting the configured boundary.",
         default=1.0, min=0.0, max=5.0, step=10, precision=2, update=update_parameters
     )
     bpy.types.Scene.differential_diffusion = bpy.props.BoolProperty(
         name="Differential Diffusion",
-        description="Replace standard inpainting with a differential diffusion based workflow\n\n - Generally works better and reduces artifacts.\n - Using a Smooth Visibilty Map is recommended for Sequential Mode.",
+        description="Vary denoising according to the mask strength rather than using only a hard selection. Gradual visibility masks can provide smoother transitions.",
         default=True, update=update_parameters
     )
     bpy.types.Scene.blur_mask = bpy.props.BoolProperty(
@@ -972,11 +956,11 @@ def register_properties(update_model_list, ControlNetUnit, LoRAUnit,
         default=True, update=update_parameters
     )
     bpy.types.Scene.blur_mask_radius = bpy.props.IntProperty(
-        name="Blur Mask Radius", description="Radius for mask blurring (ComfyUI)",
+        name="Mask blur radius (px)", description="Radius of the mask-blur neighborhood, in image pixels. Larger values spread the transition farther.",
         default=1, min=1, max=31, update=update_parameters
     )
     bpy.types.Scene.blur_mask_sigma = bpy.props.FloatProperty(
-        name="Blur Mask Sigma", description="Sigma for mask blurring (ComfyUI)",
+        name="Mask blur sigma", description="Falloff of the Gaussian mask blur. Higher sigma spreads smoothing more evenly within the blur neighborhood.",
         default=1.0, min=0.1, update=update_parameters
     )
     bpy.types.Scene.sequential_custom_camera_order = bpy.props.StringProperty(
@@ -985,13 +969,13 @@ def register_properties(update_model_list, ControlNetUnit, LoRAUnit,
         default="", update=update_parameters
     )
     bpy.types.Scene.clip_skip = bpy.props.IntProperty(
-        name="CLIP Skip", description="CLIP skip value for generation",
+        name="CLIP layer skip", description="CLIP text-encoder layer used for prompt conditioning. 1 uses the usual final layer; larger values use earlier layers. Follow the selected checkpoint’s requirements.",
         default=1, min=1, update=update_parameters
     )
 
     # ── Presets ────────────────────────────────────────────────────────
     bpy.types.Scene.stablegen_preset = bpy.props.EnumProperty(
-        name="Preset", description="Select a preset for easy mode",
+        name="Preset", description="Apply a saved configuration for this architecture. Presets change several generation and blending settings. Custom indicates manual settings; Save stores the current configuration.",
         items=get_preset_items, default=1  # DEFAULT; index 0 is the section header.
     )
     bpy.types.Scene.active_preset = bpy.props.StringProperty(
@@ -1093,7 +1077,7 @@ def register_properties(update_model_list, ControlNetUnit, LoRAUnit,
         default=False, update=update_parameters
     )
     bpy.types.Scene.trellis2_coverage_target = bpy.props.FloatProperty(
-        name="Coverage Target", description="Stop adding cameras when this fraction of surface area is visible (Greedy mode)",
+        name="Camera coverage target", description="Fraction of surface area to observe before Greedy Coverage stops adding cameras. 0.9 means 90% coverage, subject to the maximum camera count.",
         default=0.95, min=0.5, max=1.0, subtype='FACTOR', update=update_parameters
     )
     bpy.types.Scene.trellis2_max_auto_cameras = bpy.props.IntProperty(
@@ -1153,8 +1137,8 @@ def register_properties(update_model_list, ControlNetUnit, LoRAUnit,
         default='depth', update=update_parameters
     )
     bpy.types.Scene.qwen_voronoi_mode = bpy.props.BoolProperty(
-        name="Voronoi Projection",
-        description="Instead of zeroing weights of non-generated cameras, keep natural angle-based weights and project magenta from cameras that have not been generated yet. Use a high Weight Exponent to achieve Voronoi-like segmentation where each surface point is dominated by its closest camera. This eliminates the need for low discard-over-angle thresholds",
+        name="Hard view segmentation",
+        description="Keep natural weights for views not generated yet and project their fallback color. A high view exponent produces hard camera-dominated regions based on projection weights, not simply distance to the nearest camera. Angle and guard settings still matter.",
         default=False, update=update_parameters
     )
     bpy.types.Scene.qwen_context_render_mode = bpy.props.EnumProperty(
@@ -1182,7 +1166,7 @@ def register_properties(update_model_list, ControlNetUnit, LoRAUnit,
     )
     bpy.types.Scene.qwen_use_custom_prompts = bpy.props.BoolProperty(
         name="Use Custom Qwen Prompts",
-        description="Legacy custom prompt control retained for saved files and FLUX.2 Klein",
+        description="Override the prepared model instructions used with the shared appearance prompt. Template placeholders insert the main prompt and view wording.",
         default=False, update=update_parameters
     )
     bpy.types.Scene.qwen_prompt_template = bpy.props.EnumProperty(
@@ -1217,65 +1201,65 @@ def register_properties(update_model_list, ControlNetUnit, LoRAUnit,
         update=update_qwen_prompt_field
     )
     bpy.types.Scene.qwen_guidance_fallback_color = bpy.props.FloatVectorProperty(
-        name="Guidance Fallback Color", description="Color used for fallback regions in the Qwen context render",
+        name="Missing-context color", description="Marker color for surface regions lacking reliable context. This is separate from the image background outside the object.",
         subtype='COLOR', default=(1.0, 0.0, 1.0), min=0.0, max=1.0, update=update_parameters
     )
     bpy.types.Scene.qwen_guidance_background_color = bpy.props.FloatVectorProperty(
-        name="Guidance Background Color", description="Background color for the Qwen context render",
+        name="Image background", description="Color outside the object in the Qwen context image. Missing-context color marks unreliable regions on the object itself.",
         subtype='COLOR', default=(1.0, 0.0, 1.0), min=0.0, max=1.0, update=update_parameters
     )
     bpy.types.Scene.qwen_context_cleanup = bpy.props.BoolProperty(
-        name="Use Context Cleanup",
-        description="Replace fallback color in subsequent Qwen renders before projection",
+        name="Legacy fallback cleanup",
+        description="Clean fallback-color residue before projecting subsequent Qwen outputs in the legacy context path. Used when confidence-gated context is off.",
         default=False, update=update_parameters
     )
     bpy.types.Scene.qwen_context_cleanup_hue_tolerance = bpy.props.FloatProperty(
-        name="Cleanup Hue Tolerance", description="Hue tolerance in degrees for identifying fallback regions during cleanup",
+        name="Hue tolerance (°)", description="Hue-matching tolerance in degrees when finding fallback-color residue. Higher values match a wider range of hues.",
         default=5.0, min=0.0, max=180.0, update=update_parameters
     )
     bpy.types.Scene.qwen_context_cleanup_value_adjust = bpy.props.FloatProperty(
-        name="Cleanup Value Adjustment",
-        description="Adjust value (brightness) for cleaned pixels. -1 darkens to black, 1 brightens to white.",
+        name="Brightness adjustment",
+        description="Brightness adjustment applied during legacy fallback cleanup. -1 darkens toward black; 0 preserves brightness; 1 brightens toward white.",
         default=0.0, min=-1.0, max=1.0, update=update_parameters
     )
     bpy.types.Scene.qwen_context_fallback_dilation = bpy.props.IntProperty(
-        name="Fallback Dilation",
-        description="Dilate fallback color regions in the context render before sending to Qwen.",
+        name="Legacy context expansion (px)",
+        description="In the legacy context path, expand missing-context regions by this many image pixels before sending the render to the model. Used when confidence-gated context is off.",
         default=1, min=0, max=64, update=update_parameters
     )
     bpy.types.Scene.qwen_use_confidence_context = bpy.props.BoolProperty(
-        name="Confidence-Gated Context",
-        description="Build an ownership-independent best-source quality field and replace low-quality context with an explicit binary repair mask. Continuous RGB projection blending is preserved",
+        name="Protect reliable context",
+        description="Protect context observed reliably by previous source cameras and mark unreliable regions for regeneration. This confidence decision is separate from the displayed RGB mixture.",
         default=TEXTURING_DEFAULTS["qwen_use_confidence_context"], update=update_parameters,
     )
     bpy.types.Scene.qwen_regularize_context_mask = bpy.props.BoolProperty(
-        name="Regularize Context Boundary",
-        description="Apply island, hole, strip, dilation, and part-aware cleanup to the explicit binary Qwen repair mask",
+        name="Clean repair-mask boundaries",
+        description="Clean fragmented repair-mask boundaries using the island, hole, strip and expansion controls below. Experimental.",
         default=TEXTURING_DEFAULTS["qwen_regularize_context_mask"], update=update_parameters,
     )
     bpy.types.Scene.qwen_trust_threshold = bpy.props.FloatProperty(
-        name="Trusted Source Threshold",
-        description="Minimum original source-camera acquisition quality required before RGB is protected in later Qwen context views",
+        name="Minimum trusted view quality",
+        description="Minimum geometric source-view quality needed to protect existing context. Higher values mark more surface for repair; this is not an artistic image-quality score.",
         default=0.70, min=0.0, max=1.0, update=update_parameters,
     )
     bpy.types.Scene.qwen_mask_min_island_area = bpy.props.IntProperty(
-        name="Minimum Trusted Island",
-        description="Trusted islands smaller than this pixel area become repair; 0 disables",
+        name="Minimum trusted island (px²)",
+        description="Trusted islands smaller than this image-pixel area become repair. 0 disables this cleanup.",
         default=16, min=0, max=65536, update=update_parameters,
     )
     bpy.types.Scene.qwen_mask_min_hole_area = bpy.props.IntProperty(
-        name="Minimum Repair Hole",
-        description="Repair holes smaller than this pixel area are filled back to trusted; 0 disables",
+        name="Minimum repair hole (px²)",
+        description="Repair holes smaller than this image-pixel area become trusted. 0 disables this cleanup.",
         default=8, min=0, max=65536, update=update_parameters,
     )
     bpy.types.Scene.qwen_mask_min_strip_width = bpy.props.IntProperty(
-        name="Minimum Context Strip",
-        description="Remove thin stretched trusted strips narrower than this many pixels",
+        name="Minimum trusted strip (px)",
+        description="Trusted strips narrower than this many image pixels become repair.",
         default=2, min=0, max=64, update=update_parameters,
     )
     bpy.types.Scene.qwen_mask_uncertainty_dilation = bpy.props.IntProperty(
-        name="Repair Uncertainty Dilation",
-        description="Expand repair into uncertain boundary pixels while respecting object and material labels",
+        name="Repair expansion (px)",
+        description="Expand repair around uncertain boundaries by this many image pixels while respecting object/material labels.",
         default=1, min=0, max=64, update=update_parameters,
     )
     bpy.types.Scene.qwen_mask_keep_largest_components = bpy.props.IntProperty(
@@ -1313,7 +1297,7 @@ def register_properties(update_model_list, ControlNetUnit, LoRAUnit,
         description="Stores viewpoint descriptions for each camera"
     )
     bpy.types.Scene.use_camera_prompts = bpy.props.BoolProperty(
-        name="Use Camera Prompts", description="Use camera prompts for generating images",
+        name="Use view prompts", description="Include each camera’s view prompt with the shared generation prompt. Use view prompts for viewing direction or details belonging to that view.",
         default=True, update=update_parameters
     )
     bpy.types.Scene.sg_camera_order = bpy.props.CollectionProperty(
@@ -1384,17 +1368,17 @@ def register_properties(update_model_list, ControlNetUnit, LoRAUnit,
     )
     bpy.types.Scene.early_priority_strength = bpy.props.FloatProperty(
         name="Priority Strength",
-        description="Extra replacement resistance applied only to reliable early-view owners; it never promotes grazing coverage to trusted",
+        description="Replacement resistance for earlier views: higher values make later views replace their colors less readily. Does not change the confidence used to decide which context needs repair.",
         default=0.5, min=0.0, max=1.0, update=update_parameters
     )
     bpy.types.Scene.early_priority = bpy.props.BoolProperty(
-        name="Prioritize Initial Views",
-        description="Anchor already-reliable early-view detail by raising its replacement margin. Poorly observed side texels remain untrusted and replaceable",
+        name="Prioritize earlier views",
+        description="Bias RGB blending toward views generated earlier. This preference does not increase source confidence or protect only reliable views.",
         default=False, update=update_parameters
     )
     bpy.types.Scene.sg_auto_view_sequence = bpy.props.BoolProperty(
-        name="Overlap-Aware View Sequence",
-        description="Order non-custom camera plans through nearby bridge views to reduce angular jumps and context discontinuities",
+        name="Automatic view sequence",
+        description="Order views through nearby overlapping cameras to reduce abrupt viewpoint changes. A custom camera order takes precedence.",
         default=False, update=update_parameters,
     )
     bpy.types.Scene.sg_anchor_camera = bpy.props.StringProperty(
@@ -1579,7 +1563,7 @@ def register_properties(update_model_list, ControlNetUnit, LoRAUnit,
     bpy.types.WindowManager.sg_batch_index = bpy.props.IntProperty(default=0)
     bpy.types.WindowManager.sg_batch_total = bpy.props.IntProperty(default=0)
     bpy.types.Scene.trellis2_resolution = bpy.props.EnumProperty(
-        name="Resolution", description="Model resolution for generation. Higher values use more VRAM",
+        name="Mesh generation resolution", description="Resolution of the mesh-generation representation, not the output texture image. Higher values require more GPU memory.",
         items=[
             ('512', '512', 'Low resolution, fast, less VRAM'),
             ('1024_cascade', '1024 Cascade', 'Medium resolution with cascade (recommended)'),
@@ -1613,39 +1597,37 @@ def register_properties(update_model_list, ControlNetUnit, LoRAUnit,
         default=0, min=0, max=2147483647
     )
     bpy.types.Scene.trellis2_ss_guidance = bpy.props.FloatProperty(
-        name="SS Guidance", description="Sparse structure CFG scale. Higher = stronger adherence to input image",
+        name="Structure guidance", description="Prompt/image guidance strength for the sparse-structure stage, which establishes occupied regions before detailed shape generation.",
         default=7.5, min=1.0, max=20.0, step=10, update=update_parameters
     )
     bpy.types.Scene.trellis2_ss_steps = bpy.props.IntProperty(
-        name="SS Steps", description="Sparse structure sampling steps. More steps = better quality but slower",
+        name="Structure steps", description="Sampling iterations for the sparse-structure stage. More costs time and does not guarantee better geometry.",
         default=12, min=1, max=50, update=update_parameters
     )
     bpy.types.Scene.trellis2_shape_guidance = bpy.props.FloatProperty(
-        name="Shape Guidance", description="Shape CFG scale. Higher = stronger adherence to input image",
+        name="Shape guidance", description="Guidance strength for detailed shape generation from the structure and input image.",
         default=7.5, min=1.0, max=20.0, step=10, update=update_parameters
     )
     bpy.types.Scene.trellis2_shape_steps = bpy.props.IntProperty(
-        name="Shape Steps", description="Shape sampling steps. More steps = better quality but slower",
+        name="Shape steps", description="Sampling iterations for detailed shape generation. More costs time and does not guarantee better geometry.",
         default=12, min=1, max=50, update=update_parameters
     )
     bpy.types.Scene.trellis2_tex_guidance = bpy.props.FloatProperty(
-        name="Texture Guidance", description="Texture CFG scale. Higher = stronger adherence to input image",
+        name="Texture guidance", description="Guidance strength for native texture generation from the input image. Does not control diffusion-based per-camera texturing.",
         default=3.0, min=1.0, max=20.0, step=10, update=update_parameters
     )
     bpy.types.Scene.trellis2_tex_steps = bpy.props.IntProperty(
-        name="Texture Steps", description="Texture sampling steps. More steps = better quality but slower",
+        name="Texture steps", description="Sampling iterations for native texture generation. More costs time and does not guarantee improved texture detail.",
         default=12, min=1, max=50, update=update_parameters
     )
     bpy.types.Scene.trellis2_max_tokens = bpy.props.IntProperty(
-        name="Max Tokens",
-        description="Max sparse-voxel tokens during cascade upsampling (only affects cascade modes). "
-                    "Higher = more detail but more VRAM. Increase to 49152 for maximum detail if VRAM allows",
+        name="Sparse voxel budget",
+        description="Sparse-voxel budget during cascade upsampling, not prompt length. Higher budgets may allow more geometry detail but require more VRAM. Affects cascade modes only.",
         default=49152, min=16384, max=65536, step=4096, update=update_parameters
     )
     bpy.types.Scene.trellis2_texture_size = bpy.props.IntProperty(
-        name="Texture Size",
-        description="Resolution of the UV-baked texture in pixels. Higher values reduce aliasing at UV seams. "
-                    "The native voxel grid is 1024, so values above 1024 interpolate existing data",
+        name="Texture size (px)",
+        description="UV texture image size in pixels. Larger images interpolate the native voxel texture and may reduce raster aliasing; they do not create new underlying model detail.",
         default=4096, min=512, max=8192, step=512, update=update_parameters
     )
     bpy.types.Scene.trellis2_decimation = bpy.props.IntProperty(
@@ -1688,7 +1670,7 @@ def register_properties(update_model_list, ControlNetUnit, LoRAUnit,
     )
     bpy.types.Scene.trellis2_post_processing_enabled = bpy.props.BoolProperty(
         name="Post-Processing",
-        description="Run ComfyUI-side mesh post-processing (decimation + remeshing). Disable to import the raw mesh for manual retopology",
+        description="Apply the selected decimation and remeshing methods after generation. Local methods run in Blender; server methods run in ComfyUI. Disable to import the generated mesh without this processing.",
         default=True, update=update_parameters
     )
     bpy.types.Scene.trellis2_solidify = bpy.props.BoolProperty(
@@ -1780,33 +1762,33 @@ def register_properties(update_model_list, ControlNetUnit, LoRAUnit,
         default='FORTUNE', update=update_parameters,
     )
     bpy.types.Scene.trellis2_autorig_top_k = bpy.props.IntProperty(
-        name="Top K", description="SkinTokens sampling top-k",
+        name="Rig candidate limit (top-k)", description="Maximum number of candidate choices retained during SkinTokens rig sampling. Lower values constrain choices more; this affects rig prediction, not image generation.",
         default=5, min=1, max=200, update=update_parameters
     )
     bpy.types.Scene.trellis2_autorig_top_p = bpy.props.FloatProperty(
-        name="Top P", description="SkinTokens nucleus sampling top-p",
+        name="Rig probability cutoff (top-p)", description="Probability mass retained during SkinTokens rig sampling (0–1). Lower values discard more low-probability choices.",
         default=0.95, min=0.1, max=1.0, step=0.01, update=update_parameters
     )
     bpy.types.Scene.trellis2_autorig_temperature = bpy.props.FloatProperty(
-        name="Temperature", description="SkinTokens sampling temperature",
+        name="Rig sampling temperature", description="Scale of sampling variability for SkinTokens rig prediction. Lower values favor more likely choices; higher values allow more varied choices.",
         default=1.0, min=0.1, max=2.0, step=0.1, update=update_parameters
     )
     bpy.types.Scene.trellis2_autorig_repetition_penalty = bpy.props.FloatProperty(
-        name="Repetition Penalty", description="SkinTokens repetition penalty",
+        name="Repetition Penalty", description="Penalty applied to repeated SkinTokens outputs. 1 is neutral; larger values discourage repetition. This affects rig prediction, not texture appearance.",
         default=2.0, min=0.5, max=3.0, step=0.1, update=update_parameters
     )
     bpy.types.Scene.trellis2_autorig_num_beams = bpy.props.IntProperty(
-        name="Beams", description="SkinTokens beam count",
+        name="Rig beam count", description="Number of candidates explored by beam search for rig prediction. More increases search breadth and processing cost.",
         default=10, min=1, max=20, update=update_parameters
     )
     bpy.types.Scene.trellis2_autorig_model_ckpt = bpy.props.StringProperty(
-        name="Model Checkpoint",
-        description="Optional SkinTokens checkpoint path relative to SKINTOKENS_ROOT",
+        name="Rig checkpoint path",
+        description="Optional rig-model checkpoint path relative to SKINTOKENS_ROOT. Leave empty to use SkinTokens’ configured default.",
         default="", update=update_parameters
     )
     bpy.types.Scene.trellis2_autorig_hf_path = bpy.props.StringProperty(
-        name="HF Path",
-        description="Optional Hugging Face path passed to SkinTokens",
+        name="Hugging Face model path",
+        description="Optional Hugging Face model source passed to SkinTokens. Leave empty to use its configured default.",
         default="", update=update_parameters
     )
 
@@ -1840,12 +1822,12 @@ def register_properties(update_model_list, ControlNetUnit, LoRAUnit,
 
     # ── PBR Decomposition ──────────────────────────────────────────────
     bpy.types.Scene.pbr_decomposition = bpy.props.BoolProperty(
-        name="PBR Decomposition",
-        description="Run Marigold decomposition on each generated image to produce PBR material maps (albedo, roughness, metallic, normal, depth)",
+        name="PBR map extraction",
+        description="Create selected material maps from generated images and geometry. Methods include learned decomposition, highlight removal, geometry-based AO and inferred emission. Extraction, material assignment and baking are separate steps.",
         default=False, update=update_parameters
     )
     bpy.types.Scene.pbr_albedo_source = bpy.props.EnumProperty(
-        name="Albedo Source", description="Model to use for extracting the Base Color / albedo map",
+        name="Albedo Source", description="Method used to estimate lighting-reduced base color. Different methods preserve or remove different image details; this does not recover measured physical reflectance.",
         items=[
             ('marigold', "Marigold IID (Flat Albedo)", "True albedo from Marigold IID-Appearance \u2014 removes all lighting but may lose texture detail"),
             ('delight', "StableDelight (Delighted)", "Specular-removed image via StableDelight \u2014 preserves diffuse shading and texture detail, only strips highlights"),
@@ -1854,7 +1836,7 @@ def register_properties(update_model_list, ControlNetUnit, LoRAUnit,
         default='marigold', update=update_parameters,
     )
     bpy.types.Scene.pbr_map_albedo = bpy.props.BoolProperty(
-        name="Albedo", description="Extract albedo (diffuse colour without lighting) and use it as Base Color",
+        name="Albedo", description="Extract a lighting-reduced base-color map using the selected method. Enable Use as material base color separately to assign it to the projected material.",
         default=True, update=update_parameters
     )
     bpy.types.Scene.pbr_map_roughness = bpy.props.BoolProperty(
@@ -1872,7 +1854,7 @@ def register_properties(update_model_list, ControlNetUnit, LoRAUnit,
     )
     bpy.types.Scene.pbr_normal_strength = bpy.props.FloatProperty(
         name="Normal Strength",
-        description="How strongly the normal map perturbs the surface shading. Lower values reduce triangle artifacts on poor topology",
+        description="Strength of shading detail from the Normal Map node. 0 removes the normal-map effect; larger values exaggerate it. This does not change mesh geometry.",
         default=1.0, min=0.0, max=2.0, step=0.05, update=update_parameters
     )
     bpy.types.Scene.pbr_delight_strength = bpy.props.FloatProperty(
@@ -1885,19 +1867,19 @@ def register_properties(update_model_list, ControlNetUnit, LoRAUnit,
         default=False, update=update_parameters
     )
     bpy.types.Scene.pbr_height_scale = bpy.props.FloatProperty(
-        name="Height Scale", description="Displacement scale for the height map. Higher values produce more pronounced surface displacement",
+        name="Material displacement scale", description="Scale of the material’s Displacement node, centered on height 0.5. Visible displacement depends on Blender’s render/material settings; this does not directly rewrite mesh vertices.",
         default=0.1, min=0.001, max=2.0, step=0.01, precision=3, update=update_parameters
     )
     bpy.types.Scene.pbr_map_ao = bpy.props.BoolProperty(
-        name="AO", description="Bake an Ambient Occlusion map from mesh geometry (uses Blender's built-in bake, no ML required)",
+        name="AO", description="Add geometry-based ambient occlusion to the projected material using Blender’s AO shader. Bake textures separately to produce an image map.",
         default=False, update=update_parameters
     )
     bpy.types.Scene.pbr_ao_samples = bpy.props.IntProperty(
-        name="AO Samples", description="Number of samples for AO baking. Higher = cleaner but slower",
+        name="AO samples", description="Samples evaluated by the ambient-occlusion shader. More samples can reduce noise at greater render cost.",
         default=16, min=1, max=128, update=update_parameters
     )
     bpy.types.Scene.pbr_ao_distance = bpy.props.FloatProperty(
-        name="AO Distance", description="Maximum ray distance for AO baking. 0 = scene size (automatic)",
+        name="Ray distance (BU)", description="Maximum AO ray distance in Blender units. Larger distances include more distant occluders; 0 keeps the AO node’s default distance.",
         default=0.0, min=0.0, max=100.0, step=0.1, update=update_parameters
     )
     bpy.types.Scene.pbr_map_emission = bpy.props.BoolProperty(
@@ -1905,7 +1887,7 @@ def register_properties(update_model_list, ControlNetUnit, LoRAUnit,
         default=False, update=update_parameters
     )
     bpy.types.Scene.pbr_emission_method = bpy.props.EnumProperty(
-        name="Emission Method", description="Algorithm used to detect emissive regions",
+        name="Emission Method", description="Residual estimates emission from the lighting residual, with metallic suppression when available. HSV detects bright, saturated source pixels. Both are estimates and can mistake highlights for emission.",
         items=[
             ('residual', "IID-Lighting Residual", "Run Marigold IID-Lighting and extract the residual (image \u2212 albedo \u00d7 shading). Most accurate but requires an additional model pass"),
             ('hsv', "HSV Threshold", "Isolate pixels with high saturation + high value in HSV space. Fast, zero model cost, best for neon/sci-fi styles"),
@@ -1913,35 +1895,35 @@ def register_properties(update_model_list, ControlNetUnit, LoRAUnit,
         default='residual', update=update_parameters
     )
     bpy.types.Scene.pbr_emission_threshold = bpy.props.FloatProperty(
-        name="Emission Threshold",
-        description="Minimum value to consider as emission. In Residual mode, fades out low-luminance residuals. In HSV mode, zeroes the blurred mask below this cutoff. Higher = fewer false positives, lower = catches subtle glow",
+        name="Emission detection cutoff",
+        description="Residual method: soft cutoff for lighting-residual intensity. HSV method: cutoff applied to the blurred detection mask. Range 0–1; higher values remove more weak candidates.",
         default=0.2, min=0.0, max=1.0, step=0.05, precision=2, update=update_parameters
     )
     bpy.types.Scene.pbr_emission_saturation_min = bpy.props.FloatProperty(
-        name="Saturation Min",
-        description="(HSV method) Minimum saturation for a pixel to be considered emissive. Glowing objects retain colour intensity while lit surfaces wash out",
+        name="Minimum saturation",
+        description="Minimum HSV saturation (0–1) needed to detect emission. Higher values accept only more saturated colors. Used by HSV detection.",
         default=0.5, min=0.0, max=1.0, step=0.05, precision=2, update=update_parameters
     )
     bpy.types.Scene.pbr_emission_value_min = bpy.props.FloatProperty(
-        name="Value Min", description="(HSV method) Minimum value/brightness for a pixel to be considered emissive",
+        name="Minimum brightness", description="Minimum HSV brightness (0–1) needed to detect emission. Higher values accept only brighter pixels. Used by HSV detection.",
         default=0.85, min=0.0, max=1.0, step=0.05, precision=2, update=update_parameters
     )
     bpy.types.Scene.pbr_emission_bloom = bpy.props.FloatProperty(
-        name="Bloom Radius",
-        description="(HSV method) Gaussian blur radius applied to the emission mask to simulate bloom / glow bleed. 0 = sharp mask, higher = more bloom",
+        name="Detection blur (px)",
+        description="Blur radius of the HSV detection mask, in source-image pixels. 0 disables blur. This changes the inferred emission map, not a render-engine bloom effect.",
         default=5.0, min=0.0, max=50.0, step=1.0, precision=1, update=update_parameters
     )
     bpy.types.Scene.pbr_emission_strength = bpy.props.FloatProperty(
-        name="Emission Strength", description="Strength of the emission channel in the Principled BSDF",
+        name="Emission Strength", description="Multiplier for emission in the material. Higher values increase self-illumination; this does not change which pixels the detector selects.",
         default=2.5, min=0.0, max=100.0, step=0.5, precision=1, update=update_parameters
     )
     bpy.types.Scene.pbr_use_native_resolution = bpy.props.BoolProperty(
-        name="Use Native Resolution",
-        description="Process PBR maps at the image's native resolution (longest edge, rounded to 64px). Produces sharper results but uses more VRAM. When disabled, the fixed Processing Resolution is used",
+        name="Use source size for inference",
+        description="Use the source image’s size for map inference instead of the configured inference resolution. Final output sizing is controlled separately by tiling options.",
         default=True, update=update_parameters
     )
     bpy.types.Scene.pbr_tiling = bpy.props.EnumProperty(
-        name="Tiling", description="Tile-based super-resolution for PBR maps. Each tile is upscaled to the full image resolution before processing, producing N\u00b2\u00d7 the effective detail",
+        name="Tiling", description="Process maps as a grid of image tiles for more pixels per region. Tiling costs more time and can improve local detail, but does not guarantee additional true detail.",
         items=[
             ('off', "Off", "No tiling \u2014 process the full image in one pass"),
             ('selective', "Selective", "Tile albedo only (StableDelight and/or IID albedo). Normals, roughness, metallic and height are processed normally"),
@@ -1972,28 +1954,28 @@ def register_properties(update_model_list, ControlNetUnit, LoRAUnit,
         default=False, update=update_parameters
     )
     bpy.types.Scene.pbr_tile_grid = bpy.props.IntProperty(
-        name="Tile Grid",
-        description="N\u00d7N grid size for tiling. 2 = 4 tiles (4\u00d7 detail), 3 = 9 tiles (9\u00d7 detail), 4 = 16 tiles (16\u00d7 detail). Processing time scales with N\u00b2",
+        name="Tile grid",
+        description="N×N tile grid: 2 creates 4 tiles, 3 creates 9, 4 creates 16. Processing time grows roughly with tile count; tile count is not a guaranteed detail multiplier.",
         default=2, min=2, max=4, update=update_parameters
     )
     bpy.types.Scene.pbr_tile_superres = bpy.props.BoolProperty(
-        name="Super Resolution",
-        description="When enabled, the stitched PBR maps are kept at the upscaled tile resolution (~N\u00d7 the original image size). When disabled (default), tiles are scaled back to the original image resolution \u2014 still higher detail from tiled processing, but matching the source texture size",
+        name="Keep tiled output resolution",
+        description="Retain the higher-resolution tiled result instead of reducing maps back to the source dimensions. Uses more image memory.",
         default=True, update=update_parameters
     )
     bpy.types.Scene.pbr_processing_resolution = bpy.props.IntProperty(
-        name="Processing Resolution",
-        description="Internal processing resolution for the Marigold model. Output is upscaled back to the original resolution. 768 is the default for the model's training resolution",
+        name="Inference resolution (px)",
+        description="Internal resolution used for map prediction. Output is resized to the source dimensions unless higher-resolution tiled output is retained. Higher values cost memory and processing time.",
         default=768, min=256, max=2048, step=64, update=update_parameters
     )
     bpy.types.Scene.pbr_denoise_steps = bpy.props.IntProperty(
-        name="Denoise Steps",
-        description="Number of denoising steps. More steps = better quality but slower. 4 is a good balance",
+        name="Inference steps",
+        description="Sampling iterations for material-map prediction. More costs time; it does not guarantee more physically accurate maps.",
         default=4, min=1, max=50, update=update_parameters
     )
     bpy.types.Scene.pbr_ensemble_size = bpy.props.IntProperty(
-        name="Ensemble Size",
-        description="Number of ensemble predictions to average. Higher = more stable results but linearly slower. 1 is usually sufficient",
+        name="Predictions per map",
+        description="Repeated predictions combined for each map. More can improve consistency at additional processing cost.",
         default=1, min=1, max=10, update=update_parameters
     )
     bpy.types.Scene.pbr_albedo_auto_saturation = bpy.props.BoolProperty(
@@ -2013,7 +1995,7 @@ def register_properties(update_model_list, ControlNetUnit, LoRAUnit,
     )
     bpy.types.Scene.pbr_replace_color_with_albedo = bpy.props.BoolProperty(
         name="Use Albedo as Base Color",
-        description="Replace the projected colour texture with the albedo map. This effectively delights the texture",
+        description="Use the extracted albedo map as the projected material’s Base Color instead of the generated color texture. Requires an extracted albedo map.",
         default=True, update=update_parameters
     )
     bpy.types.Scene.pbr_auto_lighting = bpy.props.BoolProperty(

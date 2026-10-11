@@ -2334,23 +2334,23 @@ class StableGenAutoRigSelectedMesh(bpy.types.Operator):
         default='FORTUNE',
     )  # type: ignore
     top_k: bpy.props.IntProperty(
-        name="Top K",
-        description="SkinTokens sampling top-k",
+        name="Rig candidate limit (top-k)",
+        description="Maximum candidate choices retained during SkinTokens rig sampling. Lower values constrain choices more; this affects rig prediction, not image generation",
         default=5,
         min=1,
         max=200,
     )  # type: ignore
     top_p: bpy.props.FloatProperty(
-        name="Top P",
-        description="SkinTokens nucleus sampling top-p",
+        name="Rig probability cutoff (top-p)",
+        description="Probability mass retained during rig sampling (0–1). Lower values discard more low-probability choices",
         default=0.95,
         min=0.1,
         max=1.0,
         step=0.01,
     )  # type: ignore
     temperature: bpy.props.FloatProperty(
-        name="Temperature",
-        description="SkinTokens sampling temperature",
+        name="Rig sampling temperature",
+        description="Variability in rig sampling. Lower values favor likely choices; higher values allow more varied choices",
         default=1.0,
         min=0.1,
         max=2.0,
@@ -2358,27 +2358,27 @@ class StableGenAutoRigSelectedMesh(bpy.types.Operator):
     )  # type: ignore
     repetition_penalty: bpy.props.FloatProperty(
         name="Repetition Penalty",
-        description="SkinTokens repetition penalty",
+        description="Penalty applied to repeated SkinTokens outputs. 1 is neutral; larger values discourage repetition",
         default=2.0,
         min=0.5,
         max=3.0,
         step=0.1,
     )  # type: ignore
     num_beams: bpy.props.IntProperty(
-        name="Beams",
-        description="Number of candidate rig-token sequences retained during SkinTokens generation",
+        name="Rig beam count",
+        description="Candidate rig-token sequences explored by beam search. More increases search breadth and processing cost",
         default=10,
         min=1,
         max=20,
     )  # type: ignore
     model_ckpt: bpy.props.StringProperty(
-        name="Model Checkpoint",
-        description="Optional SkinTokens checkpoint path relative to SKINTOKENS_ROOT",
+        name="Rig checkpoint path",
+        description="Optional rig-model checkpoint path relative to SKINTOKENS_ROOT. Empty uses the configured default",
         default="",
     )  # type: ignore
     hf_path: bpy.props.StringProperty(
-        name="HF Path",
-        description="Optional Hugging Face path passed to SkinTokens",
+        name="Hugging Face model path",
+        description="Optional Hugging Face model source passed to SkinTokens. Empty uses the configured default",
         default="",
     )  # type: ignore
 

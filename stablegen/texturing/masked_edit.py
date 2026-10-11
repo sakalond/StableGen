@@ -1176,7 +1176,7 @@ def register_properties():
     bpy.types.Scene.sg_masked_feather = bpy.props.IntProperty(
         name='Edge Softness (px)', default=4, min=0, max=32,
         description='Feather inward from the expanded selection boundary')
-    bpy.types.Scene.sg_masked_strength = bpy.props.FloatProperty(name='Inpaint Strength', default=0.85, min=0.05, max=1.0)
+    bpy.types.Scene.sg_masked_strength = bpy.props.FloatProperty(description="Denoising strength inside the prepared selection. Lower values preserve more of the source image; higher values allow larger changes. Selection expansion and feathering control the boundary separately.", name="Edit strength", default=0.85, min=0.05, max=1.0)
     bpy.types.Scene.sg_masked_status = bpy.props.StringProperty(default='')
     keyconfig = bpy.context.window_manager.keyconfigs.addon
     if keyconfig:

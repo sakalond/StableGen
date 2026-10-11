@@ -185,6 +185,7 @@ class Reproject(bpy.types.Operator):
     - Will not work with textures which used refine mode with the preserve parameter enabled"""
     bl_idname = "object.stablegen_reproject"
     bl_label = "Reproject Images"
+    bl_description = "Rebuild projection from saved camera images using the current blending settings. Does not generate new images; requires a previous generation output"
     bl_options = {'REGISTER', 'UNDO'}
 
     _original_method = None

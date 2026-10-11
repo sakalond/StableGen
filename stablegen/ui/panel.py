@@ -989,13 +989,13 @@ class StableGenPanel(bpy.types.Panel):
                     # Shape generation
                     content_box.label(text="Shape Generation:", icon="MESH_ICOSPHERE")
                     row = content_box.row(align=True)
-                    row.prop(scene, "trellis2_ss_guidance", text="SS Guidance")
-                    row.prop(scene, "trellis2_ss_steps", text="SS Steps")
+                    row.prop(scene, "trellis2_ss_guidance", text="Structure guidance")
+                    row.prop(scene, "trellis2_ss_steps", text="Structure steps")
                     row = content_box.row(align=True)
-                    row.prop(scene, "trellis2_shape_guidance", text="Shape Guidance")
-                    row.prop(scene, "trellis2_shape_steps", text="Shape Steps")
+                    row.prop(scene, "trellis2_shape_guidance", text="Shape guidance")
+                    row.prop(scene, "trellis2_shape_steps", text="Shape steps")
                     row = content_box.row()
-                    row.prop(scene, "trellis2_max_tokens", text="Max Tokens (VRAM)")
+                    row.prop(scene, "trellis2_max_tokens", text="Sparse voxel budget")
 
                     content_box.separator()
 
@@ -1124,29 +1124,29 @@ class StableGenPanel(bpy.types.Panel):
 
                         content_box.separator()
                         row = content_box.row(align=True)
-                        row.prop(scene, "trellis2_autorig_top_k", text="Top K")
-                        row.prop(scene, "trellis2_autorig_top_p", text="Top P")
+                        row.prop(scene, "trellis2_autorig_top_k", text="Rig candidate limit (top-k)")
+                        row.prop(scene, "trellis2_autorig_top_p", text="Rig probability cutoff (top-p)")
                         row = content_box.row(align=True)
-                        row.prop(scene, "trellis2_autorig_temperature", text="Temperature")
+                        row.prop(scene, "trellis2_autorig_temperature", text="Rig sampling temperature")
                         row.prop(scene, "trellis2_autorig_repetition_penalty", text="Repeat Penalty")
                         row = content_box.row()
-                        row.prop(scene, "trellis2_autorig_num_beams", text="Beams")
+                        row.prop(scene, "trellis2_autorig_num_beams", text="Rig beam count")
 
                         content_box.separator()
                         row = content_box.row()
-                        row.prop(scene, "trellis2_autorig_model_ckpt", text="Model Checkpoint")
+                        row.prop(scene, "trellis2_autorig_model_ckpt", text="Rig checkpoint path")
                         row = content_box.row()
-                        row.prop(scene, "trellis2_autorig_hf_path", text="HF Path")
+                        row.prop(scene, "trellis2_autorig_hf_path", text="Hugging Face model path")
 
             # --- TRELLIS.2: Native Texture Settings ---
             if is_trellis2 and trellis2_tex_mode == 'native':
                 content_box = draw_collapsible_section(advanced_params_box, "show_trellis2_texture_settings", "Texture Settings (TRELLIS.2 Native)", icon="TEXTURE")
                 if content_box:
                     row = content_box.row(align=True)
-                    row.prop(scene, "trellis2_tex_guidance", text="Tex Guidance")
-                    row.prop(scene, "trellis2_tex_steps", text="Tex Steps")
+                    row.prop(scene, "trellis2_tex_guidance", text="Texture guidance")
+                    row.prop(scene, "trellis2_tex_steps", text="Texture steps")
                     row = content_box.row()
-                    row.prop(scene, "trellis2_texture_size", text="Texture Size")
+                    row.prop(scene, "trellis2_texture_size", text="Texture size (px)")
 
                     content_box.separator()
                     row = content_box.row()
@@ -1175,7 +1175,7 @@ class StableGenPanel(bpy.types.Panel):
                     # Greedy-specific
                     if _t2_pm == 'greedy_coverage':
                         row = content_box.row(align=True)
-                        row.prop(scene, "trellis2_coverage_target", text="Coverage Target")
+                        row.prop(scene, "trellis2_coverage_target", text="Camera coverage target")
                         row.prop(scene, "trellis2_max_auto_cameras", text="Max Cameras")
 
                     # Fan-specific
@@ -1240,7 +1240,7 @@ class StableGenPanel(bpy.types.Panel):
                 sub = row.row()
                 if 'steps' in _diff_props:
                     sub.alert = True
-                sub.prop(scene, "steps", text="Steps")
+                sub.prop(scene, "steps", text="Sampling steps")
                 if 'steps' in _diff_props:
                     sub.label(text="→" + _diff_props['steps'])
                 if width_mode == 'narrow':
@@ -1248,7 +1248,7 @@ class StableGenPanel(bpy.types.Panel):
                 sub = row.row()
                 if 'cfg' in _diff_props:
                     sub.alert = True
-                sub.prop(scene, "cfg", text="CFG")
+                sub.prop(scene, "cfg", text="Prompt guidance (CFG)")
                 if 'cfg' in _diff_props:
                     sub.label(text="→" + _diff_props['cfg'])
 
@@ -1291,7 +1291,7 @@ class StableGenPanel(bpy.types.Panel):
                 
                 if scene.model_architecture != 'qwen_image_21':
                     row = content_box.row()
-                    row.prop(scene, "clip_skip", text="Clip Skip")
+                    row.prop(scene, "clip_skip", text="CLIP layer skip")
 
            # --- LoRA Settings ---
             if ((_show_diffusion_sections or _show_initial_image_settings)
@@ -1345,7 +1345,7 @@ class StableGenPanel(bpy.types.Panel):
                 content_box = None
             if content_box:
                 row = content_box.row(align=True)
-                row.prop(scene, "use_camera_prompts", text="Use Camera Prompts", toggle=True, icon="OUTLINER_OB_CAMERA")
+                row.prop(scene, "use_camera_prompts", text="Use view prompts", toggle=True, icon="OUTLINER_OB_CAMERA")
 
                 # ── Camera Generation Order ──
                 row = content_box.row(align=True)
@@ -1393,29 +1393,29 @@ class StableGenPanel(bpy.types.Panel):
                 sub = split.row()
                 if 'weight_exponent' in _diff_props:
                     sub.alert = True
-                sub.prop(scene, "weight_exponent", text="Exponent")
+                sub.prop(scene, "weight_exponent", text="View weight exponent")
                 if 'weight_exponent' in _diff_props:
                     sub.label(text="→" + _diff_props['weight_exponent'])
 
                 # Row 2 & 3: Reset toggles and values (only for sequential / qwen)
                 if scene.generation_method == 'sequential' or scene.model_architecture in ('qwen_image_edit', 'qwen_image_21', 'flux2_klein'):
                     split = content_box.split(factor=0.5, align=False)
-                    split.prop(scene, "discard_factor_generation_only", text="Reset Angle", toggle=True)
-                    split.prop(scene, "weight_exponent_generation_only", text="Reset Exponent", toggle=True)
+                    split.prop(scene, "discard_factor_generation_only", text="Resets", toggle=True)
+                    split.prop(scene, "weight_exponent_generation_only", text="Resets", toggle=True)
 
                     if scene.discard_factor_generation_only or scene.weight_exponent_generation_only:
                         split = content_box.split(factor=0.5, align=False)
                         if scene.discard_factor_generation_only:
-                            split.prop(scene, "discard_factor_after_generation", text="Angle After")
+                            split.prop(scene, "discard_factor_after_generation", text="Reset angle (°)")
                         else:
                             split.label(text="")
                         if scene.weight_exponent_generation_only:
-                            split.prop(scene, "weight_exponent_after_generation", text="Exp. After")
+                            split.prop(scene, "weight_exponent_after_generation", text="Reset exponent")
                         else:
                             split.label(text="")
 
                 row = content_box.row()
-                row.prop(scene, "early_priority", text="Prioritize Initial Views", toggle=True, icon="REW")
+                row.prop(scene, "early_priority", text="Prioritize earlier views", toggle=True, icon="REW")
                 if scene.early_priority:
                     row = content_box.row()
                     row.prop(scene, "early_priority_strength", text="Priority Strength")
@@ -1431,7 +1431,7 @@ class StableGenPanel(bpy.types.Panel):
                 row.prop(scene, "sg_allow_backface_projection", text="Allow Backface Projection", toggle=True)
                 if width_mode == 'narrow':
                     row = content_box.row(align=True)
-                row.prop(scene, "sg_rework_acquisition_quality", text="Acquisition Quality Weighting", toggle=True)
+                row.prop(scene, "sg_rework_acquisition_quality", text="Weight by view quality", toggle=True)
                 content_box.prop(scene, "sg_rework_projection_guard", text="Depth/Part Projection Guard", toggle=True)
                 if scene.sg_rework_projection_guard:
                     guard_box = content_box.box()
@@ -1440,11 +1440,11 @@ class StableGenPanel(bpy.types.Panel):
                            if width_mode == 'wide' and scene.sg_guard_directional
                            else guard_box.row(align=True))
                     row.prop(scene, "sg_silhouette_margin", text=(
-                        "Background Margin (px)" if scene.sg_guard_directional else "Silhouette Margin (px)"))
+                        "Background margin (px)" if scene.sg_guard_directional else "Symmetric margin (px)"))
                     if scene.sg_guard_directional:
                         if width_mode == 'narrow':
                             row = guard_box.row(align=True)
-                        row.prop(scene, "sg_guard_foreground_margin", text="Foreground Margin (px)")
+                        row.prop(scene, "sg_guard_foreground_margin", text="Foreground margin (px)")
                     row = (guard_box.split(factor=0.5, align=False) if width_mode == 'wide'
                            else guard_box.row(align=True))
                     row.prop(scene, "sg_silhouette_depth", text="Depth Threshold")
@@ -1452,10 +1452,10 @@ class StableGenPanel(bpy.types.Panel):
                         row = guard_box.row(align=True)
                     row.prop(scene, "sg_guard_coverage_rescue")
                     row = guard_box.row(align=True)
-                    row.prop(scene, "sg_silhouette_feather", text="Silhouette Feather (px)")
+                    row.prop(scene, "sg_silhouette_feather", text="Guard feather width (px)")
                     row = guard_box.row(align=True)
-                    row.prop(scene, "sg_projection_guard_scale", text="Guard Resolution")
-                    guard_box.prop(scene, "sg_guard_feather_method", text="Feather Method")
+                    row.prop(scene, "sg_projection_guard_scale", text="Guard render scale")
+                    guard_box.prop(scene, "sg_guard_feather_method", text="Guard feather method")
                     if scene.sg_guard_feather_method == 'SURFACE_BLEND':
                         guard_box.label(text="Reproject to solve; detail follows mesh density", icon='INFO')
 
@@ -1506,7 +1506,7 @@ class StableGenPanel(bpy.types.Panel):
                 row = content_box.row()
                 if 'pbr_decomposition' in _diff_props:
                     row.alert = True
-                row.prop(scene, "pbr_decomposition", text="PBR Decomposition", toggle=True, icon="NODE_MATERIAL")
+                row.prop(scene, "pbr_decomposition", text="PBR map extraction", toggle=True, icon="NODE_MATERIAL")
                 if 'pbr_decomposition' in _diff_props:
                     row.label(text="→ " + _diff_props['pbr_decomposition'])
                 if scene.pbr_decomposition:
@@ -1535,24 +1535,24 @@ class StableGenPanel(bpy.types.Panel):
                         adj_row.prop(scene, "pbr_normal_strength", text="Normal Strength", slider=True)
                     if scene.pbr_map_height:
                         adj_row = sub.row()
-                        adj_row.prop(scene, "pbr_height_scale", text="Height Scale", slider=True)
+                        adj_row.prop(scene, "pbr_height_scale", text="Material displacement scale", slider=True)
                     if scene.pbr_map_ao:
                         ao_row = sub.row(align=True)
-                        ao_row.prop(scene, "pbr_ao_samples", text="AO Samples")
-                        ao_row.prop(scene, "pbr_ao_distance", text="AO Distance")
+                        ao_row.prop(scene, "pbr_ao_samples", text="AO samples")
+                        ao_row.prop(scene, "pbr_ao_distance", text="Ray distance (BU)")
                     if scene.pbr_map_emission:
                         adj_row = sub.row()
                         adj_row.prop(scene, "pbr_emission_method", text="Method")
                         adj_row = sub.row()
-                        adj_row.prop(scene, "pbr_emission_threshold", text="Threshold", slider=True)
+                        adj_row.prop(scene, "pbr_emission_threshold", text="Emission detection cutoff", slider=True)
                         adj_row = sub.row()
                         adj_row.prop(scene, "pbr_emission_strength", text="Emission Strength", slider=True)
                         if scene.pbr_emission_method == 'hsv':
                             hsv_row = sub.row(align=True)
-                            hsv_row.prop(scene, "pbr_emission_saturation_min", text="Sat Min", slider=True)
-                            hsv_row.prop(scene, "pbr_emission_value_min", text="Val Min", slider=True)
+                            hsv_row.prop(scene, "pbr_emission_saturation_min", text="Minimum saturation", slider=True)
+                            hsv_row.prop(scene, "pbr_emission_value_min", text="Minimum brightness", slider=True)
                             hsv_row = sub.row()
-                            hsv_row.prop(scene, "pbr_emission_bloom", text="Bloom Radius", slider=True)
+                            hsv_row.prop(scene, "pbr_emission_bloom", text="Detection blur (px)", slider=True)
                     # ── Albedo source selector (only when albedo enabled) ──
                     if scene.pbr_map_albedo:
                         sub.separator()
@@ -1568,12 +1568,12 @@ class StableGenPanel(bpy.types.Panel):
                     sub.separator()
                     # ── Quality settings ──
                     row = sub.row(align=True)
-                    row.prop(scene, "pbr_use_native_resolution", text="Native Resolution", toggle=True, icon="FULLSCREEN_ENTER")
+                    row.prop(scene, "pbr_use_native_resolution", text="Use source size for inference", toggle=True, icon="FULLSCREEN_ENTER")
                     row.prop(scene, "pbr_tiling", text="")
                     if scene.pbr_tiling != 'off':
                         row = sub.row(align=True)
-                        row.prop(scene, "pbr_tile_grid", text="Tile Grid (N\u00d7N)")
-                        row.prop(scene, "pbr_tile_superres", text="Super Res", toggle=True, icon="IMAGE_PLANE")
+                        row.prop(scene, "pbr_tile_grid", text="Tile grid")
+                        row.prop(scene, "pbr_tile_superres", text="Keep tiled output resolution", toggle=True, icon="IMAGE_PLANE")
                     if scene.pbr_tiling == 'custom':
                         row = sub.row(align=True)
                         row.prop(scene, "pbr_tile_albedo", text="Albedo", toggle=True)
@@ -1583,10 +1583,10 @@ class StableGenPanel(bpy.types.Panel):
                         row.prop(scene, "pbr_tile_emission", text="Emission", toggle=True)
                     if not scene.pbr_use_native_resolution:
                         row = sub.row()
-                        row.prop(scene, "pbr_processing_resolution", text="Processing Resolution")
+                        row.prop(scene, "pbr_processing_resolution", text="Inference resolution (px)")
                     row = sub.row(align=True)
-                    row.prop(scene, "pbr_denoise_steps", text="Denoise Steps")
-                    row.prop(scene, "pbr_ensemble_size", text="Ensemble Size")
+                    row.prop(scene, "pbr_denoise_steps", text="Inference steps")
+                    row.prop(scene, "pbr_ensemble_size", text="Predictions per map")
                     sub.separator()
                     row = sub.row()
                     row.prop(scene, "pbr_replace_color_with_albedo", text="Use Albedo as Base Color", toggle=True, icon="SHADING_SOLID")
@@ -1599,11 +1599,11 @@ class StableGenPanel(bpy.types.Panel):
                 split.prop(scene, "fallback_color", text="")
 
                 row = content_box.row()
-                row.prop(scene, "auto_rescale", text="Auto Rescale Resolution", toggle=True, icon="ARROW_LEFTRIGHT")
+                row.prop(scene, "auto_rescale", text="Fit camera resolution", toggle=True, icon="ARROW_LEFTRIGHT")
                 if scene.auto_rescale:
                     sub_box_rescale = content_box.box()
                     row = sub_box_rescale.row()
-                    row.prop(scene, "auto_rescale_target_mp", text="Target Megapixels")
+                    row.prop(scene, "auto_rescale_target_mp", text="Target megapixels")
                     if scene.model_architecture == 'qwen_image_edit':
                         row = sub_box_rescale.row()
                         row.prop(scene, "qwen_rescale_alignment", text="Qwen VL-Aligned Rescale (112px)", toggle=True, icon="SNAP_INCREMENT")
@@ -1654,8 +1654,8 @@ class StableGenPanel(bpy.types.Panel):
                             split.label(text="Subsequent mode:")
                             split.prop(scene, "sequential_ipadapter_mode", text="")
                             if scene.sequential_ipadapter_mode == 'recent':
-                                subsequent_box.prop(scene, "sequential_desaturate_factor", text="Desaturate")
-                                subsequent_box.prop(scene, "sequential_contrast_factor", text="Reduce Contrast")
+                                subsequent_box.prop(scene, "sequential_desaturate_factor", text="Reference desaturation")
+                                subsequent_box.prop(scene, "sequential_contrast_factor", text="Reference contrast reduction")
 
                         if getattr(scene, 'architecture_mode', '') == 'trellis2' and scene.qwen_use_trellis2_style:
                             t2_style_box = content_box.box()
@@ -1667,20 +1667,20 @@ class StableGenPanel(bpy.types.Panel):
                                 split.label(text="Subsequent mode:")
                                 split.prop(scene, "sequential_ipadapter_mode", text="")
                                 if scene.sequential_ipadapter_mode == 'recent':
-                                    subsequent_box.prop(scene, "sequential_desaturate_factor", text="Desaturate")
-                                    subsequent_box.prop(scene, "sequential_contrast_factor", text="Reduce Contrast")
+                                    subsequent_box.prop(scene, "sequential_desaturate_factor", text="Reference desaturation")
+                                    subsequent_box.prop(scene, "sequential_contrast_factor", text="Reference contrast reduction")
 
                         if not scene.qwen_use_external_style_image and scene.generation_method in ['sequential', 'separate']:
                             row = content_box.row()
-                            row.prop(scene, "sequential_ipadapter", text="Use Previous Image as Style", toggle=True, icon="MODIFIER")
+                            row.prop(scene, "sequential_ipadapter", text="Use previous view as reference", toggle=True, icon="MODIFIER")
                             if scene.sequential_ipadapter:
                                 sub_ip_box = content_box.box()
                                 split = sub_ip_box.split(factor=0.5)
                                 split.label(text="Mode:")
                                 split.prop(scene, "sequential_ipadapter_mode", text="")
                                 if scene.sequential_ipadapter_mode == 'recent':
-                                    sub_ip_box.prop(scene, "sequential_desaturate_factor", text="Desaturate")
-                                    sub_ip_box.prop(scene, "sequential_contrast_factor", text="Reduce Contrast")
+                                    sub_ip_box.prop(scene, "sequential_desaturate_factor", text="Reference desaturation")
+                                    sub_ip_box.prop(scene, "sequential_contrast_factor", text="Reference contrast reduction")
 
                         if scene.generation_method == 'sequential':
                             split = content_box.split(factor=0.5)
@@ -1688,7 +1688,7 @@ class StableGenPanel(bpy.types.Panel):
                             split.prop(scene, "qwen_context_render_mode", text="")
 
                             row = content_box.row()
-                            row.prop(scene, "qwen_voronoi_mode", text="Voronoi Projection", toggle=True, icon="MESH_GRID")
+                            row.prop(scene, "qwen_voronoi_mode", text="Hard view segmentation", toggle=True, icon="MESH_GRID")
                     
                     elif scene.qwen_generation_method in ('refine', 'local_edit'):
                         row = content_box.row()
@@ -1773,32 +1773,32 @@ class StableGenPanel(bpy.types.Panel):
                             colors_box = context_box.box()
                             colors_box.label(text="Context Render Colors")
                             row = colors_box.row()
-                            row.prop(scene, "qwen_guidance_background_color", text="Background")
+                            row.prop(scene, "qwen_guidance_background_color", text="Image background")
                             row = colors_box.row()
-                            row.prop(scene, "qwen_guidance_fallback_color", text="Fallback")
+                            row.prop(scene, "qwen_guidance_fallback_color", text="Missing-context color")
 
                         context_box.prop(
                             scene,
                             "qwen_use_confidence_context",
-                            text="Confidence-Gated Context",
+                            text="Protect reliable context",
                             toggle=True,
                             icon="MOD_MASK",
                         )
                         if scene.qwen_use_confidence_context:
                             threshold_row = context_box.row()
                             threshold_row.prop(
-                                scene, "qwen_trust_threshold", text="Trusted Quality"
+                                scene, "qwen_trust_threshold", text="Minimum trusted view quality"
                             )
                         else:
                             dilation_row = context_box.row()
-                            dilation_row.prop(scene, "qwen_context_fallback_dilation", text="Legacy Fallback Dilate (px)")
+                            dilation_row.prop(scene, "qwen_context_fallback_dilation", text="Legacy context expansion (px)")
                             cleanup_row = context_box.row()
-                            cleanup_row.prop(scene, "qwen_context_cleanup", text="Legacy Cleanup", toggle=True, icon="BRUSH_DATA")
+                            cleanup_row.prop(scene, "qwen_context_cleanup", text="Legacy fallback cleanup", toggle=True, icon="BRUSH_DATA")
                             if scene.qwen_context_cleanup:
                                 row = context_box.row()
-                                row.prop(scene, "qwen_context_cleanup_hue_tolerance", text="Hue Tol (°)")
+                                row.prop(scene, "qwen_context_cleanup_hue_tolerance", text="Hue tolerance (°)")
                                 row = context_box.row()
-                                row.prop(scene, "qwen_context_cleanup_value_adjust", text="Value Adjust")
+                                row.prop(scene, "qwen_context_cleanup_value_adjust", text="Brightness adjustment")
 
                 elif scene.model_architecture == 'sdxl' or scene.model_architecture == 'flux1':
                     # IPAdapter Parameters
@@ -1817,10 +1817,10 @@ class StableGenPanel(bpy.types.Panel):
                             row.prop(scene, "ipadapter_strength", text="Strength")
                             if width_mode == 'narrow':
                                 row = sub_ip_box.row()
-                            row.prop(scene, "ipadapter_start", text="Start")
+                            row.prop(scene, "ipadapter_start", text="Start fraction")
                             if width_mode == 'narrow':
                                 row = sub_ip_box.row()
-                            row.prop(scene, "ipadapter_end", text="End")
+                            row.prop(scene, "ipadapter_end", text="End fraction")
                             split = sub_ip_box.split(factor=0.5)
                             if context.scene.model_architecture == 'sdxl':
                                 split.label(text="Weight Type:")
@@ -1850,10 +1850,10 @@ class StableGenPanel(bpy.types.Panel):
                             row.prop(unit, "strength", text="Strength")
                             if width_mode == 'narrow':
                                 row = sub_unit_box.row()
-                            row.prop(unit, "start_percent", text="Start")
+                            row.prop(unit, "start_percent", text="Start fraction")
                             if width_mode == 'narrow':
                                 row = sub_unit_box.row()
-                            row.prop(unit, "end_percent", text="End")
+                            row.prop(unit, "end_percent", text="End fraction")
                             
                             if unit.unit_type == 'canny':
                                 row = sub_unit_box.row()
@@ -1887,11 +1887,11 @@ class StableGenPanel(bpy.types.Panel):
                         
                         if scene.differential_diffusion:
                             row = content_box.row()
-                            row.prop(scene, "differential_noise", text="Add Latent Noise Mask", toggle=True, icon="MOD_NOISE")
+                            row.prop(scene, "differential_noise", text="Use latent noise mask", toggle=True, icon="MOD_NOISE")
 
                         if not (scene.differential_diffusion and not scene.differential_noise): 
                             row = content_box.row()
-                            row.prop(scene, "mask_blocky", text="Use Blocky Mask", icon="MOD_MASK") 
+                            row.prop(scene, "mask_blocky", text="Align mask to latent grid", icon="MOD_MASK")
                             
                             if width_mode == 'narrow':
                                 row = content_box.row()
@@ -1900,13 +1900,13 @@ class StableGenPanel(bpy.types.Panel):
 
                             if scene.blur_mask:
                                 row = content_box.row()
-                                row.prop(scene, "blur_mask_radius", text="Blur Radius")
+                                row.prop(scene, "blur_mask_radius", text="Mask blur radius (px)")
                                 if width_mode == 'narrow':
                                     row = content_box.row()
-                                row.prop(scene, "blur_mask_sigma", text="Blur Sigma")
+                                row.prop(scene, "blur_mask_sigma", text="Mask blur sigma")
 
                             row = content_box.row() # Draw directly in content_box
-                            row.prop(scene, "grow_mask_by", text="Grow Mask By")
+                            row.prop(scene, "grow_mask_by", text="Mask expansion (px)")
 
 
             # --- Generation Mode Specifics ---
@@ -1930,7 +1930,7 @@ class StableGenPanel(bpy.types.Panel):
                     row = mode_specific_outer_box.row()
                     if 'denoise' in _diff_props:
                         row.alert = True
-                    row.prop(scene, "denoise", text="Denoise")
+                    row.prop(scene, "denoise", text="Edit strength")
                     if 'denoise' in _diff_props:
                         row.label(text="→ " + _diff_props['denoise'])
                     
@@ -1940,34 +1940,34 @@ class StableGenPanel(bpy.types.Panel):
                     row.prop(scene, "refine_angle_ramp_active", text="Use Angle-Based Blending", icon="DRIVER")
                     if scene.refine_angle_ramp_active:
                         row = box.row()
-                        row.prop(scene, "refine_angle_ramp_pos_0", text="Black Point")
-                        row.prop(scene, "refine_angle_ramp_pos_1", text="White Point")
+                        row.prop(scene, "refine_angle_ramp_pos_0", text="Angle ramp low point")
+                        row.prop(scene, "refine_angle_ramp_pos_1", text="Angle ramp high point")
                     
                     # Feather Ramp Controls
                     box = mode_specific_outer_box.box()
                     row = box.row()
-                    row.prop(scene, "visibility_vignette", text="Use Vignette Blending", icon="DRIVER")
+                    row.prop(scene, "visibility_vignette", text="Image-frame fade", icon="DRIVER")
                     if scene.visibility_vignette:
                         row = box.row()
-                        row.prop(scene, "refine_feather_ramp_pos_0", text="Black Point")
-                        row.prop(scene, "refine_feather_ramp_pos_1", text="White Point")
+                        row.prop(scene, "refine_feather_ramp_pos_0", text="Frame ramp low point")
+                        row.prop(scene, "refine_feather_ramp_pos_1", text="Frame ramp high point")
                         row = box.row()
-                        row.prop(scene, "visibility_vignette_width", text="Feather Width")
+                        row.prop(scene, "visibility_vignette_width", text="Frame fade width")
                         if width_mode == 'narrow':
                             row = box.row()
-                        row.prop(scene, "visibility_vignette_softness", text="Feather Softness")
+                        row.prop(scene, "visibility_vignette_softness", text="Frame fade exponent")
                         row = box.row()
-                        row.prop(scene, "visibility_vignette_blur", text="Blur Mask", icon="SURFACE_NSPHERE")
+                        row.prop(scene, "visibility_vignette_blur", text="Blur frame mask", icon="SURFACE_NSPHERE")
 
                     # Edge Feather Projection Controls
                     box = mode_specific_outer_box.box()
                     row = box.row()
-                    row.prop(scene, "refine_edge_feather_projection", text="Edge Feather (Projection)", icon="MOD_EDGESPLIT")
+                    row.prop(scene, "refine_edge_feather_projection", text="Projection silhouette fade", icon="MOD_EDGESPLIT")
                     if scene.refine_edge_feather_projection:
                         row = box.row()
-                        row.prop(scene, "refine_edge_feather_width", text="Feather Width (px)")
+                        row.prop(scene, "refine_edge_feather_width", text="Silhouette fade width (px)")
                         row = box.row()
-                        row.prop(scene, "refine_edge_feather_softness", text="Feather Softness")
+                        row.prop(scene, "refine_edge_feather_softness", text="Silhouette ramp smoothing")
 
                     # Color Matching
                     box = mode_specific_outer_box.box()
@@ -1987,7 +1987,7 @@ class StableGenPanel(bpy.types.Panel):
                     row = mode_specific_outer_box.row()
                     if 'denoise' in _diff_props:
                         row.alert = True
-                    row.prop(scene, "denoise", text="Denoise")
+                    row.prop(scene, "denoise", text="Edit strength")
                     if 'denoise' in _diff_props:
                         row.label(text="→ " + _diff_props['denoise'])
 
@@ -1999,7 +1999,7 @@ class StableGenPanel(bpy.types.Panel):
                     row.label(text="Grid Mode Parameters", icon="MESH_GRID")
                     
                     row = mode_specific_outer_box.row()
-                    row.prop(scene, "refine_images", text="Refine Images", toggle=True, icon="SHADERFX")
+                    row.prop(scene, "refine_images", text="Refine generated views", toggle=True, icon="SHADERFX")
                     if scene.refine_images:
                         split = mode_specific_outer_box.split(factor=0.5)
                         split.label(text="Refine Sampler:")
@@ -2012,15 +2012,15 @@ class StableGenPanel(bpy.types.Panel):
                         row = mode_specific_outer_box.row()
                         if 'denoise' in _diff_props:
                             row.alert = True
-                        row.prop(scene, "denoise", text="Denoise")
+                        row.prop(scene, "denoise", text="Edit strength")
                         if 'denoise' in _diff_props:
                             row.label(text="→ " + _diff_props['denoise'])
                         if width_mode == 'narrow':
                             row = mode_specific_outer_box.row()
-                        row.prop(scene, "refine_cfg", text="Refine CFG")
+                        row.prop(scene, "refine_cfg", text="Prompt guidance (CFG)")
                         if width_mode == 'narrow':
                             row = mode_specific_outer_box.row()
-                        row.prop(scene, "refine_steps", text="Refine Steps")
+                        row.prop(scene, "refine_steps", text="Sampling steps")
 
                         row = mode_specific_outer_box.row() 
                         split = mode_specific_outer_box.split(factor=0.25)
@@ -2038,7 +2038,7 @@ class StableGenPanel(bpy.types.Panel):
                     row.label(text="Separate Mode Parameters", icon='FORCE_FORCE')
                     
                     row = mode_specific_outer_box.row() 
-                    row.prop(scene, "sequential_ipadapter", text="Use IPAdapter for Separate Mode", toggle=True, icon="MODIFIER")
+                    row.prop(scene, "sequential_ipadapter", text="Use previous view as reference", toggle=True, icon="MODIFIER")
                     if scene.sequential_ipadapter: 
                         sub_ip_box_separate = mode_specific_outer_box.box()
                         
@@ -2047,8 +2047,8 @@ class StableGenPanel(bpy.types.Panel):
                         split.prop(scene, "sequential_ipadapter_mode", text="") 
 
                         if scene.sequential_ipadapter_mode == 'recent':
-                            sub_ip_box_separate.prop(scene, "sequential_desaturate_factor", text="Desaturate")
-                            sub_ip_box_separate.prop(scene, "sequential_contrast_factor", text="Reduce Contrast")
+                            sub_ip_box_separate.prop(scene, "sequential_desaturate_factor", text="Reference desaturation")
+                            sub_ip_box_separate.prop(scene, "sequential_contrast_factor", text="Reference contrast reduction")
 
                         if context.scene.model_architecture not in ('qwen_image_edit', 'qwen_image_21', 'flux2_klein'):
                             split = sub_ip_box_separate.split(factor=0.5) 
@@ -2060,10 +2060,10 @@ class StableGenPanel(bpy.types.Panel):
                         row.prop(scene, "ipadapter_strength", text="Strength")
                         if width_mode == 'narrow':
                             row = sub_ip_box_separate.row()
-                        row.prop(scene, "ipadapter_start", text="Start")
+                        row.prop(scene, "ipadapter_start", text="Start fraction")
                         if width_mode == 'narrow':
                             row = sub_ip_box_separate.row()
-                        row.prop(scene, "ipadapter_end", text="End")    
+                        row.prop(scene, "ipadapter_end", text="End fraction")
                         
                         if context.scene.sequential_ipadapter_mode == 'first':
                             row = sub_ip_box_separate.row()
@@ -2080,11 +2080,11 @@ class StableGenPanel(bpy.types.Panel):
                     row = mode_specific_outer_box.row()
                     if 'denoise' in _diff_props:
                         row.alert = True
-                    row.prop(scene, "denoise", text="Denoise")
+                    row.prop(scene, "denoise", text="Edit strength")
                     if 'denoise' in _diff_props:
                         row.label(text="→ " + _diff_props['denoise'])
                     row = mode_specific_outer_box.row() 
-                    row.prop(scene, "sequential_ipadapter", text="Use IPAdapter for Refine Mode", toggle=True, icon="MODIFIER")
+                    row.prop(scene, "sequential_ipadapter", text="Use previous view as reference", toggle=True, icon="MODIFIER")
                     if scene.sequential_ipadapter: 
                         sub_ip_box_separate = mode_specific_outer_box.box()
                         
@@ -2101,10 +2101,10 @@ class StableGenPanel(bpy.types.Panel):
                         row.prop(scene, "ipadapter_strength", text="Strength")
                         if width_mode == 'narrow':
                             row = sub_ip_box_separate.row()
-                        row.prop(scene, "ipadapter_start", text="Start")
+                        row.prop(scene, "ipadapter_start", text="Start fraction")
                         if width_mode == 'narrow':
                             row = sub_ip_box_separate.row()
-                        row.prop(scene, "ipadapter_end", text="End")    
+                        row.prop(scene, "ipadapter_end", text="End fraction")
                         
                         if context.scene.sequential_ipadapter_mode == 'first':
                             row = sub_ip_box_separate.row()
@@ -2121,7 +2121,7 @@ class StableGenPanel(bpy.types.Panel):
                     row = mode_specific_outer_box.row()
                     if 'denoise' in _diff_props:
                         row.alert = True
-                    row.prop(scene, "denoise", text="Denoise")
+                    row.prop(scene, "denoise", text="Edit strength")
                     if 'denoise' in _diff_props:
                         row.label(text="→ " + _diff_props['denoise'])
                     
@@ -2131,34 +2131,34 @@ class StableGenPanel(bpy.types.Panel):
                     row.prop(scene, "refine_angle_ramp_active", text="Use Angle-Based Blending", icon="DRIVER")
                     if scene.refine_angle_ramp_active:
                         row = box.row()
-                        row.prop(scene, "refine_angle_ramp_pos_0", text="Black Point")
-                        row.prop(scene, "refine_angle_ramp_pos_1", text="White Point")
+                        row.prop(scene, "refine_angle_ramp_pos_0", text="Angle ramp low point")
+                        row.prop(scene, "refine_angle_ramp_pos_1", text="Angle ramp high point")
                     
                     # Feather Ramp Controls
                     box = mode_specific_outer_box.box()
                     row = box.row()
-                    row.prop(scene, "visibility_vignette", text="Use Vignette Blending", icon="DRIVER")
+                    row.prop(scene, "visibility_vignette", text="Image-frame fade", icon="DRIVER")
                     if scene.visibility_vignette:
                         row = box.row()
-                        row.prop(scene, "refine_feather_ramp_pos_0", text="Black Point")
-                        row.prop(scene, "refine_feather_ramp_pos_1", text="White Point")
+                        row.prop(scene, "refine_feather_ramp_pos_0", text="Frame ramp low point")
+                        row.prop(scene, "refine_feather_ramp_pos_1", text="Frame ramp high point")
                         row = box.row()
-                        row.prop(scene, "visibility_vignette_width", text="Feather Width")
+                        row.prop(scene, "visibility_vignette_width", text="Frame fade width")
                         if width_mode == 'narrow':
                             row = box.row()
-                        row.prop(scene, "visibility_vignette_softness", text="Feather Softness")
+                        row.prop(scene, "visibility_vignette_softness", text="Frame fade exponent")
                         row = box.row()
-                        row.prop(scene, "visibility_vignette_blur", text="Blur Mask", icon="SURFACE_NSPHERE")
+                        row.prop(scene, "visibility_vignette_blur", text="Blur frame mask", icon="SURFACE_NSPHERE")
 
                     # Edge Feather Projection Controls
                     box = mode_specific_outer_box.box()
                     row = box.row()
-                    row.prop(scene, "refine_edge_feather_projection", text="Edge Feather (Projection)", icon="MOD_EDGESPLIT")
+                    row.prop(scene, "refine_edge_feather_projection", text="Projection silhouette fade", icon="MOD_EDGESPLIT")
                     if scene.refine_edge_feather_projection:
                         row = box.row()
-                        row.prop(scene, "refine_edge_feather_width", text="Feather Width (px)")
+                        row.prop(scene, "refine_edge_feather_width", text="Silhouette fade width (px)")
                         row = box.row()
-                        row.prop(scene, "refine_edge_feather_softness", text="Feather Softness")
+                        row.prop(scene, "refine_edge_feather_softness", text="Silhouette ramp smoothing")
 
                     # Color Matching
                     box = mode_specific_outer_box.box()
@@ -2171,7 +2171,7 @@ class StableGenPanel(bpy.types.Panel):
                         row.prop(scene, "view_blend_color_match_strength", text="Strength")
 
                     row = mode_specific_outer_box.row() 
-                    row.prop(scene, "sequential_ipadapter", text="Use IPAdapter for Local Edit", toggle=True, icon="MODIFIER")
+                    row.prop(scene, "sequential_ipadapter", text="Use previous view as reference", toggle=True, icon="MODIFIER")
                     if scene.sequential_ipadapter: 
                         sub_ip_box_separate = mode_specific_outer_box.box()
                         
@@ -2188,10 +2188,10 @@ class StableGenPanel(bpy.types.Panel):
                         row.prop(scene, "ipadapter_strength", text="Strength")
                         if width_mode == 'narrow':
                             row = sub_ip_box_separate.row()
-                        row.prop(scene, "ipadapter_start", text="Start")
+                        row.prop(scene, "ipadapter_start", text="Start fraction")
                         if width_mode == 'narrow':
                             row = sub_ip_box_separate.row()
-                        row.prop(scene, "ipadapter_end", text="End")    
+                        row.prop(scene, "ipadapter_end", text="End fraction")
                         
                         if context.scene.sequential_ipadapter_mode == 'first':
                             row = sub_ip_box_separate.row()
@@ -2206,7 +2206,7 @@ class StableGenPanel(bpy.types.Panel):
                     row.alignment = 'CENTER'
                     row.label(text="UV Inpainting Parameters", icon="IMAGE_PLANE")
                     row = mode_specific_outer_box.row()
-                    row.prop(scene, "allow_modify_existing_textures", text="Allow Modifying Existing Textures", toggle=True, icon="TEXTURE")
+                    row.prop(scene, "allow_modify_existing_textures", text="Allow updating textured areas", toggle=True, icon="TEXTURE")
                     row = mode_specific_outer_box.row()
                     row.prop(scene, "ask_object_prompts", text="Ask for Object Specific Prompts", toggle=True, icon="QUESTION")
 
@@ -2220,25 +2220,25 @@ class StableGenPanel(bpy.types.Panel):
                         row = mode_specific_outer_box.row()
                         if 'sequential_smooth' in _diff_props:
                             row.alert = True
-                        row.prop(scene, "sequential_smooth", text="Use Smooth Visibility Map", toggle=True, icon="MOD_SMOOTH")
+                        row.prop(scene, "sequential_smooth", text="Smooth previous-view coverage", toggle=True, icon="MOD_SMOOTH")
                         if 'sequential_smooth' in _diff_props:
                             row.label(text="→ " + _diff_props['sequential_smooth'])
                         if width_mode == 'narrow':
                             row = mode_specific_outer_box.row()
-                        row.prop(scene, "weight_exponent_mask", text="Exponent for Visibility Map", toggle=True, icon="IPO_EXPO") 
+                        row.prop(scene, "weight_exponent_mask", text="Apply view exponent to visibility mask", toggle=True, icon="IPO_EXPO")
                         
                         if not scene.sequential_smooth:
                             row = mode_specific_outer_box.row()
-                            row.prop(scene, "sequential_factor", text="Visibility Threshold") 
+                            row.prop(scene, "sequential_factor", text="Full-visibility tolerance")
                         else:
                             row = mode_specific_outer_box.row()
-                            row.prop(scene, "sequential_factor_smooth", text="Smooth Visibility Black Point")
+                            row.prop(scene, "sequential_factor_smooth", text="Coverage low point")
                             if width_mode == 'narrow':
                                 row = mode_specific_outer_box.row()
-                            row.prop(scene, "sequential_factor_smooth_2", text="Smooth Visibility White Point")
+                            row.prop(scene, "sequential_factor_smooth_2", text="Coverage high point")
                     
                     row = mode_specific_outer_box.row()
-                    row.prop(scene, "sequential_ipadapter", text="Use IPAdapter for Sequential Mode", toggle=True, icon="MODIFIER")
+                    row.prop(scene, "sequential_ipadapter", text="Use previous view as reference", toggle=True, icon="MODIFIER")
                     if scene.sequential_ipadapter:
                         sub_ip_seq_box = mode_specific_outer_box.box()
                         
@@ -2247,8 +2247,8 @@ class StableGenPanel(bpy.types.Panel):
                         split.prop(scene, "sequential_ipadapter_mode", text="")
 
                         if scene.sequential_ipadapter_mode == 'recent':
-                            sub_ip_seq_box.prop(scene, "sequential_desaturate_factor", text="Desaturate")
-                            sub_ip_seq_box.prop(scene, "sequential_contrast_factor", text="Reduce Contrast")
+                            sub_ip_seq_box.prop(scene, "sequential_desaturate_factor", text="Reference desaturation")
+                            sub_ip_seq_box.prop(scene, "sequential_contrast_factor", text="Reference contrast reduction")
 
                         if context.scene.model_architecture not in ('qwen_image_edit', 'qwen_image_21', 'flux2_klein'):
                             split = sub_ip_seq_box.split(factor=0.5)
@@ -2260,10 +2260,10 @@ class StableGenPanel(bpy.types.Panel):
                         row.prop(scene, "ipadapter_strength", text="Strength")
                         if width_mode == 'narrow':
                             row = sub_ip_seq_box.row()
-                        row.prop(scene, "ipadapter_start", text="Start")
+                        row.prop(scene, "ipadapter_start", text="Start fraction")
                         if width_mode == 'narrow':  
                             row = sub_ip_seq_box.row()
-                        row.prop(scene, "ipadapter_end", text="End")     
+                        row.prop(scene, "ipadapter_end", text="End fraction")
                         
                         if context.scene.sequential_ipadapter_mode == 'first':
                             row = sub_ip_seq_box.row()
@@ -2353,34 +2353,34 @@ class StableGenPanel(bpy.types.Panel):
             colors_box.label(text="Context Render Colors")
             if scene.model_architecture != 'qwen_image_21':
                 colors_box.prop(
-                    scene, "qwen_guidance_background_color", text="Background"
+                    scene, "qwen_guidance_background_color", text="Image background"
                 )
             colors_box.prop(
-                scene, "qwen_guidance_fallback_color", text="Fallback"
+                scene, "qwen_guidance_fallback_color", text="Missing-context color"
             )
 
             context_box.prop(
                 scene,
                 "qwen_use_confidence_context",
-                text="Confidence-Gated Context",
+                text="Protect reliable context",
                 toggle=True,
                 icon="MOD_MASK",
             )
             if scene.qwen_use_confidence_context:
                 context_box.prop(
-                    scene, "qwen_trust_threshold", text="Trusted Quality", slider=True
+                    scene, "qwen_trust_threshold", text="Minimum trusted view quality", slider=True
                 )
             else:
                 context_box.prop(
                     scene,
                     "qwen_context_fallback_dilation",
-                    text="Legacy Fallback Dilate (px)",
+                    text="Legacy context expansion (px)",
                     slider=True,
                 )
                 context_box.prop(
                     scene,
                     "qwen_context_cleanup",
-                    text="Legacy Cleanup",
+                    text="Legacy fallback cleanup",
                     toggle=True,
                     icon="BRUSH_DATA",
                 )
@@ -2388,13 +2388,13 @@ class StableGenPanel(bpy.types.Panel):
                     context_box.prop(
                         scene,
                         "qwen_context_cleanup_hue_tolerance",
-                        text="Hue Tol (°)",
+                        text="Hue tolerance (°)",
                         slider=True,
                     )
                     context_box.prop(
                         scene,
                         "qwen_context_cleanup_value_adjust",
-                        text="Value Adjust",
+                        text="Brightness adjustment",
                         slider=True,
                     )
 
@@ -2611,10 +2611,10 @@ class StableGenPrintPanel(bpy.types.Panel):
             dither_box.prop(scene, "stablegen_print_layer_height", text="Layer Height (mm)")
             
         row = box.row()
-        row.prop(scene, "stablegen_print_smoothing", text="Island Cleanup", slider=True)
+        row.prop(scene, "stablegen_print_smoothing", text="Island cleanup passes", slider=True)
             
         row = box.row()
-        row.prop(scene, "stablegen_print_chroma_threshold", text="Chroma Threshold", slider=True)
+        row.prop(scene, "stablegen_print_chroma_threshold", text="Saturation cutoff", slider=True)
 
         row = box.row()
         row.prop(scene, "stablegen_print_make_solid", text="Make Solid", icon="MOD_REMESH")
@@ -2622,7 +2622,7 @@ class StableGenPrintPanel(bpy.types.Panel):
             solid_box = box.box()
             solid_box.prop(scene, "stablegen_print_raycast_count", text="Raycast Angles")
             solid_box.prop(scene, "stablegen_print_keep_largest_island", text="Keep Largest Island", icon="MESH_ICOSPHERE")
-            solid_box.prop(scene, "stablegen_print_single_filament_internal", text="Single Filament Internal")
+            solid_box.prop(scene, "stablegen_print_single_filament_internal", text="Single filament for unseen faces")
             if scene.stablegen_print_single_filament_internal:
                 solid_box.prop(scene, "stablegen_print_internal_visibility_threshold", text="Visibility Threshold", slider=True)
 
@@ -2631,9 +2631,9 @@ class StableGenPrintPanel(bpy.types.Panel):
         row.prop(scene, "stablegen_print_show_advanced", text="Advanced Solver Settings", icon="TRIA_DOWN" if scene.stablegen_print_show_advanced else "TRIA_RIGHT")
         if scene.stablegen_print_show_advanced:
             adv_box = box.box()
-            adv_box.prop(scene, "stablegen_print_solver_formula", text="Model")
-            adv_box.prop(scene, "stablegen_print_solver_init", text="Init Method")
-            adv_box.prop(scene, "stablegen_print_solver_steps", text="Steps")
+            adv_box.prop(scene, "stablegen_print_solver_formula", text="Color mixing model")
+            adv_box.prop(scene, "stablegen_print_solver_init", text="Solver initialization")
+            adv_box.prop(scene, "stablegen_print_solver_steps", text="Solver iterations")
             adv_box.prop(scene, "stablegen_print_saturation_penalty", text="Saturation Penalty", slider=True)
             if scene.stablegen_print_solver_formula == 'KUBELKA_MUNK':
                 adv_box.prop(scene, "stablegen_print_scattering_weight", text="Opaque Scattering")

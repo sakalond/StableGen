@@ -1893,6 +1893,7 @@ class SwitchMaterial(bpy.types.Operator):
 
     bl_idname = "object.switch_material"
     bl_label = "Switch Material"
+    bl_description = "Make a material slot the active first material on scene mesh objects, preserving the other slots. Opens a material-index dialog and changes object selection"
     bl_options = {'REGISTER', 'UNDO'}
 
     material_index: bpy.props.IntProperty(
@@ -3139,6 +3140,7 @@ class BakeTextures(bpy.types.Operator):
     - This will make the generated textures available in the Material Preview viewport shading mode."""
     bl_idname = "object.bake_textures"
     bl_label = "Bake Textures"
+    bl_description = "Bake projected textures into UV image maps with Cycles. Opens resolution, UV and material options; saves maps in the output’s baked folder"
     bl_options = {'REGISTER', 'UNDO'}
 
     texture_resolution: bpy.props.IntProperty(
