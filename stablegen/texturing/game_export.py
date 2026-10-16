@@ -1,10 +1,106 @@
 """Game engine export operator (glTF/FBX)."""
 
+import contextlib
 import os
+from array import array
+
 import bpy  # pylint: disable=import-error
 from ..utils import get_dir_path, sg_modal_active
 
 _ADDON_PKG = __package__.rsplit('.', 1)[0]
+
+
+def _used_material_indices(mesh):
+    indices = array('i', [0]) * len(mesh.polygons)
+    mesh.polygons.foreach_get('material_index', indices)
+    return set(indices)
+
+
+def _material_uv_maps(material):
+    """UV map names the material's UV Map nodes read; empty when it uses the default map."""
+    if not material or not material.use_nodes or not material.node_tree:
+        return set()
+    return {node.uv_map for node in material.node_tree.nodes if node.type == 'UVMAP' and node.uv_map}
+
+
+def _swap_uv_layers(mesh, a, b):
+    """Exchange the coordinates and names of two UV layers, so their order in the mesh swaps."""
+    coords_a = array('f', [0.0]) * (len(mesh.loops) * 2)
+    coords_b = array('f', [0.0]) * (len(mesh.loops) * 2)
+    mesh.uv_layers[a].data.foreach_get('uv', coords_a)
+    mesh.uv_layers[b].data.foreach_get('uv', coords_b)
+    mesh.uv_layers[a].data.foreach_set('uv', coords_b)
+    mesh.uv_layers[b].data.foreach_set('uv', coords_a)
+    name_a, name_b = mesh.uv_layers[a].name, mesh.uv_layers[b].name
+    mesh.uv_layers[a].name = '__stablegen_uv_swap__'
+    mesh.uv_layers[b].name = name_a
+    mesh.uv_layers[a].name = name_b
+    flags = [(layer.active, layer.active_render) for layer in (mesh.uv_layers[a], mesh.uv_layers[b])]
+    for layer, (active, render) in zip((mesh.uv_layers[b], mesh.uv_layers[a]), flags):
+        if active:
+            layer.active = True
+        if render:
+            layer.active_render = True
+
+
+@contextlib.contextmanager
+def _fbx_ready_meshes(meshes):
+    """Temporarily shape mesh data the way FBX importers read it, then restore it.
+
+    FBX carries no link between a texture and the UV map it uses, so engines such as Unreal map
+    every texture through the first UV channel. After Bake that is usually the model's original UV
+    map, while the baked texture uses the BakeUV map. When all of a mesh's used materials read one
+    UV map, that map is made the first for the export. Material slots no face uses (the projection
+    material kept beside the baked one) are left out, so they are not imported as extra assets.
+    """
+    restore = []
+    seen = set()
+    try:
+        for obj in meshes:
+            mesh = obj.data
+            if mesh is None or mesh.name in seen or getattr(mesh, 'library', None):
+                continue
+            seen.add(mesh.name)
+            used = _used_material_indices(mesh)
+
+            uv_maps = set()
+            for index in used:
+                if index < len(mesh.materials):
+                    uv_maps |= _material_uv_maps(mesh.materials[index])
+            if len(uv_maps) == 1 and len(mesh.uv_layers) > 1:
+                target = mesh.uv_layers.find(next(iter(uv_maps)))
+                if target > 0:
+                    _swap_uv_layers(mesh, 0, target)
+                    restore.append(('uv', mesh, target))
+
+            object_linked = any(slot.link == 'OBJECT' for slot in obj.material_slots)
+            unused = [i for i in range(len(mesh.materials)) if i not in used]
+            if unused and used and not object_linked:
+                indices = array('i', [0]) * len(mesh.polygons)
+                mesh.polygons.foreach_get('material_index', indices)
+                materials = list(mesh.materials)
+                remap = {}
+                for old in range(len(materials)):
+                    if old not in unused:
+                        remap[old] = len(remap)
+                mesh.materials.clear()
+                for old, material in enumerate(materials):
+                    if old in remap:
+                        mesh.materials.append(material)
+                mesh.polygons.foreach_set('material_index', array('i', (remap.get(i, 0) for i in indices)))
+                restore.append(('materials', mesh, (materials, indices)))
+        yield
+    finally:
+        for kind, mesh, data in reversed(restore):
+            if kind == 'uv':
+                _swap_uv_layers(mesh, 0, data)
+            else:
+                materials, indices = data
+                mesh.materials.clear()
+                for material in materials:
+                    mesh.materials.append(material)
+                mesh.polygons.foreach_set('material_index', indices)
+            mesh.update()
 
 
 def _is_gltf_not_exported_helper(obj):
@@ -222,18 +318,19 @@ class ExportForGameEngine(bpy.types.Operator):
                     export_animations=self.export_animations,
                 )
             else:  # FBX
-                bpy.ops.export_scene.fbx(
-                    filepath=filepath,
-                    use_selection=True,
-                    object_types={'MESH', 'ARMATURE'},
-                    apply_scale_options='FBX_SCALE_ALL',
-                    path_mode='COPY',
-                    embed_textures=True,
-                    add_leaf_bones=False,
-                    bake_anim=self.export_animations,
-                    bake_anim_use_all_bones=True,
-                    mesh_smooth_type='FACE',
-                )
+                with _fbx_ready_meshes(meshes):
+                    bpy.ops.export_scene.fbx(
+                        filepath=filepath,
+                        use_selection=True,
+                        object_types={'MESH', 'ARMATURE'},
+                        apply_scale_options='FBX_SCALE_ALL',
+                        path_mode='COPY',
+                        embed_textures=True,
+                        add_leaf_bones=False,
+                        bake_anim=self.export_animations,
+                        bake_anim_use_all_bones=True,
+                        mesh_smooth_type='FACE',
+                    )
 
             if rigged_export:
                 print(
