@@ -2792,6 +2792,23 @@ _PBR_CHANNEL_SUFFIXES = {
 }
 
 
+def _remove_stale_pbr_maps(output_dir, object_name, channels):
+    """Delete ``{object_name}_{Suffix}.png`` maps left in *output_dir* by an earlier bake for every channel that is
+    not in *channels*. The baked material wires each map it finds on disk, so a channel switched off since the last
+    bake would otherwise come back. Base colour is always rewritten and is kept."""
+    removed = []
+    for channel, suffix in _PBR_CHANNEL_SUFFIXES.items():
+        if channel == 'base_color' or channel in channels:
+            continue
+        path = os.path.join(output_dir, f"{object_name}_{suffix}.png")
+        if os.path.isfile(path):
+            os.remove(path)
+            removed.append(os.path.basename(path))
+    if removed:
+        print(f"[StableGen] Removed maps from an earlier bake of {object_name}: {', '.join(removed)}")
+    return removed
+
+
 def _find_pbr_bake_sources(mat):
     """Inspect a Principled BSDF material and return bakeable PBR channel sources.
 
@@ -3504,10 +3521,14 @@ class BakeTextures(bpy.types.Operator):
                         self.report({'INFO'}, "Baking PBR channels...")
                         self._phase = 'bake_pbr'
                         self._pbr_queue = []
+                        baked_dir = get_dir_path(context, "baked")
                         for obj in self._objects:
+                            channels = []
                             if obj.active_material and _has_pbr_channels(obj.active_material):
-                                for ch in _find_pbr_bake_sources(obj.active_material):
+                                channels = list(_find_pbr_bake_sources(obj.active_material))
+                                for ch in channels:
                                     self._pbr_queue.append((obj, ch))
+                            _remove_stale_pbr_maps(baked_dir, obj.name, channels)
                         self._pbr_queue_idx = 0
                         if not self._pbr_queue:
                             # No PBR sources — skip straight to apply
