@@ -585,6 +585,29 @@ DEPENDENCIES: Dict[str, Dict[str, Any]] = {
         "license": "Apache-2.0", "size_mb": 3300,
         "packages": ["pbr_stabledelight"],
     },
+    # --- Marigold V2 (albedo + normals; ComfyUI core nodes, LoRAs on Qwen-Image-Edit-2509) ---
+    "model_marigold_v2_base": {
+        "id": "model_marigold_v2_base", "type": "model",
+        "name": "Marigold V2 base: Qwen Image Edit 2509 (int8)",
+        "url": "https://huggingface.co/Comfy-Org/marigold-v2-0/resolve/main/diffusion_models/qwen_image_edit_2509_int8_convrot.safetensors?download=true",
+        "target_path_relative": "models/diffusion_models", "filename": "qwen_image_edit_2509_int8_convrot.safetensors",
+        "license": "Apache 2.0", "size_mb": 19550, "packages": ["pbr_marigold_v2"],
+    },
+    **{
+        f"model_marigold_v2_{task}_{kind}": {
+            "id": f"model_marigold_v2_{task}_{kind}", "type": "model",
+            "name": f"Marigold V2 {task.capitalize()} {label}",
+            "url": f"https://huggingface.co/Comfy-Org/marigold-v2-0/resolve/main/{folder}/{filename}?download=true",
+            "target_path_relative": f"models/{folder}", "filename": filename,
+            "license": "Apache 2.0", "size_mb": size_mb, "packages": ["pbr_marigold_v2"],
+        }
+        for task in ("albedo", "normals")
+        for kind, label, folder, filename, size_mb in (
+            ("lora", "LoRA", "loras", f"marigold_v2_{task}.safetensors", 1625),
+            ("vae", "VAE", "vae", f"marigold_v2_{task}_vae.safetensors", 242),
+            ("cond", "Conditioning", "embeddings", f"marigold_v2_{task}_conditioning.safetensors", 3),
+        )
+    },
     # --- TRELLIS.2 ---
     "cn_trellis2": {
         "id": "cn_trellis2", "type": "node", "name": "ComfyUI TRELLIS.2",
@@ -771,6 +794,13 @@ MENU_PACKAGES: Dict[str, Dict[str, Any]] = {
         "description_suffix": "*Downloads FLUX.2 Klein 4B FP8 diffusion model (~4.1GB), Qwen 3 4B text encoder bf16 (~8.0GB),*\n"
                               "    *and FLUX.2 VAE (~0.3GB). All ComfyUI nodes are built-in (no custom nodes needed).*\n"
                               "    *Apache 2.0 license. Requires ~13GB VRAM.*",
+    },
+    '12': {"name": "[PBR DECOMPOSITION] Marigold V2 Models (Albedo + Normals)",
+        "tags": ["pbr_marigold_v2"],
+        "size_gb": 23.3,
+        "description_suffix": "*Downloads Marigold V2 (Apache 2.0): the int8 Qwen Image Edit 2509 base (~19.5GB) plus albedo*\n"
+                              "    *and normals LoRAs, VAEs and conditionings. Uses ComfyUI core nodes (September 2026 or newer).*\n"
+                              "    *Roughness and metallic still need the Marigold IID node (option 9).*",
     },
 }
 
