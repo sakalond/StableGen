@@ -72,320 +72,289 @@ _PATCH_TRELLIS_PRESTARTUP = (
     "# -- End StableGen patch --\n\n"
 )
 
-# Patch for lazy_manager.py: Add attn_backend to config comparison.
-# Without this, switching attention backend (e.g. xformers -> flash_attn)
-# doesn't recreate the model manager, leaving stale config.
-_PATCH_TRELLIS_ATTN_CMP_ANCHOR = (
-    "    elif (_LAZY_MANAGER.model_name != model_name or\n"
-    "          _LAZY_MANAGER.resolution != resolution or\n"
-    "          _LAZY_MANAGER.vram_mode != vram_mode):\n"
-    "        # Config changed, recreate manager\n"
-    "        _LAZY_MANAGER.cleanup()\n"
+# --- comfy-env core sync ---
+# comfy-env runs nodes like ComfyUI-TRELLIS2 in isolated pixi environments,
+# but their workers still import ComfyUI's own `comfy` package. ComfyUI core
+# pins some packages exactly (e.g. comfy-aimdo, comfy-kitchen), while the
+# node's comfy-env.toml asks for "*" and pixi's lock keeps whatever was current
+# at install time. After a ComfyUI update the worker then fails with errors
+# like "No module named 'comfy_aimdo.storage'".
+#
+# This module brings those pins into every isolated env of a node. The
+# installer writes it into the node folder, runs it with ComfyUI's Python, and
+# hooks it into the node's prestartup script so it re-checks on every ComfyUI
+# start (cheap: it only reads dist-info metadata unless something is out of date).
+_COMFY_ENV_SYNC_FILENAME = "stablegen_env_sync.py"
+_COMFY_ENV_SYNC_SOURCE = r'''"""Keep comfy-env isolated environments in step with ComfyUI core's pinned packages.
+
+Written by StableGen's installer. Run as:
+    python stablegen_env_sync.py <ComfyUI dir> <custom node dir> [--check]
+or import and call sync(comfyui_dir, node_dir). Safe to run repeatedly.
+"""
+import os
+import re
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+
+TAG = "[StableGen env sync]"
+SKIP_DIRS = {".git", ".pixi", "node_modules", "__pycache__"}
+
+
+def _norm(name):
+    return re.sub(r"[-_.]+", "-", name).lower()
+
+
+def _log(msg):
+    print(f"{TAG} {msg}", file=sys.stderr, flush=True)
+
+
+try:
+    from packaging.specifiers import SpecifierSet
+except ImportError:
+    try:
+        from pip._vendor.packaging.specifiers import SpecifierSet
+    except ImportError:
+        SpecifierSet = None
+
+
+def _satisfies(version, spec):
+    if SpecifierSet is None:  # no packaging library: only exact pins can be compared
+        return not spec.startswith("==") or version == spec[2:]
+    try:
+        return SpecifierSet(spec).contains(version, prereleases=True)
+    except Exception:
+        return True
+
+
+def _main_version(name):
+    """Version installed in the Python running this module (ComfyUI's own environment)."""
+    from importlib import metadata
+    try:
+        return metadata.version(name)
+    except metadata.PackageNotFoundError:
+        return None
+
+
+def core_requirements(comfyui_dir):
+    """Versioned requirements from ComfyUI's requirements.txt, as {name: specifier}.
+
+    Workers import ComfyUI's `comfy` and `comfy_api` packages, so whatever version
+    rules ComfyUI core sets must hold inside isolated envs too. Unversioned lines
+    are skipped, and front-end/template packages (comfyui-*) only matter to the
+    server, not to workers.
+    """
+    req = Path(comfyui_dir) / "requirements.txt"
+    reqs = {}
+    if not req.is_file():
+        return reqs
+    for line in req.read_text(encoding="utf-8", errors="ignore").splitlines():
+        line = line.split("#", 1)[0].split(";", 1)[0].strip()
+        m = re.fullmatch(r"([A-Za-z0-9_.\-]+)(?:\[[^\]]*\])?\s*((?:[<>=!~]=?|===)\s*[^\s,]+(?:\s*,\s*(?:[<>=!~]=?)\s*[^\s,]+)*)", line)
+        if m and not _norm(m.group(1)).startswith("comfyui-"):
+            reqs[_norm(m.group(1))] = re.sub(r"\s+", "", m.group(2))
+    return reqs
+
+
+def _target(name, spec):
+    """What to install for a requirement: ComfyUI's own version when it satisfies the rule."""
+    main = _main_version(name)
+    return f"{name}=={main}" if main and _satisfies(main, spec) else f"{name}{spec}"
+
+
+def _workspace_root():
+    override = os.environ.get("COMFY_ENV_ROOT")
+    if override:
+        return Path(override)
+    if sys.platform == "win32":
+        base = Path(os.environ.get("LOCALAPPDATA") or Path.home() / "AppData" / "Local")
+        return base / "Programs" / "comfy-env"
+    return Path.home() / ".ce"
+
+
+def _env_name(node_dir, config_path):
+    """comfy-env's naming rule; used only when comfy_env itself can't be imported."""
+    plugin = Path(node_dir).name
+    for prefix in ("ComfyUI-", "ComfyUI_", "comfyui-", "comfyui_"):
+        if plugin.startswith(prefix):
+            plugin = plugin[len(prefix):]
+            break
+    clean = lambda s: re.sub(r"-+", "-", re.sub(r"[^a-z0-9-]+", "-", s.lower())).strip("-")
+    name = clean(plugin)
+    parent = Path(config_path).parent.resolve()
+    if parent != Path(node_dir).resolve():
+        suffix = clean(parent.name)
+        if suffix:
+            name = f"{name}-{suffix}" if name else suffix
+    return name
+
+
+def env_dirs(node_dir):
+    """(config file, materialized env dir) for each isolated env of a node."""
+    node_dir = Path(node_dir)
+    configs = []
+    for root, dirs, files in os.walk(node_dir):
+        dirs[:] = [d for d in dirs if d not in SKIP_DIRS and not d.startswith("_env_")]
+        if "comfy-env.toml" in files:
+            configs.append(Path(root) / "comfy-env.toml")
+    try:
+        from comfy_env.environment.cache import get_env_name, get_workspace_env_dir
+        resolve = lambda cfg: get_workspace_env_dir(None, get_env_name(node_dir, cfg))
+    except Exception:
+        resolve = lambda cfg: _workspace_root() / "envs" / _env_name(node_dir, cfg) / ".pixi" / "envs" / "default"
+    return [(cfg, Path(resolve(cfg))) for cfg in configs]
+
+
+def _env_python(env_dir):
+    exe = env_dir / ("python.exe" if sys.platform == "win32" else "bin/python")
+    return exe if exe.is_file() else None
+
+
+def _site_packages(env_dir):
+    return [p for p in [env_dir / "Lib" / "site-packages", *env_dir.glob("lib/python3*/site-packages")] if p.is_dir()]
+
+
+def installed_versions(env_dir):
+    from importlib import metadata
+    versions = {}
+    for dist in metadata.distributions(path=[str(p) for p in _site_packages(env_dir)]):
+        name = dist.metadata.get("Name")
+        if name:
+            versions[_norm(name)] = dist.version
+    return versions
+
+
+def declared_packages(config_path):
+    """Package names listed under any *pypi-dependencies* table of a comfy-env.toml."""
+    names, active = set(), False
+    for line in Path(config_path).read_text(encoding="utf-8", errors="ignore").splitlines():
+        line = line.strip()
+        header = re.fullmatch(r"\[([^\]]+)\]", line)
+        if header:
+            active = "pypi-dependencies" in header.group(1)
+            continue
+        m = re.match(r"([A-Za-z0-9_.\-]+)\s*=", line)
+        if active and m:
+            names.add(_norm(m.group(1)))
+    return names
+
+
+def sync(comfyui_dir, node_dir, check_only=False):
+    """Make the node's envs satisfy ComfyUI core's requirements. Returns a list of problems left over.
+
+    Only packages an env already has (or declares) are touched, and only when their
+    version breaks ComfyUI's rule; they get the version ComfyUI's own env runs.
+    """
+    reqs = core_requirements(comfyui_dir)
+    if not reqs:
+        _log(f"no versioned requirements found in {Path(comfyui_dir) / 'requirements.txt'}; nothing to sync")
+        return []
+    problems = []
+    for config, env_dir in env_dirs(node_dir):
+        python = _env_python(env_dir)
+        if not python:
+            continue  # not materialized yet; comfy-env builds it on first use
+        installed = installed_versions(env_dir)
+        relevant = installed.keys() | declared_packages(config)
+        wanted = {n: _target(n, s) for n, s in reqs.items()
+                  if n in relevant and not (n in installed and _satisfies(installed[n], s))}
+        if not wanted:
+            continue
+        summary = ", ".join(f"{n} {installed.get(n, 'missing')} -> {t[len(n):]}" for n, t in wanted.items())
+        if check_only:
+            problems.append(f"{env_dir.parent.parent.parent.name}: {summary}")
+            continue
+        _log(f"{env_dir.parent.parent.parent.name}: {summary}")
+        # Hold every other package at its current version so pip can't swap the
+        # env's CUDA torch build or anything else while resolving.
+        with tempfile.NamedTemporaryFile("w", suffix=".txt", delete=False, encoding="utf-8") as fh:
+            fh.write("\n".join(f"{n}=={v}" for n, v in installed.items() if n not in wanted))
+            constraints = fh.name
+        try:
+            # Packages pixi took from conda (e.g. av) may have no build for this
+            # Python that satisfies ComfyUI; pip replaces them with the PyPI wheel.
+            result = subprocess.run(
+                [str(python), "-m", "pip", "install", "--disable-pip-version-check", "--no-input",
+                 "-c", constraints, *wanted.values()],
+                env=dict(os.environ, PYTHONNOUSERSITE="1"), capture_output=True, text=True, timeout=900)
+        finally:
+            os.unlink(constraints)
+        after = installed_versions(env_dir)
+        left = [t for n, t in wanted.items() if not (n in after and _satisfies(after[n], reqs[n]))]
+        if result.returncode != 0 or left:
+            tail = (result.stderr or result.stdout).strip().splitlines()[-3:]
+            problems.append(f"{env_dir}: could not install {', '.join(left) or 'all packages'}: "
+                            + " | ".join(tail))
+        else:
+            _log(f"{env_dir.parent.parent.parent.name}: up to date")
+    for p in problems:
+        _log(("OUT OF DATE " if check_only else "FAILED ") + p)
+    return problems
+
+
+_VERIFY = (
+    "import sys; sys.argv = ['main.py']; sys.path[:0] = [{comfy!r}]\n"
+    "import comfy.model_management, comfy.utils, comfy_api.latest\n"
+    "print('ok')\n"
 )
 
-_PATCH_TRELLIS_ATTN_CMP_REPLACE = (
-    "    elif (_LAZY_MANAGER.model_name != model_name or\n"
-    "          _LAZY_MANAGER.resolution != resolution or\n"
-    "          _LAZY_MANAGER.vram_mode != vram_mode or\n"
-    "          _LAZY_MANAGER.attn_backend != attn_backend):\n"
-    "        # Config changed, recreate manager\n"
-    "        print(f\"[TRELLIS2] Config changed, recreating model manager...\", file=sys.stderr)\n"
-    "        _LAZY_MANAGER.cleanup()\n"
-)
 
-# Patch for stages.py: Wrap DinoV3 feature extraction in torch.no_grad().
-# Without this, autograd retains ViT-L intermediate activations on GPU,
-# leaking ~5-9 GB between runs in the persistent comfy-env worker.
-_PATCH_TRELLIS_NOGRAD_ANCHOR = (
-    "    # Load DinoV3 and extract features\n"
-    "    model = manager.get_dinov3(device)\n"
-    "\n"
-    "    # Get 512px conditioning\n"
-    "    model.image_size = 512\n"
-    "    cond_512 = model([pil_image])\n"
-    "\n"
-    "    # Get 1024px conditioning if requested\n"
-    "    cond_1024 = None\n"
-    "    if include_1024:\n"
-    "        model.image_size = 1024\n"
-    "        cond_1024 = model([pil_image])\n"
-    "\n"
-    "    # Unload DinoV3 immediately\n"
-    "    manager.unload_dinov3()\n"
-    "\n"
-    "    # Create negative conditioning\n"
-    "    neg_cond = torch.zeros_like(cond_512)\n"
-    "\n"
-    "    conditioning = {\n"
-    "        'cond_512': cond_512.cpu(),\n"
-    "        'neg_cond': neg_cond.cpu(),\n"
-    "    }\n"
-    "    if cond_1024 is not None:\n"
-    "        conditioning['cond_1024'] = cond_1024.cpu()\n"
-)
+def verify(comfyui_dir, node_dir):
+    """Import ComfyUI core with each env's own Python, the way the node's worker does."""
+    problems = []
+    for _, env_dir in env_dirs(node_dir):
+        python = _env_python(env_dir)
+        if not python:
+            continue
+        result = subprocess.run([str(python), "-c", _VERIFY.format(comfy=str(Path(comfyui_dir).resolve()))],
+                                env=dict(os.environ, PYTHONNOUSERSITE="1"), capture_output=True, text=True,
+                                timeout=600, cwd=str(comfyui_dir))
+        if result.returncode != 0:
+            output = (result.stderr or result.stdout).strip()
+            last = output.splitlines()[-1:] or ["unknown error"]
+            if "WinError 1455" in output or "MemoryError" in output:
+                # Not an env problem: the machine is out of memory (e.g. a generation is running).
+                _log(f"{env_dir.parent.parent.parent.name}: could not verify, system is low on memory; "
+                     "close other GPU/RAM-heavy programs and re-run --check")
+                continue
+            problems.append(f"{env_dir.parent.parent.parent.name}: ComfyUI core does not import: {last[0]}")
+        else:
+            _log(f"{env_dir.parent.parent.parent.name}: ComfyUI core imports cleanly")
+    for p in problems:
+        _log("FAILED " + p)
+    return problems
 
-_PATCH_TRELLIS_NOGRAD_REPLACE = (
-    "    # Load DinoV3 and extract features\n"
-    "    model = manager.get_dinov3(device)\n"
-    "\n"
-    "    # Use no_grad to prevent autograd from retaining intermediate activations\n"
-    "    # on GPU. Without this, the computation graph keeps ViT-L activations alive\n"
-    "    # in the comfy-env worker, leaking ~5-9 GB between runs.\n"
-    "    with torch.no_grad():\n"
-    "        # Get 512px conditioning\n"
-    "        model.image_size = 512\n"
-    "        cond_512 = model([pil_image])\n"
-    "\n"
-    "        # Get 1024px conditioning if requested\n"
-    "        cond_1024 = None\n"
-    "        if include_1024:\n"
-    "            model.image_size = 1024\n"
-    "            cond_1024 = model([pil_image])\n"
-    "\n"
-    "    # Unload DinoV3 immediately\n"
-    "    manager.unload_dinov3()\n"
-    "\n"
-    "    # Create negative conditioning\n"
-    "    neg_cond = torch.zeros_like(cond_512)\n"
-    "\n"
-    "    # .detach() breaks any remaining graph references before moving to CPU\n"
-    "    conditioning = {\n"
-    "        'cond_512': cond_512.detach().cpu(),\n"
-    "        'neg_cond': neg_cond.detach().cpu(),\n"
-    "    }\n"
-    "    if cond_1024 is not None:\n"
-    "        conditioning['cond_1024'] = cond_1024.detach().cpu()\n"
-    "\n"
-    "    # Free the GPU originals immediately\n"
-    "    del cond_512, cond_1024, neg_cond\n"
-    "    gc.collect()\n"
-    "    torch.cuda.empty_cache()\n"
-)
 
-# ---------------------------------------------------------------------------
-# comfy-env VRAM leak fix patches
-# ---------------------------------------------------------------------------
-# comfy-env hooks torch.nn.Module.to() and .cuda() to auto-register every
-# model that lands on CUDA in a permanent _model_registry (with no unregister
-# API).  Between ComfyUI node calls the model manager issues
-# "Requested to load SubprocessModel" which calls model_to_device("cuda"),
-# moving ALL registered models back to GPU.  This leaks ~7 GB of model
-# weights between runs.  The fix: unregister from the registry before
-# moving models to CPU / deleting them.
-# ---------------------------------------------------------------------------
+if __name__ == "__main__":
+    args = [a for a in sys.argv[1:] if not a.startswith("--")]
+    if len(args) != 2:
+        sys.exit(__doc__)
+    left = sync(args[0], args[1], check_only="--check" in sys.argv)
+    if not left:
+        left = verify(args[0], args[1])
+    sys.exit(1 if left else 0)
+'''
 
-# -- base.py _unload_model: unregister from comfy-env + model.cpu() before del
-_PATCH_TRELLIS_UNLOAD_CPU_ANCHOR = (
-    "            # Delete the model entirely\n"
-    "            self.models[model_key] = None\n"
-    "            del model\n"
-)
-
-_PATCH_TRELLIS_UNLOAD_CPU_REPLACE = (
-    "            # Unregister from comfy-env's model registry BEFORE moving to CPU.\n"
-    "            # comfy-env auto-registers every nn.Module that lands on CUDA via\n"
-    "            # hooked Module.to(). Without unregistering, the registry keeps a\n"
-    "            # permanent reference and ComfyUI's model manager re-loads the model\n"
-    "            # to GPU between calls, leaking the full model weights per run.\n"
-    "            # Replace with zero-param dummy so host's model_to_device succeeds\n"
-    "            # but consumes 0 VRAM.  Registry accessed via closure on\n"
-    "            # sys.modules['comfy_worker'].register_model.\n"
-    "            try:\n"
-    "                _cw = sys.modules.get('comfy_worker')\n"
-    "                if _cw is not None:\n"
-    "                    _reg_fn = getattr(_cw, 'register_model', None)\n"
-    "                    if _reg_fn is not None and hasattr(_reg_fn, '__closure__'):\n"
-    "                        _fv = _reg_fn.__code__.co_freevars\n"
-    "                        _cl = _reg_fn.__closure__\n"
-    "                        _by_obj = _cl[_fv.index('_model_id_by_obj')].cell_contents\n"
-    "                        _registry = _cl[_fv.index('_model_registry')].cell_contents\n"
-    "                        _meta = _cl[_fv.index('_model_registry_meta')].cell_contents\n"
-    "                        obj_id = id(model)\n"
-    "                        if obj_id in _by_obj:\n"
-    "                            ce_model_id = _by_obj.pop(obj_id)\n"
-    "                            dummy = torch.nn.Module()\n"
-    "                            _registry[ce_model_id] = dummy\n"
-    "                            _meta[ce_model_id] = {'size': 0, 'kind': 'other'}\n"
-    "                            _by_obj[id(dummy)] = ce_model_id\n"
-    '                            print(f"[TRELLIS2] Unregistered {model_key} from comfy-env registry (id={ce_model_id})", file=sys.stderr, flush=True)\n'
-    "            except Exception:\n"
-    "                pass\n"
-    "            # Force all parameters and buffers off GPU.\n"
-    "            try:\n"
-    "                model.cpu()\n"
-    "            except Exception:\n"
-    "                pass\n"
-    "            # Delete the model entirely\n"
-    "            self.models[model_key] = None\n"
-    "            del model\n"
-)
-
-# -- lazy_manager.py: insert _unregister_from_comfy_env helper function
-_PATCH_TRELLIS_COMFY_HELPER_ANCHOR = (
-    "# Global model manager instance\n"
-    '_LAZY_MANAGER: Optional["LazyModelManager"] = None\n'
-)
-
-_PATCH_TRELLIS_COMFY_HELPER_REPLACE = (
-    "\n"
-    "def _unregister_from_comfy_env(model, label: str = \"\"):\n"
-    '    """Remove an nn.Module from comfy-env\'s worker-side model registry.\n'
-    "\n"
-    "    comfy-env hooks Module.to() to auto-register every model that lands on\n"
-    "    CUDA.  The registry keeps a permanent reference, and ComfyUI's model\n"
-    "    manager will re-load the model to GPU between calls via\n"
-    "    'Requested to load SubprocessModel'.  We replace the model with a\n"
-    "    zero-param dummy so the host's model_to_device succeeds (no-op) but\n"
-    "    no VRAM is consumed.  Registry accessed via closure on\n"
-    "    sys.modules['comfy_worker'].register_model.\n"
-    '    """\n'
+_PATCH_COMFY_ENV_SYNC_PRESTARTUP = (
+    "# -- StableGen patch: keep comfy-env envs in step with ComfyUI core --\n"
+    "try:\n"
+    "    import os as _os, sys as _sys\n"
+    "    _here = _os.path.dirname(_os.path.abspath(__file__))\n"
+    "    _sys.path.insert(0, _here)\n"
     "    try:\n"
-    "        _cw = sys.modules.get('comfy_worker')\n"
-    "        if _cw is None:\n"
-    "            return\n"
-    "        _reg_fn = getattr(_cw, 'register_model', None)\n"
-    "        if _reg_fn is None or not hasattr(_reg_fn, '__closure__'):\n"
-    "            return\n"
-    "        _fv = _reg_fn.__code__.co_freevars\n"
-    "        _cl = _reg_fn.__closure__\n"
-    "        _by_obj = _cl[_fv.index('_model_id_by_obj')].cell_contents\n"
-    "        _registry = _cl[_fv.index('_model_registry')].cell_contents\n"
-    "        _meta = _cl[_fv.index('_model_registry_meta')].cell_contents\n"
-    "        obj_id = id(model)\n"
-    "        if obj_id in _by_obj:\n"
-    "            model_id = _by_obj.pop(obj_id)\n"
-    "            dummy = torch.nn.Module()\n"
-    "            _registry[model_id] = dummy\n"
-    "            _meta[model_id] = {'size': 0, 'kind': 'other'}\n"
-    "            _by_obj[id(dummy)] = model_id\n"
-    '            print(f"[TRELLIS2] Unregistered {label} from comfy-env registry (id={model_id})", file=sys.stderr)\n'
-    "    except Exception:\n"
-    "        pass\n"
-    "\n"
-    "\n"
-    "# Global model manager instance\n"
-    '_LAZY_MANAGER: Optional["LazyModelManager"] = None\n'
+    "        import stablegen_env_sync as _sg_env_sync\n"
+    "        _sg_env_sync.sync(_os.path.dirname(_os.path.dirname(_here)), _here)\n"
+    "    finally:\n"
+    "        _sys.path.remove(_here)\n"
+    "except Exception as _e:\n"
+    "    print(f'[StableGen env sync] skipped: {_e}', file=_sys.stderr)\n"
+    "# -- End StableGen patch --\n\n"
 )
 
-# -- lazy_manager.py unload_dinov3: add comfy-env unregistration
-_PATCH_TRELLIS_UNLOAD_DINOV3_ANCHOR = (
-    "    def unload_dinov3(self):\n"
-    '        """Unload DinoV3 to free VRAM."""\n'
-    "        if self.dinov3_model is not None:\n"
-    "            self.dinov3_model.cpu()\n"
-    "            self.dinov3_model = None\n"
-    "            gc.collect()\n"
-    "            torch.cuda.empty_cache()\n"
-    '            print(f"[TRELLIS2] DinoV3 offloaded", file=sys.stderr)\n'
-)
-
-_PATCH_TRELLIS_UNLOAD_DINOV3_REPLACE = (
-    "    def unload_dinov3(self):\n"
-    '        """Unload DinoV3 to free VRAM."""\n'
-    "        if self.dinov3_model is not None:\n"
-    "            # Unregister the inner nn.Module (DINOv3ViTModel) from comfy-env.\n"
-    "            # DinoV3FeatureExtractor is a plain class; comfy-env hooks on the\n"
-    "            # inner .model which is the actual nn.Module that got .to(cuda).\n"
-    "            inner = getattr(self.dinov3_model, 'model', self.dinov3_model)\n"
-    '            _unregister_from_comfy_env(inner, "dinov3")\n'
-    "            self.dinov3_model.cpu()\n"
-    "            self.dinov3_model = None\n"
-    "            gc.collect()\n"
-    "            torch.cuda.empty_cache()\n"
-    '            print(f"[TRELLIS2] DinoV3 offloaded", file=sys.stderr)\n'
-)
-
-# -- lazy_manager.py unload_shape_pipeline: iterate models + comfy-env unreg
-_PATCH_TRELLIS_UNLOAD_SHAPE_ANCHOR = (
-    "    def unload_shape_pipeline(self):\n"
-    '        """Unload shape pipeline to free VRAM."""\n'
-    "        if self.shape_pipeline is not None:\n"
-    "            self.shape_pipeline = None\n"
-    "            gc.collect()\n"
-    "            torch.cuda.empty_cache()\n"
-    '            print(f"[TRELLIS2] Shape pipeline offloaded", file=sys.stderr)\n'
-)
-
-_PATCH_TRELLIS_UNLOAD_SHAPE_REPLACE = (
-    "    def unload_shape_pipeline(self):\n"
-    '        """Unload shape pipeline to free VRAM."""\n'
-    "        if self.shape_pipeline is not None:\n"
-    "            # Force any remaining models off GPU before dropping pipeline\n"
-    "            if hasattr(self.shape_pipeline, 'models'):\n"
-    "                for key in list(self.shape_pipeline.models.keys()):\n"
-    "                    model = self.shape_pipeline.models[key]\n"
-    "                    if model is not None:\n"
-    '                        _unregister_from_comfy_env(model, f"shape/{key}")\n'
-    "                        try:\n"
-    "                            model.cpu()\n"
-    "                        except Exception:\n"
-    "                            pass\n"
-    "                        self.shape_pipeline.models[key] = None\n"
-    "                        del model\n"
-    "                self.shape_pipeline.models.clear()\n"
-    "            self.shape_pipeline = None\n"
-    "            gc.collect()\n"
-    "            torch.cuda.empty_cache()\n"
-    '            print(f"[TRELLIS2] Shape pipeline offloaded", file=sys.stderr)\n'
-)
-
-# -- lazy_manager.py unload_texture_pipeline: iterate models + comfy-env unreg
-_PATCH_TRELLIS_UNLOAD_TEX_ANCHOR = (
-    "    def unload_texture_pipeline(self):\n"
-    '        """Unload texture pipeline to free VRAM."""\n'
-    "        if self.texture_pipeline is not None:\n"
-    "            self.texture_pipeline = None\n"
-    "            gc.collect()\n"
-    "            torch.cuda.empty_cache()\n"
-    '            print(f"[TRELLIS2] Texture pipeline offloaded", file=sys.stderr)\n'
-)
-
-_PATCH_TRELLIS_UNLOAD_TEX_REPLACE = (
-    "    def unload_texture_pipeline(self):\n"
-    '        """Unload texture pipeline to free VRAM."""\n'
-    "        if self.texture_pipeline is not None:\n"
-    "            # Force any remaining models off GPU before dropping pipeline\n"
-    "            if hasattr(self.texture_pipeline, 'models'):\n"
-    "                for key in list(self.texture_pipeline.models.keys()):\n"
-    "                    model = self.texture_pipeline.models[key]\n"
-    "                    if model is not None:\n"
-    '                        _unregister_from_comfy_env(model, f"texture/{key}")\n'
-    "                        try:\n"
-    "                            model.cpu()\n"
-    "                        except Exception:\n"
-    "                            pass\n"
-    "                        self.texture_pipeline.models[key] = None\n"
-    "                        del model\n"
-    "                self.texture_pipeline.models.clear()\n"
-    "            self.texture_pipeline = None\n"
-    "            gc.collect()\n"
-    "            torch.cuda.empty_cache()\n"
-    '            print(f"[TRELLIS2] Texture pipeline offloaded", file=sys.stderr)\n'
-)
-
-# Patch for stages.py: clean up IPC tensor files from previous generations
-# inside _save_to_disk so they don't accumulate and fill the disk.
-_PATCH_TRELLIS_TEMP_CLEANUP_ANCHOR = (
-    "def _save_to_disk(data, prefix):\n"
-    "    path = os.path.join(_get_temp_dir(), f'{prefix}_{uuid.uuid4().hex[:8]}.pt')\n"
-    "    torch.save(data, path)\n"
-    "    return {'_tensor_file': path}"
-)
-
-_PATCH_TRELLIS_TEMP_CLEANUP_REPLACE = (
-    "def _save_to_disk(data, prefix):\n"
-    "    import glob as _glob\n"
-    "    temp_dir = _get_temp_dir()\n"
-    "    # StableGen patch: clean up files from previous generations\n"
-    "    for _old in _glob.glob(os.path.join(temp_dir, f'{prefix}_*.pt')):\n"
-    "        try:\n"
-    "            os.remove(_old)\n"
-    "        except OSError:\n"
-    "            pass\n"
-    "    path = os.path.join(temp_dir, f'{prefix}_{uuid.uuid4().hex[:8]}.pt')\n"
-    "    torch.save(data, path)\n"
-    "    return {'_tensor_file': path}"
-)
+# Older StableGen releases also patched nodes/trellis_utils/ and nodes/trellis2/pipelines/ (VRAM-leak and
+# temp-file fixes). Upstream replaced that code with ComfyUI's native model loading in February 2026, so those
+# patches no longer have anything to apply to and were removed when the node was pinned below.
 
 # --- Configuration: Dependencies Data ---
 # Sizes are in MB.
@@ -614,6 +583,9 @@ DEPENDENCIES: Dict[str, Dict[str, Any]] = {
         "git_url": "https://github.com/PozzettiAndrea/ComfyUI-TRELLIS2.git",
         "target_dir_relative": "custom_nodes",
         "repo_name": "ComfyUI-TRELLIS2",
+        # Verified with ComfyUI 0.37 and comfy-env 0.4.1 (October 2026). Upstream refactors
+        # regularly break the patches below, so move this pin only after re-testing.
+        "commit": "9b878516f2dc2fd873f4f6cceadba403dd12d83e",
         "license": "MIT (Note: textured pipeline uses NVIDIA non-commercial libs)", "packages": ["trellis2"],
         "pip_packages": ["comfy-env", "comfy-sparse-attn", "comfy-3d-viewers"],
         "clean_envs": True,
@@ -632,80 +604,16 @@ DEPENDENCIES: Dict[str, Dict[str, Any]] = {
                 "patch": _PATCH_TRELLIS_PRESTARTUP,
             },
             {
-                "file": "nodes/trellis_utils/lazy_manager.py",
-                "marker": "_LAZY_MANAGER.attn_backend != attn_backend",
-                "anchor": _PATCH_TRELLIS_ATTN_CMP_ANCHOR,
-                "patch": _PATCH_TRELLIS_ATTN_CMP_REPLACE,
-                "mode": "replace",
-            },
-            {
-                "file": "nodes/trellis_utils/stages.py",
-                "marker": "# Use no_grad to prevent autograd",
-                "anchor": _PATCH_TRELLIS_NOGRAD_ANCHOR,
-                "patch": _PATCH_TRELLIS_NOGRAD_REPLACE,
-                "mode": "replace",
-            },
-            {
-                "file": "nodes/trellis2/pipelines/base.py",
-                "marker": "_model_id_by_obj",
-                "anchor": _PATCH_TRELLIS_UNLOAD_CPU_ANCHOR,
-                "patch": _PATCH_TRELLIS_UNLOAD_CPU_REPLACE,
-                "mode": "replace",
-            },
-            {
-                "file": "nodes/trellis_utils/lazy_manager.py",
-                "marker": "_unregister_from_comfy_env",
-                "anchor": _PATCH_TRELLIS_COMFY_HELPER_ANCHOR,
-                "patch": _PATCH_TRELLIS_COMFY_HELPER_REPLACE,
-                "mode": "replace",
-            },
-            {
-                "file": "nodes/trellis_utils/lazy_manager.py",
-                "marker": '_unregister_from_comfy_env(self.dinov3_model',
-                "anchor": _PATCH_TRELLIS_UNLOAD_DINOV3_ANCHOR,
-                "patch": _PATCH_TRELLIS_UNLOAD_DINOV3_REPLACE,
-                "mode": "replace",
-            },
-            {
-                "file": "nodes/trellis_utils/lazy_manager.py",
-                "marker": '_unregister_from_comfy_env(model, f"shape/',
-                "anchor": _PATCH_TRELLIS_UNLOAD_SHAPE_ANCHOR,
-                "patch": _PATCH_TRELLIS_UNLOAD_SHAPE_REPLACE,
-                "mode": "replace",
-            },
-            {
-                "file": "nodes/trellis_utils/lazy_manager.py",
-                "marker": '_unregister_from_comfy_env(model, f"texture/',
-                "anchor": _PATCH_TRELLIS_UNLOAD_TEX_ANCHOR,
-                "patch": _PATCH_TRELLIS_UNLOAD_TEX_REPLACE,
-                "mode": "replace",
-            },
-            {
-                "file": "nodes/trellis_utils/stages.py",
-                "marker": "# StableGen patch: clean up files from previous generations",
-                "anchor": _PATCH_TRELLIS_TEMP_CLEANUP_ANCHOR,
-                "patch": _PATCH_TRELLIS_TEMP_CLEANUP_REPLACE,
-                "mode": "replace",
+                "file": "prestartup_script.py",
+                "marker": "StableGen patch: keep comfy-env envs in step",
+                "anchor": "from comfy_env import",
+                "patch": _PATCH_COMFY_ENV_SYNC_PRESTARTUP,
             },
             {
                 "file": "nodes/rembg/BiRefNet.py",
                 "marker": "StableGen patch: BiRefNet fp32",
                 "anchor": "self.model.eval()",
                 "patch": "self.model.eval()\n        self.model.float()  # StableGen patch: BiRefNet fp32 — avoid fp16/fp32 dtype mismatch",
-                "mode": "replace",
-            },
-            {
-                "file": "nodes/trellis2/pipelines/rembg/BiRefNet.py",
-                "marker": "StableGen patch: timm.layers compat",
-                "anchor": "import torch",
-                "patch": (
-                    "import torch\n"
-                    "import sys as _sys  # StableGen patch: timm.layers compat\n"
-                    "if 'timm.layers' not in _sys.modules:\n"
-                    "    try:\n"
-                    "        import timm.models.layers as _tl; _sys.modules['timm.layers'] = _tl  # timm<0.9 compat for BiRefNet\n"
-                    "    except ImportError: pass\n"
-                ),
                 "mode": "replace",
             },
         ]
@@ -811,11 +719,20 @@ def print_header(title: str):
 def print_separator(char='-', length=70):
     print(char * length)
 
-def get_comfyui_path_from_args() -> Path:
+def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="StableGen Dependency Installer Script.")
     parser.add_argument("comfyuipath", nargs='?', default=None,
                         help="Full path to your ComfyUI installation directory. If not provided, will be prompted.")
-    args = parser.parse_args()
+    parser.add_argument("--repair", action="store_true",
+                        help="Repair installed TRELLIS.2 nodes without the menu: re-apply StableGen's patches and "
+                             "sync their isolated environments with ComfyUI core. Run after updating ComfyUI or "
+                             "the TRELLIS.2 node.")
+    parser.add_argument("--check", action="store_true",
+                        help="Only report whether installed TRELLIS.2 environments are out of date; change nothing.")
+    return parser.parse_args()
+
+
+def get_comfyui_path_from_args(args: argparse.Namespace) -> Path:
 
     comfyui_path_str = args.comfyuipath
     while not comfyui_path_str:
@@ -1325,6 +1242,65 @@ def run_node_install_script(item_details: Dict[str, Any], comfyui_path: Path):
         print(f"  ERROR: Python executable not found at '{python_exe}'.")
 
 
+def _uses_comfy_env(item_details: Dict[str, Any]) -> bool:
+    return any("comfy-env" in p for p in item_details.get("pip_packages", []))
+
+
+def sync_comfy_env_core(item_details: Dict[str, Any], comfyui_path: Path, check_only: bool = False) -> bool:
+    """Bring ComfyUI core's exact pins into a comfy-env node's isolated environments.
+
+    Writes the sync module into the node folder (the prestartup patch imports it
+    on every ComfyUI start) and runs it once now with ComfyUI's own Python, so it
+    resolves env paths with the installed comfy-env. Returns True when everything
+    is in step.
+    """
+    repo_path = comfyui_path / item_details["target_dir_relative"] / item_details["repo_name"]
+    if not repo_path.is_dir():
+        return True
+    module_path = repo_path / _COMFY_ENV_SYNC_FILENAME
+    if not module_path.is_file() or module_path.read_text(encoding="utf-8") != _COMFY_ENV_SYNC_SOURCE:
+        module_path.write_text(_COMFY_ENV_SYNC_SOURCE, encoding="utf-8")
+    python_exe = find_comfyui_python(comfyui_path)
+    action = "Checking" if check_only else "Syncing"
+    print(f"  {action} {item_details['name']} isolated environment(s) with ComfyUI core requirements...")
+    try:
+        result = subprocess.run(
+            [python_exe, str(module_path), str(comfyui_path), str(repo_path)] + (["--check"] if check_only else []),
+            cwd=str(repo_path), timeout=1800,
+        )
+    except (OSError, subprocess.TimeoutExpired) as e:
+        print(f"  WARNING: Environment sync did not complete: {e}")
+        return False
+    if result.returncode == 0:
+        print("  Isolated environment(s) match ComfyUI core.")
+        return True
+    print("  WARNING: Some isolated packages are still out of date (see messages above).")
+    print(f"  Re-run with:  python installer.py \"{comfyui_path}\" --repair")
+    return False
+
+
+def repair_comfy_env_nodes(comfyui_path: Path, check_only: bool = False) -> bool:
+    """Re-apply StableGen's patches and env sync to every installed comfy-env node.
+
+    Node updates (git pull, ComfyUI-Manager) overwrite patched files, and ComfyUI
+    updates move core's pinned packages ahead of the isolated envs; both break
+    TRELLIS.2 until repaired. Safe to run any number of times.
+    """
+    ok = True
+    for item in DEPENDENCIES.values():
+        if item.get("type") != "node" or not _uses_comfy_env(item):
+            continue
+        repo_path = comfyui_path / item["target_dir_relative"] / item["repo_name"]
+        if not repo_path.is_dir():
+            continue
+        print_separator(char='.')
+        print(f"{'Checking' if check_only else 'Repairing'}: {item['name']}")
+        if not check_only:
+            apply_post_clone_patches(item, comfyui_path)
+        ok = sync_comfy_env_core(item, comfyui_path, check_only=check_only) and ok
+    return ok
+
+
 def apply_post_clone_patches(item_details: Dict[str, Any], comfyui_path: Path):
     """Apply compatibility patches to a cloned custom node repository.
 
@@ -1711,9 +1687,15 @@ def get_unique_item_ids_for_tags(selected_tags: List[str]) -> Set[str]:
 
 # --- Main Script Logic ---
 def main():
-    comfyui_base_path = get_comfyui_path_from_args()
+    args = parse_args()
+    comfyui_base_path = get_comfyui_path_from_args(args)
+
+    if args.check:
+        print_header("Checking TRELLIS.2 environments")
+        sys.exit(0 if repair_comfy_env_nodes(comfyui_base_path, check_only=True) else 1)
 
     # Ensure all comfy-env patches are applied if comfy-env is already installed
+    has_comfy_env = False
     try:
         python_exe = find_comfyui_python(comfyui_base_path)
         result = subprocess.run(
@@ -1722,10 +1704,21 @@ def main():
             text=True,
         )
         if result.returncode == 0:
+            has_comfy_env = True
             print("  Detected existing comfy-env installation. Ensuring all patches are applied...")
             _apply_all_comfy_env_patches(comfyui_base_path)
     except Exception as e:
         print(f"  WARNING: Could not check/patch existing comfy-env: {e}")
+
+    # Already-installed TRELLIS.2 nodes drift out of step whenever ComfyUI or
+    # the node updates; repair them on every installer run.
+    if has_comfy_env or args.repair:
+        print_header("Repairing installed TRELLIS.2 nodes")
+        ok = repair_comfy_env_nodes(comfyui_base_path)
+        if args.repair:
+            print("Repair complete." if ok else "Repair finished with warnings (see above).")
+            print("Restart ComfyUI so the TRELLIS.2 worker picks up the changes.")
+            sys.exit(0 if ok else 1)
 
     processed_during_this_session: Set[str] = set() # To avoid re-processing in same session if menu is re-shown
 
@@ -1824,7 +1817,7 @@ def main():
             print("  - Projection texture modes (SDXL, Flux, Qwen) - the selected")
             print("    diffusion model's own license applies as usual")
             print()
-            print("For full details, see the README.md License section.")
+            print("For full details, see docs/trellis2.md (Third-party licenses) in the StableGen repository.")
             print_separator(char='!')
             ack = input("Acknowledge and continue? (y/n, Enter for yes): ").strip().lower()
             if not (ack == "" or ack == 'y'):
@@ -1865,6 +1858,9 @@ def main():
                     print("  Re-installing comfy-env (overriding node requirements.txt)...")
                     install_pip_packages(["comfy-env"], comfyui_base_path, force_reinstall=True)
                     _apply_all_comfy_env_patches(comfyui_base_path)
+                    # The isolated env was just solved from the node's own manifest;
+                    # bring ComfyUI core's exact pins into it.
+                    sync_comfy_env_core(item_details, comfyui_base_path)
             elif item_details["type"] == "model":
                 target_full_path = comfyui_base_path / item_details["target_path_relative"] / item_details["filename"]
                 download_file(item_details, comfyui_base_path)
