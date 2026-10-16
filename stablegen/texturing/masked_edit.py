@@ -908,6 +908,8 @@ def project_view(context, objects, camera, image_path, write_path, material_id, 
         weight = invert.inputs[1].links[0].from_socket
         texture = _upstream_texture(mix.inputs['Color1'])
         if texture is not None:
+            # Keeps camera image displays on the generated views, not this edit layer.
+            texture['sg_masked_edit'] = True
             layers[obj.name] = {'mix': mix.name, 'texture': texture.name}
         selected = selection_socket(material, obj.sg_edit_mask)
         # With expansion enabled, the camera-space write mask defines the

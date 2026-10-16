@@ -1,10 +1,25 @@
 """Read existing projection images without loading files or changing materials."""
 import json
+import re
 from pathlib import Path
 
 import bpy
 
 from ..texturing.view_plan import generation_cameras, order_cameras
+
+# Masked Edit output folders: '<timestamp>-masked-<hex>' (see masked_edit.SG_OT_MaskedEdit).
+_MASKED_RUN = re.compile(r'-masked-[0-9a-f]+$', re.IGNORECASE)
+
+
+def is_masked_edit_layer(node):
+    """A Masked Edit view layer reuses projection labels but is not a camera's generated image.
+
+    Masked Edit tags its layers; older files are recognised by the run folder holding the image.
+    """
+    if node.get('sg_masked_edit'):
+        return True
+    path = Path(bpy.path.abspath(node.image.filepath, library=node.image.library))
+    return any(_MASKED_RUN.search(part) for part in path.parts[:-1])
 
 
 def images_from_manifest(cameras, textures, manifest):
@@ -54,6 +69,8 @@ def projected_images(context, *, objects=None, materials=None, manifests=None):
                 continue
             parts = node.label.split('-')
             if len(parts) != 2 or not all(part.isdigit() for part in parts):
+                continue
+            if is_masked_edit_layer(node):
                 continue
             index, version = map(int, parts)
             if version > latest:
