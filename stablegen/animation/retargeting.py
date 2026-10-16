@@ -16,6 +16,8 @@ import blf  # pylint: disable=import-error
 import bpy  # pylint: disable=import-error
 import gpu  # pylint: disable=import-error
 import mathutils  # pylint: disable=import-error
+import mathutils.bvhtree  # pylint: disable=import-error
+import numpy as np
 from bpy_extras import view3d_utils  # pylint: disable=import-error
 from gpu_extras.batch import batch_for_shader  # pylint: disable=import-error
 
@@ -35,12 +37,18 @@ _HAND_ROLL_LIMIT_PROP = "sg_retarget_hand_roll_limit"
 _TWIST_CHAIN_VERSION_PROP = "sg_retarget_twist_chain_version"
 _PROFILE_VERSION = 14
 _REFERENCE_POSE_VERSION = 2
-_COLLISION_PROXY_VERSION = 3
+# 4: body capsules carry side and front half-widths; hands are thin capsules along the hand.
+# 5: records each hand's skinned centre, the hand direction of rigs without finger bones.
+_COLLISION_PROXY_VERSION = 5
 _HAND_MATCH_ALGORITHM_VERSION = 4
 # 2: AUTO corrects from the upper arm when the arm chain starts at a clavicle. Reference poses
 # matched by version 1 carry a shrug in the clavicles, so they are re-matched.
-_ARM_CORRECTION_ALGORITHM_VERSION = 2
+# 3: the reference match aligns the upper arm, elbow plane, forearm and hand to the source
+# frame, not only the shoulder-to-wrist line; older references keep stiff elbows and bent wrists.
+_ARM_CORRECTION_ALGORITHM_VERSION = 3
 _TWIST_CHAIN_VERSION = 1
+# Proxy margin (share of height) kept by the reference-pose clearance pass.
+_REFERENCE_CLEARANCE_MARGIN = 0.01
 _LEGACY_REFERENCE_POSE_VERSION = 1
 _CONSTRAINT_PREFIX = "SG_Retarget_"
 _BONE_ENUM_ITEMS_CACHE = {}
@@ -1829,6 +1837,28 @@ def _proxy_radius_limits(bone, role, target_height):
     return target_height * 0.010, max(target_height * 0.075, bone_length * 0.42)
 
 
+def _hand_capsule_fit(bone, points):
+    """Fit a hand as a thin capsule from the wrist along its bone.
+
+    A hand is flat, so a ball around the wrist sized by the hand's length keeps every hand a
+    hand-length away from the hips. The capsule instead runs from the wrist to where nine in ten
+    of the hand's vertices end (up to 1.5 bone lengths, for short palm bones), and its radius is
+    the hand's typical distance from that axis. Returns (end fraction, radius) or (None, None).
+    """
+    if not bone or not points:
+        return None, None
+    head = bone.head_local
+    axis = bone.tail_local - head
+    length_squared = axis.length_squared
+    if length_squared < 1e-12:
+        return None, None
+    parameters = [(point - head).dot(axis) / length_squared for point in points]
+    fraction = max(0.25, min(1.5, _percentile(parameters, 0.9)))
+    end = head + (axis * fraction)
+    distances = [_point_segment_distance(point, head, end)[0] for point in points]
+    return float(fraction), _percentile(distances, 0.75)
+
+
 def _build_collision_proxy(
         armature, target_profile, segment_mode="BONE_TAILS"):
     """Estimate a compact rest-space capsule rig from dominant skin weights."""
@@ -1864,11 +1894,20 @@ def _build_collision_proxy(
         return None
 
     radial_samples = {name: [] for name in proxy_bones}
-    terminal_head_samples = {name: [] for name in terminal_arm_bones}
+    offset_samples = {name: [] for name in body_bones}
+    taper_samples = {
+        name: ([], [])
+        for chain in arm_chains.values() for name in chain[:-1]
+    }
+    hand_points = {name: [] for name in terminal_arm_bones}
     target_height = _height_from_profile(armature, target_profile)
     armature_inverse = armature.matrix_world.inverted_safe()
     sampled_vertices = 0
     meshes = _target_skin_meshes(armature)
+    body_basis = _profile_body_basis(armature, target_profile)
+    body_left, body_forward, _body_up = _basis_axes(body_basis)
+    body_left = _safe_normalized(body_left, mathutils.Vector((1.0, 0.0, 0.0)))
+    body_forward = _safe_normalized(body_forward, mathutils.Vector((0.0, 1.0, 0.0)))
 
     for obj in meshes:
         if not obj.vertex_groups or not obj.data.vertices:
@@ -1898,6 +1937,12 @@ def _build_collision_proxy(
             if not bone:
                 continue
             point = to_armature @ vertex.co
+            if dominant_name in hand_points:
+                # Sized below as a thin capsule along the hand (see _hand_capsule_fit).
+                hand_points[dominant_name].append(point)
+                radial_samples[dominant_name].append(0.0)
+                sampled_vertices += 1
+                continue
             segment_end = bone.tail_local
             if (
                     segment_mode == "JOINT_HEADS"
@@ -1914,15 +1959,23 @@ def _build_collision_proxy(
             if parameter < -0.35 or parameter > 1.35:
                 continue
             radial_samples[dominant_name].append(float(distance))
-            if (
-                    dominant_name in terminal_head_samples
-                    and -0.35 <= parameter <= 0.45):
-                terminal_head_samples[dominant_name].append(
-                    float((point - bone.head_local).length))
+            if dominant_name in taper_samples:
+                taper_samples[dominant_name][0 if parameter < 0.5 else 1].append(
+                    float(distance))
+            if dominant_name in offset_samples:
+                closest = bone.head_local.lerp(
+                    segment_end, max(0.0, min(1.0, parameter)))
+                offset = point - closest
+                offset_samples[dominant_name].append(
+                    (abs(offset.dot(body_left)), abs(offset.dot(body_forward))))
             sampled_vertices += 1
 
     radii = {}
     sample_counts = {}
+    half_widths = {}
+    segment_fractions = {}
+    hand_centres = {}
+    ends = {}
     for name in proxy_bones:
         bone = armature.data.bones.get(name)
         role = _proxy_bone_role(name, target_profile, chains)
@@ -1930,14 +1983,39 @@ def _build_collision_proxy(
         if estimate is None:
             estimate = _default_proxy_radius(bone, role, target_height)
         minimum, maximum = _proxy_radius_limits(bone, role, target_height)
-        if name in terminal_head_samples:
-            hand_estimate = _percentile(terminal_head_samples[name], 0.88)
+        if name in hand_points:
+            fraction, hand_estimate = _hand_capsule_fit(bone, hand_points[name])
             if hand_estimate is not None:
                 estimate = hand_estimate
-            minimum = target_height * 0.012
-            maximum = target_height * 0.055
+                segment_fractions[name] = fraction
+            if len(hand_points[name]) >= 8:
+                centre = sum(
+                    hand_points[name], mathutils.Vector((0.0, 0.0, 0.0))
+                ) / len(hand_points[name])
+                hand_centres[name] = _vector_to_list(
+                    bone.matrix_local.inverted_safe() @ centre)
+            minimum = target_height * 0.010
+            maximum = target_height * 0.035
         radii[name] = float(max(minimum, min(maximum, estimate)))
         sample_counts[name] = len(radial_samples[name])
+        near, far = taper_samples.get(name, ([], []))
+        if len(near) >= 8 and len(far) >= 8:
+            # Arms taper (a thick elbow or rolled sleeve, a thin wrist), and it is the thin
+            # distal end that passes the hips, so each end keeps its own radius.
+            ends[name] = [
+                float(max(minimum, min(maximum, _percentile(near, 0.88)))),
+                float(max(minimum, min(maximum, _percentile(far, 0.88)))),
+            ]
+        offsets = offset_samples.get(name, [])
+        if len(offsets) >= 8:
+            # A torso is wider than it is deep, and aprons, coats or packs add depth; one
+            # round radius would turn that depth into side clearance the hands do not need.
+            lateral = _percentile([item[0] for item in offsets], 0.9)
+            forward = _percentile([item[1] for item in offsets], 0.9)
+            half_widths[name] = [
+                float(max(minimum, min(maximum, lateral))),
+                float(max(minimum, min(maximum, forward))),
+            ]
 
     proxy = {
         "version": _COLLISION_PROXY_VERSION,
@@ -1950,6 +2028,14 @@ def _build_collision_proxy(
         "arm_chains": arm_chains,
         "terminal_arm_bones": terminal_arm_bones,
         "radii": radii,
+        "half_widths": half_widths,
+        "end_radii": ends,
+        "body_axes": {
+            "left": _vector_to_list(body_left),
+            "forward": _vector_to_list(body_forward),
+        },
+        "segment_fractions": segment_fractions,
+        "hand_centres": hand_centres,
         "sample_counts": sample_counts,
     }
     armature[_COLLISION_PROXY_PROP] = json.dumps(proxy, sort_keys=True)
@@ -2508,6 +2594,25 @@ def _apply_rest_space_pose(
         context.view_layer.update()
 
 
+def _source_clip_is_cyclic(context, source_armature, pairs, start, end, tolerance=3.0):
+    """True when the source's mapped bones end the clip in the pose they start it in (a loop)."""
+    names = [source_name for source_name, _target, _role in pairs]
+
+    def rotations(frame):
+        context.scene.frame_set(frame)
+        context.view_layer.update()
+        return {
+            name: source_armature.pose.bones[name].matrix_basis.to_quaternion()
+            for name in names if source_armature.pose.bones.get(name)
+        }
+
+    first, last = rotations(start), rotations(end)
+    limit = math.radians(tolerance)
+    return bool(first) and all(
+        first[name].rotation_difference(last[name]).angle <= limit
+        for name in first if name in last)
+
+
 def _bake_rest_space_retarget(
         context, source_armature, target_armature, pairs,
         source_profile, target_profile, start, end, frame_step,
@@ -2562,6 +2667,28 @@ def _bake_rest_space_retarget(
             source_profile,
             _profile_rotation_basis(source_armature, source_profile),
             use_rest=source_reference_mode == "REST",
+        )
+
+    mesh_clearance = None
+    if collision_adaptation and collision_proxy:
+        # On a skinned rig every frame's forearms and hands are checked against the mesh;
+        # proxy capsules then only keep the arms off each other.
+        try:
+            mesh_clearance = _ArmMeshClearance(target_armature, target_profile)
+        except Exception as exc:
+            print(f"[StableGen] Per-frame collisions use proxy capsules only: {exc}")
+    if mesh_clearance is not None and target_reference_pose.get("contact_bones"):
+        # The reference match pushed its arms clear of the body in that one frame, and as the
+        # neutral pose that push would hold the arms open for the whole clip. The per-frame
+        # pass opens them only where needed, so start from the arms as they were before it.
+        target_reference_pose = dict(target_reference_pose)
+        target_reference_pose["bones"] = {
+            **target_reference_pose.get("bones", {}),
+            **target_reference_pose["contact_bones"],
+        }
+        print(
+            "[StableGen] Per-frame mesh clearance replaces the reference pose's "
+            "body clearance."
         )
 
     if target_reference_pose.get("label") == "rest_pose":
@@ -2632,7 +2759,9 @@ def _bake_rest_space_retarget(
     collision_adjusted_frames = 0
     hand_matched_frames = 0
     previous_keyed_rotations = {}
-    for frame in range(start, end + 1, frame_step):
+    frames = list(range(start, end + 1, frame_step))
+
+    def pose_frame(frame):
         context.scene.frame_set(frame)
         context.view_layer.update()
         if target_reference_pose.get("label") == "rest_pose":
@@ -2661,7 +2790,62 @@ def _bake_rest_space_retarget(
                 target_reference_body_directions=target_reference_body_directions,
                 arm_correction_driver=arm_correction_driver,
             )
+
+    # Skinned rigs: first measure, frame by frame, how far each arm must open to clear the body,
+    # then ease those offsets over time. Pushing each frame on its own made a hand jump out
+    # around a belt pouch and snap back.
+    clearance_offsets = None
+    if collision_adaptation and collision_proxy and mesh_clearance is not None:
+        needed = {"left_arm": [], "right_arm": []}
+        for frame in frames:
+            pose_frame(frame)
+            result = _push_arms_out_of_mesh(
+                context,
+                target_armature,
+                target_profile,
+                mesh_clearance,
+                arm_correction_driver=arm_correction_driver,
+                iterations=max(8, collision_iterations + 6),
+                max_deviation=collision_max_deviation * mesh_clearance.world_height,
+            )
+            if result is None:
+                needed = None
+                break
+            for role in needed:
+                needed[role].append(result[3].get(role, 0.0))
+        if needed is not None:
+            cyclic = (
+                frames[-1] == end
+                and _source_clip_is_cyclic(context, source_armature, pairs, start, end)
+            )
+            clearance_offsets = {
+                role: _smooth_clearance_offsets(values, cyclic=cyclic)
+                for role, values in needed.items()
+            }
+            height = mesh_clearance.world_height
+            print(
+                "[StableGen] Mesh clearance per frame"
+                + (" (looping clip)" if cyclic else "")
+                + ": "
+                + ", ".join(
+                    f"{role} opens up to {max(values) / height:.3f} h on "
+                    f"{sum(1 for value in values if value > 1e-6)}/{len(values)} frames"
+                    for role, values in needed.items()
+                )
+            )
+
+    for index, frame in enumerate(frames):
+        pose_frame(frame)
         if collision_adaptation and collision_proxy:
+            opened = 0
+            if clearance_offsets is not None:
+                opened = _open_arms_sideways(
+                    context,
+                    target_armature,
+                    target_profile,
+                    {role: values[index] for role, values in clearance_offsets.items()},
+                    arm_correction_driver=arm_correction_driver,
+                )
             adjusted = _resolve_skeletal_proxy_collisions(
                 context,
                 target_armature,
@@ -2674,8 +2858,9 @@ def _bake_rest_space_retarget(
                 accepted_penetrations=collision_baseline,
                 arm_correction_driver=arm_correction_driver,
                 upper_arm_collision=upper_arm_collision,
+                include_body=clearance_offsets is None,
             )
-            if adjusted:
+            if adjusted or opened:
                 collision_adjusted_frames += 1
         if match_hand_orientation and hand_roll_mode == "TWIST_CHAIN":
             _sync_twist_helpers_from_reference(
@@ -3484,6 +3669,146 @@ def _match_limb_chain_directions(
     return matched
 
 
+def _hand_direction_landmark(armature, hand_name, use_digits, profile=None):
+    """The point a hand aims at: its digit roots' centre, else its skin's centre, else its tail.
+
+    The hand bone of a rig without finger bones can point well away from the hand it deforms
+    (21 degrees on a generated adventurer), so aiming that bone bends the visible hand; the
+    centre of the hand's skinned vertices follows the hand itself.
+    """
+    if use_digits:
+        roots = _hand_digit_root_names(armature, hand_name)
+        points = [_pose_point(armature, name, use_tail=False) for name in roots]
+        if len(points) >= 3 and all(point is not None for point in points):
+            return sum(points, mathutils.Vector((0.0, 0.0, 0.0))) / len(points)
+    pose_bone = armature.pose.bones.get(hand_name)
+    if profile is not None and pose_bone and _target_skin_meshes(armature):
+        try:
+            proxy = _collision_proxy_for_armature(armature, profile)
+        except Exception:
+            proxy = None
+        local = (proxy or {}).get("hand_centres", {}).get(hand_name)
+        if local:
+            return pose_bone.matrix @ mathutils.Vector(local)
+    return _pose_point(armature, hand_name, use_tail=True)
+
+
+def _rotate_segment_toward(context, pose_bone, start, end, desired_direction, strength):
+    current = end - start
+    if current.length < 1e-6 or desired_direction.length < 1e-6:
+        return False
+    try:
+        delta = current.normalized().rotation_difference(desired_direction.normalized())
+    except ValueError:
+        return False
+    if strength < 1.0:
+        delta = mathutils.Quaternion((1.0, 0.0, 0.0, 0.0)).slerp(delta, strength)
+    _rotate_pose_bone_in_armature_space(pose_bone, delta)
+    context.view_layer.update()
+    return True
+
+
+def _match_arm_segment_directions(
+        context, source_armature, target_armature,
+        source_profile, target_profile, strength=1.0,
+        swap_target_sides=False, max_elbow_twist=60.0):
+    """Match each arm segment of the target reference pose to the source frame.
+
+    Aiming only the shoulder-to-wrist line leaves the elbow and wrist wherever the rest-pose
+    delta put them, and that offset then persists through the whole animation (stiff elbows,
+    hands bent back). Here the upper arm, the elbow's bend plane, the forearm and the hand are
+    each turned to the source's body-space directions, so the per-bone rotation transfer that
+    follows reproduces the source's elbow and wrist motion.
+    """
+    source_basis = _pose_body_basis(source_armature, source_profile)
+    target_basis = _pose_body_basis(target_armature, target_profile)
+    to_target = target_basis @ source_basis.inverted_safe()
+    source_chains = _profile_chains(source_profile)
+    target_chains = _profile_chains(target_profile)
+    strength = max(0.0, min(float(strength), 1.0))
+    max_twist = math.radians(max(0.0, float(max_elbow_twist)))
+    matched = 0
+
+    for source_role in ("left_arm", "right_arm"):
+        target_role = _target_chain_key(source_role, swap_target_sides=swap_target_sides)
+        source_chain = source_chains.get(source_role, [])
+        target_chain = target_chains.get(target_role, [])
+        if len(source_chain) < 3 or len(target_chain) < 3:
+            continue
+        upper_name, fore_name, hand_name = target_chain[-3:]
+        upper_pose = target_armature.pose.bones.get(upper_name)
+        fore_pose = target_armature.pose.bones.get(fore_name)
+        hand_pose = target_armature.pose.bones.get(hand_name)
+        if not (upper_pose and fore_pose and hand_pose):
+            continue
+
+        def source_point(name, use_tail=False):
+            return _pose_point(source_armature, name, use_tail=use_tail)
+
+        s_shoulder, s_elbow, s_wrist = (source_point(name) for name in source_chain[-3:])
+        if s_shoulder is None or s_elbow is None or s_wrist is None:
+            continue
+        use_digits = (
+            len(_hand_digit_root_names(source_armature, source_chain[-1])) >= 3
+            and len(_hand_digit_root_names(target_armature, hand_name)) >= 3
+        )
+        s_hand = _hand_direction_landmark(
+            source_armature, source_chain[-1], use_digits, source_profile)
+        desired_upper = to_target @ (s_elbow - s_shoulder)
+        desired_fore = to_target @ (s_wrist - s_elbow)
+        desired_hand = to_target @ (s_hand - s_wrist) if s_hand is not None else None
+        if desired_upper.length < 1e-6 or desired_fore.length < 1e-6:
+            continue
+        desired_upper.normalize()
+        desired_fore.normalize()
+
+        def target_points():
+            return (
+                _pose_point(target_armature, upper_name),
+                _pose_point(target_armature, fore_name),
+                _pose_point(target_armature, hand_name),
+            )
+
+        shoulder, elbow, wrist = target_points()
+        if not _rotate_segment_toward(
+                context, upper_pose, shoulder, elbow, desired_upper, strength):
+            continue
+
+        # Turn the upper arm about its own axis until the forearm lies in the source's elbow
+        # plane, so the forearm then only has to flex. Skipped while either elbow is nearly
+        # straight (no defined plane), and limited so a mismatched rig cannot corkscrew.
+        shoulder, elbow, wrist = target_points()
+        axis = (elbow - shoulder).normalized()
+        current_fore = wrist - elbow
+        current_flat = current_fore - axis * current_fore.dot(axis)
+        desired_flat = desired_fore - axis * desired_fore.dot(axis)
+        bend_floor = math.sin(math.radians(12.0))
+        if (
+                current_fore.length > 1e-6
+                and current_flat.length > bend_floor * current_fore.length
+                and desired_flat.length > bend_floor):
+            twist = current_flat.normalized().angle(desired_flat.normalized())
+            if current_flat.cross(desired_flat).dot(axis) < 0.0:
+                twist = -twist
+            twist = max(-max_twist, min(max_twist, twist)) * strength
+            if abs(twist) > 1e-5:
+                _rotate_pose_bone_in_armature_space(
+                    upper_pose, mathutils.Quaternion(axis, twist))
+                context.view_layer.update()
+
+        shoulder, elbow, wrist = target_points()
+        _rotate_segment_toward(context, fore_pose, elbow, wrist, desired_fore, strength)
+        if desired_hand is not None and desired_hand.length > 1e-6:
+            wrist = _pose_point(target_armature, hand_name)
+            landmark = _hand_direction_landmark(
+                target_armature, hand_name, use_digits, target_profile)
+            if wrist is not None and landmark is not None:
+                _rotate_segment_toward(
+                    context, hand_pose, wrist, landmark, desired_hand, strength)
+        matched += 1
+    return matched
+
+
 def _rotate_chain_endpoint_toward(
         context, armature, chain, desired_endpoint, strength=1.0,
         use_terminal_head=False):
@@ -3569,7 +3894,8 @@ def _proxy_pose_capsule(armature, proxy, bone_name, radius_scale=1.0):
         return None
     start = pose_bone.head.copy()
     if bone_name in set(proxy.get("terminal_arm_bones", [])):
-        end = start.copy()
+        fraction = float(proxy.get("segment_fractions", {}).get(bone_name, 0.0))
+        end = start.lerp(pose_bone.tail, fraction)
     elif proxy.get("segment_mode") == "JOINT_HEADS":
         end_name = proxy.get("segment_end_bones", {}).get(bone_name)
         end_pose_bone = (
@@ -3577,12 +3903,86 @@ def _proxy_pose_capsule(armature, proxy, bone_name, radius_scale=1.0):
         end = end_pose_bone.head.copy() if end_pose_bone else pose_bone.tail.copy()
     else:
         end = pose_bone.tail.copy()
-    return {
+    capsule = {
         "bone": bone_name,
         "start": start,
         "end": end,
         "radius": radius,
     }
+    end_radii = proxy.get("end_radii", {}).get(bone_name)
+    if end_radii:
+        capsule["end_radii"] = (
+            float(end_radii[0]) * radius_scale,
+            float(end_radii[1]) * radius_scale,
+        )
+    half_widths = proxy.get("half_widths", {}).get(bone_name)
+    axes = proxy.get("body_axes")
+    bone = armature.data.bones.get(bone_name)
+    if half_widths and axes and bone:
+        # The rest-space body axes follow the bone's pose rotation.
+        rotation = (
+            pose_bone.matrix.to_quaternion()
+            @ bone.matrix_local.to_quaternion().inverted()
+        )
+        capsule["half_widths"] = (
+            float(half_widths[0]) * radius_scale,
+            float(half_widths[1]) * radius_scale,
+        )
+        capsule["axes"] = (
+            rotation @ mathutils.Vector(axes["left"]),
+            rotation @ mathutils.Vector(axes["forward"]),
+        )
+    return capsule
+
+
+def _capsule_radius_toward(capsule, direction, point=None):
+    """The capsule's radius in ``direction`` (a unit vector out of its axis) at ``point``.
+
+    Arm capsules taper between their two end radii; body capsules have an elliptical
+    cross-section (side and front half-widths). Directions mostly along a body capsule's axis
+    (its end caps) keep the round radius.
+    """
+    end_radii = capsule.get("end_radii")
+    if end_radii and point is not None:
+        axis = capsule["end"] - capsule["start"]
+        length_squared = axis.length_squared
+        parameter = (
+            (point - capsule["start"]).dot(axis) / length_squared
+            if length_squared > 1e-12 else 0.0
+        )
+        parameter = max(0.0, min(1.0, parameter))
+        return end_radii[0] + (end_radii[1] - end_radii[0]) * parameter
+    half_widths = capsule.get("half_widths")
+    if not half_widths:
+        return capsule["radius"]
+    left, forward = capsule["axes"]
+    x = direction.dot(left)
+    y = direction.dot(forward)
+    planar = math.hypot(x, y)
+    if planar < 0.3:
+        return capsule["radius"]
+    lateral, depth = half_widths
+    elliptical = (lateral * depth) / max(
+        1e-9, math.sqrt((depth * x / planar) ** 2 + (lateral * y / planar) ** 2))
+    blend = min(1.0, (planar - 0.3) / 0.4)
+    return capsule["radius"] + (elliptical - capsule["radius"]) * blend
+
+
+def _capsule_pair_gap(moving, obstacle):
+    """(separation from obstacle to moving, distance, summed radii along it)."""
+    point_a, point_b = _closest_points_on_segments(
+        moving["start"], moving["end"], obstacle["start"], obstacle["end"])
+    separation = point_a - point_b
+    distance = separation.length
+    if distance > 1e-9:
+        direction = separation / distance
+        radii = (
+            _capsule_radius_toward(moving, -direction, point_a)
+            + _capsule_radius_toward(obstacle, direction, point_b)
+        )
+    else:
+        radii = moving["radius"] + obstacle["radius"]
+    return separation, distance, radii
 
 
 def _proxy_capsules_for_bones(
@@ -3602,6 +4002,10 @@ def _proxy_capsules_for_bones(
                 start_fraction = max(0.0, min(0.95, start_fraction))
                 capsule["start"] = capsule["start"].lerp(
                     capsule["end"], start_fraction)
+                if capsule.get("end_radii"):
+                    near, far = capsule["end_radii"]
+                    capsule["end_radii"] = (
+                        near + (far - near) * start_fraction, far)
             result.append(capsule)
     return result
 
@@ -3629,13 +4033,8 @@ def _capsule_pair_key(moving, obstacle):
 
 
 def _capsule_pair_penetration(moving, obstacle, margin):
-    point_a, point_b = _closest_points_on_segments(
-        moving["start"], moving["end"], obstacle["start"], obstacle["end"])
-    distance = (point_a - point_b).length
-    return max(
-        0.0,
-        moving["radius"] + obstacle["radius"] + margin - distance,
-    )
+    _separation, distance, radii = _capsule_pair_gap(moving, obstacle)
+    return max(0.0, radii + margin - distance)
 
 
 def _capture_proxy_collision_baseline(
@@ -3692,12 +4091,9 @@ def _strongest_capsule_push(
     accepted_penetrations = accepted_penetrations or {}
     for moving in moving_capsules:
         for obstacle in obstacle_capsules:
-            point_a, point_b = _closest_points_on_segments(
-                moving["start"], moving["end"], obstacle["start"], obstacle["end"])
-            separation = point_a - point_b
-            distance = separation.length
+            separation, distance, radii = _capsule_pair_gap(moving, obstacle)
             penetration = (
-                moving["radius"] + obstacle["radius"] + margin - distance
+                radii + margin - distance
                 - float(accepted_penetrations.get(
                     _capsule_pair_key(moving, obstacle), 0.0))
             )
@@ -3719,8 +4115,12 @@ def _resolve_skeletal_proxy_collisions(
         strength=0.75, margin=0.008, iterations=2,
         max_pose_deviation=0.08, radius_scale=1.0,
         accepted_penetrations=None, arm_correction_driver="AUTO",
-        upper_arm_collision="DISABLED"):
-    """Push distal arm capsules out of body/opposite-arm proxy capsules."""
+        upper_arm_collision="DISABLED", include_body=True):
+    """Push distal arm capsules out of body/opposite-arm proxy capsules.
+
+    ``include_body=False`` keeps only the arm-against-arm tests, for rigs whose body clearance
+    is checked on the skinned mesh.
+    """
     if not collision_proxy:
         return 0
     arm_chains = collision_proxy.get("arm_chains", {})
@@ -3747,7 +4147,7 @@ def _resolve_skeletal_proxy_collisions(
         collision_proxy,
         collision_proxy.get("body_bones", []),
         radius_scale=radius_scale,
-    )
+    ) if include_body else []
     basis = _pose_body_basis(target_armature, target_profile)
     left_axis = basis @ mathutils.Vector((1.0, 0.0, 0.0))
     adjusted_roles = set()
@@ -3817,12 +4217,347 @@ def _resolve_skeletal_proxy_collisions(
     return len(adjusted_roles)
 
 
+class _ArmMeshClearance:
+    """Measure how deep the skinned forearms and hands sink into the rest of the body.
+
+    Vertices are split by their dominant bone into each arm (its chain bones and everything
+    below them, fingers included) and the body (all other bones). A sampled forearm or hand
+    vertex is inside when horizontal rays in six directions cross the body surface an odd number
+    of times in at least five; its depth is the distance to the nearest body surface. Only body
+    triangles in the height band the probes span are kept, which horizontal rays never leave.
+    """
+
+    _RAYS = tuple(
+        (math.cos(math.radians(angle)), math.sin(math.radians(angle)), 0.0)
+        for angle in (0.0, 60.0, 120.0, 180.0, 240.0, 300.0)
+    )
+
+    def __init__(self, armature, profile, max_probes=3000):
+        self.armature = armature
+        self.profile = profile
+        self.meshes = []
+        chains = _profile_chains(profile)
+        families = {}
+        distal = {}
+        for role in ("left_arm", "right_arm"):
+            chain = [name for name in chains.get(role, []) if armature.data.bones.get(name)]
+            if len(chain) < 2:
+                raise ValueError(f"{role} has no usable chain")
+            family, below = set(), set()
+            for index, name in enumerate(chain):
+                bone = armature.data.bones[name]
+                members = {name} | {child.name for child in bone.children_recursive}
+                family |= members
+                if index >= len(chain) - 2:
+                    below |= members
+            families[role] = family
+            distal[role] = below
+        arm_bones = set().union(*families.values())
+        for obj in _target_skin_meshes(armature):
+            mesh = obj.data
+            if not obj.vertex_groups or not mesh.vertices:
+                continue
+            names = {group.index: group.name for group in obj.vertex_groups}
+            dominant = []
+            for vertex in mesh.vertices:
+                best, weight = None, 0.0
+                for membership in vertex.groups:
+                    if membership.weight > weight and membership.group in names:
+                        best, weight = names[membership.group], membership.weight
+                dominant.append(best)
+            body = np.array(
+                [name is not None and name not in arm_bones for name in dominant], dtype=bool)
+            mesh.calc_loop_triangles()
+            triangles = np.empty(len(mesh.loop_triangles) * 3, dtype=np.int64)
+            mesh.loop_triangles.foreach_get("vertices", triangles)
+            triangles = triangles.reshape(-1, 3)
+            triangles = triangles[body[triangles].all(axis=1)]
+            probes = {}
+            for role, below in distal.items():
+                indices = np.array(
+                    [index for index, name in enumerate(dominant) if name in below],
+                    dtype=np.int64)
+                stride = max(1, len(indices) // max_probes)
+                probes[role] = indices[::stride]
+            # Body and arms may live in separate objects (clothing, split characters).
+            if len(triangles) or any(len(item) for item in probes.values()):
+                self.meshes.append((obj, len(mesh.vertices), triangles, probes))
+        if not any(len(entry[2]) for entry in self.meshes):
+            raise ValueError("no skinned body surface")
+        for role in ("left_arm", "right_arm"):
+            if not any(len(entry[3].get(role, ())) for entry in self.meshes):
+                raise ValueError(f"no skinned {role.replace('_', ' ')} vertices")
+        self.world_height = (
+            _height_from_profile(armature, profile) * max(armature.matrix_world.to_scale()))
+
+    def measure(self, context, roles=("left_arm", "right_arm")):
+        """{role: (depth, inside count, probe count)} in world units, or None."""
+        depsgraph = context.evaluated_depsgraph_get()
+        coordinates, triangles, probes = [], [], {role: [] for role in roles}
+        offset = 0
+        for obj, vertex_count, body_triangles, mesh_probes in self.meshes:
+            evaluated = obj.evaluated_get(depsgraph)
+            mesh = evaluated.to_mesh()
+            try:
+                if len(mesh.vertices) != vertex_count:
+                    return None
+                local = np.empty(vertex_count * 3, dtype=np.float64)
+                mesh.vertices.foreach_get("co", local)
+            finally:
+                evaluated.to_mesh_clear()
+            matrix = np.array(obj.matrix_world, dtype=np.float64)
+            world = local.reshape(-1, 3) @ matrix[:3, :3].T + matrix[:3, 3]
+            coordinates.append(world)
+            triangles.append(body_triangles + offset)
+            for role in roles:
+                probes[role].append(world[mesh_probes.get(role, np.empty(0, dtype=np.int64))])
+            offset += vertex_count
+        coordinates = np.concatenate(coordinates)
+        triangles = np.concatenate(triangles)
+        probes = {role: np.concatenate(items) for role, items in probes.items()}
+        every_probe = np.concatenate([items for items in probes.values() if len(items)] or [
+            np.zeros((0, 3))])
+        if not len(every_probe) or not len(triangles):
+            return {role: (0.0, 0, len(items)) for role, items in probes.items()}
+        pad = self.world_height * 0.05
+        low, high = every_probe[:, 2].min() - pad, every_probe[:, 2].max() + pad
+        heights = coordinates[:, 2][triangles]
+        triangles = triangles[(heights.max(axis=1) >= low) & (heights.min(axis=1) <= high)]
+        if not len(triangles):
+            return {role: (0.0, 0, len(items)) for role, items in probes.items()}
+        used, remapped = np.unique(triangles, return_inverse=True)
+        tree = mathutils.bvhtree.BVHTree.FromPolygons(
+            coordinates[used].tolist(), remapped.reshape(-1, 3).tolist())
+        rays = [mathutils.Vector(ray) for ray in self._RAYS]
+        results = {}
+        for role, points in probes.items():
+            depths = []
+            for row in points:
+                point = mathutils.Vector(row)
+                odd = 0
+                for ray in rays:
+                    hits, origin = 0, point
+                    for _hit in range(24):
+                        location, _normal, _index, _distance = tree.ray_cast(origin, ray)
+                        if location is None:
+                            break
+                        hits += 1
+                        origin = location + ray * 1e-5
+                    odd += hits % 2
+                if odd < 5:
+                    continue
+                nearest = tree.find_nearest(point)
+                if nearest[0] is not None:
+                    depths.append(nearest[3])
+            depths.sort()
+            depth = depths[int(len(depths) * 0.95)] if depths else 0.0
+            results[role] = (depth, len(depths), len(points))
+        return results
+
+
+def _push_arms_out_of_mesh(
+        context, armature, profile, probe, roles=("left_arm", "right_arm"),
+        clearance=1.0, arm_correction_driver="AUTO", iterations=5,
+        max_deviation=None, strength=1.0):
+    """Open each arm sideways until its forearm and hand clear the skinned body.
+
+    Out to the side, because a hand that grazes the hip should open the arm, not change how far
+    it swings forward or back. ``max_deviation`` (world units) caps how far a wrist may move.
+    Returns (roles moved, first measurement, last measurement, sideways wrist offset per role in
+    world units), or None without a usable mesh.
+    """
+    world_height = probe.world_height
+    tolerance = world_height * 0.0015
+    gap = world_height * 0.004 * max(0.25, min(2.0, float(clearance)))
+    to_armature = armature.matrix_world.inverted_safe().to_3x3()
+    world_left = armature.matrix_world.to_3x3() @ (
+        _pose_body_basis(armature, profile) @ mathutils.Vector((1.0, 0.0, 0.0)))
+    world_left = _safe_normalized(world_left, mathutils.Vector((1.0, 0.0, 0.0)))
+    chains = _profile_chains(profile)
+    start = {
+        role: armature.matrix_world @ _pose_point(armature, chains[role][-1])
+        for role in roles if chains.get(role)
+    }
+    adjusted = set()
+    first = last = None
+    # The nearest-surface depth understates how far a forearm crossing a rounded pouch must move
+    # sideways, so each further pass steps out a little more than the last.
+    steps = {role: world_height * 0.003 for role in roles}
+    for _iteration in range(max(1, iterations)):
+        results = probe.measure(context, roles=roles)
+        if results is None:
+            return None
+        first = first or results
+        last = results
+        moved = False
+        for role, (depth, inside, total) in results.items():
+            if depth <= tolerance or inside < max(3, total // 1000):
+                continue
+            chain = chains.get(role, [])
+            correction_chain = _arm_correction_chain(
+                armature, profile, role, chain, driver_mode=arm_correction_driver)
+            wrist = _pose_point(armature, chain[-1], use_tail=False)
+            if wrist is None or len(correction_chain) < 2:
+                continue
+            outward = world_left if role == "left_arm" else -world_left
+            # The skin gap is added once; later passes only remove what is still inside.
+            extra = 0.0 if role in adjusted else gap
+            distance = max(depth + extra, steps[role])
+            steps[role] *= 1.4
+            desired = armature.matrix_world @ wrist + outward * (distance * strength)
+            if max_deviation is not None and role in start:
+                offset = desired - start[role]
+                if offset.length > max_deviation:
+                    desired = start[role] + offset.normalized() * max_deviation
+            push = to_armature @ (desired - armature.matrix_world @ wrist)
+            if push.length < 1e-7:
+                continue
+            if _rotate_chain_endpoint_toward(
+                    context, armature, correction_chain, wrist + push,
+                    strength=1.0, use_terminal_head=True):
+                adjusted.add(role)
+                moved = True
+        if not moved:
+            break
+    offsets = {}
+    for role, before in start.items():
+        outward = world_left if role == "left_arm" else -world_left
+        after = armature.matrix_world @ _pose_point(armature, chains[role][-1])
+        offsets[role] = max(0.0, (after - before).dot(outward))
+    return adjusted, first, last, offsets
+
+
+def _open_arms_sideways(context, armature, profile, offsets, arm_correction_driver="AUTO"):
+    """Move each wrist ``offsets[role]`` (world units) out to the side by turning its arm."""
+    to_armature = armature.matrix_world.inverted_safe().to_3x3()
+    world_left = armature.matrix_world.to_3x3() @ (
+        _pose_body_basis(armature, profile) @ mathutils.Vector((1.0, 0.0, 0.0)))
+    world_left = _safe_normalized(world_left, mathutils.Vector((1.0, 0.0, 0.0)))
+    chains = _profile_chains(profile)
+    moved = 0
+    for role, offset in offsets.items():
+        chain = chains.get(role, [])
+        if offset <= 1e-7 or len(chain) < 2:
+            continue
+        correction_chain = _arm_correction_chain(
+            armature, profile, role, chain, driver_mode=arm_correction_driver)
+        wrist = _pose_point(armature, chain[-1], use_tail=False)
+        if wrist is None or len(correction_chain) < 2:
+            continue
+        outward = world_left if role == "left_arm" else -world_left
+        if _rotate_chain_endpoint_toward(
+                context, armature, correction_chain,
+                wrist + to_armature @ (outward * offset),
+                strength=1.0, use_terminal_head=True):
+            moved += 1
+    return moved
+
+
+def _smooth_clearance_offsets(values, cyclic=False, hold=5, sigma=3.0):
+    """Ease per-frame clearance offsets in and out so an arm never jumps around an obstacle.
+
+    Each frame's push is first held over its neighbors (a running maximum), so the arm starts
+    opening before it reaches a belt pouch and closes after passing it, then blurred. A looping
+    clip wraps around. The result is never below what a frame needs.
+    """
+    count = len(values)
+    if count < 3:
+        return list(values)
+    period = count - 1 if cyclic else count
+    base = list(values[:period])
+
+    def sample(series, index):
+        if cyclic:
+            return series[index % period]
+        return series[max(0, min(period - 1, index))]
+
+    held = [
+        max(sample(base, index + step) for step in range(-hold, hold + 1))
+        for index in range(period)
+    ]
+    radius = max(1, int(round(3.0 * sigma)))
+    weights = [math.exp(-(step * step) / (2.0 * sigma * sigma)) for step in range(-radius, radius + 1)]
+    total = sum(weights)
+    smoothed = [
+        sum(weight * sample(held, index + step)
+            for weight, step in zip(weights, range(-radius, radius + 1))) / total
+        for index in range(period)
+    ]
+    if cyclic:
+        smoothed.append(smoothed[0])
+    return [max(value, need) for value, need in zip(smoothed, values)]
+
+
+def _protect_reference_pose_clearance_on_mesh(
+        context, target_armature, target_profile, clearance=1.0,
+        arm_correction_driver="AUTO", iterations=8):
+    """Move reference-pose arms out of the body only as far as the skinned mesh needs.
+
+    Returns the number of arms moved, or None when the rig has no usable skinned mesh (the
+    caller then falls back to the proxy capsules, which over-approximate a body).
+    """
+    try:
+        probe = _ArmMeshClearance(target_armature, target_profile)
+    except Exception as exc:
+        print(f"[StableGen] Mesh clearance check unavailable: {exc}")
+        return None
+    result = _push_arms_out_of_mesh(
+        context, target_armature, target_profile, probe, clearance=clearance,
+        arm_correction_driver=arm_correction_driver, iterations=iterations)
+    if result is None:
+        return None
+    adjusted, first, last, _offsets = result
+    height = probe.world_height
+    print(
+        "[StableGen] Mesh clearance at the reference: "
+        + ", ".join(
+            f"{role} {first[role][1]}/{first[role][2]} probes inside "
+            f"(depth {first[role][0] / height:.3f} h) -> "
+            f"{last[role][1]} ({last[role][0] / height:.3f} h)"
+            for role in first
+        )
+    )
+    return len(adjusted)
+
+
 def _protect_reference_pose_clearance(
         context, target_armature, target_profile, clearance=1.0,
         collision_proxy=None, accepted_penetrations=None,
         arm_correction_driver="AUTO",
         upper_arm_collision="DISABLED"):
-    """Keep matched hands outside conservative torso and hand proxy colliders."""
+    """Keep matched forearms and hands out of the body.
+
+    A skinned rig is checked against its own mesh, so the arms keep the source's lines unless
+    they really cut into the body; proxy capsules over-approximate a body (an apron, a coat or a
+    round end cap all read as hip width) and pushed every arm out to an A-pose angle. They remain
+    the fallback for rigs without a usable skin.
+    """
+    adjusted = _protect_reference_pose_clearance_on_mesh(
+        context,
+        target_armature,
+        target_profile,
+        clearance=clearance,
+        arm_correction_driver=arm_correction_driver,
+    )
+    if adjusted is not None:
+        if collision_proxy:
+            # The mesh covers arms against the body; the capsules still keep the arms apart.
+            adjusted = max(adjusted, _resolve_skeletal_proxy_collisions(
+                context,
+                target_armature,
+                target_profile,
+                collision_proxy,
+                strength=1.0,
+                margin=_REFERENCE_CLEARANCE_MARGIN,
+                iterations=4,
+                max_pose_deviation=0.08,
+                radius_scale=clearance,
+                accepted_penetrations=accepted_penetrations,
+                arm_correction_driver=arm_correction_driver,
+                upper_arm_collision=upper_arm_collision,
+                include_body=False,
+            ))
+        return adjusted
     if collision_proxy:
         return _resolve_skeletal_proxy_collisions(
             context,
@@ -3830,7 +4565,7 @@ def _protect_reference_pose_clearance(
             target_profile,
             collision_proxy,
             strength=1.0,
-            margin=0.01,
+            margin=_REFERENCE_CLEARANCE_MARGIN,
             iterations=4,
             max_pose_deviation=0.08,
             radius_scale=clearance,
@@ -3924,7 +4659,12 @@ def _match_source_reference_pose(
         collision_proxy=None, arm_correction_driver="AUTO",
         upper_arm_collision="DISABLED",
         match_hand_orientation=False, hand_match_strength=1.0,
-        hand_roll_mode="FOREARM", hand_roll_limit=60.0):
+        hand_roll_mode="FOREARM", hand_roll_limit=60.0, contact_pose=None):
+    """Pose the target like the source's current frame.
+
+    ``contact_pose``, when a dict, receives the matrix_basis rows of the bones the body
+    clearance moved, as they were before that push (see _reference_pose_for_bake).
+    """
     if match_hand_orientation:
         _ensure_hand_roll_setup(
             context,
@@ -3994,7 +4734,25 @@ def _match_source_reference_pose(
         swap_target_sides=swap_target_sides,
         arm_correction_driver=arm_correction_driver,
     )
+    matched_arm_segments = _match_arm_segment_directions(
+        context,
+        source_armature,
+        target_armature,
+        source_profile,
+        target_profile,
+        strength=strength,
+        swap_target_sides=swap_target_sides,
+    )
+    if matched_arm_segments:
+        print(
+            f"[StableGen] Reference match aligned the upper arm, elbow and hand of "
+            f"{matched_arm_segments} arm(s) to the source frame."
+        )
     if protect_mesh:
+        before_clearance = {
+            pose_bone.name: pose_bone.matrix_basis.copy()
+            for pose_bone in target_armature.pose.bones
+        }
         adjusted = _protect_reference_pose_clearance(
             context,
             target_armature,
@@ -4007,9 +4765,17 @@ def _match_source_reference_pose(
         )
         if adjusted:
             print(
-                f"[StableGen] Reference clearance adjusted {adjusted} arm chain(s) "
-                "away from skeletal proxy colliders."
+                f"[StableGen] Reference clearance moved {adjusted} arm chain(s) "
+                "out of the body."
             )
+        if contact_pose is not None:
+            for pose_bone in target_armature.pose.bones:
+                previous = before_clearance.get(pose_bone.name)
+                current = pose_bone.matrix_basis
+                if previous is not None and any(
+                        abs(previous[row][column] - current[row][column]) > 1e-6
+                        for row in range(4) for column in range(4)):
+                    contact_pose[pose_bone.name] = _matrix_to_rows(previous)
     if match_hand_orientation and hand_match_strength > 0.0:
         if hand_roll_mode == "TWIST_CHAIN":
             _sync_twist_helpers_to_forearms(
@@ -4978,13 +5744,16 @@ class StableGenMatchSourceReferencePose(bpy.types.Operator):
 
     protect_mesh: bpy.props.BoolProperty(
         name="Protect Body Clearance",
-        description="Keep matched hands outside conservative torso and hand proxy colliders",
+        description=(
+            "Move matched forearms and hands out of the body, checked against the skinned mesh "
+            "(proxy capsules when the rig has no skin)"
+        ),
         default=True,
     )  # type: ignore
 
     clearance: bpy.props.FloatProperty(
         name="Body Clearance",
-        description="Scale the conservative torso and hand separation margin",
+        description="Scale the gap kept between the arms and the body",
         default=1.0,
         min=0.25,
         max=2.0,
@@ -5113,6 +5882,7 @@ class StableGenMatchSourceReferencePose(bpy.types.Operator):
             print(f"[StableGen] Source reference rig profile for {source_armature.name}: {_profile_summary(source_profile)}")
             print(f"[StableGen] Target rig profile for {target_armature.name}: {_profile_summary(target_profile)}")
             print(f"[StableGen] Reference match mapping: {_pair_summary(pairs)}")
+            contact_pose = {}
             matched_chains = _match_source_reference_pose(
                 context,
                 source_armature,
@@ -5135,6 +5905,7 @@ class StableGenMatchSourceReferencePose(bpy.types.Operator):
                 hand_match_strength=self.hand_match_strength,
                 hand_roll_mode=self.hand_roll_mode,
                 hand_roll_limit=self.hand_roll_limit,
+                contact_pose=contact_pose,
             )
 
             if self.store_reference:
@@ -5157,6 +5928,8 @@ class StableGenMatchSourceReferencePose(bpy.types.Operator):
                 )
                 if not reference_pose or not reference_pose.get("bones"):
                     raise RuntimeError("Could not capture the matched target reference pose")
+                if contact_pose:
+                    reference_pose["contact_bones"] = contact_pose
                 _save_reference_pose(target_armature, reference_pose)
 
             print(
@@ -5537,13 +6310,16 @@ class StableGenApplyAnimationToRig(bpy.types.Operator):
 
     protect_auto_match: bpy.props.BoolProperty(
         name="Protect Body Clearance",
-        description="Keep auto-matched hands outside conservative torso and hand proxy colliders",
+        description=(
+            "Move auto-matched forearms and hands out of the body, checked against the skinned mesh "
+            "(proxy capsules when the rig has no skin)"
+        ),
         default=True,
     )  # type: ignore
 
     auto_match_clearance: bpy.props.FloatProperty(
         name="Body Clearance",
-        description="Scale the conservative torso and hand separation margin",
+        description="Scale the gap kept between the arms and the body",
         default=1.0,
         min=0.25,
         max=2.0,
@@ -5905,6 +6681,7 @@ class StableGenApplyAnimationToRig(bpy.types.Operator):
                     expected_provenance,
                 )
                 if not reference_matches and self.auto_match_reference:
+                    contact_pose = {}
                     matched_chains = _match_source_reference_pose(
                         context,
                         source_armature,
@@ -5923,12 +6700,15 @@ class StableGenApplyAnimationToRig(bpy.types.Operator):
                         hand_match_strength=self.hand_match_strength,
                         hand_roll_mode=self.hand_roll_mode,
                         hand_roll_limit=self.hand_roll_limit,
+                        contact_pose=contact_pose,
                     )
                     target_reference_pose = _capture_reference_pose(
                         target_armature,
                         label="auto_matched_source_reference",
                         provenance=expected_provenance,
                     )
+                    if contact_pose:
+                        target_reference_pose["contact_bones"] = contact_pose
                     reference_label = (
                         f"temporary source-matched reference ({matched_chains} limb chains)"
                     )
