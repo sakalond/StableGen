@@ -1,3 +1,5 @@
+<p align="center"><img src="docs/img/brand/stablegen-logo.svg" alt="StableGen logo" width="140"></p>
+
 # StableGen: AI-Powered 3D Generation & Texturing in Blender ✨
 
 [![License: GPL v3](https://img.shields.io/badge/License-GPLv3-blue.svg)](https://www.gnu.org/licenses/gpl-3.0)
