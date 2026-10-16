@@ -134,6 +134,80 @@ def pop_svm_stack_warning():
             f"or disable some Precise+ features.")
 
 
+# EEVEE loads every mesh attribute a material reads as a vertex input and
+# fails to compile a material reading more than this many: Material Preview
+# then shows it magenta while Cycles renders it fine. Measured with Blender
+# 5.1 (14 attributes compile, 15 fail with "uses too many attributes").
+EEVEE_MAX_ATTRIBUTES = 14
+
+# Materials EEVEE cannot compile, reported by the generation operators.
+_eevee_attribute_warnings = {}
+
+
+def projection_material_attributes(material):
+    """Names of the mesh attributes and UV maps the material's nodes read."""
+    names = set()
+    for node in material.node_tree.nodes:
+        if node.mute or not any(output.is_linked for output in node.outputs):
+            continue
+        if node.bl_idname == 'ShaderNodeAttribute' and node.attribute_type == 'GEOMETRY':
+            names.add(node.attribute_name)
+        elif node.bl_idname == 'ShaderNodeUVMap':
+            names.add(node.uv_map or '<active UV map>')
+        elif node.bl_idname == 'ShaderNodeTexCoord':
+            if node.outputs['UV'].is_linked:
+                names.add('<active UV map>')
+            if node.outputs['Generated'].is_linked:
+                names.add('<generated coordinates>')
+    return names
+
+
+def check_projection_eevee_attributes(material):
+    """Remember materials that read too many attributes for EEVEE."""
+    attributes = projection_material_attributes(material)
+    if len(attributes) > EEVEE_MAX_ATTRIBUTES:
+        print(f"[StableGen] WARNING: projection material '{material.name}' reads "
+              f"{len(attributes)} mesh attributes; EEVEE supports {EEVEE_MAX_ATTRIBUTES}, "
+              "so Material Preview shows it magenta. Cycles renders it correctly.")
+        _eevee_attribute_warnings[material.name] = attributes
+    else:
+        _eevee_attribute_warnings.pop(material.name, None)
+    return len(attributes)
+
+
+def pop_eevee_attribute_warning(context=None):
+    """Return a one-line user warning for materials EEVEE cannot show, then reset.
+
+    With ``context``, 3D views in Material Preview switch to Rendered so the
+    new texture is visible instead of magenta.
+    """
+    if not _eevee_attribute_warnings:
+        return None
+    names = sorted(_eevee_attribute_warnings)
+    attributes = set().union(*_eevee_attribute_warnings.values())
+    count = max(len(found) for found in _eevee_attribute_warnings.values())
+    _eevee_attribute_warnings.clear()
+    switched = False
+    if context is not None and context.scene.render.engine == 'CYCLES':
+        for window in context.window_manager.windows:
+            for area in window.screen.areas:
+                if area.type != 'VIEW_3D':
+                    continue
+                for space in area.spaces:
+                    if space.type == 'VIEW_3D' and space.shading.type == 'MATERIAL':
+                        space.shading.type = 'RENDERED'
+                        switched = True
+    shown = ', '.join(names[:3]) + (f' and {len(names) - 3} more' if len(names) > 3 else '')
+    hint = "use fewer cameras"
+    if any(name.startswith(('_SG_VisWeight_', '_SG_ProjectionDepth_')) for name in attributes):
+        hint += " or disable Bake Visibility"
+    return (f"Projection material {shown} reads {count} mesh attributes, more than "
+            f"EEVEE's {EEVEE_MAX_ATTRIBUTES}, so Material Preview shows it magenta"
+            + ("; switched the viewport to Rendered (Cycles)" if switched
+               else "; view it in Rendered mode (Cycles)")
+            + f". To preview it in EEVEE, {hint}.")
+
+
 def _is_projection_mesh(obj):
     """Consistent render/visibility filter for production geometry."""
     if obj.type != 'MESH' or obj.hide_get():
@@ -315,14 +389,29 @@ def _write_projection_uvw(obj, camera, uv_attr_name, uvw_attr_name):
     return True
 
 
-def _create_projection_uv_nodes(nodes, links, camera_index, mat_id, location):
+def _projection_uvw_coverage(objects, camera_index, mat_id):
+    """How many ``objects`` carry ``ProjectionUVW_*``: ``'ALL'``, ``'NONE'`` or ``'SOME'``."""
+    name = _projection_uvw_name(camera_index, mat_id)
+    present = {obj.data.attributes.get(name) is not None for obj in objects}
+    if present == {True}:
+        return 'ALL'
+    return 'SOME' if True in present else 'NONE'
+
+
+def _create_projection_uv_nodes(nodes, links, camera_index, mat_id, location, coverage='SOME'):
     """Build the per-camera projection UV and return its output node.
 
     The result's ``Vector`` output is ``(u, v, 0)``.  When the mesh carries
     ``ProjectionUVW_*`` the divide happens per shading point, which keeps the
     mapping exact on faces of any size.  Meshes without it (older
-    projections, orthographic cameras, joined objects) read zero ``w`` and
-    use the per-vertex ``ProjectionUV_*`` instead.
+    projections, orthographic cameras, poor fits) use the per-vertex
+    ``ProjectionUV_*`` instead.
+
+    ``coverage`` (see ``_projection_uvw_coverage``) says which meshes using
+    the material carry ``ProjectionUVW_*``.  EEVEE rejects materials reading
+    more than ``EEVEE_MAX_ATTRIBUTES`` mesh attributes and renders them
+    magenta, so a camera reads both attributes and selects per shading point
+    only when the meshes disagree.
     """
     x, y = location
 
@@ -333,9 +422,13 @@ def _create_projection_uv_nodes(nodes, links, camera_index, mat_id, location):
         node['sg_layout_stage'] = 'Image and UV'
         return node
 
-    legacy = new("ShaderNodeAttribute", "ProjectionUVLinear", -800, -150)
-    legacy.attribute_name = f"ProjectionUV_{camera_index}_{mat_id}"
-    legacy.attribute_type = 'GEOMETRY'
+    if coverage != 'ALL':
+        legacy = new("ShaderNodeAttribute", "ProjectionUVLinear", -800, -150)
+        legacy.attribute_name = f"ProjectionUV_{camera_index}_{mat_id}"
+        legacy.attribute_type = 'GEOMETRY'
+        if coverage == 'NONE':
+            # Stored as (u, v, 0) already.
+            return legacy
 
     homogeneous = new("ShaderNodeAttribute", "ProjectionUVW", -800)
     homogeneous.attribute_name = _projection_uvw_name(camera_index, mat_id)
@@ -358,6 +451,13 @@ def _create_projection_uv_nodes(nodes, links, camera_index, mat_id, location):
     links.new(homogeneous.outputs["Vector"], divided.inputs[0])
     links.new(inverse_w.outputs[0], divided.inputs["Scale"])
 
+    flatten = new("ShaderNodeVectorMath", "ProjectionUV", 0)
+    flatten.operation = 'MULTIPLY'
+    flatten.inputs[1].default_value = (1.0, 1.0, 0.0)
+    if coverage == 'ALL':
+        links.new(divided.outputs["Vector"], flatten.inputs[0])
+        return flatten
+
     missing = new("ShaderNodeMath", "ProjectionUVWMissing", -450, -150)
     missing.operation = 'COMPARE'
     missing.inputs[1].default_value = 0.0
@@ -376,10 +476,6 @@ def _create_projection_uv_nodes(nodes, links, camera_index, mat_id, location):
     links.new(difference.outputs["Vector"], select.inputs[0])
     links.new(missing.outputs[0], select.inputs[1])
     links.new(divided.outputs["Vector"], select.inputs[2])
-
-    flatten = new("ShaderNodeVectorMath", "ProjectionUV", 0)
-    flatten.operation = 'MULTIPLY'
-    flatten.inputs[1].default_value = (1.0, 1.0, 0.0)
     links.new(select.outputs["Vector"], flatten.inputs[0])
     return flatten
 
@@ -2837,7 +2933,8 @@ def project_image(
 
             # Perspective-correct projection UV from the corner attributes
             uv_map_node = _create_projection_uv_nodes(
-                nodes, links, i, mat_id, (-200, -200 * (i+1)))
+                nodes, links, i, mat_id, (-200, -200 * (i+1)),
+                _projection_uvw_coverage(to_project, i, mat_id))
             uv_map_nodes.append(uv_map_node)
             
             # Compute the dot product of the direction vector and geometry normal
@@ -3514,6 +3611,7 @@ def project_image(
             _steps=True,
         )
         check_projection_svm_stack(mat, svm_estimates)
+        check_projection_eevee_attributes(mat)
         if stable_sequential:
             active_assets = [n.image.filepath for i, n in enumerate(tex_image_nodes)
                              if i <= stop_index and n.image]

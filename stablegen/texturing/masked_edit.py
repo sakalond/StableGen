@@ -1318,6 +1318,10 @@ class SG_OT_MaskedEdit(bpy.types.Operator):
         for area in self.window.screen.areas:
             area.tag_redraw()
         if done:
+            from .projection import pop_svm_stack_warning, pop_eevee_attribute_warning
+            for warning in (pop_svm_stack_warning(), pop_eevee_attribute_warning(context)):
+                if warning:
+                    self.report({'WARNING'}, warning)
             self.write_report()
             self.cleanup(context)
             return {'FINISHED'}

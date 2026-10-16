@@ -29,7 +29,7 @@ from ..util.workflow_templates import prompt_text, prompt_text_img2img, prompt_t
 from .rendering import export_emit_image, export_visibility, export_canny, bake_texture, prepare_baking, unwrap, export_render, export_viewport, render_edge_feather_mask, apply_uv_inpaint_texture, flatten_projection_material_for_refine, _RenderStateTransaction, _legacy_render_dither, _prepare_compositor_render, _finish_compositor_render
 from ..cameras.geometry import _SGCameraResolution, _get_camera_resolution, _get_resolution_align
 from ..cameras.overlays import _sg_restore_square_display, _sg_remove_crop_overlay, _sg_ensure_crop_overlay, _sg_hide_label_overlay, _sg_restore_label_overlay
-from .projection import project_image, reinstate_compare_nodes, _bake_visibility_weights, reset_projection_material_nodes, _is_projection_mesh, pop_svm_stack_warning
+from .projection import project_image, reinstate_compare_nodes, _bake_visibility_weights, reset_projection_material_nodes, _is_projection_mesh, pop_svm_stack_warning, pop_eevee_attribute_warning
 from .jobs import operation, RenderRequest, MainThreadOperation, run_sync
 from ..utils import get_last_material_index, get_generation_dirs, get_file_path, get_dir_path, remove_empty_dirs, get_compositor_node_tree, configure_output_node_paths, get_eevee_engine_id, sg_modal_active
 from ..util.mirror_color import MirrorReproject, _get_viewport_ref_np, _apply_color_match_to_file
@@ -176,6 +176,9 @@ class Regenerate(bpy.types.Operator):
                 svm_warning = pop_svm_stack_warning()
                 if svm_warning:
                     self.report({'WARNING'}, svm_warning)
+                eevee_warning = pop_eevee_attribute_warning(context)
+                if eevee_warning:
+                    self.report({'WARNING'}, eevee_warning)
                 return {'FINISHED'}
         return {'PASS_THROUGH'}
 
@@ -358,6 +361,9 @@ class Reproject(bpy.types.Operator):
                 svm_warning = pop_svm_stack_warning()
                 if svm_warning:
                     self.report({'WARNING'}, svm_warning)
+                eevee_warning = pop_eevee_attribute_warning(context)
+                if eevee_warning:
+                    self.report({'WARNING'}, eevee_warning)
                 return {'FINISHED'}
         return {'PASS_THROUGH'}
 
@@ -1357,6 +1363,9 @@ class ComfyUIGenerate(_PBRMixin, bpy.types.Operator):
                 svm_warning = pop_svm_stack_warning()
                 if svm_warning:
                     self.report({'WARNING'}, svm_warning)
+                eevee_warning = pop_eevee_attribute_warning(context)
+                if eevee_warning:
+                    self.report({'WARNING'}, eevee_warning)
 
                 # If viewport rendering mode is 'Rendered' and mode is 'regenerate_selected', switch to 'Solid' and then back to 'Rendered' to refresh the viewport
                 if context.scene.generation_mode == 'regenerate_selected' and context.area.spaces.active.shading.type == 'RENDERED':
