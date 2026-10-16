@@ -1,12 +1,11 @@
-<p align="center"><img src="docs/img/brand/stablegen-logo.svg" width="96" alt="StableGen logo"></p>
-<h1 align="center">StableGen</h1>
+<h1 align="center"><img src="docs/img/brand/stablegen-logo.svg" width="52" align="absmiddle" alt="StableGen logo">&nbsp;StableGen</h1>
 <p align="center">Generate, texture and rig 3D assets in Blender.</p>
 <p align="center">
 <a href="LICENSE"><img src="https://img.shields.io/badge/license-GPL--3.0-007ec6" alt="License: GPL-3.0"></a>
 <img src="https://img.shields.io/badge/Blender-4.2--4.5%20%7C%205.1%2B-e5722c" alt="Blender 4.2 to 4.5, or 5.1 and later">
 <a href="https://github.com/sakalond/stablegen/releases"><img src="https://img.shields.io/github/downloads/sakalond/stablegen/total" alt="Downloads"></a>
 </p>
-<p align="center"><a href="docs/README.md">Documentation</a> · <a href="docs/installation.md">Installation</a> · <a href="docs/quick-start.md">Quick start</a> · <a href="https://github.com/sakalond/stablegen/releases">Releases</a></p>
+<p align="center"><a href="https://github.com/sakalond/StableGen/wiki">Documentation</a> · <a href="https://github.com/sakalond/StableGen/wiki/Installation">Installation</a> · <a href="https://github.com/sakalond/StableGen/wiki/Quick-start">Quick start</a> · <a href="https://github.com/sakalond/stablegen/releases">Releases</a></p>
 
 StableGen is a Blender add-on that textures meshes and whole scenes with diffusion models, and generates new meshes from a prompt or an image. It renders guidance images from cameras in your scene, sends the work to a [ComfyUI](https://github.com/comfyanonymous/ComfyUI) server on the same computer or elsewhere on your network, and projects the results back onto the meshes.
 
@@ -19,7 +18,7 @@ StableGen is a Blender add-on that textures meshes and whole scenes with diffusi
 
 ## One prompt to a rigged asset
 
-Describe a character and pick one of the preview images; StableGen does the rest in one run. TRELLIS.2 builds the mesh, SkinTokens rigs it, and views generated around it are projected into its texture. A run can also start from an image, skip the rig, or keep the texture TRELLIS.2 makes itself. [TRELLIS.2](docs/trellis2.md)
+Describe a character and pick one of the preview images; StableGen does the rest in one run. TRELLIS.2 builds the mesh, SkinTokens rigs it, and views generated around it are projected into its texture. A run can also start from an image, skip the rig, or keep the texture TRELLIS.2 makes itself. [TRELLIS.2](https://github.com/sakalond/StableGen/wiki/TRELLIS.2-mesh-generation)
 
 <p>
 <picture><source media="(min-width: 768px)" srcset="https://raw.githubusercontent.com/sakalond/stablegen-media/main/readme/blank.svg"><source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/sakalond/stablegen-media/main/readme/pipeline-phone-dark.webp"><img src="https://raw.githubusercontent.com/sakalond/stablegen-media/main/readme/pipeline-phone-light.webp" alt="The StableGen panel: a prompt, the preview gallery, then the mesh, rig and texture generated in Blender"></picture><picture><source media="(max-width: 767px)" srcset="https://raw.githubusercontent.com/sakalond/stablegen-media/main/readme/blank.svg"><source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/sakalond/stablegen-media/main/readme/pipeline-dark.webp"><img src="https://raw.githubusercontent.com/sakalond/stablegen-media/main/readme/pipeline-light.webp" alt="The StableGen panel: a prompt, the preview gallery, then the mesh, rig and texture generated in Blender"></picture>
@@ -29,7 +28,7 @@ Describe a character and pick one of the preview images; StableGen does the rest
 
 ### Texture any model
 
-Place cameras around one object or a whole scene. StableGen generates a view from each camera and projects it onto every surface that camera sees; each view is generated with the earlier ones as context, so the texture stays consistent all the way round. [Generation modes](docs/generation-modes.md) · [Cameras](docs/cameras.md)
+Place cameras around one object or a whole scene. StableGen generates a view from each camera and projects it onto every surface that camera sees; each view is generated with the earlier ones as context, so the texture stays consistent all the way round. [Generation modes](https://github.com/sakalond/StableGen/wiki/Generation-modes) · [Cameras](https://github.com/sakalond/StableGen/wiki/Cameras)
 
 <p>
 <picture><source media="(min-width: 768px)" srcset="https://raw.githubusercontent.com/sakalond/stablegen-media/main/readme/blank.svg"><source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/sakalond/stablegen-media/main/readme/texture-phone-dark.webp"><img src="https://raw.githubusercontent.com/sakalond/stablegen-media/main/readme/texture-phone-light.webp" alt="A floating island textured view by view from ten generated camera views"></picture><picture><source media="(max-width: 767px)" srcset="https://raw.githubusercontent.com/sakalond/stablegen-media/main/readme/blank.svg"><source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/sakalond/stablegen-media/main/readme/texture-wide-dark.webp"><img src="https://raw.githubusercontent.com/sakalond/stablegen-media/main/readme/texture-wide-light.webp" alt="A floating island textured view by view from ten generated camera views"></picture>
@@ -37,7 +36,7 @@ Place cameras around one object or a whole scene. StableGen generates a view fro
 
 ### Edit part of a texture
 
-Paint over the part you want to change and describe the change. Masked Edit regenerates only the painted region, in every view that sees it, and leaves the rest of the texture as it was. [Masked Edit](docs/masked-edit.md)
+Paint over the part you want to change and describe the change. Masked Edit regenerates only the painted region, in every view that sees it, and leaves the rest of the texture as it was. [Masked Edit](https://github.com/sakalond/StableGen/wiki/Masked-Edit)
 
 <p>
 <picture><source media="(min-width: 768px)" srcset="https://raw.githubusercontent.com/sakalond/stablegen-media/main/readme/blank.svg"><source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/sakalond/stablegen-media/main/readme/edit-phone-dark.webp"><img src="https://raw.githubusercontent.com/sakalond/stablegen-media/main/readme/edit-phone-light.webp" alt="A character's jacket replaced in turn by plate armor, a wool coat and sci-fi armor"></picture><picture><source media="(max-width: 767px)" srcset="https://raw.githubusercontent.com/sakalond/stablegen-media/main/readme/blank.svg"><source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/sakalond/stablegen-media/main/readme/edit-wide-dark.webp"><img src="https://raw.githubusercontent.com/sakalond/stablegen-media/main/readme/edit-wide-light.webp" alt="A character's jacket replaced in turn by plate armor, a wool coat and sci-fi armor"></picture>
@@ -45,7 +44,7 @@ Paint over the part you want to change and describe the change. Masked Edit rege
 
 ### PBR materials
 
-Marigold estimates albedo, roughness, metallic and normal maps from the generated views. StableGen projects them like the color and bakes them into standard maps for other software. [PBR maps](docs/pbr.md)
+Marigold estimates albedo, roughness, metallic and normal maps from the generated views. StableGen projects them like the color and bakes them into standard maps for other software. [PBR maps](https://github.com/sakalond/StableGen/wiki/PBR-maps)
 
 <p>
 <picture><source media="(min-width: 768px)" srcset="https://raw.githubusercontent.com/sakalond/stablegen-media/main/readme/blank.svg"><source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/sakalond/stablegen-media/main/readme/pbr-phone-dark.webp"><img src="https://raw.githubusercontent.com/sakalond/stablegen-media/main/readme/pbr-phone-light.webp" alt="A log house under a moving light, with its base color, roughness, metallic and normal maps"></picture><picture><source media="(max-width: 767px)" srcset="https://raw.githubusercontent.com/sakalond/stablegen-media/main/readme/blank.svg"><source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/sakalond/stablegen-media/main/readme/pbr-wide-dark.webp"><img src="https://raw.githubusercontent.com/sakalond/stablegen-media/main/readme/pbr-wide-light.webp" alt="A log house under a moving light, with its base color, roughness, metallic and normal maps"></picture>
@@ -53,7 +52,7 @@ Marigold estimates albedo, roughness, metallic and normal maps from the generate
 
 ### Rig and animate
 
-SkinTokens adds a skeleton and skin weights to a character, during a TRELLIS.2 run or on any mesh you select. Motion from FBX or BVH files, such as Mixamo animations, can then be retargeted onto the rig. [Rigging and animation](docs/rigging-and-animation.md)
+SkinTokens adds a skeleton and skin weights to a character, during a TRELLIS.2 run or on any mesh you select. Motion from FBX or BVH files, such as Mixamo animations, can then be retargeted onto the rig. [Rigging and animation](https://github.com/sakalond/StableGen/wiki/Rigging-and-animation)
 
 <p>
 <picture><source media="(min-width: 768px)" srcset="https://raw.githubusercontent.com/sakalond/stablegen-media/main/readme/blank.svg"><source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/sakalond/stablegen-media/main/readme/rig-phone-dark.webp"><img src="https://raw.githubusercontent.com/sakalond/stablegen-media/main/readme/rig-phone-light.webp" alt="A generated character with its skeleton, then walking with a retargeted Mixamo animation"></picture><picture><source media="(max-width: 767px)" srcset="https://raw.githubusercontent.com/sakalond/stablegen-media/main/readme/blank.svg"><source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/sakalond/stablegen-media/main/readme/rig-wide-dark.webp"><img src="https://raw.githubusercontent.com/sakalond/stablegen-media/main/readme/rig-wide-light.webp" alt="A generated character with its skeleton, then walking with a retargeted Mixamo animation"></picture>
@@ -61,7 +60,7 @@ SkinTokens adds a skeleton and skin weights to a character, during a TRELLIS.2 r
 
 ### Export to a game engine
 
-Bake the result, PBR maps included, into UV textures and export it with its rig and animations: glTF for Godot and the web, or FBX for Unreal Engine and Unity. Below, a village in Unreal Engine 5.7 built only from StableGen exports: the houses, props, trees and ground as GLB with PBR maps, and five rigged characters as FBX with their walk. Orbit GIFs and MP4s, multi-color 3MF files for 3D printing, and the scene queue for unattended batches are in the same place. [Export](docs/export.md) · [Batch processing](docs/batch-and-queue.md)
+Bake the result, PBR maps included, into UV textures and export it with its rig and animations: glTF for Godot and the web, or FBX for Unreal Engine and Unity. Below, a village in Unreal Engine 5.7 built only from StableGen exports: the houses, props, trees and ground as GLB with PBR maps, and five rigged characters as FBX with their walk. Orbit GIFs and MP4s, multi-color 3MF files for 3D printing, and the scene queue for unattended batches are in the same place. [Export](https://github.com/sakalond/StableGen/wiki/Export) · [Batch processing](https://github.com/sakalond/StableGen/wiki/Batch-processing-and-the-Scene-Queue)
 
 <p>
 <picture><source media="(min-width: 768px)" srcset="https://raw.githubusercontent.com/sakalond/stablegen-media/main/readme/blank.svg"><source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/sakalond/stablegen-media/main/readme/export-phone-dark.webp"><img src="https://raw.githubusercontent.com/sakalond/stablegen-media/main/readme/export-phone-light.webp" alt="A village of StableGen assets in Unreal Engine 5.7: the level editor with the imported assets, then aerial, market, street and village shots with five walking characters"></picture><picture><source media="(max-width: 767px)" srcset="https://raw.githubusercontent.com/sakalond/stablegen-media/main/readme/blank.svg"><source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/sakalond/stablegen-media/main/readme/export-wide-dark.webp"><img src="https://raw.githubusercontent.com/sakalond/stablegen-media/main/readme/export-wide-light.webp" alt="A village of StableGen assets in Unreal Engine 5.7: the level editor with the imported assets, then aerial, market, street and village shots with five walking characters"></picture>
@@ -124,14 +123,13 @@ Texturing works by projection. Each camera gets a generated view that follows th
 1. Install [ComfyUI](https://github.com/comfyanonymous/ComfyUI#installing) and check that it runs.
 2. Install the custom nodes and models StableGen uses with the installer in this repository, then restart ComfyUI:
    ```bash
-   pip install requests tqdm
    python installer.py <path to ComfyUI>
    ```
-   Package 3 sets up SDXL texturing, package 6 Qwen Image Edit, and package 8 adds mesh generation.
+   Package 3 sets up SDXL texturing, package 13 Qwen Image 2.1, package 8 mesh generation and package 14 auto-rigging.
 3. Download the add-on ZIP from [Releases](https://github.com/sakalond/stablegen/releases). In Blender, open **Edit > Preferences > Get Extensions**, choose **Install from Disk** in the top-right menu, and select the ZIP.
 4. In the add-on preferences, set **Output Directory** and **Server Address** (`127.0.0.1:8188` by default). Under **System > Network**, enable **Allow Online Access**.
 
-[Installation](docs/installation.md) covers every installer package, Qwen Image 2.1 models, a remote server and manual setup.
+[Installation](https://github.com/sakalond/StableGen/wiki/Installation) covers every installer package, unattended installs, a remote server and manual setup.
 
 ## Quick start
 
@@ -151,18 +149,18 @@ Press <kbd>N</kbd> in the 3D Viewport and open the **StableGen** tab.
 3. To rig a character in the same run, enable **Auto-rig** under **Rigging & Animation**.
 4. Click **Generate asset**, then pick a preview image.
 
-[Quick start](docs/quick-start.md) goes through both in detail.
+[Quick start](https://github.com/sakalond/StableGen/wiki/Quick-start) goes through both in detail.
 
 ## Documentation
 
-[Installation](docs/installation.md) · [Quick start](docs/quick-start.md) · [Architectures and presets](docs/architectures-and-presets.md) · [Generation modes](docs/generation-modes.md) · [Cameras](docs/cameras.md) · [Masked Edit](docs/masked-edit.md) · [PBR maps](docs/pbr.md) · [TRELLIS.2](docs/trellis2.md) · [Rigging and animation](docs/rigging-and-animation.md) · [Export](docs/export.md) · [Batch processing](docs/batch-and-queue.md) · [Output files](docs/output-files.md) · [Troubleshooting](docs/troubleshooting.md)
+[Installation](https://github.com/sakalond/StableGen/wiki/Installation) · [Quick start](https://github.com/sakalond/StableGen/wiki/Quick-start) · [Architectures and presets](https://github.com/sakalond/StableGen/wiki/Architectures-and-presets) · [Generation modes](https://github.com/sakalond/StableGen/wiki/Generation-modes) · [Cameras](https://github.com/sakalond/StableGen/wiki/Cameras) · [Masked Edit](https://github.com/sakalond/StableGen/wiki/Masked-Edit) · [PBR maps](https://github.com/sakalond/StableGen/wiki/PBR-maps) · [TRELLIS.2](https://github.com/sakalond/StableGen/wiki/TRELLIS.2-mesh-generation) · [Rigging and animation](https://github.com/sakalond/StableGen/wiki/Rigging-and-animation) · [Export](https://github.com/sakalond/StableGen/wiki/Export) · [Batch processing](https://github.com/sakalond/StableGen/wiki/Batch-processing-and-the-Scene-Queue) · [Output files](https://github.com/sakalond/StableGen/wiki/Output-files) · [Troubleshooting](https://github.com/sakalond/StableGen/wiki/Troubleshooting)
 
 ## License
 
 StableGen is released under the [GNU General Public License v3.0](LICENSE). The models and nodes it runs on ComfyUI have their own licenses, and two of them are for non-commercial use only:
 
 - Qwen Image 2.1 is released under the [Qwen Research License](https://huggingface.co/Qwen/Qwen-Image-2.1/blob/main/LICENSE). Qwen Image Edit and SDXL are not affected.
-- The TRELLIS.2 **Native** texture mode uses NVIDIA's nvdiffrast and nvdiffrec. The other modes do not use them. See [TRELLIS.2 third-party licenses](docs/trellis2.md#third-party-licenses).
+- The TRELLIS.2 **Native** texture mode uses NVIDIA's nvdiffrast and nvdiffrec. The other modes do not use them. See [TRELLIS.2 third-party licenses](https://github.com/sakalond/StableGen/wiki/TRELLIS.2-mesh-generation#third-party-licenses).
 
 ## Acknowledgements
 
@@ -190,4 +188,4 @@ It builds on [ComfyUI](https://github.com/comfyanonymous/ComfyUI), [ComfyUI-TREL
 
 ## Contact
 
-Report bugs and ask questions in [GitHub issues](https://github.com/sakalond/stablegen/issues). Ondřej Sakala: `sakalaondrej@gmail.com`, [@sakalond](https://x.com/sakalond) on X.
+Ask questions and share results in [Discussions](https://github.com/sakalond/StableGen/discussions), and report bugs in [Issues](https://github.com/sakalond/StableGen/issues). Ondřej Sakala: `sakalaondrej@gmail.com`, [@sakalond](https://x.com/sakalond) on X.
