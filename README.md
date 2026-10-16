@@ -22,12 +22,7 @@ StableGen is a Blender add-on that textures meshes and whole scenes with diffusi
 Describe a character and pick one of the preview images; StableGen does the rest in one run. TRELLIS.2 builds the mesh, SkinTokens rigs it, and views generated around it are projected into its texture. A run can also start from an image, skip the rig, or keep the texture TRELLIS.2 makes itself. [TRELLIS.2](docs/trellis2.md)
 
 <p>
-<picture>
-  <source media="(max-width: 767px) and (prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/sakalond/stablegen-media/main/readme/pipeline-phone-dark.webp">
-  <source media="(max-width: 767px)" srcset="https://raw.githubusercontent.com/sakalond/stablegen-media/main/readme/pipeline-phone-light.webp">
-  <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/sakalond/stablegen-media/main/readme/pipeline-dark.webp">
-  <img src="https://raw.githubusercontent.com/sakalond/stablegen-media/main/readme/pipeline-light.webp" alt="The StableGen panel: a prompt, the preview gallery, then the mesh, rig and texture generated in Blender">
-</picture>
+<picture><source media="(min-width: 768px)" srcset="https://raw.githubusercontent.com/sakalond/stablegen-media/main/readme/blank.svg"><source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/sakalond/stablegen-media/main/readme/pipeline-phone-dark.webp"><img src="https://raw.githubusercontent.com/sakalond/stablegen-media/main/readme/pipeline-phone-light.webp" alt="The StableGen panel: a prompt, the preview gallery, then the mesh, rig and texture generated in Blender"></picture><picture><source media="(max-width: 767px)" srcset="https://raw.githubusercontent.com/sakalond/stablegen-media/main/readme/blank.svg"><source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/sakalond/stablegen-media/main/readme/pipeline-dark.webp"><img src="https://raw.githubusercontent.com/sakalond/stablegen-media/main/readme/pipeline-light.webp" alt="The StableGen panel: a prompt, the preview gallery, then the mesh, rig and texture generated in Blender"></picture>
 </p>
 
 ## What it does
@@ -37,12 +32,7 @@ Describe a character and pick one of the preview images; StableGen does the rest
 Place cameras around one object or a whole scene. StableGen generates a view from each camera and projects it onto every surface that camera sees; each view is generated with the earlier ones as context, so the texture stays consistent all the way round. [Generation modes](docs/generation-modes.md) · [Cameras](docs/cameras.md)
 
 <p>
-<picture>
-  <source media="(max-width: 767px) and (prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/sakalond/stablegen-media/main/readme/texture-phone-dark.webp">
-  <source media="(max-width: 767px)" srcset="https://raw.githubusercontent.com/sakalond/stablegen-media/main/readme/texture-phone-light.webp">
-  <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/sakalond/stablegen-media/main/readme/texture-wide-dark.webp">
-  <img src="https://raw.githubusercontent.com/sakalond/stablegen-media/main/readme/texture-wide-light.webp" alt="A floating island textured view by view from ten generated camera views">
-</picture>
+<picture><source media="(min-width: 768px)" srcset="https://raw.githubusercontent.com/sakalond/stablegen-media/main/readme/blank.svg"><source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/sakalond/stablegen-media/main/readme/texture-phone-dark.webp"><img src="https://raw.githubusercontent.com/sakalond/stablegen-media/main/readme/texture-phone-light.webp" alt="A floating island textured view by view from ten generated camera views"></picture><picture><source media="(max-width: 767px)" srcset="https://raw.githubusercontent.com/sakalond/stablegen-media/main/readme/blank.svg"><source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/sakalond/stablegen-media/main/readme/texture-wide-dark.webp"><img src="https://raw.githubusercontent.com/sakalond/stablegen-media/main/readme/texture-wide-light.webp" alt="A floating island textured view by view from ten generated camera views"></picture>
 </p>
 
 ### Edit part of a texture
@@ -50,12 +40,7 @@ Place cameras around one object or a whole scene. StableGen generates a view fro
 Paint over the part you want to change and describe the change. Masked Edit regenerates only the painted region, in every view that sees it, and leaves the rest of the texture as it was. [Masked Edit](docs/masked-edit.md)
 
 <p>
-<picture>
-  <source media="(max-width: 767px) and (prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/sakalond/stablegen-media/main/readme/edit-phone-dark.webp">
-  <source media="(max-width: 767px)" srcset="https://raw.githubusercontent.com/sakalond/stablegen-media/main/readme/edit-phone-light.webp">
-  <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/sakalond/stablegen-media/main/readme/edit-wide-dark.webp">
-  <img src="https://raw.githubusercontent.com/sakalond/stablegen-media/main/readme/edit-wide-light.webp" alt="A character's jacket replaced in turn by plate armor, a wool coat and sci-fi armor">
-</picture>
+<picture><source media="(min-width: 768px)" srcset="https://raw.githubusercontent.com/sakalond/stablegen-media/main/readme/blank.svg"><source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/sakalond/stablegen-media/main/readme/edit-phone-dark.webp"><img src="https://raw.githubusercontent.com/sakalond/stablegen-media/main/readme/edit-phone-light.webp" alt="A character's jacket replaced in turn by plate armor, a wool coat and sci-fi armor"></picture><picture><source media="(max-width: 767px)" srcset="https://raw.githubusercontent.com/sakalond/stablegen-media/main/readme/blank.svg"><source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/sakalond/stablegen-media/main/readme/edit-wide-dark.webp"><img src="https://raw.githubusercontent.com/sakalond/stablegen-media/main/readme/edit-wide-light.webp" alt="A character's jacket replaced in turn by plate armor, a wool coat and sci-fi armor"></picture>
 </p>
 
 ### PBR materials
@@ -63,12 +48,7 @@ Paint over the part you want to change and describe the change. Masked Edit rege
 Marigold estimates albedo, roughness, metallic and normal maps from the generated views. StableGen projects them like the color and bakes them into standard maps for other software. [PBR maps](docs/pbr.md)
 
 <p>
-<picture>
-  <source media="(max-width: 767px) and (prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/sakalond/stablegen-media/main/readme/pbr-phone-dark.webp">
-  <source media="(max-width: 767px)" srcset="https://raw.githubusercontent.com/sakalond/stablegen-media/main/readme/pbr-phone-light.webp">
-  <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/sakalond/stablegen-media/main/readme/pbr-wide-dark.webp">
-  <img src="https://raw.githubusercontent.com/sakalond/stablegen-media/main/readme/pbr-wide-light.webp" alt="A log house under a moving light, with its base color, roughness, metallic and normal maps">
-</picture>
+<picture><source media="(min-width: 768px)" srcset="https://raw.githubusercontent.com/sakalond/stablegen-media/main/readme/blank.svg"><source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/sakalond/stablegen-media/main/readme/pbr-phone-dark.webp"><img src="https://raw.githubusercontent.com/sakalond/stablegen-media/main/readme/pbr-phone-light.webp" alt="A log house under a moving light, with its base color, roughness, metallic and normal maps"></picture><picture><source media="(max-width: 767px)" srcset="https://raw.githubusercontent.com/sakalond/stablegen-media/main/readme/blank.svg"><source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/sakalond/stablegen-media/main/readme/pbr-wide-dark.webp"><img src="https://raw.githubusercontent.com/sakalond/stablegen-media/main/readme/pbr-wide-light.webp" alt="A log house under a moving light, with its base color, roughness, metallic and normal maps"></picture>
 </p>
 
 ### Rig and animate
@@ -76,12 +56,7 @@ Marigold estimates albedo, roughness, metallic and normal maps from the generate
 SkinTokens adds a skeleton and skin weights to a character, during a TRELLIS.2 run or on any mesh you select. Motion from FBX or BVH files, such as Mixamo animations, can then be retargeted onto the rig. [Rigging and animation](docs/rigging-and-animation.md)
 
 <p>
-<picture>
-  <source media="(max-width: 767px) and (prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/sakalond/stablegen-media/main/readme/rig-phone-dark.webp">
-  <source media="(max-width: 767px)" srcset="https://raw.githubusercontent.com/sakalond/stablegen-media/main/readme/rig-phone-light.webp">
-  <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/sakalond/stablegen-media/main/readme/rig-wide-dark.webp">
-  <img src="https://raw.githubusercontent.com/sakalond/stablegen-media/main/readme/rig-wide-light.webp" alt="A generated character with its skeleton, then walking with a retargeted Mixamo animation">
-</picture>
+<picture><source media="(min-width: 768px)" srcset="https://raw.githubusercontent.com/sakalond/stablegen-media/main/readme/blank.svg"><source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/sakalond/stablegen-media/main/readme/rig-phone-dark.webp"><img src="https://raw.githubusercontent.com/sakalond/stablegen-media/main/readme/rig-phone-light.webp" alt="A generated character with its skeleton, then walking with a retargeted Mixamo animation"></picture><picture><source media="(max-width: 767px)" srcset="https://raw.githubusercontent.com/sakalond/stablegen-media/main/readme/blank.svg"><source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/sakalond/stablegen-media/main/readme/rig-wide-dark.webp"><img src="https://raw.githubusercontent.com/sakalond/stablegen-media/main/readme/rig-wide-light.webp" alt="A generated character with its skeleton, then walking with a retargeted Mixamo animation"></picture>
 </p>
 
 ### Export to a game engine
@@ -89,12 +64,7 @@ SkinTokens adds a skeleton and skin weights to a character, during a TRELLIS.2 r
 Bake the result, PBR maps included, into UV textures and export it with its rig and animations: glTF for Godot and the web, or FBX for Unreal Engine and Unity. Below, a village in Unreal Engine 5.7 built only from StableGen exports: the houses, props, trees and ground as GLB with PBR maps, and five rigged characters as FBX with their walk. Orbit GIFs and MP4s, multi-color 3MF files for 3D printing, and the scene queue for unattended batches are in the same place. [Export](docs/export.md) · [Batch processing](docs/batch-and-queue.md)
 
 <p>
-<picture>
-  <source media="(max-width: 767px) and (prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/sakalond/stablegen-media/main/readme/export-phone-dark.webp">
-  <source media="(max-width: 767px)" srcset="https://raw.githubusercontent.com/sakalond/stablegen-media/main/readme/export-phone-light.webp">
-  <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/sakalond/stablegen-media/main/readme/export-wide-dark.webp">
-  <img src="https://raw.githubusercontent.com/sakalond/stablegen-media/main/readme/export-wide-light.webp" alt="A village of StableGen assets in Unreal Engine 5.7: the level editor with the imported assets, then aerial, market, street and village shots with five walking characters">
-</picture>
+<picture><source media="(min-width: 768px)" srcset="https://raw.githubusercontent.com/sakalond/stablegen-media/main/readme/blank.svg"><source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/sakalond/stablegen-media/main/readme/export-phone-dark.webp"><img src="https://raw.githubusercontent.com/sakalond/stablegen-media/main/readme/export-phone-light.webp" alt="A village of StableGen assets in Unreal Engine 5.7: the level editor with the imported assets, then aerial, market, street and village shots with five walking characters"></picture><picture><source media="(max-width: 767px)" srcset="https://raw.githubusercontent.com/sakalond/stablegen-media/main/readme/blank.svg"><source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/sakalond/stablegen-media/main/readme/export-wide-dark.webp"><img src="https://raw.githubusercontent.com/sakalond/stablegen-media/main/readme/export-wide-light.webp" alt="A village of StableGen assets in Unreal Engine 5.7: the level editor with the imported assets, then aerial, market, street and village shots with five walking characters"></picture>
 </p>
 
 ## Working by hand
@@ -102,12 +72,7 @@ Bake the result, PBR maps included, into UV textures and export it with its rig 
 Each step can also be done by hand: reorder the cameras and give views their own prompts, change how the views blend and reproject without generating again, extract PBR maps, and repaint a region with Masked Edit.
 
 <p>
-<picture>
-  <source media="(max-width: 767px) and (prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/sakalond/stablegen-media/main/readme/tools-phone-dark.webp">
-  <source media="(max-width: 767px)" srcset="https://raw.githubusercontent.com/sakalond/stablegen-media/main/readme/tools-phone-light.webp">
-  <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/sakalond/stablegen-media/main/readme/tools-dark.webp">
-  <img src="https://raw.githubusercontent.com/sakalond/stablegen-media/main/readme/tools-light.webp" alt="The StableGen panel: camera order and view prompts, blending, PBR maps and Masked Edit">
-</picture>
+<picture><source media="(min-width: 768px)" srcset="https://raw.githubusercontent.com/sakalond/stablegen-media/main/readme/blank.svg"><source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/sakalond/stablegen-media/main/readme/tools-phone-dark.webp"><img src="https://raw.githubusercontent.com/sakalond/stablegen-media/main/readme/tools-phone-light.webp" alt="The StableGen panel: camera order and view prompts, blending, PBR maps and Masked Edit"></picture><picture><source media="(max-width: 767px)" srcset="https://raw.githubusercontent.com/sakalond/stablegen-media/main/readme/blank.svg"><source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/sakalond/stablegen-media/main/readme/tools-dark.webp"><img src="https://raw.githubusercontent.com/sakalond/stablegen-media/main/readme/tools-light.webp" alt="The StableGen panel: camera order and view prompts, blending, PBR maps and Masked Edit"></picture>
 </p>
 
 ## How it works
@@ -115,23 +80,13 @@ Each step can also be done by hand: reorder the cameras and give views their own
 StableGen runs inside Blender and sends the model work to a ComfyUI server, on the same computer or another one on the network. You start from a prompt, an image or your own model, and the results come back into the scene as materials, meshes and armatures.
 
 <p>
-<picture>
-  <source media="(max-width: 767px) and (prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/sakalond/stablegen-media/main/readme/pipeline-narrow-dark.svg">
-  <source media="(max-width: 767px)" srcset="https://raw.githubusercontent.com/sakalond/stablegen-media/main/readme/pipeline-narrow-light.svg">
-  <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/sakalond/stablegen-media/main/readme/pipeline-diagram-dark.svg">
-  <img src="https://raw.githubusercontent.com/sakalond/stablegen-media/main/readme/pipeline-diagram-light.svg" width="100%" alt="In Blender: prompt, mesh, cameras, projection, bake and export. On the ComfyUI server: mesh generation with TRELLIS.2, rigging with SkinTokens, diffusion with SDXL or Qwen Image, and PBR maps with Marigold.">
-</picture>
+<picture><source media="(min-width: 768px)" srcset="https://raw.githubusercontent.com/sakalond/stablegen-media/main/readme/blank.svg"><source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/sakalond/stablegen-media/main/readme/pipeline-narrow-dark.svg"><img src="https://raw.githubusercontent.com/sakalond/stablegen-media/main/readme/pipeline-narrow-light.svg" width="100%" alt="In Blender: prompt, mesh, cameras, projection, bake and export. On the ComfyUI server: mesh generation with TRELLIS.2, rigging with SkinTokens, diffusion with SDXL or Qwen Image, and PBR maps with Marigold."></picture><picture><source media="(max-width: 767px)" srcset="https://raw.githubusercontent.com/sakalond/stablegen-media/main/readme/blank.svg"><source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/sakalond/stablegen-media/main/readme/pipeline-diagram-dark.svg"><img src="https://raw.githubusercontent.com/sakalond/stablegen-media/main/readme/pipeline-diagram-light.svg" width="100%" alt="In Blender: prompt, mesh, cameras, projection, bake and export. On the ComfyUI server: mesh generation with TRELLIS.2, rigging with SkinTokens, diffusion with SDXL or Qwen Image, and PBR maps with Marigold."></picture>
 </p>
 
 Texturing works by projection. Each camera gets a generated view that follows the geometry through a depth guide, and the views are blended onto the surface by how directly each camera sees it.
 
 <p>
-<picture>
-  <source media="(max-width: 767px) and (prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/sakalond/stablegen-media/main/readme/projection-narrow-dark.svg">
-  <source media="(max-width: 767px)" srcset="https://raw.githubusercontent.com/sakalond/stablegen-media/main/readme/projection-narrow-light.svg">
-  <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/sakalond/stablegen-media/main/readme/projection-diagram-dark.svg">
-  <img src="https://raw.githubusercontent.com/sakalond/stablegen-media/main/readme/projection-diagram-light.svg" width="100%" alt="Projection in three steps: place cameras, generate a view for each from a depth guide, project and blend the views">
-</picture>
+<picture><source media="(min-width: 768px)" srcset="https://raw.githubusercontent.com/sakalond/stablegen-media/main/readme/blank.svg"><source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/sakalond/stablegen-media/main/readme/projection-narrow-dark.svg"><img src="https://raw.githubusercontent.com/sakalond/stablegen-media/main/readme/projection-narrow-light.svg" width="100%" alt="Projection in three steps: place cameras, generate a view for each from a depth guide, project and blend the views"></picture><picture><source media="(max-width: 767px)" srcset="https://raw.githubusercontent.com/sakalond/stablegen-media/main/readme/blank.svg"><source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/sakalond/stablegen-media/main/readme/projection-diagram-dark.svg"><img src="https://raw.githubusercontent.com/sakalond/stablegen-media/main/readme/projection-diagram-light.svg" width="100%" alt="Projection in three steps: place cameras, generate a view for each from a depth guide, project and blend the views"></picture>
 </p>
 
 ### Built on
