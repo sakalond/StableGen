@@ -1,4 +1,4 @@
-<h1 align="center"><img src="docs/img/brand/stablegen-logo.svg" width="52" align="absmiddle" alt="StableGen logo">&nbsp;StableGen</h1>
+<h1 align="center"><img src="docs/img/brand/stablegen-logo.svg" width="44" align="absmiddle" alt="StableGen logo">&ensp;StableGen</h1>
 <p align="center">Generate, texture and rig 3D assets in Blender.</p>
 <p align="center">
 <a href="LICENSE"><img src="https://img.shields.io/badge/license-GPL--3.0-007ec6" alt="License: GPL-3.0"></a>
