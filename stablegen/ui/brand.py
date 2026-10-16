@@ -1,7 +1,7 @@
 """StableGen's logo: a lens projecting onto a cube, painting the faces it can see.
 
-The geometry lives here once. The Studio header rasterizes it at the current
-UI scale, and tools/export_brand.py writes the SVG and PNG assets from it.
+The geometry lives here once. The panel header rasterizes it at the current
+UI scale, and the SVG and PNG assets in docs/img/brand are exported from it.
 Pure Python + numpy so it also runs outside Blender.
 """
 import math

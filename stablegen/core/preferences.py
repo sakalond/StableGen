@@ -109,7 +109,7 @@ class StableGenAddonPreferences(bpy.types.AddonPreferences):
 
     use_legacy_panel: bpy.props.BoolProperty(
         name="Use Legacy Panel",
-        description="Show the original StableGen sidebar panel instead of the Studio panel",
+        description="Show the original StableGen sidebar panel instead of the new one",
         default=False,
         update=_redraw_sidebars
     )  # type: ignore
