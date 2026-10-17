@@ -5,7 +5,7 @@
 <img src="https://img.shields.io/badge/Blender-4.2--4.5%20%7C%205.1%2B-e5722c" alt="Blender 4.2 to 4.5, or 5.1 and later">
 <a href="https://github.com/sakalond/stablegen/releases"><img src="https://img.shields.io/github/downloads/sakalond/stablegen/total" alt="Downloads"></a>
 </p>
-<p align="center"><a href="https://github.com/sakalond/StableGen/wiki">Documentation</a> · <a href="https://github.com/sakalond/StableGen/wiki/Installation">Installation</a> · <a href="https://github.com/sakalond/StableGen/wiki/Quick-start">Quick start</a> · <a href="https://github.com/sakalond/stablegen/releases">Releases</a></p>
+<p align="center"><a href="https://github.com/sakalond/StableGen/wiki">Documentation</a> · <a href="https://github.com/sakalond/StableGen/wiki/Installation">Installation</a> · <a href="https://github.com/sakalond/StableGen/wiki/Quick-start">Quick start</a> · <a href="https://github.com/sakalond/StableGen/discussions">Discussions</a> · <a href="https://github.com/sakalond/stablegen/releases">Releases</a></p>
 
 StableGen is a Blender add-on that textures meshes and whole scenes with diffusion models, and generates new meshes from a prompt or an image. It renders guidance images from cameras in your scene, sends the work to a [ComfyUI](https://github.com/comfyanonymous/ComfyUI) server on the same computer or elsewhere on your network, and projects the results back onto the meshes.
 
@@ -153,7 +153,12 @@ Press <kbd>N</kbd> in the 3D Viewport and open the **StableGen** tab.
 
 ## Documentation
 
-[Installation](https://github.com/sakalond/StableGen/wiki/Installation) · [Quick start](https://github.com/sakalond/StableGen/wiki/Quick-start) · [Architectures and presets](https://github.com/sakalond/StableGen/wiki/Architectures-and-presets) · [Generation modes](https://github.com/sakalond/StableGen/wiki/Generation-modes) · [Cameras](https://github.com/sakalond/StableGen/wiki/Cameras) · [Masked Edit](https://github.com/sakalond/StableGen/wiki/Masked-Edit) · [PBR maps](https://github.com/sakalond/StableGen/wiki/PBR-maps) · [TRELLIS.2](https://github.com/sakalond/StableGen/wiki/TRELLIS.2-mesh-generation) · [Rigging and animation](https://github.com/sakalond/StableGen/wiki/Rigging-and-animation) · [Export](https://github.com/sakalond/StableGen/wiki/Export) · [Batch processing](https://github.com/sakalond/StableGen/wiki/Batch-processing-and-the-Scene-Queue) · [Output files](https://github.com/sakalond/StableGen/wiki/Output-files) · [Troubleshooting](https://github.com/sakalond/StableGen/wiki/Troubleshooting)
+The [StableGen wiki](https://github.com/sakalond/StableGen/wiki) covers every feature in detail:
+
+- **Getting started:** [Installation](https://github.com/sakalond/StableGen/wiki/Installation) · [Manual installation](https://github.com/sakalond/StableGen/wiki/Manual-installation) · [Quick start](https://github.com/sakalond/StableGen/wiki/Quick-start)
+- **Texturing:** [Architectures and presets](https://github.com/sakalond/StableGen/wiki/Architectures-and-presets) · [Generation modes](https://github.com/sakalond/StableGen/wiki/Generation-modes) · [Masked Edit](https://github.com/sakalond/StableGen/wiki/Masked-Edit) · [Cameras](https://github.com/sakalond/StableGen/wiki/Cameras) · [PBR maps](https://github.com/sakalond/StableGen/wiki/PBR-maps)
+- **Mesh generation and rigging:** [TRELLIS.2 mesh generation](https://github.com/sakalond/StableGen/wiki/TRELLIS.2-mesh-generation) · [Rigging and animation](https://github.com/sakalond/StableGen/wiki/Rigging-and-animation)
+- **Output and automation:** [Export](https://github.com/sakalond/StableGen/wiki/Export) · [Batch processing and the Scene Queue](https://github.com/sakalond/StableGen/wiki/Batch-processing-and-the-Scene-Queue) · [Output files](https://github.com/sakalond/StableGen/wiki/Output-files) · [Troubleshooting](https://github.com/sakalond/StableGen/wiki/Troubleshooting)
 
 ## License
 
