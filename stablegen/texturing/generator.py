@@ -32,7 +32,7 @@ from ..cameras.overlays import _sg_restore_square_display, _sg_remove_crop_overl
 from .projection import project_image, reinstate_compare_nodes, _bake_visibility_weights, reset_projection_material_nodes, _is_projection_mesh, pop_svm_stack_warning, pop_eevee_attribute_warning
 from .jobs import operation, RenderRequest, MainThreadOperation, run_sync
 from ..utils import get_last_material_index, get_generation_dirs, get_file_path, get_dir_path, remove_empty_dirs, get_compositor_node_tree, new_compositor_math, configure_output_node_paths, get_eevee_engine_id, sg_modal_active
-from ..util.mirror_color import MirrorReproject, _get_viewport_ref_np, _apply_color_match_to_file
+from ..util.mirror_color import MirrorReproject, _get_viewport_ref_np, _apply_color_match_to_file, restore_unmatched_image
 from ..timeout_config import get_timeout
 from .._generator_utils import redraw_ui, setup_studio_lighting, _pbr_setup_studio_lights, upload_image_to_comfyui
 from .pbr import _PBRMixin
@@ -1250,6 +1250,11 @@ class ComfyUIGenerate(_PBRMixin, bpy.types.Operator):
                         ref_rgb=ref_np,
                         scene=context.scene,
                     )
+        elif context.scene.generation_mode == 'project_only':
+            # Color matching was turned off: reproject the views as generated
+            for cam_idx, _cam in enumerate(self._cameras):
+                restore_unmatched_image(get_file_path(
+                    context, "generated", camera_id=cam_idx, material_id=self._material_id))
 
         self.prompt_text = context.scene.comfyui_prompt
 
