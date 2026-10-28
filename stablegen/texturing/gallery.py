@@ -184,12 +184,17 @@ class _PreviewGalleryOverlay:
 
         # Detect sidebar (N-panel) width so the grid avoids being covered.
         sidebar_w = 0
+        # Headers drawn over the viewport (region overlap) would cover the title.
+        top_inset = 0
         area = context.area
         if area:
+            top = region.y + region.height
             for r in area.regions:
-                if r.type == 'UI' and r.width > 1:
+                if r.type == 'UI' and r.width > 1 and not sidebar_w:
                     sidebar_w = r.width
-                    break
+                if (r.type in {'HEADER', 'TOOL_HEADER'} and r.height > 1
+                        and region.y < r.y < top):
+                    top_inset = max(top_inset, top - r.y)
 
         # Layout constants
         pad = 20
@@ -205,11 +210,11 @@ class _PreviewGalleryOverlay:
         blf.size(0, 20)
         title = "Select an image — or generate more"
         tw, th = blf.dimensions(0, title)
-        blf.position(0, (usable_w - tw) / 2, vh - pad - th, 0)
+        blf.position(0, (usable_w - tw) / 2, vh - top_inset - pad - th, 0)
         blf.color(0, 1.0, 1.0, 1.0, 1.0)
         blf.draw(0, title)
 
-        grid_top = vh - pad - title_h - pad
+        grid_top = vh - top_inset - pad - title_h - pad
         available_w = usable_w - pad * 2
         available_h = grid_top - bottom_area - pad
 

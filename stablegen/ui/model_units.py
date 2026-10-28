@@ -14,7 +14,11 @@ import bpy  # pylint: disable=import-error
 from .presets import update_parameters
 from ..utils import sg_modal_active
 from ..core import ADDON_PKG
-from ..core.server_api import _fetch_api_list
+from ..core.server_api import _fetch_api_list, fetch_diffusion_models
+from ..texturing.qwen_models import (
+    is_fibo_model, is_moss_image_model,
+    is_qwen_image_21_model, is_qwen_image_21_turbo_model,
+)
 from ..core.state import (
     _cached_checkpoint_list,
     _cached_checkpoint_architecture,
@@ -23,6 +27,23 @@ from ..core.state import (
     _inc_pending_refreshes,
     _run_async,
 )
+
+# Architectures whose model is listed from the diffusion-model folders:
+# (accepts filename, description used in refresh reports).
+_DIFFUSION_MODEL_FILTERS = {
+    'flux1': (lambda name: True, "UNET"),
+    'qwen_image_edit': (
+        lambda name: not (is_qwen_image_21_model(name)
+                          or is_moss_image_model(name) or is_fibo_model(name)),
+        "Qwen-Image-Edit model"),
+    'qwen_image_21': (
+        lambda name: (is_qwen_image_21_model(name)
+                      and not is_qwen_image_21_turbo_model(name)),
+        "Qwen-Image 2.1 model"),
+    'qwen_image_21_turbo': (is_qwen_image_21_turbo_model, "Qwen-Image 2.1 Turbo model"),
+    'moss_image': (is_moss_image_model, "MOSS-Image model"),
+    'fibo_edit': (is_fibo_model, "FIBO model"),
+}
 
 
 # ── Enum callbacks for model dropdowns ─────────────────────────────────────
@@ -122,19 +143,19 @@ class ControlNetUnit(bpy.types.PropertyGroup):
     )  # type: ignore
     strength: bpy.props.FloatProperty(
         name="Strength",
-        description="Strength of the ControlNet effect",
+        description="Multiplier for ControlNet conditioning: 0 disables its contribution, 1 uses nominal strength. Higher values can enforce guidance more strongly but may overconstrain the result",
         default=0.5, min=0.0, max=3.0,
         update=update_parameters
     )  # type: ignore
     start_percent: bpy.props.FloatProperty(
-        name="Start",
-        description="Start percentage (/100)",
+        name="Start fraction",
+        description="Denoising fraction when conditioning begins: 0 is the start, 1 the end; 0.2 means 20% of the schedule. Keep Start at or below End.",
         default=0.0, min=0.0, max=1.0,
         update=update_parameters
     )  # type: ignore
     end_percent: bpy.props.FloatProperty(
-        name="End",
-        description="End percentage (/100)",
+        name="End fraction",
+        description="Denoising fraction when conditioning ends: 0 is the start, 1 the end; 0.8 means 80% of the schedule. Keep End at or above Start.",
         default=1.0, min=0.0, max=1.0,
         update=update_parameters
     )  # type: ignore
@@ -146,7 +167,7 @@ class ControlNetUnit(bpy.types.PropertyGroup):
     )  # type: ignore
     use_union_type: bpy.props.BoolProperty(
         name="Use Union Type",
-        description="Use union type for ControlNet",
+        description="Explicitly select the guidance kind for a compatible union ControlNet, such as depth or edges. Requires a union-capable model",
         default=True,
         update=update_parameters
     )  # type: ignore
@@ -161,13 +182,13 @@ class LoRAUnit(bpy.types.PropertyGroup):
     )  # type: ignore
     model_strength: bpy.props.FloatProperty(
         name="Model Strength",
-        description="Strength of the LoRA's effect on the model's weights",
+        description="Multiplier for the LoRA’s effect on model weights: 0 disables it, 1 uses nominal strength. Useful values depend on the LoRA; excessive strength can distort the result",
         default=1.0, min=0.0, max=100.0,
         update=update_parameters
     )  # type: ignore
     clip_strength: bpy.props.FloatProperty(
         name="CLIP Strength",
-        description="Strength of the LoRA's effect on the CLIP/text conditioning",
+        description="Multiplier for the LoRA’s text-encoder contribution: 0 disables it, 1 uses nominal strength. Separate from model strength; architectures with model-only LoRAs hide this control",
         default=1.0, min=0.0, max=100.0,
         update=update_parameters
     )  # type: ignore
@@ -208,13 +229,11 @@ class RefreshCheckpointList(bpy.types.Operator):
             if architecture == 'sdxl':
                 model_list = _fetch_api_list(server_address, "/models/checkpoints")
                 model_type_desc = "Checkpoint"
-            elif architecture in ('flux1', 'qwen_image_edit'):
-                model_list = _fetch_api_list(server_address, "/models/unet_gguf")
+            elif architecture in _DIFFUSION_MODEL_FILTERS:
+                model_list = fetch_diffusion_models(server_address)
+                accepts, model_type_desc = _DIFFUSION_MODEL_FILTERS[architecture]
                 if model_list is not None:
-                    extra = _fetch_api_list(server_address, "/models/diffusion_models")
-                    if extra:
-                        model_list.extend(extra)
-                model_type_desc = "UNET" if architecture == 'flux1' else "UNET (GGUF/Safetensors)"
+                    model_list = [name for name in model_list if accepts(name)]
             elif architecture == 'flux2_klein':
                 model_list = _fetch_api_list(server_address, "/models/diffusion_models")
                 model_type_desc = "Diffusion Model"
@@ -233,7 +252,7 @@ class RefreshCheckpointList(bpy.types.Operator):
             desc = result.get('model_type_desc', 'Model')
 
             if model_list is None:
-                _state._cached_checkpoint_list = [("NO_SERVER", "Set Server Address", "Cannot fetch")]
+                _state._cached_checkpoint_list = [_state.no_server_item(server_address)]
                 _state._cached_checkpoint_architecture = None
                 print("[StableGen] Checkpoint refresh: cannot reach server.")
             elif not model_list:
@@ -311,7 +330,7 @@ class RefreshLoRAList(bpy.types.Operator):
             lora_list = result.get('lora_list')
 
             if lora_list is None:
-                _state._cached_lora_list = [("NO_SERVER", "Set Server Address", "Cannot fetch")]
+                _state._cached_lora_list = [_state.no_server_item(server_address)]
                 print("[StableGen] LoRA refresh: cannot reach server.")
             elif not lora_list:
                 _state._cached_lora_list = [("NONE_FOUND", "No LoRAs Found", "Server list is empty")]

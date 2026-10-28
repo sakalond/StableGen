@@ -10,6 +10,7 @@ Contains:
 
 import bpy  # pylint: disable=import-error
 
+from .architectures import redraw_architecture_menus
 from ..ui.presets import update_parameters
 from ..utils import sg_modal_active
 from . import ADDON_PKG
@@ -18,6 +19,7 @@ from .server_api import (
     _fetch_api_list,
     check_pbr_available,
     check_server_availability,
+    check_skintokens_autorig_available,
     check_trellis2_available,
 )
 from .state import (
@@ -53,9 +55,37 @@ class ControlNetModelMappingItem(bpy.types.PropertyGroup):
 
 # ── Addon Preferences ─────────────────────────────────────────────────────
 
+def _redraw_sidebars(self, context):
+    """Swap the Studio and legacy panels immediately in every 3D Viewport."""
+    for window in context.window_manager.windows:
+        for area in window.screen.areas:
+            if area.type == 'VIEW_3D':
+                area.tag_redraw()
+
+
 class StableGenAddonPreferences(bpy.types.AddonPreferences):
     """Preferences for the StableGen addon."""
     bl_idname = ADDON_PKG
+
+    enable_deprecated_architectures: bpy.props.BoolProperty(
+        name="Enable Deprecated Architectures",
+        description="Show FLUX.1 and FLUX.2 Klein architectures and their settings; these architectures no longer receive further support",
+        default=False,
+        update=redraw_architecture_menus,
+    )  # type: ignore
+
+    enable_experimental_architectures: bpy.props.BoolProperty(
+        name="Enable Experimental Architectures",
+        description="Show Qwen Image 2.1 Turbo, MOSS Image and FIBO 2.0 Edit; these architectures are new and their results and settings may still change",
+        default=True,
+        update=redraw_architecture_menus,
+    )  # type: ignore
+
+    enable_texturing_experiments: bpy.props.BoolProperty(
+        name="Enable Experimental Texturing Features",
+        description="Show research controls and allow their saved settings to affect texturing; disabling keeps saved values but prevents experimental execution",
+        default=False,
+    )  # type: ignore
 
     server_address: bpy.props.StringProperty(
         name="Server Address",
@@ -84,9 +114,16 @@ class StableGenAddonPreferences(bpy.types.AddonPreferences):
         update=update_parameters
     )  # type: ignore
 
+    use_legacy_panel: bpy.props.BoolProperty(
+        name="Use Legacy Panel",
+        description="Show the original StableGen sidebar panel instead of the new one",
+        default=False,
+        update=_redraw_sidebars
+    )  # type: ignore
+
     enable_print_tab: bpy.props.BoolProperty(
-        name="Enable 3D Print Tab",
-        description="Show 3D Printing Palette and Exporters in a separate Sidebar tab",
+        name="Enable 3D Printing",
+        description="Show the 3D printing palette and exporters; the legacy panel shows them in a separate Sidebar tab",
         default=False,
         update=update_parameters
     )  # type: ignore
@@ -103,7 +140,7 @@ class StableGenAddonPreferences(bpy.types.AddonPreferences):
 
     overlay_color: bpy.props.FloatVectorProperty(
         name="Overlay Color",
-        description="Color used for the camera aspect-ratio crop rectangle and floating view labels in the viewport",
+        description="Color of the scene-camera indicator. Camera selection follows Blender’s theme; diagnostic camera colors take precedence",
         subtype='COLOR',
         size=3,
         min=0.0, max=1.0,
@@ -141,6 +178,15 @@ class StableGenAddonPreferences(bpy.types.AddonPreferences):
         default=120.0, min=10.0, max=600.0, step=100, precision=0,
     )  # type: ignore
 
+    timeout_generation_heartbeat: bpy.props.FloatProperty(
+        name="Generation Heartbeat (s)",
+        description=(
+            "Interval without WebSocket events before StableGen checks "
+            "ComfyUI history and queue; this does not cancel active generation"
+        ),
+        default=120.0, min=10.0, max=600.0, step=100, precision=0,
+    )  # type: ignore
+
     timeout_reboot: bpy.props.FloatProperty(
         name="Reboot Timeout (s)",
         description="How long to wait for ComfyUI server to come back after a reboot",
@@ -175,8 +221,16 @@ class StableGenAddonPreferences(bpy.types.AddonPreferences):
         row.prop(self, "server_address")
         row.operator("stablegen.check_server_status", text="", icon='FILE_REFRESH')
 
+        row = layout.row()
+        row.prop(self, "use_legacy_panel")
+        row.operator("stablegen.reset_tips", icon='LOOP_BACK')
         layout.prop(self, "save_blend_file")
         layout.prop(self, "enable_print_tab")
+        layout.prop(self, "enable_texturing_experiments")
+        layout.prop(self, "enable_experimental_architectures")
+        layout.prop(self, "enable_deprecated_architectures")
+        if self.enable_deprecated_architectures:
+            layout.label(text="FLUX.1 and FLUX.2 Klein no longer receive support.", icon='INFO')
         layout.prop(self, "enable_scene_queue")
 
         layout.separator()
@@ -216,6 +270,7 @@ class StableGenAddonPreferences(bpy.types.AddonPreferences):
             col.prop(self, "timeout_ping")
             col.prop(self, "timeout_api")
             col.prop(self, "timeout_transfer")
+            col.prop(self, "timeout_generation_heartbeat")
             col.prop(self, "timeout_reboot")
             col.prop(self, "timeout_mesh_gen")
             col.prop(self, "timeout_scan")
@@ -228,9 +283,13 @@ class CheckServerStatus(bpy.types.Operator):
     bl_idname = "stablegen.check_server_status"
     bl_label = "Check Server Status"
     bl_description = "Ping the ComfyUI server to check connectivity"
+    _checking = False
 
     @classmethod
     def poll(cls, context):
+        if cls._checking:
+            cls.poll_message_set("Checking server connection")
+            return False
         prefs = context.preferences.addons.get(ADDON_PKG)
         if not prefs or not prefs.preferences.server_address:
             cls.poll_message_set("Server address not configured (check addon preferences)")
@@ -254,12 +313,16 @@ class CheckServerStatus(bpy.types.Operator):
             if result['online']:
                 result['trellis2'] = check_trellis2_available(server_addr, timeout=get_timeout('api'))
                 result['pbr'] = check_pbr_available(server_addr, timeout=get_timeout('api'))
+                result['skintokens'] = check_skintokens_autorig_available(server_addr, timeout=get_timeout('api'))
             else:
                 result['trellis2'] = False
                 result['pbr'] = False
+                result['skintokens'] = False
             return result
 
         def _on_done(result):
+            # Also release the button after an error or a superseded request.
+            type(self)._checking = False
             if result is None:
                 return
             _prefs = bpy.context.preferences.addons[ADDON_PKG].preferences
@@ -268,6 +331,7 @@ class CheckServerStatus(bpy.types.Operator):
             if hasattr(bpy.context, 'scene') and bpy.context.scene:
                 bpy.context.scene.trellis2_available = result.get('trellis2', False)
                 bpy.context.scene.pbr_nodes_available = result.get('pbr', False)
+                bpy.context.scene.skintokens_autorig_available = result.get('skintokens', False)
 
             if result.get('online', False):
                 print(f"[StableGen] ComfyUI server is online at {server_addr}.")
@@ -283,8 +347,15 @@ class CheckServerStatus(bpy.types.Operator):
                 bpy.app.timers.register(_deferred_refresh, first_interval=0.1)
             else:
                 print(f"[StableGen] ComfyUI server unreachable or timed out at {server_addr}.")
+                from . import state as _state
+                _state.show_offline_lists(server_addr)
 
-        _run_async(_bg_work, _on_done, track_generation=True)
+        type(self)._checking = True
+        try:
+            _run_async(_bg_work, _on_done, track_generation=True)
+        except Exception:
+            type(self)._checking = False
+            raise
         self.report({'INFO'}, f"Checking server at {server_addr}...")
 
         return {'FINISHED'}

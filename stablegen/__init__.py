@@ -10,9 +10,10 @@ import bpy  # pylint: disable=import-error
 # -- UI / Operator classes ------------------------------------------------
 from .ui.presets import (
     ApplyPreset, SavePreset, DeletePreset,
-    ResetQwenPrompt, SwitchToMeshGeneration,
+    ResetQwenPrompt, ResetTexturingExperiments, SwitchToMeshGeneration,
 )
 from .ui.panel import StableGenPanel, StableGenPrintPanel
+from .ui.studio import STUDIO_UI_CLASSES, register_studio_ui, unregister_studio_ui
 from .ui.queue import (
     SG_UL_SceneQueueList, SceneQueueAdd, SceneQueueRemove, SceneQueueClear,
     SceneQueueMoveUp, SceneQueueMoveDown, SceneQueueOpenResult,
@@ -23,11 +24,24 @@ from .texturing.rendering import (
 )
 from .texturing.orbit_export import ExportOrbitGIF
 from .texturing.game_export import ExportForGameEngine
+from .texturing.solidify import StableGenMakeSolid
+from .animation import (
+    StableGenCharacterizeRig, StableGenApplyRigPosePreset,
+    StableGenSetRetargetReferencePose,
+    StableGenMatchSourceReferencePose,
+    StableGenToggleRigMappingOverlay,
+    StableGenToggleCollisionProxyOverlay,
+    StableGenToggleSourcePreview,
+    StableGenEditRigMapping,
+    StableGenExportRetargetDebugBundle,
+    StableGenApplyAnimationToRig,
+    cleanup_retarget_overlays,
+)
 from .texturing.print_export import (
     StableGenPaletteColor, StableGenAddPaletteColor, StableGenRemovePaletteColor,
     StableGenPreviewQuantization, StableGenClearQuantizationPreview,
     StableGenPreviewSliced, StableGenPreviewSlicedCancel,
-    ExportSTL, Export3MF, Export3MFCancel,
+    ExportTexturedPrintOBJ, ExportSTL, Export3MF, Export3MFCancel,
 )
 from .cameras import (
     AddCameras, ApplyAutoAspect, CloneCamera, MirrorCamera, ToggleCameraLabels,
@@ -36,11 +50,18 @@ from .cameras import (
     MoveCameraOrder, ApplyCameraOrderPreset,
 )
 from .debug_tools import debug_classes as _debug_classes
+from .cameras import display as camera_display
+from .core import server_monitor
+from .texturing.regression import REGRESSION_CLASSES
+from .texturing import masked_edit
 from .utils import AddHDRI, ApplyModifiers, CurvesToMesh
 from .texturing.generator import (
     ComfyUIGenerate, Reproject, Regenerate, MirrorReproject,
 )
-from .mesh_gen.trellis2 import Trellis2Generate, StableGenLocalPostProcess
+from .mesh_gen.trellis2 import (
+    Trellis2Generate, StableGenApplyBoneDisplay,
+    StableGenAutoRigSelectedMesh, StableGenLocalPostProcess,
+)
 from .mesh_gen.batch import (
     TRELLIS2_OT_BatchSelectFolder, TRELLIS2_OT_BatchGenerate,
     TRELLIS2_OT_BatchCancel, TRELLIS2_OT_BatchClear,
@@ -68,7 +89,7 @@ bl_info = {
     "name": "StableGen",
     "category": "Object",
     "author": "Ondrej Sakala",
-    "version": (0, 3, 1),
+    "version": (0, 4, 0),
     'blender': (4, 2, 0)
 }
 
@@ -104,6 +125,8 @@ classes = [
     Regenerate,
     MirrorReproject,
     Trellis2Generate,
+    StableGenApplyBoneDisplay,
+    StableGenAutoRigSelectedMesh,
     StableGenLocalPostProcess,
     TRELLIS2_OT_BatchSelectFolder,
     TRELLIS2_OT_BatchGenerate,
@@ -120,12 +143,24 @@ classes = [
     SwitchMaterial,
     ExportOrbitGIF,
     ExportForGameEngine,
+    StableGenMakeSolid,
+    StableGenCharacterizeRig,
+    StableGenApplyRigPosePreset,
+    StableGenSetRetargetReferencePose,
+    StableGenMatchSourceReferencePose,
+    StableGenToggleRigMappingOverlay,
+    StableGenToggleCollisionProxyOverlay,
+    StableGenToggleSourcePreview,
+    StableGenEditRigMapping,
+    StableGenExportRetargetDebugBundle,
+    StableGenApplyAnimationToRig,
     StableGenAddPaletteColor,
     StableGenRemovePaletteColor,
     StableGenPreviewQuantization,
     StableGenClearQuantizationPreview,
     StableGenPreviewSliced,
     StableGenPreviewSlicedCancel,
+    ExportTexturedPrintOBJ,
     ExportSTL,
     Export3MF,
     Export3MFCancel,
@@ -145,6 +180,7 @@ classes = [
     SavePreset,
     DeletePreset,
     ResetQwenPrompt,
+    ResetTexturingExperiments,
     SwitchToMeshGeneration,
     # Queue operators
     SG_UL_SceneQueueList,
@@ -162,11 +198,17 @@ classes = [
 ]
 # Append debug classes (defined in debug_tools.py)
 classes.extend(_debug_classes)
+classes.extend(REGRESSION_CLASSES)
+classes.extend(masked_edit.MASKED_EDIT_CLASSES)
+classes.extend(STUDIO_UI_CLASSES)
+classes.extend(camera_display.CLASSES)
 
 
 def register():
     for cls in classes:
         bpy.utils.register_class(cls)
+
+    masked_edit.register_properties()
 
     register_properties(
         update_model_list=update_model_list,
@@ -177,11 +219,21 @@ def register():
         _sg_queue_load_handler=_sg_queue_load_handler,
         _sg_queue_load=_sg_queue_load,
     )
+    register_studio_ui()
+    camera_display.register()
+    server_monitor.register()
 
 
 def unregister():
+    server_monitor.unregister()
+    camera_display.unregister()
+    unregister_studio_ui()
+    masked_edit.unregister_properties()
     from .mesh_gen.batch import unregister_batch
+    from .dae_import.batch_texture import unregister_batch_texture
     unregister_batch()
+    unregister_batch_texture()
+    cleanup_retarget_overlays()
 
     unregister_properties(
         load_handler=load_handler,

@@ -1,14 +1,30 @@
 #!/usr/bin/env python3
+"""StableGen dependency installer: custom nodes and models for a ComfyUI server.
+
+    python installer.py <ComfyUI folder>                      menu
+    python installer.py <ComfyUI folder> --packages 3,8 --yes unattended
+    python installer.py --list                                 what each package installs
+
+Needs only Python 3.8+ and Git (for custom nodes). `tqdm`, when installed, draws progress bars.
+"""
 import os
 import sys
 import argparse
+import fnmatch
+import hashlib
+import json
+import socket
 import subprocess
-import requests
+import tempfile
+import time
 import glob
 import re
 import shutil
+import urllib.error
+import urllib.parse
+import urllib.request
 from pathlib import Path
-from typing import Dict, List, Set, Any
+from typing import Dict, List, Set, Any, Optional, Tuple
 
 try:
     from tqdm.auto import tqdm
@@ -72,323 +88,298 @@ _PATCH_TRELLIS_PRESTARTUP = (
     "# -- End StableGen patch --\n\n"
 )
 
-# Patch for lazy_manager.py: Add attn_backend to config comparison.
-# Without this, switching attention backend (e.g. xformers -> flash_attn)
-# doesn't recreate the model manager, leaving stale config.
-_PATCH_TRELLIS_ATTN_CMP_ANCHOR = (
-    "    elif (_LAZY_MANAGER.model_name != model_name or\n"
-    "          _LAZY_MANAGER.resolution != resolution or\n"
-    "          _LAZY_MANAGER.vram_mode != vram_mode):\n"
-    "        # Config changed, recreate manager\n"
-    "        _LAZY_MANAGER.cleanup()\n"
+# --- comfy-env core sync ---
+# comfy-env runs nodes like ComfyUI-TRELLIS2 in isolated pixi environments,
+# but their workers still import ComfyUI's own `comfy` package. ComfyUI core
+# pins some packages exactly (e.g. comfy-aimdo, comfy-kitchen), while the
+# node's comfy-env.toml asks for "*" and pixi's lock keeps whatever was current
+# at install time. After a ComfyUI update the worker then fails with errors
+# like "No module named 'comfy_aimdo.storage'".
+#
+# This module brings those pins into every isolated env of a node. The
+# installer writes it into the node folder, runs it with ComfyUI's Python, and
+# hooks it into the node's prestartup script so it re-checks on every ComfyUI
+# start (cheap: it only reads dist-info metadata unless something is out of date).
+_COMFY_ENV_SYNC_FILENAME = "stablegen_env_sync.py"
+_COMFY_ENV_SYNC_SOURCE = r'''"""Keep comfy-env isolated environments in step with ComfyUI core's pinned packages.
+
+Written by StableGen's installer. Run as:
+    python stablegen_env_sync.py <ComfyUI dir> <custom node dir> [--check]
+or import and call sync(comfyui_dir, node_dir). Safe to run repeatedly.
+"""
+import os
+import re
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+
+TAG = "[StableGen env sync]"
+SKIP_DIRS = {".git", ".pixi", "node_modules", "__pycache__"}
+
+
+def _norm(name):
+    return re.sub(r"[-_.]+", "-", name).lower()
+
+
+def _log(msg):
+    print(f"{TAG} {msg}", file=sys.stderr, flush=True)
+
+
+try:
+    from packaging.specifiers import SpecifierSet
+except ImportError:
+    try:
+        from pip._vendor.packaging.specifiers import SpecifierSet
+    except ImportError:
+        SpecifierSet = None
+
+
+def _satisfies(version, spec):
+    if SpecifierSet is None:  # no packaging library: only exact pins can be compared
+        return not spec.startswith("==") or version == spec[2:]
+    try:
+        return SpecifierSet(spec).contains(version, prereleases=True)
+    except Exception:
+        return True
+
+
+def _main_version(name):
+    """Version installed in the Python running this module (ComfyUI's own environment)."""
+    from importlib import metadata
+    try:
+        return metadata.version(name)
+    except metadata.PackageNotFoundError:
+        return None
+
+
+def core_requirements(comfyui_dir):
+    """Versioned requirements from ComfyUI's requirements.txt, as {name: specifier}.
+
+    Workers import ComfyUI's `comfy` and `comfy_api` packages, so whatever version
+    rules ComfyUI core sets must hold inside isolated envs too. Unversioned lines
+    are skipped, and front-end/template packages (comfyui-*) only matter to the
+    server, not to workers.
+    """
+    req = Path(comfyui_dir) / "requirements.txt"
+    reqs = {}
+    if not req.is_file():
+        return reqs
+    for line in req.read_text(encoding="utf-8", errors="ignore").splitlines():
+        line = line.split("#", 1)[0].split(";", 1)[0].strip()
+        m = re.fullmatch(r"([A-Za-z0-9_.\-]+)(?:\[[^\]]*\])?\s*((?:[<>=!~]=?|===)\s*[^\s,]+(?:\s*,\s*(?:[<>=!~]=?)\s*[^\s,]+)*)", line)
+        if m and not _norm(m.group(1)).startswith("comfyui-"):
+            reqs[_norm(m.group(1))] = re.sub(r"\s+", "", m.group(2))
+    return reqs
+
+
+def _target(name, spec):
+    """What to install for a requirement: ComfyUI's own version when it satisfies the rule."""
+    main = _main_version(name)
+    return f"{name}=={main}" if main and _satisfies(main, spec) else f"{name}{spec}"
+
+
+def _workspace_root():
+    override = os.environ.get("COMFY_ENV_ROOT")
+    if override:
+        return Path(override)
+    if sys.platform == "win32":
+        base = Path(os.environ.get("LOCALAPPDATA") or Path.home() / "AppData" / "Local")
+        return base / "Programs" / "comfy-env"
+    return Path.home() / ".ce"
+
+
+def _env_name(node_dir, config_path):
+    """comfy-env's naming rule; used only when comfy_env itself can't be imported."""
+    plugin = Path(node_dir).name
+    for prefix in ("ComfyUI-", "ComfyUI_", "comfyui-", "comfyui_"):
+        if plugin.startswith(prefix):
+            plugin = plugin[len(prefix):]
+            break
+    clean = lambda s: re.sub(r"-+", "-", re.sub(r"[^a-z0-9-]+", "-", s.lower())).strip("-")
+    name = clean(plugin)
+    parent = Path(config_path).parent.resolve()
+    if parent != Path(node_dir).resolve():
+        suffix = clean(parent.name)
+        if suffix:
+            name = f"{name}-{suffix}" if name else suffix
+    return name
+
+
+def env_dirs(node_dir):
+    """(config file, materialized env dir) for each isolated env of a node."""
+    node_dir = Path(node_dir)
+    configs = []
+    for root, dirs, files in os.walk(node_dir):
+        dirs[:] = [d for d in dirs if d not in SKIP_DIRS and not d.startswith("_env_")]
+        if "comfy-env.toml" in files:
+            configs.append(Path(root) / "comfy-env.toml")
+    try:
+        from comfy_env.environment.cache import get_env_name, get_workspace_env_dir
+        resolve = lambda cfg: get_workspace_env_dir(None, get_env_name(node_dir, cfg))
+    except Exception:
+        resolve = lambda cfg: _workspace_root() / "envs" / _env_name(node_dir, cfg) / ".pixi" / "envs" / "default"
+    return [(cfg, Path(resolve(cfg))) for cfg in configs]
+
+
+def _env_python(env_dir):
+    exe = env_dir / ("python.exe" if sys.platform == "win32" else "bin/python")
+    return exe if exe.is_file() else None
+
+
+def _site_packages(env_dir):
+    return [p for p in [env_dir / "Lib" / "site-packages", *env_dir.glob("lib/python3*/site-packages")] if p.is_dir()]
+
+
+def installed_versions(env_dir):
+    from importlib import metadata
+    versions = {}
+    for dist in metadata.distributions(path=[str(p) for p in _site_packages(env_dir)]):
+        name = dist.metadata.get("Name")
+        if name:
+            versions[_norm(name)] = dist.version
+    return versions
+
+
+def declared_packages(config_path):
+    """Package names listed under any *pypi-dependencies* table of a comfy-env.toml."""
+    names, active = set(), False
+    for line in Path(config_path).read_text(encoding="utf-8", errors="ignore").splitlines():
+        line = line.strip()
+        header = re.fullmatch(r"\[([^\]]+)\]", line)
+        if header:
+            active = "pypi-dependencies" in header.group(1)
+            continue
+        m = re.match(r"([A-Za-z0-9_.\-]+)\s*=", line)
+        if active and m:
+            names.add(_norm(m.group(1)))
+    return names
+
+
+def sync(comfyui_dir, node_dir, check_only=False):
+    """Make the node's envs satisfy ComfyUI core's requirements. Returns a list of problems left over.
+
+    Only packages an env already has (or declares) are touched, and only when their
+    version breaks ComfyUI's rule; they get the version ComfyUI's own env runs.
+    """
+    reqs = core_requirements(comfyui_dir)
+    if not reqs:
+        _log(f"no versioned requirements found in {Path(comfyui_dir) / 'requirements.txt'}; nothing to sync")
+        return []
+    problems = []
+    for config, env_dir in env_dirs(node_dir):
+        python = _env_python(env_dir)
+        if not python:
+            continue  # not materialized yet; comfy-env builds it on first use
+        installed = installed_versions(env_dir)
+        relevant = installed.keys() | declared_packages(config)
+        wanted = {n: _target(n, s) for n, s in reqs.items()
+                  if n in relevant and not (n in installed and _satisfies(installed[n], s))}
+        if not wanted:
+            continue
+        summary = ", ".join(f"{n} {installed.get(n, 'missing')} -> {t[len(n):]}" for n, t in wanted.items())
+        if check_only:
+            problems.append(f"{env_dir.parent.parent.parent.name}: {summary}")
+            continue
+        _log(f"{env_dir.parent.parent.parent.name}: {summary}")
+        # Hold every other package at its current version so pip can't swap the
+        # env's CUDA torch build or anything else while resolving.
+        with tempfile.NamedTemporaryFile("w", suffix=".txt", delete=False, encoding="utf-8") as fh:
+            fh.write("\n".join(f"{n}=={v}" for n, v in installed.items() if n not in wanted))
+            constraints = fh.name
+        try:
+            # Packages pixi took from conda (e.g. av) may have no build for this
+            # Python that satisfies ComfyUI; pip replaces them with the PyPI wheel.
+            result = subprocess.run(
+                [str(python), "-m", "pip", "install", "--disable-pip-version-check", "--no-input",
+                 "-c", constraints, *wanted.values()],
+                env=dict(os.environ, PYTHONNOUSERSITE="1"), capture_output=True, text=True, timeout=900)
+        finally:
+            os.unlink(constraints)
+        after = installed_versions(env_dir)
+        left = [t for n, t in wanted.items() if not (n in after and _satisfies(after[n], reqs[n]))]
+        if result.returncode != 0 or left:
+            tail = (result.stderr or result.stdout).strip().splitlines()[-3:]
+            problems.append(f"{env_dir}: could not install {', '.join(left) or 'all packages'}: "
+                            + " | ".join(tail))
+        else:
+            _log(f"{env_dir.parent.parent.parent.name}: up to date")
+    for p in problems:
+        _log(("OUT OF DATE " if check_only else "FAILED ") + p)
+    return problems
+
+
+_VERIFY = (
+    "import sys; sys.argv = ['main.py']; sys.path[:0] = [{comfy!r}]\n"
+    "import comfy.model_management, comfy.utils, comfy_api.latest\n"
+    "print('ok')\n"
 )
 
-_PATCH_TRELLIS_ATTN_CMP_REPLACE = (
-    "    elif (_LAZY_MANAGER.model_name != model_name or\n"
-    "          _LAZY_MANAGER.resolution != resolution or\n"
-    "          _LAZY_MANAGER.vram_mode != vram_mode or\n"
-    "          _LAZY_MANAGER.attn_backend != attn_backend):\n"
-    "        # Config changed, recreate manager\n"
-    "        print(f\"[TRELLIS2] Config changed, recreating model manager...\", file=sys.stderr)\n"
-    "        _LAZY_MANAGER.cleanup()\n"
-)
 
-# Patch for stages.py: Wrap DinoV3 feature extraction in torch.no_grad().
-# Without this, autograd retains ViT-L intermediate activations on GPU,
-# leaking ~5-9 GB between runs in the persistent comfy-env worker.
-_PATCH_TRELLIS_NOGRAD_ANCHOR = (
-    "    # Load DinoV3 and extract features\n"
-    "    model = manager.get_dinov3(device)\n"
-    "\n"
-    "    # Get 512px conditioning\n"
-    "    model.image_size = 512\n"
-    "    cond_512 = model([pil_image])\n"
-    "\n"
-    "    # Get 1024px conditioning if requested\n"
-    "    cond_1024 = None\n"
-    "    if include_1024:\n"
-    "        model.image_size = 1024\n"
-    "        cond_1024 = model([pil_image])\n"
-    "\n"
-    "    # Unload DinoV3 immediately\n"
-    "    manager.unload_dinov3()\n"
-    "\n"
-    "    # Create negative conditioning\n"
-    "    neg_cond = torch.zeros_like(cond_512)\n"
-    "\n"
-    "    conditioning = {\n"
-    "        'cond_512': cond_512.cpu(),\n"
-    "        'neg_cond': neg_cond.cpu(),\n"
-    "    }\n"
-    "    if cond_1024 is not None:\n"
-    "        conditioning['cond_1024'] = cond_1024.cpu()\n"
-)
+def verify(comfyui_dir, node_dir):
+    """Import ComfyUI core with each env's own Python, the way the node's worker does."""
+    problems = []
+    for _, env_dir in env_dirs(node_dir):
+        python = _env_python(env_dir)
+        if not python:
+            continue
+        result = subprocess.run([str(python), "-c", _VERIFY.format(comfy=str(Path(comfyui_dir).resolve()))],
+                                env=dict(os.environ, PYTHONNOUSERSITE="1"), capture_output=True, text=True,
+                                timeout=600, cwd=str(comfyui_dir))
+        if result.returncode != 0:
+            output = (result.stderr or result.stdout).strip()
+            last = output.splitlines()[-1:] or ["unknown error"]
+            if "WinError 1455" in output or "MemoryError" in output:
+                # Not an env problem: the machine is out of memory (e.g. a generation is running).
+                _log(f"{env_dir.parent.parent.parent.name}: could not verify, system is low on memory; "
+                     "close other GPU/RAM-heavy programs and re-run --check")
+                continue
+            problems.append(f"{env_dir.parent.parent.parent.name}: ComfyUI core does not import: {last[0]}")
+        else:
+            _log(f"{env_dir.parent.parent.parent.name}: ComfyUI core imports cleanly")
+    for p in problems:
+        _log("FAILED " + p)
+    return problems
 
-_PATCH_TRELLIS_NOGRAD_REPLACE = (
-    "    # Load DinoV3 and extract features\n"
-    "    model = manager.get_dinov3(device)\n"
-    "\n"
-    "    # Use no_grad to prevent autograd from retaining intermediate activations\n"
-    "    # on GPU. Without this, the computation graph keeps ViT-L activations alive\n"
-    "    # in the comfy-env worker, leaking ~5-9 GB between runs.\n"
-    "    with torch.no_grad():\n"
-    "        # Get 512px conditioning\n"
-    "        model.image_size = 512\n"
-    "        cond_512 = model([pil_image])\n"
-    "\n"
-    "        # Get 1024px conditioning if requested\n"
-    "        cond_1024 = None\n"
-    "        if include_1024:\n"
-    "            model.image_size = 1024\n"
-    "            cond_1024 = model([pil_image])\n"
-    "\n"
-    "    # Unload DinoV3 immediately\n"
-    "    manager.unload_dinov3()\n"
-    "\n"
-    "    # Create negative conditioning\n"
-    "    neg_cond = torch.zeros_like(cond_512)\n"
-    "\n"
-    "    # .detach() breaks any remaining graph references before moving to CPU\n"
-    "    conditioning = {\n"
-    "        'cond_512': cond_512.detach().cpu(),\n"
-    "        'neg_cond': neg_cond.detach().cpu(),\n"
-    "    }\n"
-    "    if cond_1024 is not None:\n"
-    "        conditioning['cond_1024'] = cond_1024.detach().cpu()\n"
-    "\n"
-    "    # Free the GPU originals immediately\n"
-    "    del cond_512, cond_1024, neg_cond\n"
-    "    gc.collect()\n"
-    "    torch.cuda.empty_cache()\n"
-)
 
-# ---------------------------------------------------------------------------
-# comfy-env VRAM leak fix patches
-# ---------------------------------------------------------------------------
-# comfy-env hooks torch.nn.Module.to() and .cuda() to auto-register every
-# model that lands on CUDA in a permanent _model_registry (with no unregister
-# API).  Between ComfyUI node calls the model manager issues
-# "Requested to load SubprocessModel" which calls model_to_device("cuda"),
-# moving ALL registered models back to GPU.  This leaks ~7 GB of model
-# weights between runs.  The fix: unregister from the registry before
-# moving models to CPU / deleting them.
-# ---------------------------------------------------------------------------
+if __name__ == "__main__":
+    args = [a for a in sys.argv[1:] if not a.startswith("--")]
+    if len(args) != 2:
+        sys.exit(__doc__)
+    left = sync(args[0], args[1], check_only="--check" in sys.argv)
+    if not left:
+        left = verify(args[0], args[1])
+    sys.exit(1 if left else 0)
+'''
 
-# -- base.py _unload_model: unregister from comfy-env + model.cpu() before del
-_PATCH_TRELLIS_UNLOAD_CPU_ANCHOR = (
-    "            # Delete the model entirely\n"
-    "            self.models[model_key] = None\n"
-    "            del model\n"
-)
-
-_PATCH_TRELLIS_UNLOAD_CPU_REPLACE = (
-    "            # Unregister from comfy-env's model registry BEFORE moving to CPU.\n"
-    "            # comfy-env auto-registers every nn.Module that lands on CUDA via\n"
-    "            # hooked Module.to(). Without unregistering, the registry keeps a\n"
-    "            # permanent reference and ComfyUI's model manager re-loads the model\n"
-    "            # to GPU between calls, leaking the full model weights per run.\n"
-    "            # Replace with zero-param dummy so host's model_to_device succeeds\n"
-    "            # but consumes 0 VRAM.  Registry accessed via closure on\n"
-    "            # sys.modules['comfy_worker'].register_model.\n"
-    "            try:\n"
-    "                _cw = sys.modules.get('comfy_worker')\n"
-    "                if _cw is not None:\n"
-    "                    _reg_fn = getattr(_cw, 'register_model', None)\n"
-    "                    if _reg_fn is not None and hasattr(_reg_fn, '__closure__'):\n"
-    "                        _fv = _reg_fn.__code__.co_freevars\n"
-    "                        _cl = _reg_fn.__closure__\n"
-    "                        _by_obj = _cl[_fv.index('_model_id_by_obj')].cell_contents\n"
-    "                        _registry = _cl[_fv.index('_model_registry')].cell_contents\n"
-    "                        _meta = _cl[_fv.index('_model_registry_meta')].cell_contents\n"
-    "                        obj_id = id(model)\n"
-    "                        if obj_id in _by_obj:\n"
-    "                            ce_model_id = _by_obj.pop(obj_id)\n"
-    "                            dummy = torch.nn.Module()\n"
-    "                            _registry[ce_model_id] = dummy\n"
-    "                            _meta[ce_model_id] = {'size': 0, 'kind': 'other'}\n"
-    "                            _by_obj[id(dummy)] = ce_model_id\n"
-    '                            print(f"[TRELLIS2] Unregistered {model_key} from comfy-env registry (id={ce_model_id})", file=sys.stderr, flush=True)\n'
-    "            except Exception:\n"
-    "                pass\n"
-    "            # Force all parameters and buffers off GPU.\n"
-    "            try:\n"
-    "                model.cpu()\n"
-    "            except Exception:\n"
-    "                pass\n"
-    "            # Delete the model entirely\n"
-    "            self.models[model_key] = None\n"
-    "            del model\n"
-)
-
-# -- lazy_manager.py: insert _unregister_from_comfy_env helper function
-_PATCH_TRELLIS_COMFY_HELPER_ANCHOR = (
-    "# Global model manager instance\n"
-    '_LAZY_MANAGER: Optional["LazyModelManager"] = None\n'
-)
-
-_PATCH_TRELLIS_COMFY_HELPER_REPLACE = (
-    "\n"
-    "def _unregister_from_comfy_env(model, label: str = \"\"):\n"
-    '    """Remove an nn.Module from comfy-env\'s worker-side model registry.\n'
-    "\n"
-    "    comfy-env hooks Module.to() to auto-register every model that lands on\n"
-    "    CUDA.  The registry keeps a permanent reference, and ComfyUI's model\n"
-    "    manager will re-load the model to GPU between calls via\n"
-    "    'Requested to load SubprocessModel'.  We replace the model with a\n"
-    "    zero-param dummy so the host's model_to_device succeeds (no-op) but\n"
-    "    no VRAM is consumed.  Registry accessed via closure on\n"
-    "    sys.modules['comfy_worker'].register_model.\n"
-    '    """\n'
+_PATCH_COMFY_ENV_SYNC_PRESTARTUP = (
+    "# -- StableGen patch: keep comfy-env envs in step with ComfyUI core --\n"
+    "try:\n"
+    "    import os as _os, sys as _sys\n"
+    "    _here = _os.path.dirname(_os.path.abspath(__file__))\n"
+    "    _sys.path.insert(0, _here)\n"
     "    try:\n"
-    "        _cw = sys.modules.get('comfy_worker')\n"
-    "        if _cw is None:\n"
-    "            return\n"
-    "        _reg_fn = getattr(_cw, 'register_model', None)\n"
-    "        if _reg_fn is None or not hasattr(_reg_fn, '__closure__'):\n"
-    "            return\n"
-    "        _fv = _reg_fn.__code__.co_freevars\n"
-    "        _cl = _reg_fn.__closure__\n"
-    "        _by_obj = _cl[_fv.index('_model_id_by_obj')].cell_contents\n"
-    "        _registry = _cl[_fv.index('_model_registry')].cell_contents\n"
-    "        _meta = _cl[_fv.index('_model_registry_meta')].cell_contents\n"
-    "        obj_id = id(model)\n"
-    "        if obj_id in _by_obj:\n"
-    "            model_id = _by_obj.pop(obj_id)\n"
-    "            dummy = torch.nn.Module()\n"
-    "            _registry[model_id] = dummy\n"
-    "            _meta[model_id] = {'size': 0, 'kind': 'other'}\n"
-    "            _by_obj[id(dummy)] = model_id\n"
-    '            print(f"[TRELLIS2] Unregistered {label} from comfy-env registry (id={model_id})", file=sys.stderr)\n'
-    "    except Exception:\n"
-    "        pass\n"
-    "\n"
-    "\n"
-    "# Global model manager instance\n"
-    '_LAZY_MANAGER: Optional["LazyModelManager"] = None\n'
+    "        import stablegen_env_sync as _sg_env_sync\n"
+    "        _sg_env_sync.sync(_os.path.dirname(_os.path.dirname(_here)), _here)\n"
+    "    finally:\n"
+    "        _sys.path.remove(_here)\n"
+    "except Exception as _e:\n"
+    "    print(f'[StableGen env sync] skipped: {_e}', file=_sys.stderr)\n"
+    "# -- End StableGen patch --\n\n"
 )
 
-# -- lazy_manager.py unload_dinov3: add comfy-env unregistration
-_PATCH_TRELLIS_UNLOAD_DINOV3_ANCHOR = (
-    "    def unload_dinov3(self):\n"
-    '        """Unload DinoV3 to free VRAM."""\n'
-    "        if self.dinov3_model is not None:\n"
-    "            self.dinov3_model.cpu()\n"
-    "            self.dinov3_model = None\n"
-    "            gc.collect()\n"
-    "            torch.cuda.empty_cache()\n"
-    '            print(f"[TRELLIS2] DinoV3 offloaded", file=sys.stderr)\n'
-)
+# Older StableGen releases also patched nodes/trellis_utils/ and nodes/trellis2/pipelines/ (VRAM-leak and
+# temp-file fixes). Upstream replaced that code with ComfyUI's native model loading in February 2026, so those
+# patches no longer have anything to apply to and were removed when the node was pinned below.
 
-_PATCH_TRELLIS_UNLOAD_DINOV3_REPLACE = (
-    "    def unload_dinov3(self):\n"
-    '        """Unload DinoV3 to free VRAM."""\n'
-    "        if self.dinov3_model is not None:\n"
-    "            # Unregister the inner nn.Module (DINOv3ViTModel) from comfy-env.\n"
-    "            # DinoV3FeatureExtractor is a plain class; comfy-env hooks on the\n"
-    "            # inner .model which is the actual nn.Module that got .to(cuda).\n"
-    "            inner = getattr(self.dinov3_model, 'model', self.dinov3_model)\n"
-    '            _unregister_from_comfy_env(inner, "dinov3")\n'
-    "            self.dinov3_model.cpu()\n"
-    "            self.dinov3_model = None\n"
-    "            gc.collect()\n"
-    "            torch.cuda.empty_cache()\n"
-    '            print(f"[TRELLIS2] DinoV3 offloaded", file=sys.stderr)\n'
-)
-
-# -- lazy_manager.py unload_shape_pipeline: iterate models + comfy-env unreg
-_PATCH_TRELLIS_UNLOAD_SHAPE_ANCHOR = (
-    "    def unload_shape_pipeline(self):\n"
-    '        """Unload shape pipeline to free VRAM."""\n'
-    "        if self.shape_pipeline is not None:\n"
-    "            self.shape_pipeline = None\n"
-    "            gc.collect()\n"
-    "            torch.cuda.empty_cache()\n"
-    '            print(f"[TRELLIS2] Shape pipeline offloaded", file=sys.stderr)\n'
-)
-
-_PATCH_TRELLIS_UNLOAD_SHAPE_REPLACE = (
-    "    def unload_shape_pipeline(self):\n"
-    '        """Unload shape pipeline to free VRAM."""\n'
-    "        if self.shape_pipeline is not None:\n"
-    "            # Force any remaining models off GPU before dropping pipeline\n"
-    "            if hasattr(self.shape_pipeline, 'models'):\n"
-    "                for key in list(self.shape_pipeline.models.keys()):\n"
-    "                    model = self.shape_pipeline.models[key]\n"
-    "                    if model is not None:\n"
-    '                        _unregister_from_comfy_env(model, f"shape/{key}")\n'
-    "                        try:\n"
-    "                            model.cpu()\n"
-    "                        except Exception:\n"
-    "                            pass\n"
-    "                        self.shape_pipeline.models[key] = None\n"
-    "                        del model\n"
-    "                self.shape_pipeline.models.clear()\n"
-    "            self.shape_pipeline = None\n"
-    "            gc.collect()\n"
-    "            torch.cuda.empty_cache()\n"
-    '            print(f"[TRELLIS2] Shape pipeline offloaded", file=sys.stderr)\n'
-)
-
-# -- lazy_manager.py unload_texture_pipeline: iterate models + comfy-env unreg
-_PATCH_TRELLIS_UNLOAD_TEX_ANCHOR = (
-    "    def unload_texture_pipeline(self):\n"
-    '        """Unload texture pipeline to free VRAM."""\n'
-    "        if self.texture_pipeline is not None:\n"
-    "            self.texture_pipeline = None\n"
-    "            gc.collect()\n"
-    "            torch.cuda.empty_cache()\n"
-    '            print(f"[TRELLIS2] Texture pipeline offloaded", file=sys.stderr)\n'
-)
-
-_PATCH_TRELLIS_UNLOAD_TEX_REPLACE = (
-    "    def unload_texture_pipeline(self):\n"
-    '        """Unload texture pipeline to free VRAM."""\n'
-    "        if self.texture_pipeline is not None:\n"
-    "            # Force any remaining models off GPU before dropping pipeline\n"
-    "            if hasattr(self.texture_pipeline, 'models'):\n"
-    "                for key in list(self.texture_pipeline.models.keys()):\n"
-    "                    model = self.texture_pipeline.models[key]\n"
-    "                    if model is not None:\n"
-    '                        _unregister_from_comfy_env(model, f"texture/{key}")\n'
-    "                        try:\n"
-    "                            model.cpu()\n"
-    "                        except Exception:\n"
-    "                            pass\n"
-    "                        self.texture_pipeline.models[key] = None\n"
-    "                        del model\n"
-    "                self.texture_pipeline.models.clear()\n"
-    "            self.texture_pipeline = None\n"
-    "            gc.collect()\n"
-    "            torch.cuda.empty_cache()\n"
-    '            print(f"[TRELLIS2] Texture pipeline offloaded", file=sys.stderr)\n'
-)
-
-# Patch for stages.py: clean up IPC tensor files from previous generations
-# inside _save_to_disk so they don't accumulate and fill the disk.
-_PATCH_TRELLIS_TEMP_CLEANUP_ANCHOR = (
-    "def _save_to_disk(data, prefix):\n"
-    "    path = os.path.join(_get_temp_dir(), f'{prefix}_{uuid.uuid4().hex[:8]}.pt')\n"
-    "    torch.save(data, path)\n"
-    "    return {'_tensor_file': path}"
-)
-
-_PATCH_TRELLIS_TEMP_CLEANUP_REPLACE = (
-    "def _save_to_disk(data, prefix):\n"
-    "    import glob as _glob\n"
-    "    temp_dir = _get_temp_dir()\n"
-    "    # StableGen patch: clean up files from previous generations\n"
-    "    for _old in _glob.glob(os.path.join(temp_dir, f'{prefix}_*.pt')):\n"
-    "        try:\n"
-    "            os.remove(_old)\n"
-    "        except OSError:\n"
-    "            pass\n"
-    "    path = os.path.join(temp_dir, f'{prefix}_{uuid.uuid4().hex[:8]}.pt')\n"
-    "    torch.save(data, path)\n"
-    "    return {'_tensor_file': path}"
-)
+# comfy-env runs TRELLIS.2 in its isolated environment. The patches below and the pinned TRELLIS.2 commit were
+# verified with this version; newer releases change the code the patches anchor on.
+COMFY_ENV = "comfy-env==0.4.1"
 
 # --- Configuration: Dependencies Data ---
-# Sizes are in MB.
+# Sizes are in MB. Every custom node is pinned to a commit StableGen was tested with ("commit"). A fresh clone
+# checks out that commit. An existing clone at another commit is left alone with a note, unless the node sets
+# "enforce_pin" (StableGen's patches depend on that exact code) or the installer runs with --update-nodes.
 DEPENDENCIES: Dict[str, Dict[str, Any]] = {
     # --- Custom Nodes ---
     "cn_ipadapter_plus": {
@@ -396,6 +387,7 @@ DEPENDENCIES: Dict[str, Dict[str, Any]] = {
         "git_url": "https://github.com/cubiq/ComfyUI_IPAdapter_plus.git",
         "target_dir_relative": "custom_nodes",
         "repo_name": "ComfyUI_IPAdapter_plus",
+        "commit": "a0f451a5113cf9becb0847b92884cb10cbdec0ef",
         "license": "GPL-3.0", "packages": ["core"]
     },
     # --- Models ---
@@ -487,6 +479,7 @@ DEPENDENCIES: Dict[str, Dict[str, Any]] = {
         "git_url": "https://github.com/city96/ComfyUI-GGUF.git",
         "target_dir_relative": "custom_nodes",
         "repo_name": "ComfyUI-GGUF",
+        "commit": "6ea2651e7df66d7585f6ffee804b20e92fb38b8a",
         "license": "Apache 2.0", "packages": ["qwen_core"],
         "pip_packages": ["gguf"]
     },
@@ -533,14 +526,18 @@ DEPENDENCIES: Dict[str, Dict[str, Any]] = {
         "git_url": "https://github.com/nunchaku-tech/ComfyUI-nunchaku.git",
         "target_dir_relative": "custom_nodes",
         "repo_name": "ComfyUI-nunchaku",
+        "commit": "b600f879a777fdef1466c362e850f7e8c31bf89a",
         "license": "Apache 2.0", "packages": ["qwen_nunchaku"],
-        "pip_packages": ["nunchaku"]
+        # The engine is not the PyPI package called "nunchaku" (an unrelated project): it ships as wheels built
+        # per Python, torch and platform, picked with the node's own version list.
+        "post_install": "nunchaku_wheel",
     },
     "cn_qwen_lora_loader": {
         "id": "cn_qwen_lora_loader", "type": "node", "name": "ComfyUI Qwen Image LoRA Loader",
         "git_url": "https://github.com/ussoewwin/ComfyUI-QwenImageLoraLoader.git",
         "target_dir_relative": "custom_nodes",
         "repo_name": "ComfyUI-QwenImageLoraLoader",
+        "commit": "ccb55860b80d41835110609748000f4c64932635",  # v2.6.7
         "license": "Apache 2.0", "packages": ["qwen_nunchaku"]
     },
     "model_nunchaku_qwen": {
@@ -555,6 +552,7 @@ DEPENDENCIES: Dict[str, Dict[str, Any]] = {
         "git_url": "https://github.com/kijai/ComfyUI-Marigold.git",
         "target_dir_relative": "custom_nodes",
         "repo_name": "ComfyUI-Marigold",
+        "commit": "2adfec75c430b0751a98a82453dc2dd8077bca85",
         "license": "GPL-3.0", "packages": ["pbr_marigold"],
         "pip_packages": ["diffusers>=0.28", "accelerate", "matplotlib"] + (["triton-windows"] if sys.platform == "win32" else []),
         "run_install_script": True,
@@ -565,6 +563,7 @@ DEPENDENCIES: Dict[str, Dict[str, Any]] = {
         "git_url": "https://github.com/lldacing/ComfyUI_StableDelight_ll.git",
         "target_dir_relative": "custom_nodes",
         "repo_name": "ComfyUI_StableDelight_ll",
+        "commit": "42c0463cc65554509804cbf577a1675c61499ec4",
         "license": "Apache-2.0", "packages": ["pbr_stabledelight"],
         "pip_packages": ["diffusers>=0.28", "accelerate", "matplotlib"] + (["triton-windows"] if sys.platform == "win32" else []),
         "post_clone_patches": [
@@ -585,14 +584,41 @@ DEPENDENCIES: Dict[str, Dict[str, Any]] = {
         "license": "Apache-2.0", "size_mb": 3300,
         "packages": ["pbr_stabledelight"],
     },
+    # --- Marigold V2 (albedo + normals; ComfyUI core nodes, LoRAs on Qwen-Image-Edit-2509) ---
+    "model_marigold_v2_base": {
+        "id": "model_marigold_v2_base", "type": "model",
+        "name": "Marigold V2 base: Qwen Image Edit 2509 (int8)",
+        "url": "https://huggingface.co/Comfy-Org/marigold-v2-0/resolve/main/diffusion_models/qwen_image_edit_2509_int8_convrot.safetensors?download=true",
+        "target_path_relative": "models/diffusion_models", "filename": "qwen_image_edit_2509_int8_convrot.safetensors",
+        "license": "Apache 2.0", "size_mb": 19550, "packages": ["pbr_marigold_v2"],
+    },
+    **{
+        f"model_marigold_v2_{task}_{kind}": {
+            "id": f"model_marigold_v2_{task}_{kind}", "type": "model",
+            "name": f"Marigold V2 {task.capitalize()} {label}",
+            "url": f"https://huggingface.co/Comfy-Org/marigold-v2-0/resolve/main/{folder}/{filename}?download=true",
+            "target_path_relative": f"models/{folder}", "filename": filename,
+            "license": "Apache 2.0", "size_mb": size_mb, "packages": ["pbr_marigold_v2"],
+        }
+        for task in ("albedo", "normals")
+        for kind, label, folder, filename, size_mb in (
+            ("lora", "LoRA", "loras", f"marigold_v2_{task}.safetensors", 1625),
+            ("vae", "VAE", "vae", f"marigold_v2_{task}_vae.safetensors", 242),
+            ("cond", "Conditioning", "embeddings", f"marigold_v2_{task}_conditioning.safetensors", 3),
+        )
+    },
     # --- TRELLIS.2 ---
     "cn_trellis2": {
         "id": "cn_trellis2", "type": "node", "name": "ComfyUI TRELLIS.2",
         "git_url": "https://github.com/PozzettiAndrea/ComfyUI-TRELLIS2.git",
         "target_dir_relative": "custom_nodes",
         "repo_name": "ComfyUI-TRELLIS2",
+        # Verified with ComfyUI 0.37 and comfy-env 0.4.1 (October 2026). Upstream refactors
+        # regularly break the patches below, so move this pin only after re-testing.
+        "commit": "9b878516f2dc2fd873f4f6cceadba403dd12d83e",
+        "enforce_pin": True,
         "license": "MIT (Note: textured pipeline uses NVIDIA non-commercial libs)", "packages": ["trellis2"],
-        "pip_packages": ["comfy-env", "comfy-sparse-attn", "comfy-3d-viewers"],
+        "pip_packages": [COMFY_ENV, "comfy-sparse-attn", "comfy-3d-viewers"],
         "clean_envs": True,
         "run_install_script": True,
         "post_clone_patches": [
@@ -609,80 +635,16 @@ DEPENDENCIES: Dict[str, Dict[str, Any]] = {
                 "patch": _PATCH_TRELLIS_PRESTARTUP,
             },
             {
-                "file": "nodes/trellis_utils/lazy_manager.py",
-                "marker": "_LAZY_MANAGER.attn_backend != attn_backend",
-                "anchor": _PATCH_TRELLIS_ATTN_CMP_ANCHOR,
-                "patch": _PATCH_TRELLIS_ATTN_CMP_REPLACE,
-                "mode": "replace",
-            },
-            {
-                "file": "nodes/trellis_utils/stages.py",
-                "marker": "# Use no_grad to prevent autograd",
-                "anchor": _PATCH_TRELLIS_NOGRAD_ANCHOR,
-                "patch": _PATCH_TRELLIS_NOGRAD_REPLACE,
-                "mode": "replace",
-            },
-            {
-                "file": "nodes/trellis2/pipelines/base.py",
-                "marker": "_model_id_by_obj",
-                "anchor": _PATCH_TRELLIS_UNLOAD_CPU_ANCHOR,
-                "patch": _PATCH_TRELLIS_UNLOAD_CPU_REPLACE,
-                "mode": "replace",
-            },
-            {
-                "file": "nodes/trellis_utils/lazy_manager.py",
-                "marker": "_unregister_from_comfy_env",
-                "anchor": _PATCH_TRELLIS_COMFY_HELPER_ANCHOR,
-                "patch": _PATCH_TRELLIS_COMFY_HELPER_REPLACE,
-                "mode": "replace",
-            },
-            {
-                "file": "nodes/trellis_utils/lazy_manager.py",
-                "marker": '_unregister_from_comfy_env(self.dinov3_model',
-                "anchor": _PATCH_TRELLIS_UNLOAD_DINOV3_ANCHOR,
-                "patch": _PATCH_TRELLIS_UNLOAD_DINOV3_REPLACE,
-                "mode": "replace",
-            },
-            {
-                "file": "nodes/trellis_utils/lazy_manager.py",
-                "marker": '_unregister_from_comfy_env(model, f"shape/',
-                "anchor": _PATCH_TRELLIS_UNLOAD_SHAPE_ANCHOR,
-                "patch": _PATCH_TRELLIS_UNLOAD_SHAPE_REPLACE,
-                "mode": "replace",
-            },
-            {
-                "file": "nodes/trellis_utils/lazy_manager.py",
-                "marker": '_unregister_from_comfy_env(model, f"texture/',
-                "anchor": _PATCH_TRELLIS_UNLOAD_TEX_ANCHOR,
-                "patch": _PATCH_TRELLIS_UNLOAD_TEX_REPLACE,
-                "mode": "replace",
-            },
-            {
-                "file": "nodes/trellis_utils/stages.py",
-                "marker": "# StableGen patch: clean up files from previous generations",
-                "anchor": _PATCH_TRELLIS_TEMP_CLEANUP_ANCHOR,
-                "patch": _PATCH_TRELLIS_TEMP_CLEANUP_REPLACE,
-                "mode": "replace",
+                "file": "prestartup_script.py",
+                "marker": "StableGen patch: keep comfy-env envs in step",
+                "anchor": "from comfy_env import",
+                "patch": _PATCH_COMFY_ENV_SYNC_PRESTARTUP,
             },
             {
                 "file": "nodes/rembg/BiRefNet.py",
                 "marker": "StableGen patch: BiRefNet fp32",
                 "anchor": "self.model.eval()",
                 "patch": "self.model.eval()\n        self.model.float()  # StableGen patch: BiRefNet fp32 — avoid fp16/fp32 dtype mismatch",
-                "mode": "replace",
-            },
-            {
-                "file": "nodes/trellis2/pipelines/rembg/BiRefNet.py",
-                "marker": "StableGen patch: timm.layers compat",
-                "anchor": "import torch",
-                "patch": (
-                    "import torch\n"
-                    "import sys as _sys  # StableGen patch: timm.layers compat\n"
-                    "if 'timm.layers' not in _sys.modules:\n"
-                    "    try:\n"
-                    "        import timm.models.layers as _tl; _sys.modules['timm.layers'] = _tl  # timm<0.9 compat for BiRefNet\n"
-                    "    except ImportError: pass\n"
-                ),
                 "mode": "replace",
             },
         ]
@@ -706,12 +668,117 @@ DEPENDENCIES: Dict[str, Dict[str, Any]] = {
     },
     "model_flux2_vae": {
         "id": "model_flux2_vae", "type": "model",
-        "name": "FLUX.2 Klein VAE",
+        "name": "FLUX.2 VAE",
         "url": "https://huggingface.co/Comfy-Org/flux2-dev/resolve/main/split_files/vae/flux2-vae.safetensors?download=true",
         "target_path_relative": "models/vae",
         "filename": "flux2-vae.safetensors",
-        "license": "Apache 2.0", "size_mb": 321, "packages": ["flux2_klein"],
+        "license": "Apache 2.0", "size_mb": 321, "packages": ["flux2_klein", "fibo_edit"],
     },
+    # --- Qwen Image 2.1 (ComfyUI core nodes; StableGen expects these text encoder and VAE file names) ---
+    "model_qwen21_diffusion": {
+        "id": "model_qwen21_diffusion", "type": "model", "name": "Qwen Image 2.1 Diffusion Model (int8)",
+        "url": "https://huggingface.co/Comfy-Org/Qwen-Image-2.1/resolve/main/diffusion_models/qwen_image_2.1_int8_convrot.safetensors?download=true",
+        "target_path_relative": "models/diffusion_models", "filename": "qwen_image_2.1_int8_convrot.safetensors",
+        "license": "Qwen Research License (non-commercial)", "size_mb": 7260, "packages": ["qwen_image_21"],
+    },
+    "model_qwen21_text_encoder": {
+        "id": "model_qwen21_text_encoder", "type": "model", "name": "Qwen Image 2.1 Text Encoder (Qwen3-VL 8B, w4a8)",
+        "url": "https://huggingface.co/Comfy-Org/Qwen-Image-2.1/resolve/main/text_encoders/qwen3vl_8b_w4a8.safetensors?download=true",
+        "target_path_relative": "models/text_encoders", "filename": "qwen3vl_8b_w4a8.safetensors",
+        "license": "Qwen Research License (non-commercial)", "size_mb": 6310,
+        "packages": ["qwen_image_21", "qwen_image_21_turbo"],
+    },
+    "model_qwen21_vae": {
+        "id": "model_qwen21_vae", "type": "model", "name": "Qwen Image 2.1 VAE",
+        "url": "https://huggingface.co/Comfy-Org/Qwen-Image-2.1/resolve/main/vae/qwen_image_2.1_vae_bf16.safetensors?download=true",
+        "target_path_relative": "models/vae", "filename": "qwen_image_2.1_vae_bf16.safetensors",
+        "license": "Qwen Research License (non-commercial)", "size_mb": 680,
+        "packages": ["qwen_image_21", "qwen_image_21_turbo"],
+    },
+    # --- Experimental architectures (ComfyUI core nodes, Comfy-Org repacks; file names as StableGen loads them) ---
+    "model_qwen21_turbo_diffusion": {
+        "id": "model_qwen21_turbo_diffusion", "type": "model", "name": "Qwen Image 2.1 Turbo Diffusion Model (int8)",
+        "url": "https://huggingface.co/Comfy-Org/Qwen-Image-2.1/resolve/main/diffusion_models/qwen_image_2.1_turbo_int8_convrot.safetensors?download=true",
+        "target_path_relative": "models/diffusion_models", "filename": "qwen_image_2.1_turbo_int8_convrot.safetensors",
+        "license": "Qwen Research License (non-commercial)", "size_mb": 6920, "packages": ["qwen_image_21_turbo"],
+    },
+    "model_moss_diffusion": {
+        "id": "model_moss_diffusion", "type": "model", "name": "MOSS-Image Diffusion Model (int8)",
+        "url": "https://huggingface.co/Comfy-Org/MOSS-Image/resolve/main/diffusion_models/moss_image_sft_int8_convrot.safetensors?download=true",
+        "target_path_relative": "models/diffusion_models", "filename": "moss_image_sft_int8_convrot.safetensors",
+        "license": "Apache 2.0", "size_mb": 5162, "packages": ["moss_image"],
+    },
+    "model_moss_text_encoder": {
+        "id": "model_moss_text_encoder", "type": "model", "name": "MOSS-Image Text Encoder (Qwen3.5 9B, int8)",
+        "url": "https://huggingface.co/Comfy-Org/MOSS-Image/resolve/main/text_encoders/qwen3.5_9b_int8_convrot.safetensors?download=true",
+        "target_path_relative": "models/text_encoders", "filename": "qwen3.5_9b_int8_convrot.safetensors",
+        "license": "Apache 2.0", "size_mb": 9296, "packages": ["moss_image"],
+    },
+    "model_moss_vae": {
+        "id": "model_moss_vae", "type": "model", "name": "MOSS-Image VAE (FLUX.2 small)",
+        "url": "https://huggingface.co/Comfy-Org/MOSS-Image/resolve/main/vae/flux2-vae_small.safetensors?download=true",
+        "target_path_relative": "models/vae", "filename": "flux2-vae_small.safetensors",
+        "license": "Apache 2.0", "size_mb": 237, "packages": ["moss_image"],
+    },
+    "model_moss_depth_control": {
+        "id": "model_moss_depth_control", "type": "model", "name": "MOSS-Image Color/Depth Control Adapter",
+        "url": "https://huggingface.co/Comfy-Org/MOSS-Image/resolve/main/loras/moss_image_color_depth_control.safetensors?download=true",
+        "target_path_relative": "models/loras", "filename": "moss_image_color_depth_control.safetensors",
+        "license": "Apache 2.0", "size_mb": 298, "packages": ["moss_image"],
+    },
+    "model_fibo_diffusion": {
+        "id": "model_fibo_diffusion", "type": "model", "name": "FIBO 2.0 Edit Turbo Diffusion Model (int8)",
+        "url": "https://huggingface.co/Comfy-Org/Fibo-2.0/resolve/main/diffusion_models/fibo2_edit_turbo_int8_convrot.safetensors?download=true",
+        "target_path_relative": "models/diffusion_models", "filename": "fibo2_edit_turbo_int8_convrot.safetensors",
+        "license": "CC BY-NC 4.0 (non-commercial)", "size_mb": 8019, "packages": ["fibo_edit"],
+    },
+    "model_fibo_text_encoder": {
+        "id": "model_fibo_text_encoder", "type": "model", "name": "FIBO 2.0 Text Encoder (Qwen3-VL 4B, int8)",
+        "url": "https://huggingface.co/Comfy-Org/Fibo-2.0/resolve/main/text_encoders/qwen3vl_4b_int8_convrot.safetensors?download=true",
+        "target_path_relative": "models/text_encoders", "filename": "qwen3vl_4b_int8_convrot.safetensors",
+        "license": "CC BY-NC 4.0 (non-commercial)", "size_mb": 4633, "packages": ["fibo_edit"],
+    },
+    # --- SkinTokens auto-rigging ---
+    "cn_skintokens": {
+        "id": "cn_skintokens", "type": "node", "name": "ComfyUI StableGen SkinTokens",
+        "git_url": "https://github.com/sakalond/ComfyUI-StableGen-SkinTokens.git",
+        "target_dir_relative": "custom_nodes",
+        "repo_name": "ComfyUI-StableGen-SkinTokens",
+        "commit": "dd0a272686b77226e6702281b6fd7eb24231abe6",
+        "license": "GPL-3.0 (SkinTokens code and weights: MIT)", "packages": ["skintokens"],
+        # The node's own setup builds SkinTokens in a separate environment (vendor/skintokens_env) with its own
+        # PyTorch and downloads the checkpoints, so ComfyUI's Python is left untouched.
+        "post_install": "skintokens_runtime",
+    },
+}
+
+# ComfyUI node types each package provides or needs (checked by --verify against /object_info), and the ComfyUI
+# core nodes a package needs, which only exist in recent ComfyUI versions (checked before installing).
+PACKAGE_NODES: Dict[str, List[str]] = {
+    "core": ["IPAdapterUnifiedLoader", "IPAdapter"],
+    "qwen_core": ["UnetLoaderGGUF", "TextEncodeQwenImageEditPlus"],
+    "qwen_nunchaku": ["NunchakuQwenImageDiTLoader", "NunchakuQwenImageLoraLoader"],
+    "pbr_marigold": ["MarigoldModelLoader", "MarigoldDepthEstimation_v2"],
+    "pbr_stabledelight": ["LoadStableDelightModel", "ApplyStableDelight"],
+    "pbr_marigold_v2": ["MarigoldV2PostProcess", "ConditioningLoader"],
+    "trellis2": ["LoadTrellis2Models", "Trellis2ImageToShape", "Trellis2GetConditioning", "Trellis2RemoveBackground",
+                 "Trellis2ExportTrimesh", "Trellis2Simplify", "Trellis2ShapeToTexturedMesh", "Trellis2RasterizePBR",
+                 "Trellis2ProcessMesh"],
+    "flux2_klein": ["Flux2Scheduler", "EmptyFlux2LatentImage"],
+    "qwen_image_21": ["TextEncodeQwenImage21", "QwenImage21Cache"],
+    "skintokens": ["StableGenSkinTokensAutoRig"],
+    "qwen_image_21_turbo": ["TextEncodeQwenImage21", "QwenImage21Cache"],
+    "moss_image": ["MOSSImageControl", "EmptyFlux2LatentImage"],
+    "fibo_edit": ["TextEncodeFibo2"],
+}
+CORE_NODES: Dict[str, List[str]] = {
+    "qwen_core": ["TextEncodeQwenImageEditPlus"],
+    "pbr_marigold_v2": ["MarigoldV2PostProcess", "ConditioningLoader"],
+    "flux2_klein": ["Flux2Scheduler", "EmptyFlux2LatentImage"],
+    "qwen_image_21": ["TextEncodeQwenImage21", "QwenImage21Cache"],
+    "qwen_image_21_turbo": ["TextEncodeQwenImage21", "QwenImage21Cache"],
+    "moss_image": ["MOSSImageControl", "EmptyFlux2LatentImage"],     # ComfyUI 0.42.3 or newer
+    "fibo_edit": ["TextEncodeFibo2"],                                   # ComfyUI master from 2026-10-21
 }
 
 # Define what items each menu option entails by listing package tags
@@ -748,10 +815,11 @@ MENU_PACKAGES: Dict[str, Dict[str, Any]] = {
     '8': {"name": "[TRELLIS.2] Image-to-3D Node",
         "tags": ["trellis2"],
         "size_gb": 20.4,
+        "notice": "trellis2",
         "description_suffix": "*Installs ComfyUI-TRELLIS2 custom node + isolated Python environment (~5 GB).*\n"
                               "    *TRELLIS.2 models (~15.4 GB) are downloaded automatically from HuggingFace on first use.*\n"
                               "    *LICENSE NOTICE: Only the 'Native (TRELLIS.2)' texture mode uses nvdiffrast/nvdiffrec*\n"
-                              "    *(NVIDIA Source Code License — non-commercial use only). See README.md for full details.*",
+                              "    *(NVIDIA Source Code License — non-commercial use only). Details in the TRELLIS.2 wiki page.*",
     },
     '9': {"name": "[PBR DECOMPOSITION] Marigold IID Node",
         "tags": ["pbr_marigold"],
@@ -765,70 +833,224 @@ MENU_PACKAGES: Dict[str, Dict[str, Any]] = {
         "description_suffix": "*Installs ComfyUI_StableDelight_ll custom node + downloads the*\n"
                               "    *Stable-X/yoso-delight-v0-4-base model (~3.3GB fp16) for specular-free albedo.*",
     },
-    '11': {"name": "[FLUX.2 KLEIN] Klein 4B FP8 + Qwen 3 Text Encoder + VAE",
+    '11': {"name": "[DEPRECATED] FLUX.2 Klein 4B FP8 + Qwen 3 Text Encoder + VAE",
         "tags": ["flux2_klein"],
         "size_gb": 12.4,
         "description_suffix": "*Downloads FLUX.2 Klein 4B FP8 diffusion model (~4.1GB), Qwen 3 4B text encoder bf16 (~8.0GB),*\n"
                               "    *and FLUX.2 VAE (~0.3GB). All ComfyUI nodes are built-in (no custom nodes needed).*\n"
+                              "    *Deprecated: StableGen shows FLUX.2 Klein only with Enable Deprecated Architectures.*\n"
                               "    *Apache 2.0 license. Requires ~13GB VRAM.*",
+    },
+    '12': {"name": "[PBR DECOMPOSITION] Marigold V2 Models (Albedo + Normals)",
+        "tags": ["pbr_marigold_v2"],
+        "size_gb": 23.3,
+        "description_suffix": "*Downloads Marigold V2 (Apache 2.0): the int8 Qwen Image Edit 2509 base (~19.5GB) plus albedo*\n"
+                              "    *and normals LoRAs, VAEs and conditionings. Uses ComfyUI core nodes (September 2026 or newer).*\n"
+                              "    *Roughness and metallic still need the Marigold IID node (option 9).*",
+    },
+    '13': {"name": "[QWEN IMAGE 2.1] Diffusion Model + Text Encoder + VAE",
+        "tags": ["qwen_image_21"],
+        "size_gb": 14.3,
+        "notice": "qwen21",
+        "description_suffix": "*Downloads Qwen Image 2.1 int8 (~7.3GB), the Qwen3-VL 8B text encoder (~6.3GB) and VAE*\n"
+                              "    *(~0.7GB). Uses ComfyUI core nodes (September 2026 or newer).*\n"
+                              "    *LICENSE NOTICE: Qwen Research License, non-commercial use only.*",
+    },
+    '14': {"name": "[AUTO-RIGGING] SkinTokens Node + Runtime",
+        "tags": ["skintokens"],
+        "size_gb": 9.0,
+        "description_suffix": "*Installs the StableGen SkinTokens node and builds SkinTokens in its own environment*\n"
+                              "    *(PyTorch, flash-attn when available, checkpoints ~1.6GB). Rigs TRELLIS.2 meshes; NVIDIA GPU.*",
+    },
+    '15': {"name": "[EXPERIMENTAL] Qwen Image 2.1 Turbo",
+        "tags": ["qwen_image_21_turbo"],
+        "size_gb": 13.9,
+        "notice": "qwen21",
+        "description_suffix": "*Downloads the Qwen Image 2.1 Turbo int8 model (~6.9GB) and, unless package 13 already did,*\n"
+                              "    *the Qwen Image 2.1 text encoder and VAE (~7.0GB). Uses ComfyUI core nodes.*\n"
+                              "    *LICENSE NOTICE: Qwen Research License, non-commercial use only.*",
+    },
+    '16': {"name": "[EXPERIMENTAL] MOSS Image + Depth Control",
+        "tags": ["moss_image"],
+        "size_gb": 15.0,
+        "description_suffix": "*Downloads MOSS-Image int8 (~5.2GB), its Qwen3.5 9B text encoder (~9.3GB), VAE (~0.2GB) and*\n"
+                              "    *color/depth control adapter (~0.3GB). Needs ComfyUI 0.42.3 or newer. Apache 2.0.*",
+    },
+    '17': {"name": "[EXPERIMENTAL] FIBO 2.0 Edit",
+        "tags": ["fibo_edit"],
+        "size_gb": 13.0,
+        "notice": "fibo",
+        "description_suffix": "*Downloads Bria FIBO 2.0 Edit Turbo int8 (~8.0GB), its Qwen3-VL 4B text encoder (~4.6GB) and*\n"
+                              "    *the FLUX.2 VAE (~0.3GB). Needs a ComfyUI build with core FIBO 2.0 support (master, October 2026).*\n"
+                              "    *LICENSE NOTICE: CC BY-NC 4.0, non-commercial use only.*",
     },
 }
 
+LICENSE_NOTICES: Dict[str, List[str]] = {
+    "trellis2": [
+        "TRELLIS.2 THIRD-PARTY LICENSE NOTICE",
+        "This notice applies only to the TRELLIS.2 feature. StableGen's projection texturing is unaffected.",
+        "",
+        "ComfyUI-TRELLIS2 and the TRELLIS.2 model are MIT-licensed. The TRELLIS.2 Native texture mode uses",
+        "NVIDIA's nvdiffrast and nvdiffrec, licensed for 'research or evaluation purposes only and not for any",
+        "direct or indirect monetary gain' (Section 3.3). Only that texture mode uses them; shape-only and",
+        "projection texture modes do not.",
+        "",
+        "Details: https://github.com/sakalond/StableGen/wiki/TRELLIS.2-mesh-generation#third-party-licenses",
+    ],
+    "qwen21": [
+        "QWEN IMAGE 2.1 LICENSE NOTICE",
+        "Qwen Image 2.1 is released under the Qwen Research License, which allows non-commercial use only",
+        "(research or evaluation). Commercial use needs a separate license from the Qwen team.",
+        "Qwen Image Edit 2509 (packages 5-7) is Apache 2.0 and not affected.",
+        "",
+        "License: https://huggingface.co/Qwen/Qwen-Image-2.1/blob/main/LICENSE",
+    ],
+    "fibo": [
+        "FIBO 2.0 LICENSE NOTICE",
+        "Bria FIBO 2.0 is released under CC BY-NC 4.0, which allows non-commercial use only.",
+        "Commercial use needs an agreement with Bria.",
+        "",
+        "License: https://huggingface.co/briaai/Fibo-2.0-edit-turbo",
+    ],
+}
+
 # --- Helper Functions ---
+PYTHON_OVERRIDE: Optional[str] = None   # --python
+ASSUME_YES = False                      # --yes
+
+
 def print_header(title: str):
     print(f"\n{'='*10} {title} {'='*10}")
 
 def print_separator(char='-', length=70):
     print(char * length)
 
-def get_comfyui_path_from_args() -> Path:
-    parser = argparse.ArgumentParser(description="StableGen Dependency Installer Script.")
-    parser.add_argument("comfyuipath", nargs='?', default=None,
-                        help="Full path to your ComfyUI installation directory. If not provided, will be prompted.")
-    args = parser.parse_args()
 
+def ask(question: str, default_yes: bool = True, yes_answers: bool = True) -> bool:
+    """Ask a yes/no question. --yes answers it, unless yes_answers is False (then --yes means no)."""
+    if ASSUME_YES:
+        print(f"{question} {'yes' if yes_answers else 'no'} (--yes)")
+        return yes_answers
+    suffix = "(y/n, Enter for yes)" if default_yes else "(y/n)"
+    try:
+        answer = input(f"{question} {suffix}: ").strip().lower()
+    except EOFError:
+        return False
+    return answer == "y" or (default_yes and answer == "")
+
+
+def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="StableGen dependency installer for ComfyUI.")
+    parser.add_argument("comfyuipath", nargs='?', default=None,
+                        help="Your ComfyUI folder (the one with 'models' and 'custom_nodes'). Asked for if omitted.")
+    parser.add_argument("--packages",
+                        help="Package numbers to install without the menu, comma-separated (e.g. 3,8). See --list.")
+    parser.add_argument("--yes", "-y", action="store_true",
+                        help="Answer yes to every question, including the license notices.")
+    parser.add_argument("--list", action="store_true", help="List the packages and what each installs, then exit.")
+    parser.add_argument("--dry-run", action="store_true", help="Show what would be installed; change nothing.")
+    parser.add_argument("--update-nodes", action="store_true",
+                        help="Move custom nodes that are already installed to the commits StableGen was tested with.")
+    parser.add_argument("--verify", action="store_true",
+                        help="Check the installation: model files are in place and ComfyUI registers every node the "
+                             "packages need. With --packages it runs after installing them (add --dry-run to only "
+                             "check them); alone it checks every package that looks installed.")
+    parser.add_argument("--server",
+                        help="Verify against this running ComfyUI (e.g. 127.0.0.1:8188) instead of starting one.")
+    parser.add_argument("--verify-timeout", type=int, default=900,
+                        help="Seconds to wait for ComfyUI to start during --verify (default 900: the first start "
+                             "after installing TRELLIS.2 builds its environment).")
+    parser.add_argument("--verify-hashes", action="store_true",
+                        help="Check the SHA-256 of Hugging Face downloads, including files already present (slow).")
+    parser.add_argument("--python", help="Python executable of your ComfyUI environment (detected otherwise).")
+    parser.add_argument("--repair", action="store_true",
+                        help="Repair installed TRELLIS.2 nodes without the menu: re-apply StableGen's patches and "
+                             "sync their isolated environments with ComfyUI core. Run after updating ComfyUI or "
+                             "the TRELLIS.2 node.")
+    parser.add_argument("--check", action="store_true",
+                        help="Only report whether installed TRELLIS.2 environments are out of date; change nothing.")
+    return parser.parse_args(argv)
+
+
+def get_comfyui_path_from_args(args: argparse.Namespace) -> Path:
     comfyui_path_str = args.comfyuipath
     while not comfyui_path_str:
-        comfyui_path_str = input("Please enter the full path to your ComfyUI installation directory: ").strip()
+        if ASSUME_YES:
+            sys.exit("Error: pass the ComfyUI folder as an argument when using --yes.")
+        comfyui_path_str = input("Please enter the full path to your ComfyUI installation directory: ").strip().strip('"')
 
-    comfyui_path = Path(comfyui_path_str).resolve() # Get absolute path
+    comfyui_path = Path(comfyui_path_str).expanduser().resolve()
 
     if not comfyui_path.is_dir():
-        print(f"Error: ComfyUI path '{comfyui_path}' not found or not a directory.")
-        sys.exit(1)
+        sys.exit(f"Error: ComfyUI path '{comfyui_path}' not found or not a directory.")
     if not (comfyui_path / "models").is_dir() or not (comfyui_path / "custom_nodes").is_dir():
-        print(f"Error: '{comfyui_path}' does not look like a valid ComfyUI directory (missing 'models' or 'custom_nodes' subfolder).")
-        sys.exit(1)
+        inner = comfyui_path / "ComfyUI"     # the portable build's outer folder
+        if (inner / "models").is_dir() and (inner / "custom_nodes").is_dir():
+            print(f"Using the ComfyUI folder inside it: {inner}")
+            return inner
+        sys.exit(f"Error: '{comfyui_path}' does not look like a ComfyUI folder (no 'models' or 'custom_nodes').")
     return comfyui_path
 
-def find_comfyui_python(comfyui_path: Path) -> str:
-    """Detect the Python executable used by ComfyUI.
 
-    Checks (in order):
-      1. Windows portable: python_embedded/python.exe
-      2. Virtual-env:      venv/Scripts/python.exe  or  venv/bin/python
-      3. Fallback:         the Python running this script (sys.executable)
-    """
-    # Windows portable build
-    embedded = comfyui_path / "python_embedded" / "python.exe"
-    if embedded.is_file():
-        return str(embedded)
-    # venv (Windows)
-    venv_win = comfyui_path / "venv" / "Scripts" / "python.exe"
-    if venv_win.is_file():
-        return str(venv_win)
-    # venv (Linux / macOS)
-    venv_unix = comfyui_path / "venv" / "bin" / "python"
-    if venv_unix.is_file():
-        return str(venv_unix)
-    # Fallback
+def python_candidates(comfyui_path: Path) -> List[Path]:
+    """Where ComfyUI's Python usually lives. The Windows portable build keeps it next to the ComfyUI folder, in
+    'python_embeded' (sic); venvs sit inside the folder or next to it (ComfyUI Desktop uses '.venv')."""
+    out = []
+    for base in (comfyui_path.parent, comfyui_path):
+        for name in ("python_embeded", "python_embedded"):
+            out.append(base / name / "python.exe")
+    for base in (comfyui_path, comfyui_path.parent):
+        for venv in ("venv", ".venv"):
+            out.append(base / venv / "Scripts" / "python.exe")
+            out.append(base / venv / "bin" / "python")
+    return out
+
+
+def find_comfyui_python(comfyui_path: Path) -> str:
+    """The Python ComfyUI runs with: --python, a portable build's embedded Python, a venv, else this Python."""
+    if PYTHON_OVERRIDE:
+        return PYTHON_OVERRIDE
+    for candidate in python_candidates(comfyui_path):
+        if candidate.is_file():
+            return str(candidate)
     return sys.executable
 
 
-def install_pip_packages(pip_packages: List[str], comfyui_path: Path, force_reinstall: bool = False):
-    """Install pip packages into ComfyUI's Python environment."""
+_PYTHON_REPORT = (
+    "import sys\n"
+    "v = sys.version_info\n"
+    "print(f'{v.major}.{v.minor}.{v.micro}')\n"
+    "try:\n"
+    "    import importlib.metadata as m\n"
+    "    print(m.version('torch'))\n"
+    "except Exception:\n"
+    "    print('not installed')\n"
+)
+
+
+def describe_python(comfyui_path: Path) -> bool:
+    """Print the Python the installer will use. False when none was found and this script's own Python is used."""
+    python = find_comfyui_python(comfyui_path)
+    detected = bool(PYTHON_OVERRIDE) or any(c.is_file() for c in python_candidates(comfyui_path))
+    try:
+        out = subprocess.run([python, "-c", _PYTHON_REPORT], capture_output=True, text=True, timeout=120)
+        version, torch = (out.stdout.split() + ["?", "?"])[:2]
+    except (OSError, subprocess.TimeoutExpired):
+        version, torch = "?", "?"
+    print(f"ComfyUI Python: {python} (Python {version}, torch {torch})")
+    if not detected:
+        print("WARNING: ComfyUI's own Python was not found (a portable build's python_embeded or a venv), so the")
+        print("         Python running this installer is used. If ComfyUI runs with a different Python, re-run")
+        print("         with --python <path to that python>.")
+    return detected
+
+
+def install_pip_packages(pip_packages: List[str], comfyui_path: Path, force_reinstall: bool = False) -> bool:
+    """Install pip packages into ComfyUI's Python environment. Returns True when all of them installed."""
     python_exe = find_comfyui_python(comfyui_path)
     print(f"  Installing pip packages into ComfyUI Python: {python_exe}")
+    ok = True
     for pkg in pip_packages:
         print(f"    pip install {pkg} ...")
         try:
@@ -840,10 +1062,12 @@ def install_pip_packages(pip_packages: List[str], comfyui_path: Path, force_rein
         except subprocess.CalledProcessError as e:
             print(f"    ERROR: Failed to install '{pkg}' (exit code {e.returncode}).")
             print(f"    You may need to install it manually: pip install {pkg}")
+            ok = False
         except FileNotFoundError:
             print(f"    ERROR: Python executable not found at '{python_exe}'.")
             print(f"    Please install '{pkg}' manually into your ComfyUI Python environment.")
-            break
+            return False
+    return ok
 
 
 def _apply_all_comfy_env_patches(comfyui_path: Path):
@@ -1116,7 +1340,7 @@ def _patch_comfy_env_distinfo_normalize(comfyui_path: Path):
 
     if "# StableGen patch" in content:
         print("  Fixing previously broken comfy-env installation...")
-        subprocess.run([python_exe, "-m", "pip", "install", "--force-reinstall", "--no-deps", "comfy-env==0.2.0"], check=True, capture_output=True)
+        subprocess.run([python_exe, "-m", "pip", "install", "--force-reinstall", "--no-deps", COMFY_ENV], check=True, capture_output=True)
         _patch_comfy_env_platform_tag(comfyui_path)
         _patch_comfy_env_wheel_fallback(comfyui_path)
         _patch_comfy_env_user_site_isolation(comfyui_path)
@@ -1232,8 +1456,8 @@ def _patch_flex_gemm_autotuner(repo_path: Path):
             print("  Patched flex_gemm autotuner: removed do_bench for triton 3.0+")
 
 
-def run_node_install_script(item_details: Dict[str, Any], comfyui_path: Path):
-    """Run a custom node's install.py to resolve all its dependencies.
+def run_node_install_script(item_details: Dict[str, Any], comfyui_path: Path) -> bool:
+    """Run a custom node's install.py to resolve all its dependencies. Returns True on success.
 
     Some nodes (e.g. ComfyUI-TRELLIS2) use comfy_env which manages CUDA
     wheel installation from custom indices.  Running their install.py
@@ -1250,7 +1474,7 @@ def run_node_install_script(item_details: Dict[str, Any], comfyui_path: Path):
     install_script = repo_path / "install.py"
     if not install_script.is_file():
         print(f"  WARNING: No install.py found in '{repo_path}'. Skipping dependency install.")
-        return
+        return True
 
     python_exe = find_comfyui_python(comfyui_path)
     print(f"  Running install.py for {item_details['name']}...")
@@ -1263,7 +1487,13 @@ def run_node_install_script(item_details: Dict[str, Any], comfyui_path: Path):
             cwd=str(repo_path),
         )
         print(f"  Successfully ran install.py for '{item_details['name']}'.")
+        return True
     except subprocess.CalledProcessError:
+        if not _uses_comfy_env(item_details):
+            print(f"  ERROR: install.py failed. Run it manually to see why:")
+            print(f"    cd {repo_path}")
+            print(f"    {python_exe} install.py")
+            return False
         # The cuda-wheels index may not have wheels for the auto-detected
         # CUDA version yet (e.g. cu128).  Retry with CUDA 12.4 which has
         # the widest wheel coverage for flex_gemm / nvdiffrast.
@@ -1272,7 +1502,7 @@ def run_node_install_script(item_details: Dict[str, Any], comfyui_path: Path):
         # comfy-env on disk (patches wiped).  Restore comfy-env
         # with patches before retrying so the new subprocess sees them.
         print("  Install failed. Restoring comfy-env + patches for retry...")
-        install_pip_packages(["comfy-env"], comfyui_path, force_reinstall=True)
+        install_pip_packages([COMFY_ENV], comfyui_path, force_reinstall=True)
         _apply_all_comfy_env_patches(comfyui_path)
 
         print("  Retrying with CUDA 12.4 fallback...")
@@ -1286,13 +1516,75 @@ def run_node_install_script(item_details: Dict[str, Any], comfyui_path: Path):
                 env=env,
             )
             print(f"  Successfully ran install.py for '{item_details['name']}' (CUDA 12.4 fallback).")
+            return True
         except subprocess.CalledProcessError as e:
             print(f"  ERROR: install.py failed (exit code {e.returncode}).")
             print(f"  You may need to run it manually:")
             print(f"    cd {repo_path}")
             print(f"    {python_exe} install.py")
+            return False
     except FileNotFoundError:
         print(f"  ERROR: Python executable not found at '{python_exe}'.")
+        return False
+
+
+def _uses_comfy_env(item_details: Dict[str, Any]) -> bool:
+    return any("comfy-env" in p for p in item_details.get("pip_packages", []))
+
+
+def sync_comfy_env_core(item_details: Dict[str, Any], comfyui_path: Path, check_only: bool = False) -> bool:
+    """Bring ComfyUI core's exact pins into a comfy-env node's isolated environments.
+
+    Writes the sync module into the node folder (the prestartup patch imports it
+    on every ComfyUI start) and runs it once now with ComfyUI's own Python, so it
+    resolves env paths with the installed comfy-env. Returns True when everything
+    is in step.
+    """
+    repo_path = comfyui_path / item_details["target_dir_relative"] / item_details["repo_name"]
+    if not repo_path.is_dir():
+        return True
+    module_path = repo_path / _COMFY_ENV_SYNC_FILENAME
+    if not module_path.is_file() or module_path.read_text(encoding="utf-8") != _COMFY_ENV_SYNC_SOURCE:
+        module_path.write_text(_COMFY_ENV_SYNC_SOURCE, encoding="utf-8")
+    python_exe = find_comfyui_python(comfyui_path)
+    action = "Checking" if check_only else "Syncing"
+    print(f"  {action} {item_details['name']} isolated environment(s) with ComfyUI core requirements...")
+    try:
+        result = subprocess.run(
+            [python_exe, str(module_path), str(comfyui_path), str(repo_path)] + (["--check"] if check_only else []),
+            cwd=str(repo_path), timeout=1800,
+        )
+    except (OSError, subprocess.TimeoutExpired) as e:
+        print(f"  WARNING: Environment sync did not complete: {e}")
+        return False
+    if result.returncode == 0:
+        print("  Isolated environment(s) match ComfyUI core.")
+        return True
+    print("  WARNING: Some isolated packages are still out of date (see messages above).")
+    print(f"  Re-run with:  python installer.py \"{comfyui_path}\" --repair")
+    return False
+
+
+def repair_comfy_env_nodes(comfyui_path: Path, check_only: bool = False) -> bool:
+    """Re-apply StableGen's patches and env sync to every installed comfy-env node.
+
+    Node updates (git pull, ComfyUI-Manager) overwrite patched files, and ComfyUI
+    updates move core's pinned packages ahead of the isolated envs; both break
+    TRELLIS.2 until repaired. Safe to run any number of times.
+    """
+    ok = True
+    for item in DEPENDENCIES.values():
+        if item.get("type") != "node" or not _uses_comfy_env(item):
+            continue
+        repo_path = comfyui_path / item["target_dir_relative"] / item["repo_name"]
+        if not repo_path.is_dir():
+            continue
+        print_separator(char='.')
+        print(f"{'Checking' if check_only else 'Repairing'}: {item['name']}")
+        if not check_only:
+            apply_post_clone_patches(item, comfyui_path)
+        ok = sync_comfy_env_core(item, comfyui_path, check_only=check_only) and ok
+    return ok
 
 
 def apply_post_clone_patches(item_details: Dict[str, Any], comfyui_path: Path):
@@ -1352,207 +1644,230 @@ def create_dir_if_not_exists(path: Path):
     path.mkdir(parents=True, exist_ok=True)
 
 
-def _get_remote_file_size(url: str) -> int:
-    """Return the remote file's total size in bytes via a HEAD request.
-    Returns 0 if the server does not provide Content-Length.
-    """
+# --- Downloads ---
+# Plain urllib, so the installer needs no third-party packages. Files download to '<name>.part' and are renamed
+# once complete; an interrupted download resumes from the .part file on the next attempt or the next run.
+USER_AGENT = "StableGen-installer"
+DOWNLOAD_ATTEMPTS = 4
+CHUNK = 1024 * 1024
+
+
+class _RedirectRecorder(urllib.request.HTTPRedirectHandler):
+    """Follows redirects, keeps Hugging Face's x-linked-* headers (only the first response has them), and does not
+    forward an Authorization header to another host (the CDN URLs are pre-signed)."""
+
+    def __init__(self):
+        super().__init__()
+        self.headers: Dict[str, str] = {}
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        for key in ("x-linked-etag", "x-linked-size"):
+            if headers.get(key) and key not in self.headers:
+                self.headers[key] = headers.get(key)
+        new = super().redirect_request(req, fp, code, msg, headers, newurl)
+        if new is not None and urllib.parse.urlparse(newurl).hostname != urllib.parse.urlparse(req.full_url).hostname:
+            new.remove_header("Authorization")
+        return new
+
+
+def _open(url: str, method: str = "GET", headers: Optional[Dict[str, str]] = None, timeout: int = 60):
+    """Open a URL; returns (response, headers recorded on redirects). HF_TOKEN authenticates Hugging Face."""
+    recorder = _RedirectRecorder()
+    opener = urllib.request.build_opener(recorder)
+    request_headers = {"User-Agent": USER_AGENT}
+    token = os.environ.get("HF_TOKEN") or os.environ.get("HUGGING_FACE_HUB_TOKEN")
+    if token and urllib.parse.urlparse(url).hostname == "huggingface.co":
+        request_headers["Authorization"] = f"Bearer {token}"
+    request_headers.update(headers or {})
+    response = opener.open(urllib.request.Request(url, method=method, headers=request_headers), timeout=timeout)
+    return response, recorder.headers
+
+
+def remote_info(url: str) -> Tuple[int, Optional[str]]:
+    """(size in bytes or 0, SHA-256 or None) of a remote file. Hugging Face reports both for LFS files."""
     try:
-        r = requests.head(url, allow_redirects=True, timeout=15)
-        if r.status_code == 200:
-            return int(r.headers.get('content-length', 0))
+        response, linked = _open(url, method="HEAD", timeout=30)
+        with response:
+            size = int(response.headers.get("Content-Length") or 0)
     except Exception:
-        pass
-    return 0
+        return 0, None
+    size = int(linked.get("x-linked-size") or 0) or size
+    etag = (linked.get("x-linked-etag") or "").strip().strip('"')
+    return size, (etag.lower() if re.fullmatch(r"[0-9a-fA-F]{64}", etag) else None)
 
 
-def _rename_if_needed(item_details: Dict[str, Any], temp_filepath: Path, final_filepath: Path):
-    """Move temp_filepath -> final_filepath when rename_from is set."""
-    if item_details.get("rename_from") and temp_filepath != final_filepath:
-        if final_filepath.exists():
-            final_filepath.unlink()
-        shutil.move(str(temp_filepath), str(final_filepath))
-        print(f"  Renamed to '{final_filepath.name}'.")
+def file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with open(path, "rb") as f:
+        for block in iter(lambda: f.read(8 * CHUNK), b""):
+            digest.update(block)
+    return digest.hexdigest()
 
 
-def download_file(item_details: Dict[str, Any], comfyui_path: Path):
-    url = item_details["url"]
-    target_dir = comfyui_path / item_details["target_path_relative"]
-    final_filename = item_details["filename"]
-    final_filepath = target_dir / final_filename
-    temp_filename = item_details.get("rename_from", final_filename)
-    temp_filepath = target_dir / temp_filename
-    # File we actually write to during the download
-    download_target = temp_filepath if item_details.get("rename_from") else final_filepath
+class _PlainProgress:
+    """Progress line for when tqdm is not installed."""
 
-    create_dir_if_not_exists(target_dir)
+    def __init__(self, total: int, initial: int):
+        self.total, self.done, self.shown = total, initial, 0.0
 
-    # ------------------------------------------------------------------
-    # Step 1: Check whether the final file already exists and is complete.
-    # ------------------------------------------------------------------
-    if final_filepath.exists():
-        remote_size = _get_remote_file_size(url)
-        local_size = final_filepath.stat().st_size
-        if remote_size > 0:
-            if local_size >= remote_size:
-                print(f"INFO: '{final_filename}' already complete "
-                      f"({local_size / 1024**2:.1f} MB). Skipping.")
-                return
+    def update(self, n: int):
+        self.done += n
+        now = time.time()
+        if now - self.shown >= 1:
+            self.shown = now
+            pct = f" ({self.done / self.total:.0%})" if self.total else ""
+            print(f"\r  {self.done / 1024**2:,.0f} / {self.total / 1024**2:,.0f} MB{pct}", end="", flush=True)
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        print()
+
+
+def _progress(name: str, total: int, initial: int):
+    if TQDM_AVAILABLE and total:
+        return tqdm(total=total, initial=initial, unit='B', unit_scale=True, unit_divisor=1024, desc=name[:40],
+                    ascii=True)
+    return _PlainProgress(total, initial)
+
+
+def download_url(url: str, final_path: Path, name: str, verify_hash: bool = False) -> Tuple[str, str]:
+    """Download url to final_path, resuming and retrying. Returns (status, message); status is 'installed',
+    'present', 'warning' or 'failed'."""
+    final_path.parent.mkdir(parents=True, exist_ok=True)
+    part = final_path.with_name(final_path.name + ".part")
+    remote_size, remote_sha = remote_info(url)
+
+    if final_path.exists():
+        local = final_path.stat().st_size
+        if not remote_size or local == remote_size:
+            if verify_hash and remote_sha:
+                print(f"  Checking the SHA-256 of '{final_path.name}'...")
+                if file_sha256(final_path) == remote_sha:
+                    return "present", "SHA-256 verified"
+                print(f"  '{final_path.name}' does not match the published SHA-256; downloading it again.")
+                final_path.unlink()
             else:
-                print(f"WARNING: '{final_filename}' is incomplete "
-                      f"({local_size / 1024**2:.1f} / {remote_size / 1024**2:.1f} MB). "
-                      f"Will attempt to resume.")
-                # If download_target differs from final_filepath (rename_from case),
-                # the partial final file is unusable — delete it and resume via
-                # download_target instead.  If they are the same file, keep it for resume.
-                if download_target != final_filepath:
-                    final_filepath.unlink()
+                return "present", "" if remote_size else "server did not report a size; assumed complete"
+        elif local < remote_size:
+            print(f"  '{final_path.name}' is incomplete ({local / 1024**2:,.0f} of {remote_size / 1024**2:,.0f} MB); "
+                  f"resuming.")
+            if part.exists():
+                part.unlink()
+            final_path.rename(part)
         else:
-            # Server did not return Content-Length on HEAD; trust the file's existence.
-            print(f"INFO: '{final_filename}' exists "
-                  f"(remote size unavailable, assuming complete). Skipping.")
-            print(f"      License: {item_details['license']}")
-            return
+            return "warning", (f"local file is {local:,} bytes but the server's is {remote_size:,}; left as is "
+                               f"(delete it to download again)")
 
-    # ------------------------------------------------------------------
-    # Step 2: Check for an existing partial download to resume from.
-    # ------------------------------------------------------------------
-    existing_bytes = 0
-    if download_target.exists():
-        existing_bytes = download_target.stat().st_size
-        if existing_bytes > 0:
-            print(f"  Found partial file '{download_target.name}' "
-                  f"({existing_bytes / 1024**2:.1f} MB already downloaded). "
-                  f"Attempting to resume...")
+    error = ""
+    for attempt in range(1, DOWNLOAD_ATTEMPTS + 1):
+        have = part.stat().st_size if part.exists() else 0
+        if remote_size and have == remote_size:
+            break
+        if remote_size and have > remote_size:
+            part.unlink()
+            have = 0
+        try:
+            response, _ = _open(url, headers={"Range": f"bytes={have}-"} if have else None)
+            with response:
+                if have and response.status != 206:
+                    have = 0        # the server ignored the range request: start over
+                length = int(response.headers.get("Content-Length") or 0)
+                total = remote_size or (have + length if length else 0)
+                with open(part, "ab" if have else "wb") as f, _progress(name, total, have) as bar:
+                    while True:
+                        block = response.read(CHUNK)
+                        if not block:
+                            break
+                        f.write(block)
+                        bar.update(len(block))
+            done = part.stat().st_size
+            if (remote_size and done < remote_size) or (not remote_size and length and done < have + length):
+                raise ConnectionError(f"connection closed after {done / 1024**2:,.0f} MB")
+            break
+        except urllib.error.HTTPError as e:
+            if e.code == 416 and have:
+                break       # nothing left to fetch
+            if e.code in (401, 403):
+                return "failed", (f"HTTP {e.code}: access denied (a gated model needs its license accepted on "
+                                  f"Hugging Face and HF_TOKEN set)")
+            if e.code == 404:
+                return "failed", "HTTP 404: the file is no longer at this address"
+            error = f"HTTP {e.code}"
+        except (urllib.error.URLError, OSError, ConnectionError, socket.timeout) as e:
+            error = str(getattr(e, "reason", e))
+        if attempt < DOWNLOAD_ATTEMPTS:
+            wait = 5 * attempt
+            print(f"  Download interrupted ({error}); retrying in {wait} s ({attempt}/{DOWNLOAD_ATTEMPTS - 1})...")
+            time.sleep(wait)
+        else:
+            return "failed", f"download failed after {DOWNLOAD_ATTEMPTS} attempts ({error}); run again to resume"
 
-    size_mb = item_details.get("size_mb", "N/A")
-    print(f"  Downloading: {item_details['name']} (~{size_mb} MB)"
-          f" - License: {item_details['license']}")
+    size = part.stat().st_size if part.exists() else 0
+    if remote_size and size != remote_size:
+        return "failed", f"incomplete ({size:,} of {remote_size:,} bytes); run again to resume"
+    if verify_hash and remote_sha:
+        print(f"  Checking the SHA-256 of '{final_path.name}'...")
+        if file_sha256(part) != remote_sha:
+            part.unlink()
+            return "failed", "SHA-256 mismatch; the download was deleted, run again"
+    os.replace(part, final_path)
+    return "installed", f"{size / 1024**2:,.0f} MB" + (", SHA-256 verified" if verify_hash and remote_sha else "")
+
+
+def download_file(item_details: Dict[str, Any], comfyui_path: Path, verify_hash: bool = False) -> Tuple[str, str]:
+    url = item_details["url"]
+    final_filepath = comfyui_path / item_details["target_path_relative"] / item_details["filename"]
+    print(f"  {item_details['name']} (~{item_details.get('size_mb', '?')} MB) - License: {item_details['license']}")
     print(f"  From: {url}")
     print(f"  To:   {final_filepath}")
-    if item_details.get("rename_from"):
-        print(f"  (Downloading as '{temp_filename}', will rename to '{final_filename}')")
-
-    try:
-        req_headers = {}
-        if existing_bytes > 0:
-            req_headers['Range'] = f'bytes={existing_bytes}-'
-
-        response = requests.get(url, stream=True, timeout=30, headers=req_headers)
-
-        # 416 Range Not Satisfiable: our offset is already at or beyond the file end.
-        if response.status_code == 416:
-            print(f"  File is already fully downloaded on disk.")
-            _rename_if_needed(item_details, temp_filepath, final_filepath)
-            return
-
-        if response.status_code == 206:
-            # Server supports partial content — append to the existing partial file.
-            open_mode = 'ab'
-            content_range = response.headers.get('Content-Range', '')
-            total_size = int(content_range.split('/')[-1]) if '/' in content_range else 0
-        elif response.status_code == 200:
-            # Server returned the full file (no resume support, or no Range was sent).
-            if existing_bytes > 0:
-                print(f"  Server does not support resume. Restarting download from scratch.")
-                existing_bytes = 0
-            open_mode = 'wb'
-            total_size = int(response.headers.get('content-length', 0))
-        else:
-            response.raise_for_status()
-            return
-
-        with open(download_target, open_mode) as f:
-            if TQDM_AVAILABLE and total_size > 0:
-                with tqdm(total=total_size, initial=existing_bytes,
-                          unit='B', unit_scale=True, unit_divisor=1024,
-                          desc=item_details['name'], ascii=True) as pbar:
-                    for chunk in response.iter_content(chunk_size=1024 * 1024):
-                        f.write(chunk)
-                        pbar.update(len(chunk))
-            else:
-                downloaded = existing_bytes
-                for chunk in response.iter_content(chunk_size=1024 * 1024):
-                    f.write(chunk)
-                    downloaded += len(chunk)
-                    if total_size > 0:
-                        pct = downloaded / total_size * 100
-                        print(f"\r  {downloaded / 1024**2:.0f} / "
-                              f"{total_size / 1024**2:.0f} MB "
-                              f"({pct:.0f}%)", end='', flush=True)
-                if total_size > 0:
-                    print()
-
-        print(f"  Download complete: {download_target.name}")
-        _rename_if_needed(item_details, temp_filepath, final_filepath)
-
-    except requests.exceptions.RequestException as e:
-        print(f"  ERROR downloading {item_details['name']}: {e}")
-    except Exception as e:
-        print(f"  An unexpected error occurred during download of {item_details['name']}: {e}")
+    status, message = download_url(url, final_filepath, item_details['name'], verify_hash)
+    print(f"  {status}{': ' + message if message else ''}")
+    return status, message
 
 
-def download_hf_model(item_details: Dict[str, Any], comfyui_path: Path):
-    """Download a HuggingFace diffusers model repo into ComfyUI/models/diffusers/.
+HF_REPO_PATTERNS = ["*.json", "*.txt", "*.yaml", "*.md", "*.py", "*.model", "*.fp16.safetensors", "*.fp16.bin",
+                    "tokenizer/*"]
 
-    Uses ``huggingface_hub.snapshot_download`` if available, otherwise falls
-    back to ``huggingface-cli download``.
+
+def _hf_repo_files(repo: str) -> List[str]:
+    response, _ = _open(f"https://huggingface.co/api/models/{repo}/tree/main?recursive=true", timeout=30)
+    with response:
+        entries = json.loads(response.read().decode("utf-8"))
+    return [e["path"] for e in entries if e.get("type") == "file"]
+
+
+def download_hf_model(item_details: Dict[str, Any], comfyui_path: Path, verify_hash: bool = False) -> Tuple[str, str]:
+    """Download a Hugging Face diffusers repo (configs and fp16 weights) into ComfyUI/models/diffusers/<local_dir>.
 
     Required keys in *item_details*:
         hf_repo   – e.g. ``'Stable-X/yoso-delight-v0-4-base'``
-        local_dir – directory name under ``models/diffusers/``,
-                    e.g. ``'Stable-X--yoso-delight-v0-4-base'``
+        local_dir – directory name under ``models/diffusers/``
     """
     hf_repo = item_details["hf_repo"]
-    local_dir_name = item_details["local_dir"]
-    target_dir = comfyui_path / "models" / "diffusers" / local_dir_name
-
-    if target_dir.is_dir() and (target_dir / "model_index.json").exists():
-        print(f"INFO: HuggingFace model '{hf_repo}' already exists at '{target_dir}'. Skipping.")
-        return
-
-    create_dir_if_not_exists(target_dir.parent)
-    print(f"  Downloading HuggingFace model: {hf_repo} (~{item_details.get('size_mb', '?')} MB)")
-    print(f"  License: {item_details.get('license', 'unknown')}")
-    print(f"  Destination: {target_dir}")
-
-    # Try Python API first
+    target_dir = comfyui_path / "models" / "diffusers" / item_details["local_dir"]
+    print(f"  Hugging Face model {hf_repo} (~{item_details.get('size_mb', '?')} MB) - "
+          f"License: {item_details.get('license', 'unknown')}")
+    print(f"  To:   {target_dir}")
     try:
-        from huggingface_hub import snapshot_download
-        snapshot_download(
-            repo_id=hf_repo,
-            local_dir=str(target_dir),
-            local_dir_use_symlinks=False,
-            # Download config files + fp16 weight variant only (skip fp32)
-            allow_patterns=[
-                "*.json", "*.txt", "*.yaml", "*.md", "*.py", "*.model",
-                "*.fp16.safetensors", "*.fp16.bin",
-                "tokenizer/**",
-            ],
-        )
-        print(f"  HuggingFace model download complete: {local_dir_name}")
-        return
-    except ImportError:
-        print("  huggingface_hub not available, trying CLI fallback...")
+        files = [f for f in _hf_repo_files(hf_repo)
+                 if any(fnmatch.fnmatch(f, p) or fnmatch.fnmatch(f.split("/")[-1], p) for p in HF_REPO_PATTERNS)]
     except Exception as e:
-        print(f"  snapshot_download failed: {e}. Trying CLI fallback...")
-
-    # Fallback: huggingface-cli
-    try:
-        python_exe = find_comfyui_python(comfyui_path)
-        cmd = [
-            str(python_exe), "-m", "huggingface_hub.commands.huggingface_cli",
-            "download", hf_repo,
-            "--local-dir", str(target_dir),
-        ]
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
-        if result.returncode == 0:
-            print(f"  HuggingFace model download complete: {local_dir_name}")
-        else:
-            print(f"  ERROR downloading HuggingFace model: {result.stderr}")
-    except Exception as e:
-        print(f"  ERROR downloading HuggingFace model '{hf_repo}': {e}")
-        print(f"  You can manually download it with:")
-        print(f"    huggingface-cli download {hf_repo} --local-dir {target_dir}")
+        if (target_dir / "model_index.json").exists():
+            return "present", f"could not list the repository ({e}); kept the existing copy"
+        return "failed", f"could not list the repository: {e}"
+    statuses = []
+    for path in files:
+        url = f"https://huggingface.co/{hf_repo}/resolve/main/{urllib.parse.quote(path)}"
+        status, message = download_url(url, target_dir / path, path, verify_hash)
+        if status == "failed":
+            print(f"  {path}: {message}")
+            return "failed", f"{path}: {message}"
+        statuses.append(status)
+    if "installed" in statuses:
+        return "installed", f"{statuses.count('installed')} of {len(files)} files downloaded"
+    return "present", f"{len(files)} files"
 
 
 def _clean_stale_comfy_envs(repo_path: Path):
@@ -1578,92 +1893,182 @@ def _clean_stale_comfy_envs(repo_path: Path):
         print(f"  Cleaned {removed} stale environment(s). comfy-env will recreate them on next ComfyUI start.")
 
 
-def clone_git_repo(item_details: Dict[str, Any], comfyui_path: Path):
+def _git(args: List[str], cwd: Path) -> subprocess.CompletedProcess:
+    return subprocess.run(["git"] + args, cwd=str(cwd), capture_output=True, text=True)
+
+
+def clone_git_repo(item_details: Dict[str, Any], comfyui_path: Path, update_nodes: bool = False) -> Tuple[str, str]:
+    """Clone a custom node at its tested commit, or check an existing clone. Returns (status, message)."""
     git_url = item_details["git_url"]
-    target_parent_dir = comfyui_path / item_details["target_dir_relative"]
     repo_name = item_details["repo_name"]
-    final_repo_path = target_parent_dir / repo_name
-    pinned_commit = item_details.get("commit")
-
-    if final_repo_path.is_dir():
-        # If a commit is pinned, verify the checkout matches
-        if pinned_commit:
-            try:
-                result = subprocess.run(
-                    ['git', 'rev-parse', 'HEAD'], capture_output=True, text=True,
-                    check=True, cwd=str(final_repo_path)
-                )
-                current = result.stdout.strip()
-                if current != pinned_commit:
-                    print(f"  Pinning '{repo_name}' to verified commit {pinned_commit[:12]}...")
-                    subprocess.run(['git', 'fetch', 'origin'], check=True, cwd=str(final_repo_path))
-                    subprocess.run(['git', 'checkout', pinned_commit], check=True, cwd=str(final_repo_path))
-                    print(f"  Successfully pinned to {pinned_commit[:12]}.")
-                    # Commit changed — old comfy-env virtualenvs may have stale deps
-                    if item_details.get("clean_envs"):
-                        _clean_stale_comfy_envs(final_repo_path)
-                else:
-                    print(f"INFO: '{repo_name}' already at pinned commit {pinned_commit[:12]}. Skipping.")
-            except Exception as e:
-                print(f"  WARNING: Could not verify/pin commit for '{repo_name}': {e}")
-        else:
-            print(f"INFO: Custom node directory '{repo_name}' already exists at '{final_repo_path}'. Skipping clone.")
-            print(f"      Please ensure it's the correct repository and up-to-date if you encounter issues (License: {item_details['license']}).")
-        return
-
-    create_dir_if_not_exists(target_parent_dir)
-    print(f"  Cloning: {item_details['name']} - License: {item_details['license']}")
-    print(f"  From: {git_url}")
-    print(f"  To:   {final_repo_path}")
-    if pinned_commit:
-        print(f"  Pinned commit: {pinned_commit[:12]}")
+    repo_path = comfyui_path / item_details["target_dir_relative"] / repo_name
+    pinned = item_details.get("commit")
 
     try:
-        subprocess.run(['git', 'clone', git_url, str(final_repo_path)], check=True, cwd=str(target_parent_dir))
+        if repo_path.is_dir():
+            if not (repo_path / ".git").exists():
+                return "present", "installed without Git (e.g. through ComfyUI-Manager); left as is"
+            head = _git(["rev-parse", "HEAD"], repo_path).stdout.strip()
+            if not pinned or head == pinned:
+                return "present", f"at {head[:12]}" if head else ""
+            if not (item_details.get("enforce_pin") or update_nodes):
+                return "warning", (f"at {head[:12]}; StableGen was tested with {pinned[:12]} "
+                                   f"(re-run with --update-nodes to switch)")
+            print(f"  Moving '{repo_name}' to the tested commit {pinned[:12]}...")
+            _git(["fetch", "origin"], repo_path)
+            checkout = _git(["checkout", pinned], repo_path)
+            if checkout.returncode != 0:
+                reason = (checkout.stderr.strip().splitlines() or ["unknown error"])[-1]
+                return "failed", (f"could not check out {pinned[:12]}: {reason} (commit or discard local changes "
+                                  f"in {repo_path})")
+            if item_details.get("clean_envs"):
+                _clean_stale_comfy_envs(repo_path)
+            return "updated", f"{head[:12]} -> {pinned[:12]}"
 
-        # Checkout pinned commit if specified
-        if pinned_commit:
-            subprocess.run(['git', 'checkout', pinned_commit], check=True, cwd=str(final_repo_path))
-            print(f"  Successfully cloned and pinned '{repo_name}' to {pinned_commit[:12]}.")
-        else:
-            print(f"  Successfully cloned '{repo_name}'.")
-
-        print(f"  IMPORTANT: Restart ComfyUI if it was running to load this new custom node.")
-    except subprocess.CalledProcessError as e:
-        print(f"  ERROR cloning {item_details['name']}: Git command failed with exit code {e.returncode}")
-        if e.stderr:
-            print(f"  Git stderr: {e.stderr.decode(errors='ignore')}")
-        if e.stdout:
-            print(f"  Git stdout: {e.stdout.decode(errors='ignore')}")
-
+        create_dir_if_not_exists(repo_path.parent)
+        print(f"  Cloning: {item_details['name']} - License: {item_details['license']}")
+        print(f"  From: {git_url}")
+        print(f"  To:   {repo_path}")
+        clone = subprocess.run(['git', 'clone', git_url, str(repo_path)], cwd=str(repo_path.parent))
+        if clone.returncode != 0:
+            return "failed", "git clone failed: check your network and that the repository is public"
+        if pinned:
+            checkout = _git(["checkout", pinned], repo_path)
+            if checkout.returncode != 0:
+                return "failed", f"cloned, but the tested commit {pinned[:12]} is missing upstream"
+        return "installed", f"at {pinned[:12]}" if pinned else "latest commit"
     except FileNotFoundError:
-        print("  ERROR: Git command not found. Please ensure Git is installed and in your system's PATH.")
+        return "failed", "Git is not installed or not on PATH"
+
+
+# --- Post-install steps for nodes that set up their own runtime ---
+_NUNCHAKU_WHEEL_SCRIPT = r'''"""Install the Nunchaku engine wheel matching this Python, torch and platform (StableGen installer)."""
+import importlib.metadata
+import importlib.util
+import sys
+
+spec = importlib.util.spec_from_file_location("nunchaku_installers", sys.argv[1])
+installers = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(installers)
+
+try:
+    dist = importlib.metadata.distribution("nunchaku")
+    summary = (dist.metadata.get("Summary") or "").lower()
+    if "piece-wise" not in summary and not dist.version.startswith("0.16"):
+        print(f"Nunchaku {dist.version} is already installed.")
+        sys.exit(0)
+    print(f"Replacing the unrelated PyPI package 'nunchaku' {dist.version}.")
+except importlib.metadata.PackageNotFoundError:
+    pass
+
+config = installers.generate_and_save_config() or installers.load_version_config()
+versions = config.get("versions", [])
+if not versions:
+    sys.exit("Could not read Nunchaku's version list.")
+from packaging.version import parse
+version = max(versions, key=parse)
+info = installers.get_system_info()
+if not info.get("torch_version"):
+    sys.exit("torch is not installed in this Python.")
+backend = installers.get_install_backend()
+for source in ("github", "huggingface", "modelscope"):
+    wheel = installers.construct_compatible_wheel_info(version, source, info, config)
+    if not wheel:
+        continue
+    try:
+        print(f"Installing {wheel['name']} from {source}...")
+        installers.install_wheel(wheel["url"], backend)
+        print(f"Installed Nunchaku {version}.")
+        sys.exit(0)
     except Exception as e:
-        print(f"  An unexpected error occurred during git clone of {item_details['name']}: {e}")
+        print(f"  {source}: {e}")
+sys.exit(f"No Nunchaku {version} wheel for Python {info['python_version']}, {info['torch_version']}, "
+         f"{info['platform_tag']}.")
+'''
 
 
+def _install_nunchaku_wheel(item_details: Dict[str, Any], comfyui_path: Path) -> Tuple[bool, str]:
+    repo_path = comfyui_path / item_details["target_dir_relative"] / item_details["repo_name"]
+    installers = repo_path / "nodes" / "tools" / "installers.py"
+    if not installers.is_file():
+        return False, f"{installers} not found"
+    with tempfile.TemporaryDirectory() as tmp:
+        script = Path(tmp) / "stablegen_nunchaku_wheel.py"
+        script.write_text(_NUNCHAKU_WHEEL_SCRIPT, encoding="utf-8")
+        result = subprocess.run([find_comfyui_python(comfyui_path), str(script), str(installers)])
+    return result.returncode == 0, "" if result.returncode == 0 else "see the messages above"
+
+
+def _install_skintokens_runtime(item_details: Dict[str, Any], comfyui_path: Path) -> Tuple[bool, str]:
+    repo_path = comfyui_path / item_details["target_dir_relative"] / item_details["repo_name"]
+    script = repo_path / "install_skintokens.py"
+    if not script.is_file():
+        return False, f"{script} not found"
+    print("  Building the SkinTokens runtime (its own Python environment, PyTorch and checkpoints).")
+    print("  This takes a while the first time.")
+    result = subprocess.run([find_comfyui_python(comfyui_path), str(script), "--target", "managed"], cwd=str(repo_path))
+    return result.returncode == 0, "" if result.returncode == 0 else "see the messages above"
+
+
+POST_INSTALL = {
+    "nunchaku_wheel": ("Nunchaku engine", _install_nunchaku_wheel),
+    "skintokens_runtime": ("SkinTokens runtime", _install_skintokens_runtime),
+}
+
+
+def install_node(item_details: Dict[str, Any], comfyui_path: Path, update_nodes: bool) -> List[Tuple[str, str, str]]:
+    """Clone or check a custom node, then install what it needs. Returns (name, status, message) rows."""
+    name = item_details["name"]
+    status, message = clone_git_repo(item_details, comfyui_path, update_nodes)
+    print(f"  {status}{': ' + message if message else ''}")
+    rows = [(name, status, message)]
+    if status == "failed":
+        return rows
+    repo_path = comfyui_path / item_details["target_dir_relative"] / item_details["repo_name"]
+    uses_env = _uses_comfy_env(item_details)
+    if item_details.get("pip_packages") and not install_pip_packages(item_details["pip_packages"], comfyui_path):
+        rows.append((f"{name}: Python packages", "failed", "pip install failed (see above)"))
+    # comfy-env patches go in BEFORE install.py, which needs them (e.g. the Linux platform tag for wheel lookup)
+    if uses_env:
+        _apply_all_comfy_env_patches(comfyui_path)
+    if item_details.get("post_clone_patches"):
+        apply_post_clone_patches(item_details, comfyui_path)
+    if item_details.get("run_install_script"):
+        if not run_node_install_script(item_details, comfyui_path):
+            rows.append((f"{name}: install.py", "failed", "the node's dependency install failed (see above)"))
+        _patch_flex_gemm_autotuner(repo_path)
+    if uses_env:
+        # The node's requirements.txt may pin an older comfy-env: restore the latest and re-apply the patches,
+        # then bring ComfyUI core's exact pins into the isolated env that install.py just solved.
+        print(f"  Re-installing {COMFY_ENV} (overriding the node's requirements.txt)...")
+        install_pip_packages([COMFY_ENV], comfyui_path, force_reinstall=True)
+        _apply_all_comfy_env_patches(comfyui_path)
+        if not sync_comfy_env_core(item_details, comfyui_path):
+            rows.append((f"{name}: isolated environment", "warning",
+                         "out of step with ComfyUI core; run the installer with --repair"))
+    hook = item_details.get("post_install")
+    if hook:
+        label, run = POST_INSTALL[hook]
+        ok, message = run(item_details, comfyui_path)
+        rows.append((f"{name}: {label}", "installed" if ok else "failed", message))
+    return rows
+
+
+# --- Packages ---
 def display_menu(comfyui_path: Path):
     print_header("StableGen Dependency Installer")
     print(f"Target ComfyUI Directory: {comfyui_path}")
     print_separator()
-    print("This script helps download and set up essential and optional models for StableGen.")
-    print("For FLUX.1 model setup (which requires manual download due to licensing),")
-    print("please refer to the main README.md on our GitHub page: https://github.com/sakalond/stablegen")
+    print("This script downloads and sets up the custom nodes and models StableGen uses.")
+    print("To install components by hand instead, see the manual installation guide:")
+    print("https://github.com/sakalond/StableGen/wiki/Manual-installation")
     print_separator()
-    print("Note: Download sizes are estimates. Actual sizes may vary slightly.")
-    print()
-    print("Upon entering a choice, the full list of components will be shown for approval before proceeding.")
+    print("Download sizes are estimates. The full list of components is shown for approval before anything changes.")
     print_separator()
-    print("Please choose an installation package:")
-    print()
 
     for key, val in MENU_PACKAGES.items():
         print(f"\n{key}. {val['name']}")
         print_separator(char='.')
-        # Dynamically list contents for clarity (optional, can make menu long)
-        # items_in_package = get_items_for_package_tags(val['tags'])
-        # for item_id in items_in_package:
-        #     print(f"    - {DEPENDENCIES[item_id]['name']}")
         print(f"    *Approximate total download size: ~{val['size_gb']:.1f} GB*")
         if val.get("description_suffix"):
             print(f"    {val['description_suffix']}")
@@ -1671,190 +2076,435 @@ def display_menu(comfyui_path: Path):
     print_separator()
 
 
+def print_package_list():
+    """--list: every package and the components it installs."""
+    for key, val in MENU_PACKAGES.items():
+        print(f"{key:>3}. {val['name']} (~{val['size_gb']:.1f} GB)")
+        for item in resolve_items([key]):
+            kind = {"node": "node", "model": "model", "hf_model": "model"}[item["type"]]
+            print(f"       {kind:<5} {item['name']}")
+
+
+def parse_package_choice(text: str) -> List[str]:
+    """'3, 8' -> ['3', '8']. Raises ValueError for unknown numbers."""
+    keys = [k.strip() for k in text.replace(";", ",").split(",") if k.strip()]
+    unknown = [k for k in keys if k not in MENU_PACKAGES]
+    if not keys or unknown:
+        raise ValueError(f"unknown package(s): {', '.join(unknown) or text!r}; choose from {', '.join(MENU_PACKAGES)}")
+    return list(dict.fromkeys(keys))
+
+
+def tags_for(keys: List[str]) -> List[str]:
+    return list(dict.fromkeys(tag for key in keys for tag in MENU_PACKAGES[key]["tags"]))
+
+
 def get_unique_item_ids_for_tags(selected_tags: List[str]) -> Set[str]:
-    item_ids: Set[str] = set()
-    for item_id, details in DEPENDENCIES.items():
-        # An item is included if any of its 'packages' tags are in selected_tags
-        if any(tag in details["packages"] for tag in selected_tags):
-            item_ids.add(item_id)
-    return item_ids
+    return {item_id for item_id, details in DEPENDENCIES.items()
+            if any(tag in details["packages"] for tag in selected_tags)}
+
+
+def resolve_items(keys: List[str]) -> List[Dict[str, Any]]:
+    """The components of the chosen packages, each once, in DEPENDENCIES order."""
+    ids = get_unique_item_ids_for_tags(tags_for(keys))
+    return [item for item_id, item in DEPENDENCIES.items() if item_id in ids]
+
+
+def item_target(item: Dict[str, Any], comfyui_path: Path) -> Path:
+    if item["type"] == "node":
+        return comfyui_path / item["target_dir_relative"] / item["repo_name"]
+    if item["type"] == "model":
+        return comfyui_path / item["target_path_relative"] / item["filename"]
+    return comfyui_path / "models" / "diffusers" / item["local_dir"]
+
+
+def item_present(item: Dict[str, Any], comfyui_path: Path) -> bool:
+    target = item_target(item, comfyui_path)
+    if item["type"] == "hf_model":
+        return (target / "model_index.json").exists()
+    return target.exists()
+
+
+TAG_LABELS = {
+    "core": "SDXL core", "preset_essentials": "SDXL preset essentials", "extended_optional": "SDXL extras",
+    "checkpoint_realvis": "RealVisXL checkpoint", "qwen_core": "Qwen Image Edit core", "qwen_extras": "Qwen extras",
+    "qwen_nunchaku": "Qwen Nunchaku", "pbr_marigold": "Marigold IID", "pbr_stabledelight": "StableDelight",
+    "pbr_marigold_v2": "Marigold V2", "trellis2": "TRELLIS.2", "flux2_klein": "FLUX.2 Klein",
+    "qwen_image_21": "Qwen Image 2.1", "skintokens": "SkinTokens",
+    "qwen_image_21_turbo": "Qwen Image 2.1 Turbo", "moss_image": "MOSS Image", "fibo_edit": "FIBO 2.0 Edit",
+}
+
+
+def installed_tags(comfyui_path: Path) -> Tuple[List[str], Dict[str, Tuple[int, int]]]:
+    """For --verify without --packages: package tags with every component present, and the partly installed ones
+    as {tag: (present, total)}."""
+    complete, partial = [], {}
+    for tag in TAG_LABELS:
+        items = [item for item in DEPENDENCIES.values() if tag in item["packages"]]
+        present = sum(item_present(item, comfyui_path) for item in items)
+        if items and present == len(items):
+            complete.append(tag)
+        elif present:
+            partial[tag] = (present, len(items))
+    return complete, partial
+
+
+# --- Checks before installing ---
+def missing_core_nodes(comfyui_path: Path, tags: List[str]) -> Dict[str, List[str]]:
+    """ComfyUI core nodes the packages need that this ComfyUI version does not have, by package tag."""
+    sources = [comfyui_path / "nodes.py"] + sorted((comfyui_path / "comfy_extras").glob("*.py"))
+    text = "\n".join(p.read_text(encoding="utf-8", errors="ignore") for p in sources if p.is_file())
+    if not text:
+        return {}       # not a source checkout (e.g. ComfyUI Desktop): can't tell offline
+    missing = {}
+    for tag in tags:
+        absent = [n for n in CORE_NODES.get(tag, []) if not re.search(rf"[\"']{re.escape(n)}[\"']|class {re.escape(n)}\b", text)]
+        if absent:
+            missing[tag] = absent
+    return missing
+
+
+ENV_SIZE_MB = {"trellis2": 5000, "skintokens": 9000}
+
+
+def estimate_download_mb(items: List[Dict[str, Any]], tags: List[str], comfyui_path: Path) -> int:
+    """MB still to download: models that are not present yet, plus environments the nodes build."""
+    total = sum(item.get("size_mb", 0) for item in items
+                if item["type"] in ("model", "hf_model") and not item_present(item, comfyui_path))
+    for tag in tags:
+        node_items = [i for i in items if i["type"] == "node" and tag in i["packages"]]
+        if tag in ENV_SIZE_MB and not all(item_present(i, comfyui_path) for i in node_items):
+            total += ENV_SIZE_MB[tag]
+    return total
+
+
+def trellis_python_ok(comfyui_path: Path) -> bool:
+    """TRELLIS.2's CUDA extensions have no wheels for Python 3.13 yet; ask before installing there."""
+    try:
+        out = subprocess.run([find_comfyui_python(comfyui_path), "-c",
+                              "import sys; print(sys.version_info[0], sys.version_info[1])"],
+                             capture_output=True, text=True, check=True)
+        is_313_plus = tuple(int(x) for x in out.stdout.split()) >= (3, 13)
+    except Exception:
+        is_313_plus = sys.version_info >= (3, 13)
+    if not is_313_plus:
+        return True
+    print_separator(char='!')
+    print("WARNING: TRELLIS.2 needs binary CUDA extensions (cumesh, flex_gemm, nvdiffrec, ...) that have no")
+    print("pre-built wheels for Python 3.13 yet; building them needs MSVC and the CUDA Toolkit.")
+    print("A ComfyUI with Python 3.12 (e.g. a portable build) is strongly recommended.")
+    print_separator(char='!')
+    return ask("Attempt the TRELLIS.2 installation on Python 3.13 anyway?", default_yes=False)
+
+
+def show_notice(key: str) -> bool:
+    print_separator(char='!')
+    for line in LICENSE_NOTICES[key]:
+        print(line)
+    print_separator(char='!')
+    return ask("Acknowledge and continue?")
+
+
+# --- Verification ---
+def _free_port() -> int:
+    with socket.socket() as s:
+        s.bind(("127.0.0.1", 0))
+        return s.getsockname()[1]
+
+
+def _fetch_object_info(address: str, timeout: int = 15) -> Optional[Dict[str, Any]]:
+    try:
+        with urllib.request.urlopen(f"http://{address}/object_info", timeout=timeout) as response:
+            return json.loads(response.read().decode("utf-8"))
+    except Exception:
+        return None
+
+
+def _stop_process_tree(proc: subprocess.Popen):
+    if proc.poll() is not None:
+        return
+    if sys.platform == "win32":
+        subprocess.run(["taskkill", "/F", "/T", "/PID", str(proc.pid)], capture_output=True)
+    else:
+        import signal
+        try:
+            os.killpg(proc.pid, signal.SIGTERM)
+        except OSError:
+            proc.terminate()
+    try:
+        proc.wait(timeout=30)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+
+
+def start_comfyui_for_verify(comfyui_path: Path, timeout: int) -> Tuple[Optional[Dict[str, Any]], List[str]]:
+    """Start ComfyUI on a free local port, read /object_info, stop it. Returns (object_info or None, custom node
+    folders that failed to import)."""
+    main_py = comfyui_path / "main.py"
+    if not main_py.is_file():
+        print(f"  {main_py} not found (ComfyUI Desktop?). Start ComfyUI yourself and pass --server <address>.")
+        return None, []
+    python = find_comfyui_python(comfyui_path)
+    port = _free_port()
+    log_path = Path(tempfile.gettempdir()) / f"stablegen-verify-comfyui-{port}.log"
+    cmd = [python] + (["-s"] if "python_embed" in python else []) + [
+        str(main_py), "--listen", "127.0.0.1", "--port", str(port), "--disable-auto-launch"]
+    print(f"  Starting ComfyUI on port {port} to read its node list (log: {log_path})...")
+    kwargs: Dict[str, Any] = {}
+    if sys.platform == "win32":
+        kwargs["creationflags"] = 0x00000200 | 0x08000000    # new process group, no console window
+    else:
+        kwargs["start_new_session"] = True
+    info = None
+    with open(log_path, "w", encoding="utf-8", errors="replace") as log:
+        proc = subprocess.Popen(cmd, cwd=str(comfyui_path), stdout=log, stderr=subprocess.STDOUT,
+                                stdin=subprocess.DEVNULL, **kwargs)
+        start = time.time()
+        reported = 0
+        try:
+            while time.time() - start < timeout:
+                if proc.poll() is not None:
+                    print(f"  ComfyUI exited early (code {proc.returncode}); see the log.")
+                    break
+                info = _fetch_object_info(f"127.0.0.1:{port}", timeout=5)
+                if info is not None:
+                    break
+                elapsed = int(time.time() - start)
+                if elapsed - reported >= 60:
+                    reported = elapsed
+                    print(f"  ...still starting ({elapsed} s)")
+                time.sleep(3)
+            else:
+                print(f"  ComfyUI did not answer within {timeout} s; see the log.")
+        finally:
+            _stop_process_tree(proc)
+    text = log_path.read_text(encoding="utf-8", errors="replace")
+    failed = re.findall(r"\(IMPORT FAILED\)[^\n]*?custom_nodes[\\/]([^\\/\n]+)", text)
+    return info, sorted(set(failed))
+
+
+def verify_installation(comfyui_path: Path, tags: List[str], server: Optional[str], timeout: int) -> bool:
+    print_header("Verifying the installation")
+    ok = True
+    items = [item for item in DEPENDENCIES.values() if any(t in item["packages"] for t in tags)]
+    for item in items:
+        if item["type"] == "node":
+            continue
+        target = item_target(item, comfyui_path)
+        if not item_present(item, comfyui_path):
+            print(f"  MISSING  {item['name']} ({target})")
+            ok = False
+        elif item["type"] == "model" and target.with_name(target.name + ".part").exists():
+            print(f"  WARNING  {item['name']}: an unfinished download is next to it")
+    required = list(dict.fromkeys(n for t in tags for n in PACKAGE_NODES.get(t, [])))
+    if not required:
+        return ok
+    if server:
+        info, failed = _fetch_object_info(server), []
+        if info is None:
+            print(f"  Could not reach ComfyUI at {server}.")
+    else:
+        info, failed = start_comfyui_for_verify(comfyui_path, timeout)
+    ours = {item["repo_name"] for item in items if item["type"] == "node"}
+    for folder in failed:
+        if folder in ours:
+            print(f"  FAILED   custom node '{folder}' did not import (see the ComfyUI log)")
+    others = [folder for folder in failed if folder not in ours]
+    if others:
+        print(f"  Note: other custom nodes failed to import (not StableGen's): {', '.join(others)}")
+    failed = [folder for folder in failed if folder in ours]
+    if info is None:
+        return False
+    missing = [n for n in required if n not in info]
+    for tag in tags:
+        absent = [n for n in PACKAGE_NODES.get(tag, []) if n in missing]
+        if absent:
+            core = set(CORE_NODES.get(tag, []))
+            hint = "update ComfyUI" if set(absent) <= core else "the custom node did not load"
+            print(f"  MISSING  {', '.join(absent)} ({hint})")
+    print(f"  {len(required) - len(missing)} of {len(required)} required node types are registered.")
+    return ok and not missing and not failed
+
+
+# --- Summary ---
+STATUS_LABELS = {"installed": "installed", "updated": "updated", "present": "present", "warning": "WARNING",
+                 "failed": "FAILED"}
+
+
+def print_summary(rows: List[Tuple[str, str, str]]) -> bool:
+    print_header("Summary")
+    for name, status, message in rows:
+        print(f"  {STATUS_LABELS[status]:<10} {name}" + (f" - {message}" if message else ""))
+    counts = {s: sum(1 for _, st, _ in rows if st == s) for s in STATUS_LABELS}
+    print_separator()
+    print(", ".join(f"{n} {STATUS_LABELS[s].lower()}" for s, n in counts.items() if n))
+    return counts["failed"] == 0
+
 
 # --- Main Script Logic ---
-def main():
-    comfyui_base_path = get_comfyui_path_from_args()
-
-    # Ensure all comfy-env patches are applied if comfy-env is already installed
-    try:
-        python_exe = find_comfyui_python(comfyui_base_path)
-        result = subprocess.run(
-            [python_exe, "-c", "import comfy_env"],
-            capture_output=True,
-            text=True,
-        )
-        if result.returncode == 0:
-            print("  Detected existing comfy-env installation. Ensuring all patches are applied...")
-            _apply_all_comfy_env_patches(comfyui_base_path)
-    except Exception as e:
-        print(f"  WARNING: Could not check/patch existing comfy-env: {e}")
-
-    processed_during_this_session: Set[str] = set() # To avoid re-processing in same session if menu is re-shown
-
+def choose_packages_interactively(comfyui_path: Path) -> Optional[List[str]]:
     while True:
-        display_menu(comfyui_base_path)
-        choice = input("Enter your choice (1-12, or q to quit): ").strip().lower()
-
+        display_menu(comfyui_path)
+        try:
+            choice = input("Enter one or more package numbers (e.g. 3 or 3,8), or q to quit: ").strip().lower()
+        except EOFError:
+            return None
         if choice == 'q':
+            return None
+        try:
+            return parse_package_choice(choice)
+        except ValueError as e:
+            print(f"Invalid choice: {e}")
+
+
+def main(argv: Optional[List[str]] = None) -> int:
+    global ASSUME_YES, PYTHON_OVERRIDE
+    args = parse_args(argv)
+    if args.list:
+        print_package_list()
+        return 0
+    ASSUME_YES = args.yes
+    if args.python:
+        if not Path(args.python).is_file():
+            print(f"Error: --python '{args.python}' does not exist.")
+            return 2
+        PYTHON_OVERRIDE = str(Path(args.python).resolve())
+    keys: Optional[List[str]] = None
+    if args.packages:
+        try:
+            keys = parse_package_choice(args.packages)
+        except ValueError as e:
+            print(f"Error: {e}")
+            return 2
+
+    comfyui_base_path = get_comfyui_path_from_args(args)
+    print(f"ComfyUI: {comfyui_base_path}")
+    if not describe_python(comfyui_base_path) and not args.check:
+        if not ask("Continue with this Python?", default_yes=False):
+            return 1
+
+    if args.check:
+        print_header("Checking TRELLIS.2 environments")
+        return 0 if repair_comfy_env_nodes(comfyui_base_path, check_only=True) else 1
+
+    if args.verify and keys is None and not args.repair:
+        tags, partial = installed_tags(comfyui_base_path)
+        if partial:
+            print("Partly installed, not checked: " + ", ".join(
+                f"{TAG_LABELS[t]} ({have} of {total} components)" for t, (have, total) in partial.items()))
+        if not tags:
+            print("No StableGen package is completely installed here yet.")
+            return 1
+        print("Checking: " + ", ".join(TAG_LABELS[t] for t in tags))
+        return 0 if verify_installation(comfyui_base_path, tags, args.server, args.verify_timeout) else 1
+
+    if not args.dry_run:
+        # Ensure all comfy-env patches are applied if comfy-env is already installed
+        has_comfy_env = False
+        try:
+            result = subprocess.run([find_comfyui_python(comfyui_base_path), "-c", "import comfy_env"],
+                                    capture_output=True, text=True)
+            if result.returncode == 0:
+                has_comfy_env = True
+                print("  Detected existing comfy-env installation. Ensuring all patches are applied...")
+                _apply_all_comfy_env_patches(comfyui_base_path)
+        except Exception as e:
+            print(f"  WARNING: Could not check/patch existing comfy-env: {e}")
+
+        # Already-installed TRELLIS.2 nodes drift out of step whenever ComfyUI or the node updates; repair them
+        # on every installer run.
+        if has_comfy_env or args.repair:
+            print_header("Repairing installed TRELLIS.2 nodes")
+            ok = repair_comfy_env_nodes(comfyui_base_path)
+            if args.repair:
+                print("Repair complete." if ok else "Repair finished with warnings (see above).")
+                print("Restart ComfyUI so the TRELLIS.2 worker picks up the changes.")
+                return 0 if ok else 1
+    elif args.repair:
+        print("--repair changes files; nothing to show in a dry run.")
+        return 0
+
+    if keys is None:
+        keys = choose_packages_interactively(comfyui_base_path)
+        if keys is None:
             print("Exiting installer.")
-            break
+            return 0
 
-        selected_option = MENU_PACKAGES.get(choice)
-        if not selected_option:
-            print("Invalid choice. Please try again.")
+    # License notices and the Python 3.13 check can drop packages
+    accepted = []
+    answers: Dict[str, bool] = {}       # a notice shared by two packages (Qwen 2.1 and Turbo) is asked once
+    for key in keys:
+        package = MENU_PACKAGES[key]
+        if "trellis2" in package["tags"] and not trellis_python_ok(comfyui_base_path):
+            print(f"Skipping package {key}.")
             continue
-
-        print_separator()
-        print(f"You selected: {selected_option['name']}")
-        print(f"Estimated download for this package (if items not present): ~{selected_option['size_gb']:.1f} GB")
-        
-        current_selection_item_ids = get_unique_item_ids_for_tags(selected_option["tags"])
-        items_to_process_this_round: List[Dict[str, Any]] = []
-        
-        print("This package will check/install the following components:")
-        for item_id in sorted(list(current_selection_item_ids)): # Sort for consistent display
-            if item_id not in processed_during_this_session and item_id in DEPENDENCIES:
-                print(f"  - {DEPENDENCIES[item_id]['name']}")
-                items_to_process_this_round.append(DEPENDENCIES[item_id])
-        
-        if not items_to_process_this_round:
-            print("All components for this selection appear to have been processed or are not defined. Nothing new to install for this choice.")
-            print("If you expected installations, ensure the components are not already present from a previous run or selection.")
-            print_separator()
+        notice = package.get("notice")
+        if notice and notice not in answers:
+            answers[notice] = show_notice(notice)
+        if notice and not answers[notice]:
+            print(f"Skipping package {key}.")
             continue
+        accepted.append(key)
+    if not accepted:
+        print("Nothing to install.")
+        return 0
+    tags = tags_for(accepted)
+    items = resolve_items(accepted)
 
-        confirm_all = input("Proceed with checking/installing these components? (y/n, Enter for yes): ").strip().lower()
-        if not (confirm_all == "" or confirm_all == 'y'):
-            print("Installation of this package cancelled by user.")
-            print_separator()
-            continue
+    print_separator()
+    for key in accepted:
+        print(f"Package {key}: {MENU_PACKAGES[key]['name']}")
+    print("Components:")
+    for item in items:
+        state = "present" if item_present(item, comfyui_base_path) else "to install"
+        print(f"  - {item['name']} ({state})")
+    need_mb = estimate_download_mb(items, tags, comfyui_base_path)
+    free_mb = shutil.disk_usage(comfyui_base_path).free // 1024**2
+    print(f"Estimated download: ~{need_mb / 1024:.1f} GB; free on this drive: {free_mb / 1024:.1f} GB")
 
-        # Display TRELLIS.2 license notice if installing that package
-        if "trellis2" in selected_option["tags"]:
-            # Check target environment's Python version
-            try:
-                python_exe = find_comfyui_python(comfyui_base_path)
-                py_version_res = subprocess.run(
-                    [python_exe, "-c", "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')"],
-                    capture_output=True, text=True, check=True
-                )
-                py_ver = py_version_res.stdout.strip()
-                is_python_313_plus = [int(x) for x in py_ver.split(".")] >= [3, 13]
-            except Exception:
-                is_python_313_plus = sys.version_info >= (3, 13)
+    problems = False
+    for tag, absent in missing_core_nodes(comfyui_base_path, tags).items():
+        print(f"WARNING: this ComfyUI lacks {', '.join(absent)}; update ComfyUI before using these models.")
+    if any(item["type"] == "node" for item in items) and shutil.which("git") is None:
+        print("ERROR: Git is needed to install custom nodes and was not found on PATH (https://git-scm.com).")
+        problems = True
+    if need_mb > free_mb:
+        print(f"ERROR: not enough free disk space ({need_mb / 1024:.1f} GB needed, {free_mb / 1024:.1f} GB free).")
+        problems = problems or not ask("Continue anyway?", default_yes=False, yes_answers=False)
+    if problems:
+        return 1
 
-            if is_python_313_plus:
-                print_separator(char='!')
-                print("WARNING: PYTHON 3.13 COMPATIBILITY ALERT")
-                print_separator(char='!')
-                print("You are running Python 3.13+ in ComfyUI.")
-                print("TRELLIS.2 requires binary CUDA extensions (cumesh, flex_gemm_ap, nvdiffrec, etc.)")
-                print("which DO NOT currently have pre-compiled wheels for Python 3.13 on the wheel index.")
-                print("Compiling them from source requires a local MSVC compiler and CUDA Toolkit.")
-                print()
-                print("It is HIGHLY RECOMMENDED to use Python 3.12 (or a ComfyUI portable build")
-                print("that uses Python 3.12) to run the TRELLIS.2 mesh generation pipeline.")
-                print_separator(char='!')
-                ack_313 = input("Do you still want to attempt installation on Python 3.13? (y/n): ").strip().lower()
-                if ack_313 != 'y':
-                    print("Installation cancelled.")
-                    print_separator()
-                    continue
+    if args.dry_run:
+        print("Dry run: nothing was changed.")
+        if args.verify:
+            return 0 if verify_installation(comfyui_base_path, tags, args.server, args.verify_timeout) else 1
+        return 0
+    if not ask("Proceed with checking/installing these components?"):
+        print("Installation cancelled.")
+        return 0
 
-            print_separator(char='!')
-            print("TRELLIS.2 THIRD-PARTY LICENSE NOTICE")
-            print_separator(char='!')
-            print("NOTE: This notice applies ONLY to the TRELLIS.2 Image-to-3D feature.")
-            print("StableGen's standard texturing pipelines (SDXL, FLUX, Qwen) are unaffected.")
-            print()
-            print("ComfyUI-TRELLIS2 and the TRELLIS.2 model are MIT-licensed.")
-            print("However, the TRELLIS.2 TEXTURED mesh pipeline uses the following NVIDIA")
-            print("libraries that are restricted to NON-COMMERCIAL use only:")
-            print()
-            print("  - nvdiffrast  (NVIDIA Source Code License, 1-Way Commercial)")
-            print("  - nvdiffrec   (NVIDIA Source Code License)")
-            print()
-            print("These licenses restrict usage to 'research or evaluation purposes only")
-            print("and not for any direct or indirect monetary gain' (Section 3.3).")
-            print("Only NVIDIA and its affiliates may use them commercially.")
-            print()
-            print("These libraries are ONLY used when Texture Mode is set to")
-            print("'Native (TRELLIS.2)' for UV rasterization and PBR texture baking.")
-            print()
-            print("All other modes do not introduce additional NVIDIA restrictions:")
-            print("  - Texture Mode 'None' (shape-only) - permissively licensed")
-            print("  - Projection texture modes (SDXL, Flux, Qwen) - the selected")
-            print("    diffusion model's own license applies as usual")
-            print()
-            print("For full details, see the README.md License section.")
-            print_separator(char='!')
-            ack = input("Acknowledge and continue? (y/n, Enter for yes): ").strip().lower()
-            if not (ack == "" or ack == 'y'):
-                print("Installation cancelled.")
-                print_separator()
-                continue
+    rows: List[Tuple[str, str, str]] = []
+    for item_details in items:
+        print_separator(char='.')
+        print(f"Processing: {item_details['name']}")
+        if item_details["type"] == "node":
+            rows.extend(install_node(item_details, comfyui_base_path, args.update_nodes))
+        elif item_details["type"] == "model":
+            rows.append((item_details["name"],) + download_file(item_details, comfyui_base_path, args.verify_hashes))
+        elif item_details["type"] == "hf_model":
+            status, message = download_hf_model(item_details, comfyui_base_path, args.verify_hashes)
+            print(f"  {status}{': ' + message if message else ''}")
+            rows.append((item_details["name"], status, message))
 
-        print_separator(char='*')
-        for item_details in items_to_process_this_round:
-            if item_details["id"] in processed_during_this_session: # Should not happen if items_to_process_this_round is built correctly
-                continue
+    ok = print_summary(rows)
+    node_names = {item["name"] for item in items if item["type"] == "node"}
+    if any(status in ("installed", "updated") and name in node_names for name, status, _ in rows):
+        print("Restart ComfyUI so it loads new or updated custom nodes.")
+    if args.verify:
+        ok = verify_installation(comfyui_base_path, tags, args.server, args.verify_timeout) and ok
+    return 0 if ok else 1
 
-            print_separator(char='.')
-            print(f"Processing: {item_details['name']}")
-            
-            target_full_path: Path
-            if item_details["type"] == "node":
-                target_full_path = comfyui_base_path / item_details["target_dir_relative"] / item_details["repo_name"]
-                clone_git_repo(item_details, comfyui_base_path)
-                # Install pip dependencies required by this custom node
-                if item_details.get("pip_packages"):
-                    install_pip_packages(item_details["pip_packages"], comfyui_base_path)
-                # Apply comfy-env patches BEFORE running install.py,
-                # since the install script needs them (e.g. platform_tag for Linux wheel lookup)
-                if item_details.get("pip_packages") and any("comfy-env" in p for p in item_details["pip_packages"]):
-                    _apply_all_comfy_env_patches(comfyui_base_path)
-                # Apply compatibility patches (e.g. Python 3.10 polyfills)
-                if item_details.get("post_clone_patches"):
-                    apply_post_clone_patches(item_details, comfyui_base_path)
-                # Run node's install.py for full dependency resolution (e.g. CUDA wheels)
-                if item_details.get("run_install_script"):
-                    run_node_install_script(item_details, comfyui_base_path)
-                    # Fix flex_gemm/triton version mismatch in comfy-env isolated envs
-                    _patch_flex_gemm_autotuner(target_full_path)
-                # Force comfy-env (latest) and re-apply patches AFTER install.py,
-                # since the node's requirements.txt may pin an older version
-                if item_details.get("pip_packages") and any("comfy-env" in p for p in item_details["pip_packages"]):
-                    print("  Re-installing comfy-env (overriding node requirements.txt)...")
-                    install_pip_packages(["comfy-env"], comfyui_base_path, force_reinstall=True)
-                    _apply_all_comfy_env_patches(comfyui_base_path)
-            elif item_details["type"] == "model":
-                target_full_path = comfyui_base_path / item_details["target_path_relative"] / item_details["filename"]
-                download_file(item_details, comfyui_base_path)
-            elif item_details["type"] == "hf_model":
-                target_full_path = comfyui_base_path / "models" / "diffusers" / item_details["local_dir"]
-                download_hf_model(item_details, comfyui_base_path)
-            
-            processed_during_this_session.add(item_details["id"])
-        
-        print_separator(char='*')
-        print("Processing for selected package complete.")
-        print("Please check messages above for status of each item.")
-        if any(item["type"] == "node" for item in items_to_process_this_round):
-             print("IMPORTANT: If any custom nodes were newly cloned, restart ComfyUI to load them.")
-        print_separator()
-        print("All done. Exiting installer.")
-        break
 
 if __name__ == "__main__":
     if not TQDM_AVAILABLE:
-        print("NOTE: 'tqdm' library not found. Download progress will not be shown as a bar.")
-        print("      You can install it with: pip install tqdm")
-    main()
+        print("NOTE: 'tqdm' is not installed, so downloads show a progress line instead of a bar.")
+    sys.exit(main())

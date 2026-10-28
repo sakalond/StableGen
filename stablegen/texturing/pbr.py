@@ -9,7 +9,6 @@ import os
 import json
 import io
 import math
-import colorsys
 import hashlib
 import traceback
 from statistics import median
@@ -19,6 +18,7 @@ from PIL import Image, ImageEnhance
 import bpy  # pylint: disable=import-error
 from ..utils import get_file_path, get_dir_path, get_generation_dirs
 from ..timeout_config import get_timeout
+from .pbr_emission import emission_from_hsv, emission_from_residual
 
 _ADDON_PKG = __package__.rsplit('.', 1)[0]
 
@@ -69,15 +69,24 @@ class _PBRMixin:
         def tiling_dict(is_tiled):
             """Return tiling sub-dict; grid/superres only matter when tiled."""
             if is_tiled:
-                return {'tiled': True, 'tile_grid': tile_grid,
-                        'tile_superres': tile_superres}
+                result = {'tiled': True, 'tile_grid': tile_grid,
+                          'tile_superres': tile_superres}
+                inference = getattr(scene, 'pbr_tile_inference', 'SOURCE')
+                if inference != 'SOURCE':
+                    # Only recorded when it differs from the old behaviour, so maps made
+                    # before this option existed still count as up to date.
+                    result['tile_inference'] = inference
+                return result
             return {'tiled': False}
 
         settings = {}
 
+        # Marigold V2 ignores the v1 inference, step and tiling settings and has its own resolution.
+        v2_settings = {'model': 'marigold_v2',
+                       'v2_resolution': getattr(scene, 'pbr_v2_max_resolution', 2048)}
+
         settings['albedo'] = {
-            **common,
-            **tiling_dict(tile_albedo),
+            **(v2_settings if albedo_source == 'marigold_v2' else {**common, **tiling_dict(tile_albedo)}),
             'source': albedo_source,
             'delight_strength': getattr(scene, 'pbr_delight_strength', 1.0) if albedo_source == 'delight' else None,
             'auto_saturation': getattr(scene, 'pbr_albedo_auto_saturation', False),
@@ -91,10 +100,13 @@ class _PBRMixin:
             **common,
             **tiling_dict(tile_material),
         }
-        settings['normal'] = {
-            **common,
-            **tiling_dict(tile_normal),
-        }
+        if getattr(scene, 'pbr_normal_model', 'marigold') == 'marigold_v2':
+            settings['normal'] = dict(v2_settings)
+        else:
+            settings['normal'] = {
+                **common,
+                **tiling_dict(tile_normal),
+            }
         settings['height'] = {
             **common,
             **tiling_dict(tile_height),
@@ -357,6 +369,14 @@ class _PBRMixin:
                 # Normalise to list[bytes] (StableDelight returns bytes)
                 if isinstance(result, bytes):
                     result = [result]
+            elif getattr(context.scene, 'pbr_tile_inference', 'SOURCE') == 'MODEL':
+                # Each tile at the model's inference resolution: the grid then adds
+                # detail at the scale Marigold was trained at, rather than feeding it
+                # tiles far larger than that.
+                result = self.workflow_manager.generate_pbr_maps(
+                    context, tile_path, model_name=model_name,
+                    processing_resolution=getattr(
+                        context.scene, 'pbr_processing_resolution', 768))
             else:
                 result = self.workflow_manager.generate_pbr_maps(
                     context, tile_path, model_name=model_name,
@@ -521,35 +541,70 @@ class _PBRMixin:
     # ── PBR post-processing helpers ───────────────────────────────────
 
     @staticmethod
-    def _compute_image_mean_saturation(image_path_or_bytes, sample_limit=100_000):
+    def _compute_image_mean_saturation(image_path_or_bytes, sample_limit=100_000, mask=None):
         """Compute the mean HSV saturation for a single image.
 
         *image_path_or_bytes* can be a file path (str) or raw PNG bytes.
-        Skips very dark pixels whose saturation is unreliable.
+        Skips very dark pixels whose saturation is unreliable. *mask* is an
+        optional boolean array (any size; resized to the image) restricting
+        the measurement to the object.
         Returns a float in [0, 1], or 0.0 on error.
         """
-        import colorsys
-        from PIL import Image
-
         try:
-            if isinstance(image_path_or_bytes, (str, bytes)) and isinstance(image_path_or_bytes, str):
+            if isinstance(image_path_or_bytes, str):
                 img = Image.open(image_path_or_bytes).convert('RGB')
             else:
                 img = Image.open(io.BytesIO(image_path_or_bytes)).convert('RGB')
 
-            pixels = list(img.getdata())
-            step = max(1, len(pixels) // sample_limit)
-            total_s, n = 0.0, 0
-            for i in range(0, len(pixels), step):
-                r, g, b = pixels[i]
-                _, s, v = colorsys.rgb_to_hsv(r / 255, g / 255, b / 255)
-                if v > 0.05:
-                    total_s += s
-                    n += 1
-            return total_s / n if n > 0 else 0.0
+            rgb = np.asarray(img, dtype=np.float32) / 255.0
+            value = rgb.max(axis=-1)
+            saturation = (value - rgb.min(axis=-1)) / np.maximum(value, 1e-6)
+            keep = value > 0.05
+            if mask is not None:
+                mask_img = Image.fromarray(np.asarray(mask, dtype=np.uint8) * 255)
+                if mask_img.size != img.size:
+                    mask_img = mask_img.resize(img.size, Image.NEAREST)
+                keep &= np.asarray(mask_img) > 127
+            values = saturation[keep]
+            step = max(1, values.size // sample_limit)
+            values = values[::step]
+            return float(values.mean()) if values.size else 0.0
         except Exception as err:
             print(f"[StableGen]     Warning: saturation computation failed: {err}")
             return 0.0
+
+    @staticmethod
+    def _object_mask(image_path):
+        """Return the opaque region of a generated image as a boolean array.
+
+        Generated images keep their colour under transparent pixels (often a
+        saturated backdrop), which must not count towards the object's
+        saturation. Returns ``None`` when the image has no usable alpha.
+        """
+        try:
+            with Image.open(image_path) as img:
+                if 'A' not in img.getbands():
+                    return None
+                alpha = np.asarray(img.getchannel('A'))
+        except Exception:
+            return None
+        mask = alpha > 127
+        if mask.all() or not mask.any():
+            return None
+        return mask
+
+    def _albedo_saturation_ratio(self, original_path, raw_path):
+        """Saturation of the generated image over the raw albedo, measured on the object.
+
+        Returns the ratio clamped to [0.5, 3.0], or ``None`` when the albedo is
+        nearly grey and the ratio is meaningless.
+        """
+        mask = self._object_mask(original_path)
+        s_orig = self._compute_image_mean_saturation(original_path, mask=mask)
+        s_albedo = self._compute_image_mean_saturation(raw_path, mask=mask)
+        if s_albedo < 0.01:
+            return None
+        return max(0.5, min(s_orig / s_albedo, 3.0))
 
     def _compute_uniform_saturation(self, context, use_median=True):
         """Compute a uniform auto-saturation ratio across ALL cameras.
@@ -578,14 +633,9 @@ class _PBRMixin:
             if not os.path.exists(original_path) or not os.path.exists(raw_path):
                 continue
 
-            s_orig = self._compute_image_mean_saturation(original_path)
-            s_albedo = self._compute_image_mean_saturation(raw_path)
-
-            if s_albedo < 0.01:
+            ratio = self._albedo_saturation_ratio(original_path, raw_path)
+            if ratio is None:
                 continue  # skip grayscale albedos
-
-            ratio = s_orig / s_albedo
-            ratio = max(0.5, min(ratio, 3.0))
             ratios.append(ratio)
 
         if not ratios:
@@ -672,13 +722,9 @@ class _PBRMixin:
             if not os.path.exists(raw_path) or not os.path.exists(original_path):
                 continue
 
-            s_orig = self._compute_image_mean_saturation(original_path)
-            s_albedo = self._compute_image_mean_saturation(raw_path)
-
-            if s_albedo < 0.01:
+            ratio = self._albedo_saturation_ratio(original_path, raw_path)
+            if ratio is None:
                 continue
-
-            ratio = max(0.5, min(s_orig / s_albedo, 3.0))
 
             with open(raw_path, 'rb') as f:
                 raw_bytes = f.read()
@@ -815,6 +861,9 @@ class _PBRMixin:
 
         use_delight = (want_albedo and albedo_source == 'delight')
         use_lighting_albedo = (want_albedo and albedo_source == 'lighting')
+        use_v2_albedo = (want_albedo and albedo_source == 'marigold_v2')
+        use_v2_normals = (want_normal
+                          and getattr(scene, 'pbr_normal_model', 'marigold') == 'marigold_v2')
 
         # ── Determine which Marigold models to run ────────────────────
         # When all_missing is set (selective rerun), only models whose
@@ -824,7 +873,7 @@ class _PBRMixin:
             or want_roughness
             or want_metallic
         )
-        need_normals = want_normal
+        need_normals = want_normal and not use_v2_normals
         need_height = want_height
         # IID-Lighting is needed for 'residual' emission OR 'lighting' albedo
         need_iid_lighting = (
@@ -841,6 +890,12 @@ class _PBRMixin:
             need_iid_lighting = need_iid_lighting and bool(
                 all_missing & {'emission', 'albedo'})
             use_delight = use_delight and 'albedo' in all_missing
+            use_v2_albedo = use_v2_albedo and 'albedo' in all_missing
+            use_v2_normals = use_v2_normals and 'normal' in all_missing
+
+        # Albedo produced by a separate pass: IID-Appearance then only supplies
+        # roughness and metallic, and its albedo output is discarded.
+        external_albedo = (want_albedo and albedo_source in ('delight', 'marigold_v2'))
 
         models_to_run = []
         if need_appearance:
@@ -871,6 +926,8 @@ class _PBRMixin:
 
         total_model_steps = (len(models_to_run)
                              + (1 if use_delight else 0)
+                             + (1 if use_v2_albedo else 0)
+                             + (1 if use_v2_normals else 0)
                              + extra_emission_steps)
         if total_model_steps == 0:
             print("[StableGen] No PBR maps enabled, skipping decomposition")
@@ -900,7 +957,7 @@ class _PBRMixin:
         custom_tile_height = False
         custom_tile_emission = False
         # Whether IID-Appearance is the albedo provider
-        appearance_provides_albedo = (not use_delight
+        appearance_provides_albedo = (not external_albedo
                                       and not use_lighting_albedo)
 
         if tiling_mode == 'selective':
@@ -1016,6 +1073,56 @@ class _PBRMixin:
                     except Exception as err:
                         print(f"[StableGen]     Failed to save delight albedo: {err}")
 
+        # ── Marigold V2 passes (all cameras per map) ──────────────────
+        v2_tasks = ([('albedo', 'albedo')] if use_v2_albedo else []) + \
+                   ([('normals', 'normal')] if use_v2_normals else [])
+        for task, map_name in v2_tasks:
+            model_step += 1
+            self._pbr_step = model_step
+            print(f"[StableGen]   Model {model_step}/{total_model_steps}: Marigold V2 {task}")
+            for ci, cam_idx in enumerate(cam_ids):
+                if per_camera_missing and cam_idx in per_camera_missing:
+                    if map_name not in per_camera_missing[cam_idx]:
+                        print(f"[StableGen]     Camera {cam_idx}: {map_name} exists, skipping Marigold V2")
+                        continue
+                self._pbr_cam = ci
+                self._stage = f"PBR: Marigold V2 {task} (cam {ci+1}/{num_cams})"
+                self._progress = 0
+                print(f"[StableGen]     Camera {cam_idx} ({ci+1}/{num_cams})…")
+                result = self.workflow_manager.generate_marigold_v2_map(
+                    context, camera_images[cam_idx], task)
+                if isinstance(result, dict) and "error" in result:
+                    print(f"[StableGen]     Marigold V2 error: {result['error']}")
+                    self._error = f"Marigold V2 failed: {result['error']}"
+                    return
+                if map_name == 'normal':
+                    converted = self._convert_normals_cam_to_world(result, cam_idx)
+                    if converted is not None:
+                        result = converted
+                pbr_path = get_file_path(
+                    context, "pbr", subtype=map_name,
+                    camera_id=cam_idx, material_id=self._material_id)
+                try:
+                    if map_name == 'albedo':
+                        self._save_raw_copy(context, "albedo", cam_idx, result)
+                    with open(pbr_path, 'wb') as f:
+                        f.write(result)
+                    self._pbr_maps[cam_idx][map_name] = pbr_path
+                    print(f"[StableGen]     Saved {map_name} (Marigold V2) → "
+                          f"{os.path.basename(pbr_path)}")
+                except Exception as err:
+                    print(f"[StableGen]     Failed to save Marigold V2 {map_name}: {err}")
+        if v2_tasks and models_to_run:
+            # The Qwen-Image-Edit base stays cached in ComfyUI; the Marigold v1
+            # custom nodes load their own pipelines and need the memory back.
+            try:
+                server_address = context.preferences.addons[
+                    _ADDON_PKG].preferences.server_address
+                self.workflow_manager._flush_comfyui_vram(
+                    server_address, retries=1, label="after Marigold V2")
+            except Exception as e:
+                print(f"[StableGen] VRAM flush after Marigold V2 failed (non-fatal): {e}")
+
         # ── Marigold model passes (all cameras per model) ─────────────
         for model_name, map_names in models_to_run:
             model_step += 1
@@ -1055,7 +1162,7 @@ class _PBRMixin:
 
                 if tiling_mode == 'selective':
                     dual_run_iid = (
-                        should_tile and is_iid and not use_delight
+                        should_tile and is_iid and not external_albedo
                     )
                     dual_run_lighting = (
                         should_tile and is_iid_lighting
@@ -1176,7 +1283,7 @@ class _PBRMixin:
                     context, result, map_names, cam_idx,
                     want_roughness=want_roughness,
                     want_metallic=want_metallic,
-                    use_delight=use_delight,
+                    use_delight=external_albedo,
                     use_lighting_albedo=use_lighting_albedo)
 
         # ── Post-Marigold emission passes ─────────────────────────────
@@ -1352,12 +1459,12 @@ class _PBRMixin:
     # ── Emission extraction methods ───────────────────────────────────
 
     def _gate_emission_residual(self, context, camera_id):
-        """Gate the IID-Lighting residual with roughness/metallic to
-        produce a cleaner emission map.
+        """Gate the IID-Lighting residual with metallic to produce a
+        cleaner emission map (see emission_from_residual).
 
-        emission = residual × (1 − metallic) × roughness_mask, then
-        threshold.  High-metallic + low-roughness regions are likely
-        specular reflections, not true emission.
+        emission = residual × (1 − metallic), then a soft threshold.
+        High-metallic regions are likely specular reflections, not true
+        emission.
         """
         scene = context.scene
         cam_maps = self._pbr_maps.get(camera_id, {})
@@ -1369,33 +1476,13 @@ class _PBRMixin:
         threshold = getattr(scene, 'pbr_emission_threshold', 0.2)
 
         try:
-            residual = np.array(Image.open(residual_path).convert('RGB')).astype(np.float32) / 255.0
-
-            # Optionally gate with metallic if available — high metallic
-            # surfaces produce strong specular that isn't true emission.
+            # Gate with metallic when available (it may differ in size when
+            # tiling/super-res settings aren't identical; it is resized).
             metal_path = cam_maps.get('metallic')
-            if metal_path and os.path.exists(metal_path):
-                metal_img = Image.open(metal_path).convert('L')
-                # Resize metallic to match residual dims (they may differ
-                # when tiling/super-res settings aren't identical).
-                res_h, res_w = residual.shape[:2]
-                if metal_img.size != (res_w, res_h):
-                    metal_img = metal_img.resize(
-                        (res_w, res_h), Image.Resampling.BILINEAR)
-                metallic = np.array(metal_img).astype(np.float32) / 255.0
-                gate = (1.0 - metallic)[:, :, np.newaxis]
-                residual = residual * gate
-
-            # Apply soft threshold — pixels below the threshold are
-            # smoothly faded out rather than hard-clipped.
-            luminance = np.mean(residual, axis=2)
-            # Smooth fade: rescale [0, threshold] → 0, [threshold, 1] → preserved
-            fade = np.clip((luminance - threshold * 0.5) / max(threshold * 0.5, 1e-6),
-                           0.0, 1.0)[:, :, np.newaxis]
-            emission = residual * fade
-
-            emission_img = Image.fromarray(
-                np.clip(emission * 255, 0, 255).astype(np.uint8), mode='RGB')
+            metal_img = (Image.open(metal_path).convert('L')
+                         if metal_path and os.path.exists(metal_path) else None)
+            emission_img = emission_from_residual(
+                Image.open(residual_path), metal_img, threshold)
             emission_path = get_file_path(
                 context, "pbr", subtype="emission",
                 camera_id=camera_id,
@@ -1420,42 +1507,8 @@ class _PBRMixin:
         threshold = getattr(scene, 'pbr_emission_threshold', 0.3)
 
         try:
-            original = np.array(Image.open(image_path).convert('RGB'))
-            rgb_f = original.astype(np.float32) / 255.0
-
-            # RGB → HSV
-            maxc = rgb_f.max(axis=2)
-            minc = rgb_f.min(axis=2)
-            delta = maxc - minc
-            saturation = np.where(maxc > 1e-6, delta / maxc, 0.0)
-            value = maxc
-
-            # Build binary mask: high saturation AND high value
-            mask = ((saturation >= sat_min) & (value >= val_min)).astype(np.float32)
-
-            # Apply bloom (Gaussian blur) to soften edges
-            if bloom_radius > 0:
-                try:
-                    import cv2
-                    ksize = int(bloom_radius * 4) | 1  # must be odd
-                    mask = cv2.GaussianBlur(mask, (ksize, ksize), bloom_radius)
-                except ImportError:
-                    # Fallback: simple box blur via PIL
-                    from PIL import ImageFilter
-                    mask_pil = Image.fromarray(
-                        (mask * 255).astype(np.uint8), mode='L')
-                    mask_pil = mask_pil.filter(
-                        ImageFilter.GaussianBlur(radius=bloom_radius))
-                    mask = np.array(mask_pil).astype(np.float32) / 255.0
-
-            # Apply threshold on the blurred mask
-            mask = np.where(mask > threshold, mask, 0.0)
-
-            # Multiply mask by original RGB to get coloured emission
-            emission = rgb_f * mask[:, :, np.newaxis]
-
-            emission_img = Image.fromarray(
-                np.clip(emission * 255, 0, 255).astype(np.uint8), mode='RGB')
+            emission_img = emission_from_hsv(
+                Image.open(image_path), sat_min, val_min, bloom_radius, threshold)
             emission_path = get_file_path(
                 context, "pbr", subtype="emission",
                 camera_id=camera_id,

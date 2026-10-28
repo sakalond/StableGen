@@ -18,12 +18,138 @@ from .state import (
 from .server_api import (
     check_pbr_available,
     check_server_availability,
+    check_skintokens_autorig_available,
     check_trellis2_available,
 )
 from ..timeout_config import get_timeout
+from ..texturing.qwen_models import QWEN_PROMPT_TEMPLATE_ITEMS
+from .architectures import DIFFUSION_ARCHITECTURES, QWEN_ARCHITECTURES
 
 
 # ── Architecture-mode helpers ──────────────────────────────────────────────
+
+_QWEN_DEFAULT_PROMPT_TEMPLATES = {
+    'qwen_image_edit': 'QWEN_EDIT_LEGACY',
+    'qwen_image_21': 'QWEN_21_DEFAULT',
+    'qwen_image_21_turbo': 'QWEN_21_DEFAULT',
+    # FIBO also edits its first image, so it shares the Qwen 2.1 image roles.
+    'fibo_edit': 'QWEN_21_DEFAULT',
+}
+_QWEN_PROMPT_FIELDS = (
+    ('qwen_custom_prompt_initial', True, None),
+    ('qwen_custom_prompt_seq_none', False, 'NONE'),
+    ('qwen_custom_prompt_seq_replace', False, 'REPLACE_STYLE'),
+    ('qwen_custom_prompt_seq_additional', False, 'ADDITIONAL'),
+)
+_qwen_prompt_sync_active = False
+
+
+def _qwen_template_prompt_values(scene, template_id):
+    """Return all editable stage prompts for one prepared template."""
+    from types import SimpleNamespace
+    from ..workflows import WorkflowManager
+
+    context = SimpleNamespace(scene=scene)
+    manager = WorkflowManager(SimpleNamespace())
+    return {
+        field: manager._get_qwen_default_prompts(
+            context,
+            is_initial_image=is_initial,
+            template_id=template_id,
+            context_mode_override=context_mode,
+        )
+        for field, is_initial, context_mode in _QWEN_PROMPT_FIELDS
+    }
+
+
+def refresh_qwen_prompt_template_fields(scene):
+    """Populate editable prompt fields from the selected prepared template."""
+    global _qwen_prompt_sync_active
+    if _qwen_prompt_sync_active:
+        return
+    if getattr(scene, 'model_architecture', '') not in QWEN_ARCHITECTURES:
+        return
+    template_id = getattr(scene, 'qwen_prompt_template', 'CUSTOM')
+    if template_id == 'CUSTOM':
+        return
+    try:
+        values = _qwen_template_prompt_values(scene, template_id)
+    except (AttributeError, ValueError):
+        return
+    _qwen_prompt_sync_active = True
+    try:
+        for field, value in values.items():
+            if getattr(scene, field) != value:
+                setattr(scene, field, value)
+    finally:
+        _qwen_prompt_sync_active = False
+
+
+def update_qwen_prompt_template(self, context):
+    """Refresh visible prompts when the user chooses a prepared template."""
+    if _qwen_prompt_sync_active:
+        return
+    refresh_qwen_prompt_template_fields(context.scene)
+    update_parameters(self, context)
+
+
+def update_qwen_prompt_field(self, context):
+    """Recognize a prepared template after any visible prompt is edited."""
+    global _qwen_prompt_sync_active
+    if _qwen_prompt_sync_active:
+        return
+    scene = context.scene
+    if getattr(scene, 'model_architecture', '') not in QWEN_ARCHITECTURES:
+        update_parameters(self, context)
+        return
+
+    current_values = {
+        field: getattr(scene, field)
+        for field, _is_initial, _context_mode in _QWEN_PROMPT_FIELDS
+    }
+    native_default = _QWEN_DEFAULT_PROMPT_TEMPLATES[scene.model_architecture]
+    candidates = [native_default]
+    candidates.extend(
+        identifier
+        for identifier, _name, _description in QWEN_PROMPT_TEMPLATE_ITEMS
+        if identifier not in {'CUSTOM', native_default}
+    )
+    matched = 'CUSTOM'
+    for template_id in candidates:
+        try:
+            if current_values == _qwen_template_prompt_values(
+                scene, template_id
+            ):
+                matched = template_id
+                break
+        except ValueError:
+            continue
+
+    if scene.qwen_prompt_template != matched:
+        _qwen_prompt_sync_active = True
+        try:
+            scene.qwen_prompt_template = matched
+        finally:
+            _qwen_prompt_sync_active = False
+    update_parameters(self, context)
+
+
+def update_qwen_prompt_dependencies(self, context):
+    """Refresh prepared prompts after settings that change their image roles."""
+    refresh_qwen_prompt_template_fields(context.scene)
+    update_parameters(self, context)
+
+
+def _sync_default_qwen_prompt_template(scene, architecture):
+    """Follow architecture changes only while a native default is selected."""
+    target = _QWEN_DEFAULT_PROMPT_TEMPLATES.get(architecture)
+    if not target or not hasattr(scene, 'qwen_prompt_template'):
+        return
+    current = scene.qwen_prompt_template
+    if current in {
+        '', 'STABLEGEN_DEFAULT', 'QWEN_EDIT_LEGACY', 'QWEN_21_DEFAULT'
+    } and current != target:
+        scene.qwen_prompt_template = target
 
 def update_architecture_mode(self, context):
     """Called when the user changes the architecture_mode dropdown."""
@@ -42,7 +168,7 @@ def update_architecture_mode(self, context):
 def _sync_trellis2_backbone(scene):
     """Pick the right diffusion backbone for the current TRELLIS.2 state."""
     tex_mode = getattr(scene, 'trellis2_texture_mode', 'native')
-    if tex_mode in ('sdxl', 'flux1', 'qwen_image_edit', 'flux2_klein'):
+    if tex_mode in DIFFUSION_ARCHITECTURES:
         target = tex_mode
     elif getattr(scene, 'trellis2_generate_from', 'image') == 'prompt':
         target = getattr(scene, 'trellis2_initial_image_arch', 'sdxl')
@@ -86,12 +212,31 @@ def update_trellis2_generate_from(self, context):
     update_parameters(self, context)
 
 
+def update_pbr_albedo_source(self, context):
+    """Set the saturation correction to suit the chosen albedo source.
+
+    Marigold IID-Appearance desaturates and needs the correction; Marigold V2
+    already keeps the generated colors, so the correction would only dull it.
+    """
+    source = context.scene.pbr_albedo_source
+    if source == 'marigold_v2':
+        context.scene.pbr_albedo_auto_saturation = False
+    elif source == 'marigold':
+        context.scene.pbr_albedo_auto_saturation = True
+    update_parameters(self, context)
+
+
 # ── Server-address change callback ────────────────────────────────────────
 
 def update_combined(self, context):
     """Master callback for server_address changes — pings server, refreshes models."""
     # Import lazily to avoid circular ref at module level
     from .load_handlers import load_handler
+
+    _sync_default_qwen_prompt_template(
+        context.scene, context.scene.model_architecture
+    )
+    refresh_qwen_prompt_template_fields(context.scene)
 
     prefs = context.preferences.addons[ADDON_PKG].preferences
     raw_address = prefs.server_address
@@ -112,10 +257,9 @@ def update_combined(self, context):
 
     if not server_address:
         prefs.server_online = False
-        # Must mutate the lists in-place to keep existing references valid
-        import stablegen.core.state as _state
-        _state._cached_checkpoint_list = [("NO_SERVER", "Set Server Address", "...")]
-        _state._cached_lora_list = [("NO_SERVER", "Set Server Address", "...")]
+        from . import state as _state
+        _state._cached_checkpoint_list = [_state.no_server_item("")]
+        _state._cached_lora_list = [_state.no_server_item("")]
         return None
 
     print("[StableGen] Server address changed, checking asynchronously...")
@@ -126,9 +270,11 @@ def update_combined(self, context):
         if result['online']:
             result['trellis2'] = check_trellis2_available(server_address, timeout=get_timeout('api'))
             result['pbr'] = check_pbr_available(server_address, timeout=get_timeout('api'))
+            result['skintokens'] = check_skintokens_autorig_available(server_address, timeout=get_timeout('api'))
         else:
             result['trellis2'] = False
             result['pbr'] = False
+            result['skintokens'] = False
         return result
 
     def _on_done(result):
@@ -140,9 +286,12 @@ def update_combined(self, context):
         if hasattr(bpy.context, 'scene') and bpy.context.scene:
             bpy.context.scene.trellis2_available = result.get('trellis2', False)
             bpy.context.scene.pbr_nodes_available = result.get('pbr', False)
+            bpy.context.scene.skintokens_autorig_available = result.get('skintokens', False)
 
         if not result.get('online', False):
             print("[StableGen] ComfyUI server is not reachable.")
+            from . import state as _state
+            _state.show_offline_lists(server_address)
             return
 
         update_parameters(None, bpy.context)
@@ -309,4 +458,3 @@ def update_palette_color(self, context):
 
 def update_print_dithered(self, context):
     check_print_preset_match(self.id_data)
-

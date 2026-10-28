@@ -11,6 +11,7 @@ import bpy  # pylint: disable=import-error
 from bpy.app.handlers import persistent
 
 from . import ADDON_PKG
+from .architectures import QWEN_ARCHITECTURES
 
 
 @persistent
@@ -24,6 +25,81 @@ def load_handler(dummy):
         return
 
     scene = bpy.context.scene
+
+    # Builds saved while Qwen-Image 2.1 shared the Qwen-Image-Edit enum need a
+    # one-time architecture migration.  The filename is used only here for
+    # compatibility; new generations dispatch exclusively by architecture.
+    from ..texturing.qwen_models import (
+        is_qwen_image_21_model, is_qwen_image_21_turbo_model,
+    )
+    saved_model_name = (
+        getattr(scene, "sg_model_name_backup", "")
+        or getattr(scene, "model_name", "")
+    )
+    if not getattr(scene, "sg_qwen_21_architecture_migrated", False):
+        if (getattr(scene, "model_architecture", "") == 'qwen_image_edit'
+                and is_qwen_image_21_model(saved_model_name)):
+            target = ('qwen_image_21_turbo'
+                      if is_qwen_image_21_turbo_model(saved_model_name)
+                      else 'qwen_image_21')
+            scene.model_architecture = target
+            if getattr(scene, "architecture_mode", "") == 'qwen_image_edit':
+                scene.architecture_mode = target
+            elif getattr(scene, "architecture_mode", "") == 'trellis2':
+                if getattr(scene, "trellis2_texture_mode", "") == 'qwen_image_edit':
+                    scene.trellis2_texture_mode = target
+                if getattr(scene, "trellis2_initial_image_arch", "") == 'qwen_image_edit':
+                    scene.trellis2_initial_image_arch = target
+            print("[StableGen] Migrated saved Qwen-Image 2.1 model to its dedicated architecture.")
+        scene.sg_qwen_21_architecture_migrated = True
+
+    # The old Qwen UI stored custom/default as a boolean.  Preserve that
+    # choice once when opening an existing file, then let the enum be the
+    # single source of truth for both Qwen architectures.  Klein continues to
+    # use the legacy boolean and is intentionally excluded.
+    for loaded_scene in bpy.data.scenes:
+        if getattr(loaded_scene, "sg_qwen_prompt_template_migrated", False):
+            continue
+        template_was_saved = loaded_scene.is_property_set(
+            "qwen_prompt_template"
+        )
+        architecture = getattr(loaded_scene, "model_architecture", "")
+        current_template = getattr(
+            loaded_scene, "qwen_prompt_template", ""
+        )
+        if architecture in QWEN_ARCHITECTURES:
+            valid_templates = {
+                'QWEN_EDIT_LEGACY', 'QWEN_21_DEFAULT', 'CANVAS_EDIT',
+                'REFERENCE_RECONSTRUCTION', 'CONCISE_TRANSFER',
+                'RESULT_DESCRIPTION', 'CANVAS_AUTHORITY', 'MINIMAL_EDIT',
+                'CUSTOM',
+            }
+            needs_legacy_migration = (
+                not template_was_saved or current_template not in valid_templates
+            )
+            if (needs_legacy_migration
+                    and getattr(
+                        loaded_scene, "qwen_use_custom_prompts", False
+                    )):
+                loaded_scene.qwen_prompt_template = 'CUSTOM'
+            elif needs_legacy_migration:
+                loaded_scene.qwen_prompt_template = (
+                    'QWEN_EDIT_LEGACY'
+                    if architecture == 'qwen_image_edit'
+                    else 'QWEN_21_DEFAULT'
+                )
+        loaded_scene.sg_qwen_prompt_template_migrated = True
+
+    # Modal operators and worker sockets cannot survive loading a .blend.
+    # Older files may nevertheless contain the serialized transient value
+    # "running" or "waiting", which leaves the Generate button permanently
+    # stuck after reopening. Runtime status is SKIP_SAVE now, but normalize
+    # legacy files as well.
+    for loaded_scene in bpy.data.scenes:
+        if getattr(loaded_scene, "generation_status", 'idle') != 'idle':
+            loaded_scene.generation_status = 'idle'
+        if hasattr(loaded_scene, "generation_progress"):
+            loaded_scene.generation_progress = 0.0
 
     # Pre-populate multi-color printing palette
     try:
@@ -128,7 +204,11 @@ def load_handler(dummy):
     if prefs_wrapper:
         server_address = prefs_wrapper.preferences.server_address
         if server_address:
-            from .server_api import check_trellis2_available, check_pbr_available
+            from .server_api import (
+                check_pbr_available,
+                check_skintokens_autorig_available,
+                check_trellis2_available,
+            )
             from ..timeout_config import get_timeout
 
             _timeout = get_timeout('api')
@@ -137,6 +217,7 @@ def load_handler(dummy):
                 result = {}
                 result['trellis2'] = check_trellis2_available(server_address, timeout=_timeout)
                 result['pbr'] = check_pbr_available(server_address, timeout=_timeout)
+                result['skintokens'] = check_skintokens_autorig_available(server_address, timeout=_timeout)
                 return result
 
             def _apply_node_result(result):
@@ -145,5 +226,6 @@ def load_handler(dummy):
                 if hasattr(bpy.context, 'scene') and bpy.context.scene:
                     bpy.context.scene.trellis2_available = result.get('trellis2', False)
                     bpy.context.scene.pbr_nodes_available = result.get('pbr', False)
+                    bpy.context.scene.skintokens_autorig_available = result.get('skintokens', False)
 
             _state._run_async(_check_nodes, _apply_node_result)

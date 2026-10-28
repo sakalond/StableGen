@@ -5,10 +5,14 @@ shader raycast(
     float threshold = 1,
     float CameraAspect = 1.77778, // width/height ratio (e.g., 16:9)
     float CameraFOV = 1.0,        // horizontal FOV in radians
+    float CameraShiftX = 0.0,
+    float CameraShiftY = 0.0,
     vector CameraDir = vector(0,0,-1), // Camera look direction in world space
     vector CameraUp = vector(0,1,0),   // Camera up vector in world space
     float AngleThreshold = 90.0,  // Maximum angle in degrees between ray and normal
     float Power = 4.0,            // Exponent for weight falloff (higher = sharper)
+    float AllowBackface = 0.0,    // Non-zero preserves legacy two-sided projection
+    float RayEpsilon = 0.001,     // Scene-scale occlusion tolerance
     output float Result = 0
 )
 {
@@ -38,6 +42,8 @@ shader raycast(
     // Project the ray direction onto the film plane.
     float x_proj = cam_x / -cam_z;
     float y_proj = cam_y / -cam_z;
+    x_proj -= 2.0 * CameraShiftX * filmw;
+    y_proj -= 2.0 * CameraShiftY * filmh;
     
     // If the projected point falls outside the film bounds, exit.
     if (abs(x_proj) > filmw || abs(y_proj) > filmh) {
@@ -50,11 +56,16 @@ shader raycast(
     if (trace(Origin, d))
     {
         getmessage("trace", "hitdist", Distance);
-        if ((Distance + 0.001) < threshold)
+        if ((Distance + RayEpsilon) < threshold)
             Result = 0;
         else {
             float dot_val = dot(d, normalize(SurfaceNormal));
-            float orthogonality = abs(clamp(dot_val, -1.0, 1.0));
+            float clamped_dot = clamp(dot_val, -1.0, 1.0);
+            // Direction is camera -> surface, so front-facing outward normals
+            // have a negative dot product.
+            float orthogonality = AllowBackface != 0.0
+                ? abs(clamped_dot)
+                : max(-clamped_dot, 0.0);
             float angle = acos(orthogonality) * 180.0 / M_PI;
             if (angle > AngleThreshold) {
                 Result = 0;

@@ -1,0 +1,91 @@
+"""Blender-independent helpers for preserving submitted ComfyUI workflows."""
+
+from __future__ import annotations
+
+import json
+import os
+from pathlib import Path
+import re
+from typing import Mapping
+
+try:
+    from .comfy_workflow_export import qwen_image_21_ui_workflow
+except ImportError:  # Standalone unit-test import without loading Blender package.
+    import importlib.util
+    _converter_path = Path(__file__).with_name("comfy_workflow_export.py")
+    _converter_spec = importlib.util.spec_from_file_location(
+        "stablegen_comfy_workflow_export", _converter_path
+    )
+    _converter_module = importlib.util.module_from_spec(_converter_spec)
+    assert _converter_spec.loader is not None
+    _converter_spec.loader.exec_module(_converter_module)
+    qwen_image_21_ui_workflow = _converter_module.qwen_image_21_ui_workflow
+
+
+_UNSAFE_FILENAME_CHARS = re.compile(r"[^A-Za-z0-9._-]+")
+
+
+def _safe_filename_component(value: object, fallback: str) -> str:
+    text = _UNSAFE_FILENAME_CHARS.sub("_", str(value or "").strip())
+    text = text.strip("._-")
+    return text or fallback
+
+
+def _write_json_atomic(path: Path, prompt: Mapping) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f".{path.name}.tmp")
+    with temporary.open("w", encoding="utf-8", newline="\n") as handle:
+        json.dump(prompt, handle, indent=2, ensure_ascii=False)
+        handle.write("\n")
+    os.replace(temporary, path)
+
+
+def archive_prompt(
+    prompt: Mapping,
+    output_dir: str | os.PathLike,
+    *,
+    workflow: str = "workflow",
+    view_index: int | None = None,
+    camera_name: str | None = None,
+) -> tuple[Path, Path]:
+    """Save the latest prompt plus a non-overwriting per-submission copy.
+
+    ``prompt.json`` remains a compatibility/convenience alias for the latest
+    graph. Every call also creates a JSON file under ``prompts/``. Repeated
+    submissions for the same view receive a numeric suffix.
+    """
+    output_path = Path(output_dir)
+    editable_workflow = qwen_image_21_ui_workflow(prompt)
+    latest_path = output_path / "prompt.json"
+    archive_dir = output_path / "prompts"
+
+    workflow_part = _safe_filename_component(workflow, "workflow")
+    stem_parts = []
+    if view_index is not None:
+        stem_parts.append(f"view_{int(view_index):03d}")
+    else:
+        stem_parts.append("submission")
+    if camera_name:
+        stem_parts.append(_safe_filename_component(camera_name, "camera"))
+    stem_parts.append(workflow_part)
+    stem = "_".join(stem_parts)
+
+    archive_path = archive_dir / f"{stem}.json"
+    suffix = 2
+    while archive_path.exists():
+        archive_path = archive_dir / f"{stem}_{suffix:02d}.json"
+        suffix += 1
+
+    if editable_workflow is None:
+        _write_json_atomic(latest_path, prompt)
+        _write_json_atomic(archive_path, prompt)
+    else:
+        # ``prompt.json`` remains the file users can drag into ComfyUI. Keep
+        # the exact backend graph beside it for API/debug use.
+        api_latest_path = output_path / "prompt_api.json"
+        api_archive_path = archive_dir / f"{archive_path.stem}_api.json"
+        _write_json_atomic(latest_path, editable_workflow)
+        _write_json_atomic(archive_path, editable_workflow)
+        _write_json_atomic(api_latest_path, prompt)
+        _write_json_atomic(api_archive_path, prompt)
+    return latest_path, archive_path

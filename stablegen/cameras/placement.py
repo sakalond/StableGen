@@ -27,6 +27,27 @@ from .overlays import (
     _sg_restore_label_overlay, _setup_square_camera_display,
 )
 
+# Share of the gap between a camera and its subject that the camera's viewport
+# pyramid (and the generated image drawn at its base) may fill.
+_DISPLAY_GAP_FRACTION = 0.45
+
+
+def fit_display_size(cam_obj, verts_world, scene):
+    """Shrink a camera's viewport display so it stops short of the subject.
+
+    Fitted cameras can sit closer than Blender's 1 m default display, as top and
+    bottom views of a tall character do; their pyramid then reaches into the mesh.
+    Never enlarges the display.
+    """
+    data = cam_obj.data
+    basis = cam_obj.matrix_basis
+    forward = np.array(basis.to_3x3() @ mathutils.Vector((0.0, 0.0, -1.0)))
+    gap = float(np.min((verts_world - np.array(basis.translation)) @ forward))
+    depth = abs(data.view_frame(scene=scene)[0].z) / max(data.display_size, 1e-6)
+    if gap <= 0 or depth <= 0:
+        return
+    data.display_size = max(0.05, min(data.display_size, _DISPLAY_GAP_FRACTION * gap / depth))
+
 class AddCameras(bpy.types.Operator):
     """Add cameras using various placement strategies and adjust their positions
     
@@ -761,6 +782,9 @@ class AddCameras(bpy.types.Operator):
         if temp_cam_data:
             bpy.data.cameras.remove(temp_cam_data)
 
+        for cam_obj in self._cameras:
+            fit_display_size(cam_obj, verts_world, context.scene)
+
         if self.auto_prompts and self._cameras:
             ref_front = (ref_dir if ref_dir is not None
                          else np.array([0.0, 1.0, 0.0]))
@@ -1354,7 +1378,7 @@ class AddCameras(bpy.types.Operator):
         return True
 
     def invoke(self, context, event):
-        return context.window_manager.invoke_props_dialog(self)
+        return context.window_manager.invoke_props_dialog(self, width=480)
 
 
     

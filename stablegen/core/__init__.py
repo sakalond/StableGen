@@ -15,3 +15,9 @@ def get_addon_prefs(context=None):
     ctx = context or bpy.context
     wrapper = ctx.preferences.addons.get(ADDON_PKG)
     return wrapper.preferences if wrapper else None
+
+
+def legacy_panel_enabled(context=None):
+    """Whether the sidebar shows the legacy panel instead of the new one."""
+    prefs = get_addon_prefs(context)
+    return bool(prefs and prefs.use_legacy_panel)

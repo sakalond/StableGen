@@ -4,15 +4,19 @@ from datetime import datetime
 
 # ── Heavy modal operators that should block most other panel buttons ──
 _SG_BLOCKED_MODALS = frozenset({
+    'STABLEGEN_OT_masked_edit',
+    'STABLEGEN_OT_texturing_regression',
     'OBJECT_OT_test_stable',
     'OBJECT_OT_bake_textures',
     'OBJECT_OT_add_cameras',
     'OBJECT_OT_collect_camera_prompts',
     'OBJECT_OT_trellis2_generate',
+    'OBJECT_OT_stablegen_autorig_selected_mesh',
     'OBJECT_OT_stablegen_reproject',
     'OBJECT_OT_stablegen_regenerate',
     'OBJECT_OT_stablegen_mirror_reproject',
     'OBJECT_OT_export_orbit_gif',
+    'STABLEGEN_OT_interactive_discard_check',
 })
 
 # Temporary bypass flag – set True to allow internal operator calls
@@ -26,7 +30,7 @@ def sg_modal_active(context):
         return False
     for window in context.window_manager.windows:
         for op in window.modal_operators:
-            if op.bl_idname in _SG_BLOCKED_MODALS:
+            if getattr(op, 'bl_idname', None) in _SG_BLOCKED_MODALS:
                 return True
     return False
 
@@ -233,25 +237,32 @@ class CurvesToMesh(bpy.types.Operator):
 		return {'FINISHED'}
 	
 def get_last_material_index(obj):
-	"""     
-	Get the index of the last material of the object. 
-	The index is hidden inside default value of (the only) subtract node.
-	If there are no subtract nodes, return -1. 
-	:param obj: Blender object.     
-	:return: Index of the last material.     
-	"""
- 
+	"""Read projection IDs, never infer them from active shader arithmetic."""
 	highest_index = -1
- 
-	if obj.data.materials:
-		for mat in obj.data.materials:
-			if mat and mat.use_nodes:
-				for node in mat.node_tree.nodes:
-					if node.type == 'MATH' and node.operation == 'SUBTRACT':
-						if node.inputs[0].default_value > highest_index:
-							highest_index = node.inputs[0].default_value
-
-	return int(highest_index)
+	for mat in getattr(obj.data, 'materials', ()):
+		if not mat or not mat.use_nodes:
+			continue
+		indices = []
+		legacy = []
+		for node in mat.node_tree.nodes:
+			if node.type == 'TEX_IMAGE':
+				# Existing .blend files label projected images camera-material.
+				parts = node.label.split('-')
+				if len(parts) == 2 and all(part.isdigit() for part in parts):
+					indices.append(int(parts[1]))
+			if node.type == 'MATH' and node.operation == 'SUBTRACT':
+				value = float(node.inputs[0].default_value)
+				if value < 0 or not value.is_integer():
+					continue
+				if node.label == 'SGMaterialIndex' and not node.inputs[0].is_linked:
+					indices.append(int(value))
+				elif (not node.label and not any(socket.is_linked for socket in node.inputs)
+				      and not any(socket.is_linked for socket in node.outputs)):
+					# Old versions stored the ID in an unlabeled, detached node.
+					legacy.append(int(value))
+		if indices or legacy:
+			highest_index = max(highest_index, max(indices or legacy))
+	return highest_index
 
 def get_generation_dirs(context):
 	"""
@@ -274,6 +285,21 @@ def get_generation_dirs(context):
 	
 	# Define directory structure
 	revision_dir = os.path.join(base_dir, scene_name, timestamp)
+	# Debug regression passes have isolated output paths without changing preferences.
+	regression_output = context.scene.get('_sg_regression_output')
+	if regression_output:
+		revision_dir = regression_output
+	masked_output = context.scene.get('_sg_masked_output')
+	if masked_output:
+		revision_dir = masked_output
+	# Interactive inspection follows the run referenced by the material, which
+	# can differ from the current .blend name after Save As. Removed on exit.
+	discard_output = context.scene.get('_sg_discard_output')
+	if discard_output:
+		revision_dir = discard_output
+	debug_output = context.scene.get('_sg_debug_output')
+	if debug_output:
+		revision_dir = debug_output
  
 	return {
 		"revision": revision_dir,
@@ -472,6 +498,14 @@ def get_compositor_node_tree(scene):
 	if hasattr(scene, 'node_tree'):
 		return scene.node_tree
 	return None
+
+
+def new_compositor_math(nodes, operation):
+	"""Add a Math node to a compositor tree. Blender 4.x has its own CompositorNodeMath (4.2-4.4 accept
+	no other); Blender 5 removed it in favour of the shared ShaderNodeMath."""
+	node = nodes.new('CompositorNodeMath' if hasattr(bpy.types, 'CompositorNodeMath') else 'ShaderNodeMath')
+	node.operation = operation
+	return node
 
 
 def configure_output_node_paths(node, directory, filename):

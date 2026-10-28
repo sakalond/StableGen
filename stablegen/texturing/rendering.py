@@ -2,14 +2,327 @@
 
 import os
 import math
+from contextlib import contextmanager
 import bpy, bmesh  # pylint: disable=import-error
 import numpy as np
 import mathutils
 from ..utils import get_file_path, get_dir_path, get_compositor_node_tree, configure_output_node_paths, get_eevee_engine_id, sg_modal_active, remove_empty_dirs
+from ..mesh_gen.rig_display import configure_gltf_not_exported_visibility
+from .pose_lock import ensure_texturing_frame
+from .jobs import operation, RenderRequest
 from PIL import Image
 import cv2
+from ..core.architectures import QWEN_ARCHITECTURES
 
 _ADDON_PKG = __package__.rsplit('.', 1)[0]
+
+
+@contextmanager
+def _legacy_render_dither(scene):
+    """Use Blender's legacy output dithering without mutating the scene."""
+    original = scene.render.dither_intensity
+    scene.render.dither_intensity = 1.0
+    try:
+        yield
+    finally:
+        scene.render.dither_intensity = original
+
+
+def _prepare_compositor_render(scene, node_tree):
+    """Isolate one render from stale compositor File Output nodes.
+
+    The legacy path cleared the compositor before every export. Transactional
+    mode preserves the user's graph instead, so its existing output nodes are
+    muted for the render and all nodes created by the export are removed by
+    ``_finish_compositor_render``.
+    """
+    nodes = node_tree.nodes
+    state = {
+        "pointers": {node.as_pointer() for node in nodes},
+        "muted_outputs": [],
+    }
+    for node in nodes:
+        if node.bl_idname == 'CompositorNodeOutputFile' and hasattr(node, 'mute'):
+            state["muted_outputs"].append((node, bool(node.mute)))
+            node.mute = True
+    return state
+
+
+def _finish_compositor_render(node_tree, state):
+    if state is None:
+        return
+    for node in list(node_tree.nodes):
+        if node.as_pointer() not in state["pointers"]:
+            node_tree.nodes.remove(node)
+    for node, was_muted in state["muted_outputs"]:
+        try:
+            if node.id_data is not None:
+                node.mute = was_muted
+        except ReferenceError:
+            pass
+
+
+def _snapshot_material_state(obj):
+    """Capture exact slot order, active slot, and per-polygon assignments."""
+    return {
+        "materials": list(obj.data.materials),
+        "active_index": int(obj.active_material_index),
+        "polygon_indices": [polygon.material_index for polygon in obj.data.polygons],
+    }
+
+
+def _restore_material_state(obj, state):
+    """Restore a material snapshot without active-first slot reordering."""
+    obj.data.materials.clear()
+    for material in state["materials"]:
+        obj.data.materials.append(material)
+    if obj.data.materials:
+        obj.active_material_index = min(
+            state["active_index"], len(obj.data.materials) - 1
+        )
+    polygon_indices = state["polygon_indices"]
+    if len(polygon_indices) == len(obj.data.polygons):
+        max_index = max(len(obj.data.materials) - 1, 0)
+        for polygon, material_index in zip(obj.data.polygons, polygon_indices):
+            polygon.material_index = min(material_index, max_index)
+    else:
+        print(
+            f"[StableGen] Warning: polygon count changed while exporting '{obj.name}'; "
+            "material slots were restored but polygon indices could not be."
+        )
+
+
+class _RenderStateTransaction:
+    """Restore temporary render mutations even when an export raises."""
+
+    _PASS_NAMES = (
+        "use_pass_combined",
+        "use_pass_diffuse_color",
+        "use_pass_diffuse_direct",
+        "use_pass_diffuse_indirect",
+        "use_pass_ambient_occlusion",
+        "use_pass_shadow",
+        "use_pass_emit",
+        "use_pass_environment",
+        "use_pass_z",
+        "use_pass_normal",
+        "use_pass_object_index",
+        "use_pass_material_index",
+    )
+
+    def __init__(self, context, objects=()):
+        self.context = context
+        self.scene = context.scene
+        self.objects = [obj for obj in objects if obj and obj.type == 'MESH']
+
+    def __enter__(self):
+        scene = self.scene
+        render = scene.render
+        self.material_states = {
+            obj: _snapshot_material_state(obj) for obj in self.objects
+        }
+        self.object_pass_indices = {
+            obj: int(obj.pass_index) for obj in scene.objects
+            if hasattr(obj, 'pass_index')
+        }
+        self.material_pass_indices = {
+            material: int(material.pass_index) for material in bpy.data.materials
+            if hasattr(material, 'pass_index')
+        }
+        self.material_ptrs = {material.as_pointer() for material in bpy.data.materials}
+        self.world_ptrs = {world.as_pointer() for world in bpy.data.worlds}
+        self.hide_render_state = {
+            obj: bool(obj.hide_render) for obj in scene.objects
+        }
+        self.world = scene.world
+        self.world_state = None
+        if self.world:
+            backgrounds = []
+            if self.world.node_tree:
+                for node in self.world.node_tree.nodes:
+                    if node.type == 'BACKGROUND':
+                        backgrounds.append((
+                            node,
+                            tuple(node.inputs["Color"].default_value),
+                            node.inputs["Strength"].default_value,
+                        ))
+            self.world_state = (
+                self.world.use_nodes,
+                tuple(self.world.color),
+                backgrounds,
+            )
+        self.scene_state = {
+            "frame": scene.frame_current,
+            "camera": scene.camera,
+            "engine": render.engine,
+            "film_transparent": render.film_transparent,
+            "use_compositing": render.use_compositing,
+            "filepath": render.filepath,
+            "resolution_x": render.resolution_x,
+            "resolution_y": render.resolution_y,
+            "resolution_percentage": render.resolution_percentage,
+            "dither_intensity": render.dither_intensity,
+            "image_file_format": render.image_settings.file_format,
+            "scene_use_nodes": scene.use_nodes,
+            "display_device": scene.display_settings.display_device,
+            "view_transform": scene.view_settings.view_transform,
+            "look": scene.view_settings.look,
+            "exposure": scene.view_settings.exposure,
+            "gamma": scene.view_settings.gamma,
+            "cycles_samples": getattr(scene.cycles, "samples", None),
+            "cycles_use_denoising": getattr(scene.cycles, "use_denoising", None),
+            "cycles_device": getattr(scene.cycles, "device", None),
+            "cycles_shading_system": getattr(scene.cycles, "shading_system", None),
+            "cycles_use_osl": getattr(scene.cycles, "use_osl", None),
+            "material_override": getattr(self.context.view_layer, "material_override", None),
+            "shading_light": scene.display.shading.light,
+            "shading_color_type": scene.display.shading.color_type,
+            "shading_background_type": scene.display.shading.background_type,
+            "shading_background_color": tuple(
+                scene.display.shading.background_color
+            ),
+        }
+        self.pass_state = {
+            name: getattr(self.context.view_layer, name)
+            for name in self._PASS_NAMES
+            if hasattr(self.context.view_layer, name)
+        }
+        node_tree = (
+            getattr(scene, "compositing_node_group", None)
+            if hasattr(scene, "compositing_node_group")
+            else getattr(scene, "node_tree", None)
+        )
+        self.compositor_tree = node_tree
+        self.compositor_ptrs = (
+            {node.as_pointer() for node in node_tree.nodes} if node_tree else set()
+        )
+        self.compositor_mutes = (
+            {node.as_pointer(): bool(node.mute) for node in node_tree.nodes}
+            if node_tree else {}
+        )
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        scene = self.scene
+        state = self.scene_state
+        restored_meshes = set()
+        for obj, material_state in self.material_states.items():
+            if obj.name in bpy.data.objects:
+                mesh_pointer = obj.data.as_pointer()
+                if mesh_pointer not in restored_meshes:
+                    _restore_material_state(obj, material_state)
+                    restored_meshes.add(mesh_pointer)
+        # Clearing slots on shared mesh data clamps every user's active index;
+        # restore per-object active slots only after all shared data is final.
+        for obj, material_state in self.material_states.items():
+            if obj.name in bpy.data.objects and obj.data.materials:
+                obj.active_material_index = min(
+                    material_state["active_index"], len(obj.data.materials) - 1
+                )
+
+        for obj, hidden in self.hide_render_state.items():
+            if obj.name in bpy.data.objects:
+                obj.hide_render = hidden
+        for obj, pass_index in self.object_pass_indices.items():
+            if obj.name in bpy.data.objects:
+                obj.pass_index = pass_index
+        for material, pass_index in self.material_pass_indices.items():
+            if material.name in bpy.data.materials:
+                material.pass_index = pass_index
+
+        compositor_tree = (
+            getattr(scene, "compositing_node_group", None)
+            if hasattr(scene, "compositing_node_group")
+            else getattr(scene, "node_tree", None)
+        )
+        if compositor_tree:
+            for node in list(compositor_tree.nodes):
+                if node.as_pointer() not in self.compositor_ptrs:
+                    compositor_tree.nodes.remove(node)
+                else:
+                    # Setup can fail before the export enters its render
+                    # finally block; restore outputs muted during preparation.
+                    node.mute = self.compositor_mutes[node.as_pointer()]
+
+        scene.world = self.world
+        if self.world and self.world_state:
+            use_nodes, color, backgrounds = self.world_state
+            self.world.use_nodes = use_nodes
+            self.world.color = color
+            for node, bg_color, strength in backgrounds:
+                if node.id_data:
+                    node.inputs["Color"].default_value = bg_color
+                    node.inputs["Strength"].default_value = strength
+
+        scene.camera = state["camera"]
+        if scene.render.engine != state["engine"]:
+            scene.render.engine = state["engine"]
+        scene.render.film_transparent = state["film_transparent"]
+        scene.render.use_compositing = state["use_compositing"]
+        scene.render.filepath = state["filepath"]
+        scene.render.resolution_x = state["resolution_x"]
+        scene.render.resolution_y = state["resolution_y"]
+        scene.render.resolution_percentage = state["resolution_percentage"]
+        scene.render.dither_intensity = state["dither_intensity"]
+        scene.render.image_settings.file_format = state["image_file_format"]
+        scene.use_nodes = state["scene_use_nodes"]
+        scene.display_settings.display_device = state["display_device"]
+        scene.view_settings.view_transform = state["view_transform"]
+        scene.view_settings.look = state["look"]
+        scene.view_settings.exposure = state["exposure"]
+        scene.view_settings.gamma = state["gamma"]
+        if state["cycles_samples"] is not None:
+            scene.cycles.samples = state["cycles_samples"]
+        if state["cycles_use_denoising"] is not None:
+            scene.cycles.use_denoising = state["cycles_use_denoising"]
+        if state["cycles_device"] is not None:
+            scene.cycles.device = state["cycles_device"]
+        if state["cycles_shading_system"] is not None:
+            scene.cycles.shading_system = state["cycles_shading_system"]
+        if state["cycles_use_osl"] is not None:
+            scene.cycles.use_osl = state["cycles_use_osl"]
+        if hasattr(self.context.view_layer, "material_override"):
+            self.context.view_layer.material_override = state["material_override"]
+        scene.display.shading.light = state["shading_light"]
+        scene.display.shading.color_type = state["shading_color_type"]
+        scene.display.shading.background_type = state["shading_background_type"]
+        scene.display.shading.background_color = state["shading_background_color"]
+        for name, value in self.pass_state.items():
+            setattr(self.context.view_layer, name, value)
+        scene.frame_set(state["frame"])
+
+        for material in list(bpy.data.materials):
+            if material.as_pointer() not in self.material_ptrs and material.users == 0:
+                bpy.data.materials.remove(material)
+        for world in list(bpy.data.worlds):
+            if world.as_pointer() not in self.world_ptrs and world.users == 0:
+                bpy.data.worlds.remove(world)
+        return False
+
+
+@contextmanager
+def _temporary_render_copies(context, objects):
+    """Yield isolated mesh copies without touching production material slots."""
+    originals = [obj for obj in objects if obj and obj.type == 'MESH']
+    copies = []
+    mapping = {}
+    try:
+        for original in originals:
+            duplicate = original.copy()
+            duplicate.data = original.data.copy()
+            duplicate.name = f"_SG_RenderCopy_{original.name}"
+            context.scene.collection.objects.link(duplicate)
+            original.hide_render = True
+            duplicate.hide_render = False
+            copies.append(duplicate)
+            mapping[original] = duplicate
+        yield copies, mapping
+    finally:
+        for duplicate in copies:
+            mesh = duplicate.data
+            bpy.data.objects.remove(duplicate, do_unlink=True)
+            if mesh and mesh.users == 0:
+                bpy.data.meshes.remove(mesh)
 
 
 def purge_orphans():
@@ -130,7 +443,7 @@ def create_edge_feathered_mask(mask_path, feather_width=30):
     return output_path
 
 
-def render_edge_feather_mask(context, to_export, camera, camera_index, feather_width=30, softness=1.0):
+def _render_edge_feather_mask_impl(context, to_export, camera, camera_index, feather_width=30, softness=1.0):
     """Render a geometry silhouette from *camera* and apply distance-transform
     edge feathering.
 
@@ -174,25 +487,15 @@ def render_edge_feather_mask(context, to_export, camera, camera_index, feather_w
     context.scene.camera = camera
 
     # ── Replace target-object materials with white Emission ─────────────────
-    saved_materials = {}
-    saved_active_materials = {}
-    temp_materials = []
-    for obj in to_export:
-        saved_materials[obj] = list(obj.data.materials)
-        saved_active_materials[obj] = obj.active_material
-
-        mat = bpy.data.materials.new(name="_SG_EdgeFeather_Temp")
-        mat.use_nodes = True
-        mat.node_tree.nodes.clear()
-        emission = mat.node_tree.nodes.new("ShaderNodeEmission")
-        emission.inputs["Color"].default_value = (1.0, 1.0, 1.0, 1.0)
-        emission.inputs["Strength"].default_value = 1.0
-        out_node = mat.node_tree.nodes.new("ShaderNodeOutputMaterial")
-        mat.node_tree.links.new(emission.outputs[0], out_node.inputs["Surface"])
-
-        obj.data.materials.clear()
-        obj.data.materials.append(mat)
-        temp_materials.append(mat)
+    mat = bpy.data.materials.new(name="_SG_EdgeFeather_Temp")
+    mat.use_nodes = True
+    mat.node_tree.nodes.clear()
+    emission = mat.node_tree.nodes.new("ShaderNodeEmission")
+    emission.inputs["Color"].default_value = (1.0, 1.0, 1.0, 1.0)
+    emission.inputs["Strength"].default_value = 1.0
+    out_node = mat.node_tree.nodes.new("ShaderNodeOutputMaterial")
+    mat.node_tree.links.new(emission.outputs[0], out_node.inputs["Surface"])
+    context.view_layer.material_override = mat
 
     # ── Hide non-target mesh objects ────────────────────────────────────────
     hidden_restore = {}
@@ -232,8 +535,7 @@ def render_edge_feather_mask(context, to_export, camera, camera_index, feather_w
     node_tree = get_compositor_node_tree(context.scene)
     comp_nodes = node_tree.nodes
     comp_links = node_tree.links
-    comp_nodes.clear()
-
+    compositor_state = _prepare_compositor_render(context.scene, node_tree)
     render_layers = comp_nodes.new('CompositorNodeRLayers')
     try:
         mix_node = comp_nodes.new('CompositorNodeMixRGB')
@@ -253,23 +555,14 @@ def render_edge_feather_mask(context, to_export, camera, camera_index, feather_w
     comp_links.new(mix_node.outputs[0], output_node.inputs[0])
 
     # ── Render ──────────────────────────────────────────────────────────────
-    bpy.ops.render.render(write_still=True)
+    try:
+        bpy.ops.render.render(write_still=True)
+    finally:
+        _finish_compositor_render(node_tree, compositor_state)
 
     # ── Determine actual output path ────────────────────────────────────────
     frame_suffix = "0001" if bpy.app.version < (5, 0, 0) else ""
     raw_path = os.path.join(output_dir, f"{raw_file}{frame_suffix}.png")
-
-    # ── Restore materials ───────────────────────────────────────────────────
-    for obj, mats in saved_materials.items():
-        obj.data.materials.clear()
-        if saved_active_materials[obj]:
-            obj.data.materials.append(saved_active_materials[obj])
-        for m in mats:
-            if m != saved_active_materials[obj]:
-                obj.data.materials.append(m)
-    for mat in temp_materials:
-        if mat and mat.name in bpy.data.materials:
-            bpy.data.materials.remove(mat)
 
     # ── Restore non-target visibility ───────────────────────────────────────
     for obj, was_hidden in hidden_restore.items():
@@ -335,6 +628,19 @@ def render_edge_feather_mask(context, to_export, camera, camera_index, feather_w
 
     print(f"[StableGen] Edge-feather mask saved: {ef_path} (width={feather_width}px, softness={softness:.2f})")
     return ef_path
+
+
+def render_edge_feather_mask(context, to_export, camera, camera_index, feather_width=30, softness=1.0):
+    all_meshes = [obj for obj in context.scene.objects if obj.type == 'MESH']
+    with _RenderStateTransaction(context, all_meshes):
+        return _render_edge_feather_mask_impl(
+            context,
+            to_export,
+            camera,
+            camera_index,
+            feather_width=feather_width,
+            softness=softness,
+        )
 
 
 def apply_uv_inpaint_texture(context, obj, baked_image_path):
@@ -600,7 +906,8 @@ def flatten_projection_material_for_refine(context, obj, baked_image_path):
 
     print(f"[StableGen] Flattened ProjectionMaterial for '{obj.name}' to baked texture '{os.path.basename(baked_image_path)}'")
 
-def export_emit_image(context, to_export, camera_id=None, bg_color=(0.5, 0.5, 0.5), view_transform='Standard', fallback_color=(0,0,0)):
+@operation
+def _export_emit_image_impl(context, to_export, camera_id=None, bg_color=(0.5, 0.5, 0.5), view_transform='Standard', fallback_color=(0,0,0), restore_materials=True):
         """
         Exports a emit-only render of the scene from a camera's perspective.
         :param context: Blender context.
@@ -608,13 +915,11 @@ def export_emit_image(context, to_export, camera_id=None, bg_color=(0.5, 0.5, 0.
         :return: None
         """
         print("[StableGen] Exporting emit render")
-        # Set animation frame to 1
-        bpy.context.scene.frame_set(1)
-
+        ensure_texturing_frame(context.scene)
         # Store original materials and create temporary ones
         original_materials = {}
-        original_active_material = {}
         temporary_materials = {}
+        emission_materials = {}
 
         # Check if there is BSDF applied
 
@@ -622,14 +927,21 @@ def export_emit_image(context, to_export, camera_id=None, bg_color=(0.5, 0.5, 0.
 
         for obj in to_export:
             # Store original materials
-            original_materials[obj] = list(obj.data.materials)
-            original_active_material[obj] = obj.active_material
+            if restore_materials:
+                original_materials[obj] = _snapshot_material_state(obj)
 
             # Copy active material and switch to it
             mat = obj.active_material
             if not mat:
                 continue
+            source_pointer = mat.as_pointer()
+            if source_pointer in emission_materials:
+                obj.data.materials.clear()
+                obj.data.materials.append(emission_materials[source_pointer])
+                yield None
+                continue
             mat_copy = mat.copy()
+            emission_materials[source_pointer] = mat_copy
 
             # Clear materials and assign temp material
             obj.data.materials.clear()
@@ -742,15 +1054,17 @@ def export_emit_image(context, to_export, camera_id=None, bg_color=(0.5, 0.5, 0.
         bpy.context.scene.display_settings.display_device = 'sRGB'
         bpy.context.scene.view_settings.view_transform = view_transform
         context.scene.cycles.samples = 1  # Minimum samples for speed
-        # Configure view layer settings for diffuse-only
+        # Only Emit and Environment feed this export. Denoising the unused
+        # Combined image is expensive and does not change either consumed pass.
+        # The enclosing render transaction restores the user's denoising flag.
+        context.scene.cycles.use_denoising = False
+        # Request only the two passes consumed below. In particular, saved
+        # Combined, Z, normal or index passes must not add work to every
+        # context/visibility render. The transaction restores each flag.
         view_layer = context.view_layer
-        view_layer.use_pass_diffuse_color = False
-        view_layer.use_pass_diffuse_direct = False
-        view_layer.use_pass_diffuse_indirect = False
-
-        # Disable all other passes
-        view_layer.use_pass_ambient_occlusion = False
-        view_layer.use_pass_shadow = False
+        for name in _RenderStateTransaction._PASS_NAMES:
+            if hasattr(view_layer, name):
+                setattr(view_layer, name, name in {'use_pass_emit', 'use_pass_environment'})
         view_layer.use_pass_emit = True
         view_layer.use_pass_environment = True
 
@@ -761,9 +1075,7 @@ def export_emit_image(context, to_export, camera_id=None, bg_color=(0.5, 0.5, 0.
         node_tree = get_compositor_node_tree(context.scene)
         nodes = node_tree.nodes
         links = node_tree.links
-
-        # Clear existing nodes
-        nodes.clear()
+        compositor_state = _prepare_compositor_render(context.scene, node_tree)
 
         # Create nodes
         render_layers = nodes.new('CompositorNodeRLayers')
@@ -787,7 +1099,11 @@ def export_emit_image(context, to_export, camera_id=None, bg_color=(0.5, 0.5, 0.
         links.new(mix_node.outputs[0], output_node.inputs[0])
 
         # Render
-        bpy.ops.render.render(write_still=True)
+        yield None
+        try:
+            yield RenderRequest()
+        finally:
+            _finish_compositor_render(node_tree, compositor_state)
 
         # Post-processing for visibility masks
         if "visibility" in str(camera_id):
@@ -797,7 +1113,7 @@ def export_emit_image(context, to_export, camera_id=None, bg_color=(0.5, 0.5, 0.
             else:
                 final_path = os.path.join(output_dir, f"{output_file}0001.png")
 
-            if context.scene.visibility_vignette and (context.scene.generation_method == 'local_edit' or (context.scene.model_architecture.startswith('qwen') and context.scene.qwen_generation_method == 'local_edit')):
+            if context.scene.visibility_vignette and (context.scene.generation_method == 'local_edit' or (context.scene.model_architecture in QWEN_ARCHITECTURES and context.scene.qwen_generation_method == 'local_edit')):
                 # Smooth edge feathering, no blocky mask
                 apply_vignette_to_mask(
                     final_path,
@@ -829,14 +1145,8 @@ def export_emit_image(context, to_export, camera_id=None, bg_color=(0.5, 0.5, 0.
         bpy.context.scene.view_settings.view_transform = 'Standard'
 
         # Restore original materials
-        for obj, materials in original_materials.items():
-            obj.data.materials.clear()
-            # First append the original active material
-            if original_active_material[obj]:
-                obj.data.materials.append(original_active_material[obj])
-            for mat in materials:
-                if mat != original_active_material[obj]:
-                    obj.data.materials.append(mat)
+        for obj, material_state in original_materials.items():
+            _restore_material_state(obj, material_state)
 
         # Clean up temporary materials
         for _, temp_mat in temporary_materials.items():
@@ -846,7 +1156,29 @@ def export_emit_image(context, to_export, camera_id=None, bg_color=(0.5, 0.5, 0.
         print(f"[StableGen] Emmision render saved to: {os.path.join(output_dir, output_file)}.png")
 
 
-def export_render(context, camera_id=None, output_dir=None, filename=None):
+@operation
+def export_emit_image(context, to_export, camera_id=None, bg_color=(0.5, 0.5, 0.5), view_transform='Standard', fallback_color=(0,0,0)):
+    # All material/mesh edits happen on isolated copies, so production slots
+    # must not be cleared and restored at the end of the transaction.
+    with _RenderStateTransaction(context):
+        with _temporary_render_copies(context, to_export) as (copies, _mapping):
+            return (yield from _export_emit_image_impl(
+                context,
+                copies,
+                camera_id=camera_id,
+                bg_color=bg_color,
+                view_transform=view_transform,
+                fallback_color=fallback_color,
+                restore_materials=False,
+                _steps=True,
+            ))
+
+
+@operation
+def _export_render_impl(
+    context, camera_id=None, output_dir=None, filename=None,
+    background_color=None,
+):
     """
     Renders the scene from a camera's perspective using Workbench.
     Creates temporary materials for consistent rendering.
@@ -858,38 +1190,7 @@ def export_render(context, camera_id=None, output_dir=None, filename=None):
     """
     print("[StableGen] Exporting render using Workbench")
 
-    # Store original materials and create temporary ones
-    original_materials = {}
-    original_active_material = {}
-    for obj in context.view_layer.objects:
-        if obj.type == 'MESH':
-            # Store original materials
-            original_materials[obj] = list(obj.data.materials)
-            original_active_material[obj] = obj.active_material
-
-            # Create temporary material
-            temp_mat = bpy.data.materials.new(name="TempRenderMaterial")
-            temp_mat.use_nodes = True # Even Workbench uses nodes for basic color
-            nodes = temp_mat.node_tree.nodes
-            links = temp_mat.node_tree.links
-
-            # Clear default nodes
-            for node in nodes:
-                nodes.remove(node)
-
-            # Create basic material output and diffuse BSDF (Workbench respects Base Color)
-            mat_output = nodes.new('ShaderNodeOutputMaterial')
-            diffuse = nodes.new('ShaderNodeBsdfDiffuse') # Simple diffuse color
-            diffuse.inputs['Color'].default_value = (0.8, 0.8, 0.8, 1.0) # Default grey
-            diffuse.inputs['Roughness'].default_value = 0.5
-            links.new(diffuse.outputs['BSDF'], mat_output.inputs['Surface'])
-
-            # Clear materials and assign temp material
-            obj.data.materials.clear()
-            obj.data.materials.append(temp_mat)
-
-    # Set animation frame to 1
-    context.scene.frame_set(1)
+    ensure_texturing_frame(context.scene)
 
     # Setup output path
     if output_dir is None:
@@ -904,7 +1205,11 @@ def export_render(context, camera_id=None, output_dir=None, filename=None):
     original_engine = context.scene.render.engine
     original_workbench_settings = {
         'lighting': context.scene.display.shading.light,
-        'color_type': context.scene.display.shading.color_type
+        'color_type': context.scene.display.shading.color_type,
+        'background_type': context.scene.display.shading.background_type,
+        'background_color': tuple(
+            context.scene.display.shading.background_color
+        ),
     }
     original_render_filepath = context.scene.render.filepath
     original_image_settings = context.scene.render.image_settings.file_format
@@ -916,6 +1221,14 @@ def export_render(context, camera_id=None, output_dir=None, filename=None):
     # Configure Workbench for a flat, consistent look if needed
     context.scene.display.shading.light = 'STUDIO'
     context.scene.display.shading.color_type = 'SINGLE'
+    if background_color is not None:
+        context.scene.display.shading.background_type = 'VIEWPORT'
+        context.scene.display.shading.background_color = background_color
+        # Camera Workbench renders use World.color even when the viewport
+        # background mode says VIEWPORT. The transaction around this export
+        # restores the user's world color afterwards.
+        if context.scene.world is not None:
+            context.scene.world.color = background_color
 
     render_layer = context.view_layer
     original_combined = render_layer.use_pass_combined
@@ -929,50 +1242,50 @@ def export_render(context, camera_id=None, output_dir=None, filename=None):
     node_tree = get_compositor_node_tree(context.scene)
     nodes = node_tree.nodes
     links = node_tree.links
-    nodes.clear()
-
+    compositor_state = _prepare_compositor_render(context.scene, node_tree)
     render_layers = nodes.new('CompositorNodeRLayers')
     output_node = nodes.new('CompositorNodeOutputFile')
     configure_output_node_paths(output_node, output_dir, output_file)
     links.new(render_layers.outputs['Image'], output_node.inputs[0])
 
     # Render
-    bpy.ops.render.render(write_still=True)
-
-    # Restore original materials
-    for obj, materials in original_materials.items():
-        obj.data.materials.clear()
-        # First append the original active material
-        if original_active_material[obj]:
-            obj.data.materials.append(original_active_material[obj])
-        for mat in materials:
-            if mat != original_active_material[obj]:
-                obj.data.materials.append(mat)
+    try:
+        yield RenderRequest()
+    finally:
+        _finish_compositor_render(node_tree, compositor_state)
 
     # Restore original render settings
     render_layer.use_pass_combined = original_combined
-
-    # Clean up temporary materials
-    # Use a while loop to safely remove materials while iterating
-    temp_mats = [m for m in bpy.data.materials if m.name.startswith("TempRenderMaterial")]
-    for mat in temp_mats:
-        bpy.data.materials.remove(mat)
-
 
     # Restore original render settings
     if context.scene.render.engine != original_engine:
         context.scene.render.engine = original_engine
     context.scene.display.shading.light = original_workbench_settings['lighting']
     context.scene.display.shading.color_type = original_workbench_settings['color_type']
+    context.scene.display.shading.background_type = original_workbench_settings['background_type']
+    context.scene.display.shading.background_color = original_workbench_settings['background_color']
     context.scene.render.filepath = original_render_filepath
     context.scene.render.image_settings.file_format = original_image_settings
     context.scene.render.use_compositing = original_use_compositing
 
 
-    print(f"[StableGen] Render saved to: {os.path.join(output_dir, output_file)}0001.png") # Blender adds frame number
+@operation
+def export_render(
+    context, camera_id=None, output_dir=None, filename=None,
+    background_color=None,
+):
+    objects = [obj for obj in context.view_layer.objects if obj.type == 'MESH']
+    with _RenderStateTransaction(context, objects):
+        return (yield from _export_render_impl(
+            context, camera_id=camera_id, output_dir=output_dir,
+            filename=filename, background_color=background_color, _steps=True,
+        ))
 
 
-def export_viewport(context, camera_id=None, output_dir=None, filename=None):
+def _export_viewport_impl(
+    context, camera_id=None, output_dir=None, filename=None,
+    background_color=None,
+):
     """
     Renders the scene using viewport OpenGL render to include overlays.
     :param context: Blender context.
@@ -1032,11 +1345,20 @@ def export_viewport(context, camera_id=None, output_dir=None, filename=None):
     # Store viewport settings
     original_view_perspective = viewport_region_3d.view_perspective
     original_shading_type = viewport_space.shading.type
+    original_background_type = viewport_space.shading.background_type
+    original_background_color = tuple(viewport_space.shading.background_color)
     original_overlay_show = viewport_space.overlay.show_overlays
 
     # Configure viewport for camera render with overlays
     viewport_region_3d.view_perspective = 'CAMERA'
     viewport_space.shading.type = 'RENDERED'
+    if background_color is not None:
+        viewport_space.shading.background_type = 'VIEWPORT'
+        viewport_space.shading.background_color = background_color
+        context.scene.display.shading.background_type = 'VIEWPORT'
+        context.scene.display.shading.background_color = background_color
+        if context.scene.world is not None:
+            context.scene.world.color = background_color
     viewport_space.overlay.show_overlays = True
 
     # Configure output filepath
@@ -1058,6 +1380,8 @@ def export_viewport(context, camera_id=None, output_dir=None, filename=None):
     # Restore viewport settings
     viewport_region_3d.view_perspective = original_view_perspective
     viewport_space.shading.type = original_shading_type
+    viewport_space.shading.background_type = original_background_type
+    viewport_space.shading.background_color = original_background_color
     viewport_space.overlay.show_overlays = original_overlay_show
 
     # Restore original render settings
@@ -1068,6 +1392,20 @@ def export_viewport(context, camera_id=None, output_dir=None, filename=None):
 
     print(f"[StableGen] Viewport render saved to: {os.path.join(output_dir, output_file)}.png")
 
+
+def export_viewport(
+    context, camera_id=None, output_dir=None, filename=None,
+    background_color=None,
+):
+    """Viewport export with full scene-state restoration on every exit path."""
+    objects = [obj for obj in context.view_layer.objects if obj.type == 'MESH']
+    with _RenderStateTransaction(context, objects):
+        return _export_viewport_impl(
+            context, camera_id=camera_id, output_dir=output_dir,
+            filename=filename, background_color=background_color,
+        )
+
+@operation
 def export_canny(context, camera_id=None, low_threshold=0, high_threshold=80):
     """
     Uses export_render and openCV to generate a Canny edge detection image.
@@ -1078,7 +1416,7 @@ def export_canny(context, camera_id=None, low_threshold=0, high_threshold=80):
     :return: None
     """
     # Render the scene
-    export_render(context, camera_id)
+    yield from export_render(context, camera_id, _steps=True)
 
     # Load the rendered image
     output_dir_render = get_dir_path(context, "misc")
@@ -1179,7 +1517,10 @@ def expand_mask_to_blocks(mask_file_path, block_size=8):
         return None
 
 
-def export_visibility(context, to_export, obj=None, camera_visibility=None, prepare_only=False):
+@operation
+def _export_visibility_impl(context, to_export, obj=None, camera_visibility=None,
+                            prepare_only=False, camera_render=None, camera_id=None,
+                            output_object_name=None, restore_materials=True):
     """     
     Exports the visibility of the mesh by temporarily altering the shading nodes.
     :param context: Blender context.
@@ -1193,17 +1534,30 @@ def export_visibility(context, to_export, obj=None, camera_visibility=None, prep
     """
     # Store original materials and create temporary ones
     original_materials = {}
-    original_active_material = {}
     temporary_materials = {}
+    prepared_materials = {}
+
+    def restore_prepared_materials():
+        for prepared_obj, material_state in original_materials.items():
+            _restore_material_state(prepared_obj, material_state)
+        for temp_mat in set(temporary_materials.values()):
+            if temp_mat and temp_mat.name in bpy.data.materials:
+                bpy.data.materials.remove(temp_mat)
 
     def prepare_material(obj):
         mat = obj.active_material
         if not mat:
             return False
-        
+
         # Store original materials
-        original_materials[obj] = list(obj.data.materials)
-        original_active_material[obj] = obj.active_material  # Store original active material
+            if restore_materials:
+                original_materials[obj] = _snapshot_material_state(obj)
+        source_pointer = mat.as_pointer()
+        if not prepare_only and source_pointer in prepared_materials:
+            obj.data.materials.clear()
+            obj.data.materials.append(prepared_materials[source_pointer])
+            temporary_materials[obj] = prepared_materials[source_pointer]
+            return True
 
         # Store original active mat
 
@@ -1213,13 +1567,6 @@ def export_visibility(context, to_export, obj=None, camera_visibility=None, prep
             return False
         mat_copy = mat.copy()
 
-        # Clear materials and assign temp material
-        obj.data.materials.clear()
-        obj.data.materials.append(mat_copy)
-        
-        # Store temporary material for later deletion
-        temporary_materials[obj] = mat_copy
-        
         # Enable use of nodes
         mat_copy.use_nodes = True
         nodes = mat_copy.node_tree.nodes
@@ -1233,10 +1580,46 @@ def export_visibility(context, to_export, obj=None, camera_visibility=None, prep
                 break
 
         if not output:
+            bpy.data.materials.remove(mat_copy)
             return False
         
         if not output.inputs[0].links:
+            bpy.data.materials.remove(mat_copy)
             return False
+
+        # Reworked sequential materials expose source acquisition quality
+        # independently from RGB fusion. Prefer that max-quality signal; old
+        source_quality = next(
+            (node for node in nodes if node.label == 'SGBestSourceQuality'),
+            None,
+        )
+        if source_quality is not None:
+            trusted = nodes.new("ShaderNodeMath")
+            trusted.operation = 'GREATER_THAN'
+            trusted.inputs[1].default_value = float(getattr(
+                context.scene, 'qwen_trust_threshold', 0.7
+            )) - 1e-7
+            trusted.label = "SGTrustedContext"
+            links.new(source_quality.outputs[0], trusted.inputs[0])
+
+            repair = nodes.new("ShaderNodeMath")
+            repair.operation = 'SUBTRACT'
+            repair.inputs[0].default_value = 1.0
+            repair.label = "SGRepairMask"
+            links.new(trusted.outputs[0], repair.inputs[1])
+
+            repair_color = nodes.new("ShaderNodeMixRGB")
+            repair_color.inputs["Color1"].default_value = (0, 0, 0, 1)
+            repair_color.inputs["Color2"].default_value = (1, 1, 1, 1)
+            repair_color.label = "SGRepairMaskColor"
+            links.new(repair.outputs[0], repair_color.inputs["Fac"])
+            links.new(repair_color.outputs[0], output.inputs[0])
+
+            obj.data.materials.clear()
+            obj.data.materials.append(mat_copy)
+            temporary_materials[obj] = mat_copy
+            prepared_materials[source_pointer] = mat_copy
+            return True
         
         # Determine which input to used based on existence of BSDF node before the output
         if output.inputs[0].links and output.inputs[0].links[0].from_node.type == 'BSDF_PRINCIPLED':
@@ -1244,12 +1627,20 @@ def export_visibility(context, to_export, obj=None, camera_visibility=None, prep
             if not principled.inputs[0].links:
                 # Principled BSDF exists but nothing is connected to its
                 # Base Color – this is not a projection material.
+                bpy.data.materials.remove(mat_copy)
                 return False
             color_mix = principled.inputs[0].links[0].from_node
             input = principled.inputs[0]
         else:
             color_mix = output.inputs[0].links[0].from_node
             input = output.inputs[0]
+
+        # Validation succeeded; only now replace the object's slots. This
+        # prevents an early return from leaving a complex mesh modified.
+        obj.data.materials.clear()
+        obj.data.materials.append(mat_copy)
+        temporary_materials[obj] = mat_copy
+        prepared_materials[source_pointer] = mat_copy
         # Add equal node between color mix and bsdf
         equal = nodes.new("ShaderNodeMath")
         
@@ -1405,10 +1796,13 @@ def export_visibility(context, to_export, obj=None, camera_visibility=None, prep
         # Prepare for all objects
         for obj in to_export:
             if not prepare_material(obj):
+                restore_prepared_materials()
                 return False
     else:
         if not prepare_material(obj):
+            restore_prepared_materials()
             return False
+        yield None
         
     if prepare_only:
         # Debug mode: leave the visibility material applied for viewport inspection
@@ -1420,9 +1814,12 @@ def export_visibility(context, to_export, obj=None, camera_visibility=None, prep
     # Bake or render the texture
     if not camera_visibility:
         output_dir = get_dir_path(context, "uv_inpaint")["visibility"]
-        output_file = f"{obj.name}_baked_visibility"
+        output_file = f"{output_object_name or obj.name}_baked_visibility"
         prepare_baking(context)
-        bake_texture(context, obj, suffix="_visibility", texture_resolution=1024, view_transform='Raw', output_dir=output_dir)
+        if not bake_texture(context, obj, suffix="_visibility", texture_resolution=1024,
+                            view_transform='Raw', output_dir=output_dir,
+                            output_name=output_file):
+            raise RuntimeError(f"Could not bake visibility for {output_object_name or obj.name}")
         # Use openCV to normalize the image
         image_path = os.path.join(output_dir, f"{output_file}.png")
         image = cv2.imread(image_path, cv2.IMREAD_GRAYSCALE)
@@ -1431,7 +1828,7 @@ def export_visibility(context, to_export, obj=None, camera_visibility=None, prep
         # Save the image
         cv2.imwrite(image_path, image)
 
-        if context.scene.visibility_vignette and (context.scene.generation_method == 'local_edit' or (context.scene.model_architecture.startswith('qwen') and context.scene.qwen_generation_method == 'local_edit')):
+        if context.scene.visibility_vignette and (context.scene.generation_method == 'local_edit' or (context.scene.model_architecture in QWEN_ARCHITECTURES and context.scene.qwen_generation_method == 'local_edit')):
             apply_vignette_to_mask(
                 image_path,
                 feather_width=context.scene.visibility_vignette_width,
@@ -1440,30 +1837,47 @@ def export_visibility(context, to_export, obj=None, camera_visibility=None, prep
             )
     else:
         # Make sure the camera is active and set to render
-        cameras = [obj for obj in context.scene.objects if obj.type == 'CAMERA']
-        cameras.sort(key=lambda x: x.name)
-        camera_visibility_index = [i for i, camera in enumerate(cameras) if camera == camera_visibility][0]
-        camera_render_index = (camera_visibility_index + 1) % len(cameras)
-        camera_render = cameras[camera_render_index]
+        if camera_render is None:
+            from .view_plan import order_cameras
+            cameras = order_cameras(
+                obj for obj in context.scene.objects if obj.type == 'CAMERA'
+            )
+            camera_visibility_index = cameras.index(camera_visibility)
+            camera_render_index = (camera_visibility_index + 1) % len(cameras)
+            camera_render = cameras[camera_render_index]
+        else:
+            camera_render_index = camera_id
         context.scene.camera = camera_render
-        export_emit_image(context, to_export, camera_id=f"{camera_render_index}_visibility", bg_color=(1, 1, 1), view_transform='Raw', fallback_color=(1,1,1))
+        yield from _export_emit_image_impl(context, to_export, camera_id=f"{camera_render_index}_visibility", bg_color=(1, 1, 1), view_transform='Raw', fallback_color=(1,1,1), restore_materials=restore_materials, _steps=True)
 
     # Restore original materials
-    for obj, materials in original_materials.items():
-        obj.data.materials.clear()
-        # First append the original active material
-        if original_active_material[obj]:
-            obj.data.materials.append(original_active_material[obj])
-        for mat in materials:
-            if mat != original_active_material[obj]:
-                obj.data.materials.append(mat)
-                
-    # Clean up temporary materials
-    for _, temp_mat in temporary_materials.items():
-        if temp_mat and temp_mat.name in bpy.data.materials:
-            bpy.data.materials.remove(temp_mat)
+    restore_prepared_materials()
 
     return True
+
+
+@operation
+def export_visibility(context, to_export, obj=None, camera_visibility=None,
+                      prepare_only=False, camera_render=None, camera_id=None):
+    objects = [obj] if obj is not None else list(to_export or ())
+    if prepare_only:
+        return (yield from _export_visibility_impl(
+            context, to_export, obj=obj, camera_visibility=camera_visibility,
+            prepare_only=True, camera_render=camera_render, camera_id=camera_id,
+            _steps=True,
+        ))
+    with _RenderStateTransaction(context):
+        with _temporary_render_copies(context, objects) as (copies, mapping):
+            mapped_obj = mapping.get(obj) if obj is not None else None
+            return (yield from _export_visibility_impl(
+                context, copies, obj=mapped_obj,
+                camera_visibility=camera_visibility,
+                prepare_only=False, camera_render=camera_render,
+                camera_id=camera_id,
+                output_object_name=obj.name if obj is not None else None,
+                restore_materials=False,
+                _steps=True,
+            ))
 
 
 # =========================================================
@@ -1480,6 +1894,7 @@ class SwitchMaterial(bpy.types.Operator):
 
     bl_idname = "object.switch_material"
     bl_label = "Switch Material"
+    bl_description = "Make a material slot the active first material on scene mesh objects, preserving the other slots. Opens a material-index dialog and changes object selection"
     bl_options = {'REGISTER', 'UNDO'}
 
     material_index: bpy.props.IntProperty(
@@ -1586,7 +2001,507 @@ def prepare_baking(context):
     # where we bake 5-7 channels of the same mesh back-to-back)
     bpy.context.scene.render.use_persistent_data = True
 
-def unwrap(obj, method, overlap_only):
+
+_SG_BAKE_UV_NAME = "BakeUV"
+_SG_PROJECTION_BUFFER_UV_NAME = "_SG_ProjectionBuffer"
+
+
+def _is_projection_or_buffer_uv(name):
+    return name.startswith("ProjectionUV") or name == _SG_PROJECTION_BUFFER_UV_NAME
+
+
+def _first_source_uv_name(obj):
+    if not obj or not obj.data.uv_layers:
+        return None
+    for uv in obj.data.uv_layers:
+        if uv.name != _SG_BAKE_UV_NAME and not _is_projection_or_buffer_uv(uv.name):
+            return uv.name
+    return None
+
+
+def _ensure_bake_uv(obj):
+    uv_layers = obj.data.uv_layers
+    bake_uv = uv_layers.get(_SG_BAKE_UV_NAME)
+    if bake_uv is None:
+        source_uv = _first_source_uv_name(obj)
+        if source_uv and uv_layers.get(source_uv):
+            uv_layers.active = uv_layers[source_uv]
+        bake_uv = uv_layers.new(name=_SG_BAKE_UV_NAME)
+        print(f"[StableGen] Created {_SG_BAKE_UV_NAME} on {obj.name}")
+    uv_layers.active = bake_uv
+    return bake_uv
+
+
+def _set_bake_uv_active(obj):
+    uv_layers = obj.data.uv_layers
+    bake_uv = uv_layers.get(_SG_BAKE_UV_NAME)
+    if bake_uv:
+        uv_layers.active = bake_uv
+        return bake_uv
+    for uv in uv_layers:
+        if not _is_projection_or_buffer_uv(uv.name):
+            uv_layers.active = uv
+            return uv
+    return _ensure_bake_uv(obj)
+
+
+def _projection_bake_face_mask(obj, threshold=1.0e-8):
+    """Return faces that can receive color from a projection material.
+
+    Projection materials read ``_SG_VisWeight_*`` POINT attributes and
+    interpolate them across each face. A face whose vertices are zero in
+    every such attribute cannot receive any projected texture, so giving it a
+    full BakeUV island only wastes atlas resolution.
+
+    ``None`` means the object has neither baked visibility nor projection UV
+    data and should retain the normal all-face unwrap behavior.
+    """
+    if obj is None or obj.type != 'MESH' or not obj.data:
+        return None
+
+    mesh = obj.data
+    visibility_attributes = [
+        attribute for attribute in mesh.attributes
+        if (
+            attribute.name.startswith("_SG_VisWeight_")
+            and attribute.domain == 'POINT'
+            and attribute.data_type == 'FLOAT'
+        )
+    ]
+    if not mesh.polygons:
+        return np.zeros(0, dtype=bool)
+
+    loop_vertices = np.empty(len(mesh.loops), dtype=np.int32)
+    mesh.loops.foreach_get("vertex_index", loop_vertices)
+    face_starts = np.empty(len(mesh.polygons), dtype=np.int32)
+    mesh.polygons.foreach_get("loop_start", face_starts)
+
+    if visibility_attributes:
+        vertex_coverage = np.zeros(len(mesh.vertices), dtype=np.float32)
+        values = np.empty(len(mesh.vertices), dtype=np.float32)
+        for attribute in visibility_attributes:
+            attribute.data.foreach_get("value", values)
+            np.maximum(vertex_coverage, values, out=vertex_coverage)
+        loop_coverage = vertex_coverage[loop_vertices]
+        return (
+            np.maximum.reduceat(loop_coverage, face_starts)
+            > float(threshold)
+        )
+
+    # Compatibility fallback for older projection materials that predate
+    # _SG_VisWeight attributes. Projection image nodes use CLIP extension, so
+    # a face wholly outside every camera's [0, 1] UV rectangle cannot
+    # contribute. Bounding-box intersection is intentionally conservative:
+    # it can retain extra faces, but cannot discard a triangle crossing a view
+    # merely because all three corners lie outside it.
+    projection_attributes = [
+        attribute for attribute in mesh.attributes
+        if (
+            attribute.name.startswith("ProjectionUV_")
+            and attribute.domain == 'CORNER'
+            and attribute.data_type == 'FLOAT_VECTOR'
+        )
+    ]
+    if not projection_attributes:
+        return None
+
+    covered_faces = np.zeros(len(mesh.polygons), dtype=bool)
+    vectors = np.empty(len(mesh.loops) * 3, dtype=np.float32)
+    for attribute in projection_attributes:
+        attribute.data.foreach_get("vector", vectors)
+        uv = vectors.reshape((-1, 3))[:, :2]
+        min_u = np.minimum.reduceat(uv[:, 0], face_starts)
+        max_u = np.maximum.reduceat(uv[:, 0], face_starts)
+        min_v = np.minimum.reduceat(uv[:, 1], face_starts)
+        max_v = np.maximum.reduceat(uv[:, 1], face_starts)
+        covered_faces |= (
+            (max_u >= 0.0)
+            & (min_u <= 1.0)
+            & (max_v >= 0.0)
+            & (min_v <= 1.0)
+        )
+        # Corners behind a perspective camera carry mirrored UVs, so a face
+        # crossing the camera plane may cover the view despite its bounds.
+        homogeneous = mesh.attributes.get(
+            "ProjectionUVW_" + attribute.name[len("ProjectionUV_"):])
+        if homogeneous is not None and homogeneous.domain == 'CORNER':
+            homogeneous.data.foreach_get("vector", vectors)
+            in_front = vectors.reshape((-1, 3))[:, 2] > 0.0
+            covered_faces |= (
+                np.logical_or.reduceat(in_front, face_starts)
+                & ~np.logical_and.reduceat(in_front, face_starts)
+            )
+    return covered_faces
+
+
+def _ensure_projection_visibility_for_bake(obj):
+    """Backfill visibility weights for legacy projection materials."""
+    mesh = getattr(obj, "data", None)
+    if mesh is None or any(
+        attribute.name.startswith("_SG_VisWeight_")
+        and attribute.domain == 'POINT'
+        for attribute in mesh.attributes
+    ):
+        return
+
+    projection_pairs = []
+    for attribute in mesh.attributes:
+        if not attribute.name.startswith("ProjectionUV_"):
+            continue
+        parts = attribute.name.rsplit('_', 2)
+        if len(parts) != 3:
+            continue
+        try:
+            projection_pairs.append((int(parts[1]), int(parts[2])))
+        except ValueError:
+            continue
+    if not projection_pairs:
+        return
+
+    from .view_plan import order_cameras
+
+    max_camera_index = max(camera_index for camera_index, _ in projection_pairs)
+    cameras = order_cameras(
+        scene_obj
+        for scene_obj in bpy.context.scene.objects
+        if scene_obj.type == 'CAMERA'
+    )
+    if len(cameras) <= max_camera_index:
+        print(
+            f"[StableGen] Warning: cannot rebuild projection visibility for "
+            f"{obj.name}; expected at least {max_camera_index + 1} cameras, "
+            f"found {len(cameras)}. Using conservative camera-UV coverage."
+        )
+        return
+
+    # Visibility is geometry/camera dependent, not material-ID dependent. One
+    # representative material ID supplies the union needed for UV allocation.
+    material_id = min(material_id for _, material_id in projection_pairs)
+    angle_thresholds = []
+    for material in mesh.materials:
+        if not material or not material.use_nodes:
+            continue
+        for node in material.node_tree.nodes:
+            if (
+                getattr(node, "label", "").startswith("AngleThreshold-")
+                and len(node.inputs) > 1
+            ):
+                try:
+                    angle_thresholds.append(float(node.inputs[1].default_value))
+                except (AttributeError, TypeError, ValueError):
+                    pass
+    angle_threshold = max(
+        angle_thresholds
+        or [
+            float(getattr(bpy.context.scene, "discard_factor", 90.0)),
+            float(getattr(
+                bpy.context.scene,
+                "sg_material_discard_factor",
+                90.0,
+            )),
+        ]
+    )
+    try:
+        from .projection import _bake_visibility_weights
+
+        scene = bpy.context.scene
+        original_silhouette_margin = getattr(
+            scene,
+            "sg_silhouette_margin",
+            None,
+        )
+        if original_silhouette_margin is not None:
+            # Silhouette erosion only removes uncertain edge pixels. Atlas
+            # coverage should remain conservative and needs just one ray per
+            # candidate vertex, not the extra 4/8 offset rays.
+            scene.sg_silhouette_margin = 0
+        try:
+            print(
+                f"[StableGen] Rebuilding legacy projection visibility for "
+                f"BakeUV on {obj.name}"
+            )
+            _bake_visibility_weights(
+                bpy.context,
+                [obj],
+                cameras[:max_camera_index + 1],
+                material_id,
+                stop_index=max_camera_index,
+                angle_threshold=angle_threshold,
+            )
+        finally:
+            if original_silhouette_margin is not None:
+                scene.sg_silhouette_margin = original_silhouette_margin
+    except Exception as exc:
+        print(
+            f"[StableGen] Warning: could not rebuild projection visibility "
+            f"for {obj.name}: {exc}. Using conservative camera-UV coverage."
+        )
+
+
+def _compact_uncovered_projection_uvs(
+        obj, covered_faces, texture_resolution):
+    """Fill the tile with covered UVs and collapse uncovered faces."""
+    bm = bmesh.from_edit_mesh(obj.data)
+    bm.faces.ensure_lookup_table()
+    bm.faces.index_update()
+    uv_layer = bm.loops.layers.uv.active
+    if uv_layer is None:
+        return
+
+    resolution = max(1, int(texture_resolution or 2048))
+    bake_margin = max(
+        0,
+        int(getattr(bpy.context.scene.render.bake, "margin", 16)),
+    )
+    guard = min(
+        0.2,
+        max(2.0 / resolution, (bake_margin + 2.0) / resolution),
+    )
+
+    covered_loops = [
+        loop
+        for face in bm.faces
+        if (
+            face.index < len(covered_faces)
+            and bool(covered_faces[face.index])
+        )
+        for loop in face.loops
+    ]
+    if covered_loops:
+        min_u = min(loop[uv_layer].uv.x for loop in covered_loops)
+        max_u = max(loop[uv_layer].uv.x for loop in covered_loops)
+        min_v = min(loop[uv_layer].uv.y for loop in covered_loops)
+        max_v = max(loop[uv_layer].uv.y for loop in covered_loops)
+        span_u = max(max_u - min_u, 1.0e-12)
+        span_v = max(max_v - min_v, 1.0e-12)
+        target_span = max(0.01, 1.0 - 2.0 * guard)
+        scale_u = target_span / span_u
+        scale_v = target_span / span_v
+    else:
+        min_u = min_v = 0.0
+        scale_u = scale_v = 1.0
+
+    for face in bm.faces:
+        is_covered = (
+            face.index < len(covered_faces)
+            and bool(covered_faces[face.index])
+        )
+        for loop in face.loops:
+            if is_covered:
+                uv = loop[uv_layer].uv
+                # The UV map and its baked image are consumed together, so a
+                # global per-axis reframe is lossless. It avoids keeping a
+                # wide, short island footprint centered in a square texture.
+                uv.x = guard + (uv.x - min_u) * scale_u
+                uv.y = guard + (uv.y - min_v) * scale_v
+            else:
+                # Degenerate UV faces occupy no atlas area. The guard around
+                # (0, 0) prevents their bake margin touching useful islands.
+                loop[uv_layer].uv = (0.0, 0.0)
+
+    bmesh.update_edit_mesh(obj.data, loop_triangles=False, destructive=False)
+
+
+def _pin_unlinked_image_textures_to_uv(nodes, links, uv_name, exclude_nodes=()):
+    if not uv_name:
+        return None
+
+    exclude_nodes = set(exclude_nodes or ())
+    image_nodes = [
+        node for node in nodes
+        if node.type == 'TEX_IMAGE'
+        and node not in exclude_nodes
+        and node.inputs.get("Vector")
+        and not node.inputs["Vector"].links
+    ]
+    if not image_nodes:
+        return None
+
+    uv_node = nodes.new("ShaderNodeUVMap")
+    uv_node.uv_map = uv_name
+    uv_node.label = f"StableGen Source UV ({uv_name})"
+    for image_node in image_nodes:
+        links.new(uv_node.outputs["UV"], image_node.inputs["Vector"])
+    print(
+        f"[StableGen] Pinned {len(image_nodes)} source image texture node(s) "
+        f"to UV map '{uv_name}' for baking"
+    )
+    return uv_node
+
+
+def _copy_material_slots_for_bake(obj):
+    original_materials = list(obj.data.materials)
+    original_active_index = obj.active_material_index
+    copied_materials = []
+
+    obj.data.materials.clear()
+    for mat in original_materials:
+        if mat:
+            mat_copy = mat.copy()
+            obj.data.materials.append(mat_copy)
+            copied_materials.append(mat_copy)
+
+    return original_materials, original_active_index, copied_materials
+
+
+def _restore_material_slots_after_bake(obj, original_materials, original_active_index, copied_materials):
+    obj.data.materials.clear()
+    for mat in original_materials:
+        if mat:
+            obj.data.materials.append(mat)
+    if obj.data.materials:
+        obj.active_material_index = min(max(0, original_active_index), len(obj.data.materials) - 1)
+    for mat in copied_materials:
+        if mat and mat.name in bpy.data.materials:
+            bpy.data.materials.remove(mat)
+
+
+def _first_principled_node(mat):
+    if not mat or not mat.use_nodes:
+        return None
+    for node in mat.node_tree.nodes:
+        if node.type == 'BSDF_PRINCIPLED':
+            return node
+    return None
+
+
+def _socket_gray_rgba(socket, fallback=0.0):
+    try:
+        value = socket.default_value
+    except Exception:
+        value = fallback
+    if isinstance(value, (float, int)):
+        scalar = float(value)
+    else:
+        scalar = float(value[0]) if value else float(fallback)
+    return (scalar, scalar, scalar, 1.0)
+
+
+def _pbr_channel_default_rgba(mat, channel_name):
+    principled = _first_principled_node(mat)
+    if channel_name == 'base_color':
+        if principled and principled.inputs.get("Base Color"):
+            return tuple(principled.inputs["Base Color"].default_value)
+        return (1.0, 1.0, 1.0, 1.0)
+    if channel_name == 'roughness':
+        if principled and principled.inputs.get("Roughness"):
+            return _socket_gray_rgba(principled.inputs["Roughness"], 0.5)
+        return (0.5, 0.5, 0.5, 1.0)
+    if channel_name == 'metallic':
+        if principled and principled.inputs.get("Metallic"):
+            return _socket_gray_rgba(principled.inputs["Metallic"], 0.0)
+        return (0.0, 0.0, 0.0, 1.0)
+    if channel_name == 'ao':
+        return (1.0, 1.0, 1.0, 1.0)
+    return (0.0, 0.0, 0.0, 1.0)
+
+
+def _is_bone_custom_shape_object(obj):
+    for armature in bpy.context.view_layer.objects:
+        if armature.type != 'ARMATURE' or not armature.pose:
+            continue
+        for bone in armature.pose.bones:
+            if bone.custom_shape == obj:
+                return True
+    return False
+
+
+def _is_gltf_not_exported_helper(obj):
+    for collection in getattr(obj, "users_collection", []):
+        if "not_exported" in collection.name.lower():
+            return True
+    return False
+
+
+def _configure_not_exported_helpers(context=None):
+    """Keep glTF helpers out of bakes using visible collection controls."""
+    stats = configure_gltf_not_exported_visibility(context or bpy.context)
+    if stats["collections"]:
+        print(
+            "[StableGen] Hid glTF not_exported helpers through "
+            f"{stats['layer_collections']} view-layer eye toggle(s) and "
+            f"{stats['collections']} collection render toggle(s); cleared "
+            f"{stats['object_flags_cleared']} buried object flag(s)."
+        )
+
+
+def _object_visible_in_view_layer(obj):
+    if obj.hide_get():
+        return False
+    try:
+        return obj.visible_get(view_layer=bpy.context.view_layer)
+    except TypeError:
+        try:
+            return obj.visible_get()
+        except Exception:
+            return True
+    except Exception:
+        return True
+
+
+def _is_texture_bake_target(obj):
+    if obj is None or obj.type != 'MESH':
+        return False
+    if not _object_visible_in_view_layer(obj) or obj.hide_render:
+        return False
+    if _is_gltf_not_exported_helper(obj):
+        return False
+    if _is_bone_custom_shape_object(obj):
+        return False
+    if not obj.data or not obj.data.polygons:
+        return False
+    return any(mat for mat in obj.data.materials)
+
+
+def _texture_bake_targets(objects):
+    targets = []
+    skipped = []
+    for obj in objects:
+        if _is_texture_bake_target(obj):
+            targets.append(obj)
+        elif obj and obj.type == 'MESH':
+            skipped.append(obj)
+    return targets, skipped
+
+
+def _activate_mesh_for_object_ops(obj):
+    """Select and activate a mesh object for bpy.ops calls."""
+    if obj is None or obj.type != 'MESH':
+        raise RuntimeError("Bake target is not a mesh object")
+
+    if not any(view_obj == obj for view_obj in bpy.context.view_layer.objects):
+        raise RuntimeError(
+            f"Bake target '{getattr(obj, 'name', '<unknown>')}' is not in the active view layer"
+        )
+
+    if obj.hide_get():
+        obj.hide_set(False)
+    if obj.hide_select:
+        obj.hide_select = False
+
+    try:
+        if bpy.ops.object.mode_set.poll():
+            bpy.ops.object.mode_set(mode='OBJECT')
+    except Exception:
+        pass
+
+    bpy.ops.object.select_all(action='DESELECT')
+    bpy.context.view_layer.objects.active = obj
+    obj.select_set(True)
+    bpy.context.view_layer.update()
+
+    if bpy.context.view_layer.objects.active != obj:
+        raise RuntimeError(f"Could not activate bake target '{obj.name}'")
+
+    return {
+        'active_object': obj,
+        'object': obj,
+        'selected_objects': [obj],
+        'selected_editable_objects': [obj],
+    }
+
+
+def unwrap(obj, method, overlap_only, texture_resolution=2048):
         """     
         Unwraps the UVs of the given object using the selected method.         
         :param obj: Blender object.         
@@ -1595,226 +2510,260 @@ def unwrap(obj, method, overlap_only):
         if method == 'none':
             return
         
-        # Deselect all objects
-        bpy.ops.object.select_all(action='DESELECT')
-        # Set object as active and select it
-        bpy.context.view_layer.objects.active = obj
-        obj.select_set(True)
+        op_context = _activate_mesh_for_object_ops(obj)
+        _ensure_projection_visibility_for_bake(obj)
+        covered_faces = _projection_bake_face_mask(obj)
+        projection_coverage_pack = covered_faces is not None
+        selective_projection_pack = (
+            projection_coverage_pack
+            and not bool(np.all(covered_faces))
+        )
 
-        is_new = False
+        _ensure_bake_uv(obj)
 
-        # If all UV maps are ProjectionUV or buffer, add new one
-        if all(["ProjectionUV" in uv.name or uv.name == "_SG_ProjectionBuffer" for uv in obj.data.uv_layers]):
-            # Add a new UV map
-            obj.data.uv_layers.new(name=f"BakeUV")
-            is_new = True
-            obj.data.uv_layers.active_index = len(obj.data.uv_layers) - 1
-            # Set it for rendering
-            obj.data.uv_layers.active = obj.data.uv_layers[-1]
-        else:
-            # Ensure the active UV is a non-ProjectionUV/buffer map
-            for uv_layer in obj.data.uv_layers:
-                if "ProjectionUV" not in uv_layer.name and uv_layer.name != "_SG_ProjectionBuffer":
-                    obj.data.uv_layers.active = uv_layer
-                    break
-        
-        bpy.ops.object.mode_set(mode='EDIT')
+        with bpy.context.temp_override(**op_context):
+            bpy.ops.object.mode_set(mode='EDIT')
 
-        # Ensure UV selection sync is OFF
-        bpy.context.scene.tool_settings.use_uv_select_sync = False
+            # Ensure UV selection sync is OFF
+            bpy.context.scene.tool_settings.use_uv_select_sync = False
 
-        if overlap_only:
-            # Deselect
-            bpy.ops.uv.select_all(action='DESELECT')
-            # Check if the object has overlapping UVs, if not, skip unwrapping
-            bpy.ops.uv.select_overlap()
-            # Get a BMesh representation of the mesh
-            bm = bmesh.from_edit_mesh(obj.data)
-            bm.faces.ensure_lookup_table()
-            # Use the active UV layer (this is a BMUVLayer)
-            uv_layer = bm.loops.layers.uv.active
-            uv_layer = bm.loops.layers.uv.active
-            if not uv_layer:
-                bpy.ops.object.mode_set(mode='OBJECT')
-                return
-            
-            # Check for ANY selected UV elements
-            if bpy.app.version >= (5, 0, 0):
-                # Blender 5.0+ uses loop.uv_select_vert
-                has_overlap = any(
-                    loop.uv_select_vert
-                    for face in bm.faces 
-                    for loop in face.loops
-                )
+            if overlap_only and not selective_projection_pack:
+                # Deselect
+                bpy.ops.uv.select_all(action='DESELECT')
+                # Check if the object has overlapping UVs, if not, skip unwrapping
+                bpy.ops.uv.select_overlap()
+                # Get a BMesh representation of the mesh
+                bm = bmesh.from_edit_mesh(obj.data)
+                bm.faces.ensure_lookup_table()
+                # Use the active UV layer (this is a BMUVLayer)
+                uv_layer = bm.loops.layers.uv.active
+                uv_layer = bm.loops.layers.uv.active
+                if not uv_layer:
+                    bpy.ops.object.mode_set(mode='OBJECT')
+                    return
+
+                # Check for ANY selected UV elements
+                if bpy.app.version >= (5, 0, 0):
+                    # Blender 5.0+ uses loop.uv_select_vert
+                    has_overlap = any(
+                        loop.uv_select_vert
+                        for face in bm.faces
+                        for loop in face.loops
+                    )
+                else:
+                    has_overlap = any(
+                        loop[uv_layer].select
+                        for face in bm.faces
+                        for loop in face.loops
+                    )
+
+                if not has_overlap:
+                    bpy.ops.object.mode_set(mode='OBJECT')
+                    return
+
+            bpy.context.scene.tool_settings.use_uv_select_sync = True
+            if selective_projection_pack:
+                bpy.ops.mesh.select_all(action='DESELECT')
+                bm = bmesh.from_edit_mesh(obj.data)
+                bm.faces.ensure_lookup_table()
+                bm.faces.index_update()
+                for face in bm.faces:
+                    face.select_set(
+                        face.index < len(covered_faces)
+                        and bool(covered_faces[face.index])
+                    )
+                bmesh.update_edit_mesh(
+                    obj.data, loop_triangles=False, destructive=False)
             else:
-                has_overlap = any(
-                    loop[uv_layer].select 
-                    for face in bm.faces 
-                    for loop in face.loops
+                bpy.ops.mesh.select_all(action='SELECT')
+            
+            has_selected_faces = (
+                not selective_projection_pack
+                or bool(np.any(covered_faces))
+            )
+            if has_selected_faces:
+                if method == 'basic':
+                    bpy.ops.uv.unwrap(method='ANGLE_BASED', margin=0.001)
+                elif method == 'smart':
+                    bpy.ops.uv.smart_project(
+                        rotate_method='AXIS_ALIGNED',
+                        scale_to_bounds=True,
+                    )
+                elif method == 'cube':
+                    bpy.ops.uv.cube_project(cube_size=1.0)
+                elif method == 'lightmap':
+                    bpy.ops.uv.lightmap_pack()
+                elif method == 'pack':
+                    bpy.ops.uv.pack_islands()
+
+            if projection_coverage_pack:
+                _compact_uncovered_projection_uvs(
+                    obj,
+                    covered_faces,
+                    texture_resolution,
+                )
+                covered_count = int(np.count_nonzero(covered_faces))
+                print(
+                    f"[StableGen] Filled BakeUV with {covered_count}/"
+                    f"{len(covered_faces)} projection-covered faces on "
+                    f"{obj.name}; collapsed fully uncovered faces"
                 )
 
-            if not has_overlap:
-                bpy.ops.object.mode_set(mode='OBJECT')
-                return
+            bpy.ops.uv.select_all(action='DESELECT')
+            bpy.ops.object.mode_set(mode='OBJECT')
 
-        bpy.context.scene.tool_settings.use_uv_select_sync = True
-        # Select all faces
-        bpy.ops.mesh.select_all(action='SELECT')
-        
-        if method == 'basic':
-            bpy.ops.uv.unwrap(method='ANGLE_BASED', margin=0.001)
-        elif method == 'smart':
-            bpy.ops.uv.smart_project()
-        elif method == 'cube':
-            bpy.ops.uv.cube_project(cube_size=1.0)
-        elif method == 'lightmap':
-            bpy.ops.uv.lightmap_pack()
-        elif method == 'pack':
-            bpy.ops.uv.pack_islands()
-
-        bpy.ops.uv.select_all(action='DESELECT')
-        bpy.ops.object.mode_set(mode='OBJECT')
-
-def bake_texture(context, obj, texture_resolution, suffix = "", view_transform = 'Standard', output_dir = None):
+def bake_texture(context, obj, texture_resolution, suffix = "", view_transform = 'Standard', output_dir = None,
+                 output_name=None):
         """     
         Bakes the texture of the given object.         
         :param context: Blender context.         
         :param obj: Blender object.         
         :return: True if successful, False otherwise. 
         """
-        bpy.context.scene.display_settings.display_device = 'sRGB'
-        # Backup original view transform
-        original_view_transform = bpy.context.scene.view_settings.view_transform
-        # Backup whether the object was enabled for rendering
-        original_render = obj.hide_render
-    
-        bpy.context.scene.view_settings.view_transform = view_transform
-        # Set the object to be rendered
-        obj.hide_render = False
-
-        # Create a new image for baking
-        image_name = f"{obj.name}_baked{suffix}" 
-        image = bpy.data.images.new(name=image_name, width=texture_resolution, height=texture_resolution)
-
-        # Create a new texture node in the object's material
+        _configure_not_exported_helpers(context)
+        if _is_gltf_not_exported_helper(obj) or _is_bone_custom_shape_object(obj):
+            print(f"[StableGen] Skipping helper mesh during bake: {obj.name}")
+            return False
         if not obj.data.materials:
-            # Cancel
             print("[StableGen] No materials found")
             return False
-        else:
-            # Temporarily remove all original materials
-            mat = obj.active_material.copy()
-            original_materials = list(obj.data.materials)
-            original_active_material = obj.active_material
-            obj.data.materials.clear()
-            obj.data.materials.append(mat)
 
-        mat.use_nodes = True
-        nodes = mat.node_tree.nodes
-        links = mat.node_tree.links
+        scene = bpy.context.scene
+        scene.display_settings.display_device = 'sRGB'
+        original_view_transform = scene.view_settings.view_transform
+        original_render = obj.hide_render
+        original_materials = []
+        original_active_index = obj.active_material_index
+        copied_materials = []
 
-        tex_image = nodes.new("ShaderNodeTexImage")
-        tex_image.image = image
-        tex_image.location = (0, 0)
+        try:
+            scene.view_settings.view_transform = view_transform
+            obj.hide_render = False
 
-        # Deselect all objects
-        bpy.ops.object.select_all(action='DESELECT')
-        # Set object as active and select it
-        bpy.context.view_layer.objects.active = obj
-        obj.select_set(True)
-        # Set the image node as the active bake target
-        nodes.active = tex_image    
+            source_uv_name = _first_source_uv_name(obj)
+            bake_uv = _set_bake_uv_active(obj)
 
-        # Ensure the active UV is a non-ProjectionUV/buffer map for correct baking
-        for uv_layer in obj.data.uv_layers:
-            if "ProjectionUV" not in uv_layer.name and uv_layer.name != "_SG_ProjectionBuffer":
-                obj.data.uv_layers.active = uv_layer
-                break
-        
-        # Check if there is a BSDF node before the output node
-        output = None
-        had_bsdf = False
-        for node in nodes:
-            if node.type == 'OUTPUT_MATERIAL':
-                output = node
-                break
-            
-        before_output = output.inputs[0].links[0].from_node if output and output.inputs[0].is_linked else None
-        if before_output and before_output.type != 'BSDF_PRINCIPLED':
-            bsdf_node = nodes.new("ShaderNodeBsdfPrincipled")
-            bsdf_node.location = (before_output.location[0] + 200, before_output.location[1])
-            # Connect the before output node to the BSDF node
-            links.new(before_output.outputs[0], bsdf_node.inputs[0])
-            # Connect the BSDF node to the output node
-            links.new(bsdf_node.outputs[0], output.inputs[0])
+            image_name = output_name or f"{obj.name}_baked{suffix}"
+            old_image = bpy.data.images.get(image_name)
+            if old_image is not None and old_image.users == 0:
+                bpy.data.images.remove(old_image)
+            image = bpy.data.images.new(
+                name=image_name,
+                width=texture_resolution,
+                height=texture_resolution,
+            )
 
-        # Disconnect Metallic so the DIFFUSE color-only pass returns the
-        # true Base Color.  Principled BSDF multiplies diffuse by
-        # (1 - Metallic), which would dim metallic areas incorrectly.
-        for node in nodes:
-            if node.type == 'BSDF_PRINCIPLED':
-                met = node.inputs.get("Metallic")
-                if met:
-                    for link in list(met.links):
-                        links.remove(link)
-                    met.default_value = 0.0
-                break
-            
-        # Bake the texture
-        # Ensure OBJECT mode — bake fails silently in EDIT mode
-        if bpy.context.mode != 'OBJECT':
-            bpy.ops.object.mode_set(mode='OBJECT')
-        bpy.ops.object.bake(type='DIFFUSE', width=texture_resolution, height=texture_resolution)
-       
-        # Save the image if required
-        if not os.path.exists(output_dir):
-            os.makedirs(output_dir)
-        if suffix == "":
-            image.filepath_raw = os.path.join(output_dir, f"{obj.name}.png")
-        else:
-            image.filepath_raw = os.path.join(output_dir, f"{obj.name}_baked{suffix}.png")
-        image.file_format = 'PNG'
-        image.save()
+            (original_materials,
+             original_active_index,
+             copied_materials) = _copy_material_slots_for_bake(obj)
+            if not copied_materials:
+                print("[StableGen] No material slots found")
+                return False
 
-        # Remove tex_image node
-        nodes.remove(tex_image)
+            op_context = _activate_mesh_for_object_ops(obj)
+            bake_uv = _set_bake_uv_active(obj)
 
-        # Restore original view transform
-        bpy.context.scene.view_settings.view_transform = original_view_transform
-        # Restore original render settings
-        obj.hide_render = original_render
+            for mat in copied_materials:
+                mat.use_nodes = True
+                nodes = mat.node_tree.nodes
+                links = mat.node_tree.links
 
-        # Restore original materials
-        obj.data.materials.clear()
-        # First append the original active material
-        if original_active_material:
-            obj.data.materials.append(original_active_material)
-        for mat_item in original_materials:
-            if mat_item != original_active_material:
-                obj.data.materials.append(mat_item)
+                tex_image = nodes.new("ShaderNodeTexImage")
+                tex_image.image = image
+                tex_image.location = (0, 0)
+                nodes.active = tex_image
 
-        # Remove the temporary material copy (prevent leak)
-        bpy.data.materials.remove(mat)
-                
-        return True
+                _pin_unlinked_image_textures_to_uv(
+                    nodes, links, source_uv_name, exclude_nodes={tex_image})
+
+                output = next(
+                    (node for node in nodes
+                     if node.type == 'OUTPUT_MATERIAL'),
+                    None,
+                )
+                before_output = (
+                    output.inputs[0].links[0].from_node
+                    if output and output.inputs[0].is_linked else None
+                )
+                if before_output and before_output.type != 'BSDF_PRINCIPLED':
+                    bsdf_node = nodes.new("ShaderNodeBsdfPrincipled")
+                    bsdf_node.location = (
+                        before_output.location[0] + 200,
+                        before_output.location[1],
+                    )
+                    links.new(before_output.outputs[0], bsdf_node.inputs[0])
+                    links.new(bsdf_node.outputs[0], output.inputs[0])
+
+                # DIFFUSE color-only is multiplied by (1 - Metallic).
+                # Disconnect Metallic so the pass returns true Base Color.
+                for node in nodes:
+                    if node.type == 'BSDF_PRINCIPLED':
+                        metallic = node.inputs.get("Metallic")
+                        if metallic:
+                            for link in list(metallic.links):
+                                links.remove(link)
+                            metallic.default_value = 0.0
+                        break
+                mat.node_tree.update_tag()
+
+            obj.data.update()
+            context.view_layer.update()
+
+            # Operators can return CANCELLED without raising.  Treat anything
+            # other than FINISHED as a real failure; otherwise an untouched
+            # newly-created (black) image would be saved and exported.
+            with bpy.context.temp_override(**op_context):
+                if bpy.context.mode != 'OBJECT':
+                    bpy.ops.object.mode_set(mode='OBJECT')
+                bake_result = bpy.ops.object.bake(
+                    'EXEC_DEFAULT',
+                    type='DIFFUSE',
+                    width=texture_resolution,
+                    height=texture_resolution,
+                    uv_layer=bake_uv.name if bake_uv else '',
+                )
+            if 'FINISHED' not in bake_result:
+                raise RuntimeError(
+                    f"Cycles bake returned {set(bake_result)} for {obj.name}"
+                )
+
+            if output_dir is None:
+                output_dir = get_dir_path(context, "baked")
+            os.makedirs(output_dir, exist_ok=True)
+            if output_name is not None:
+                image.filepath_raw = os.path.join(output_dir, f"{output_name}.png")
+            elif suffix == "":
+                image.filepath_raw = os.path.join(output_dir, f"{obj.name}.png")
+            else:
+                image.filepath_raw = os.path.join(
+                    output_dir, f"{obj.name}_baked{suffix}.png")
+            image.file_format = 'PNG'
+            image.save()
+            return True
+        finally:
+            scene.view_settings.view_transform = original_view_transform
+            obj.hide_render = original_render
+            if original_materials or copied_materials:
+                _restore_material_slots_after_bake(
+                    obj,
+                    original_materials,
+                    original_active_index,
+                    copied_materials,
+                )
 
 def _has_non_projection_uv(obj):
     """Return True if the object has at least one UV map that can be used
     for baking (not a StableGen projection UV or buffer)."""
     if not obj or obj.type != 'MESH':
         return False
-    if not obj.data.uv_layers:
-        return False
-    for uv in obj.data.uv_layers:
-        if (not uv.name.startswith("ProjectionUV")
-                and uv.name != "_SG_ProjectionBuffer"):
-            return True
-    return False
+    return obj.data.uv_layers.get(_SG_BAKE_UV_NAME) is not None
 
 def _uvs_likely_overlap(obj, uv_name=None):
     me = obj.data
     if not me.uv_layers:
         return False
+    if uv_name is None:
+        uv_name = _SG_BAKE_UV_NAME
     uv_layer = me.uv_layers.get(uv_name) if uv_name else me.uv_layers.active
     if not uv_layer:
         return False
@@ -1842,6 +2791,23 @@ _PBR_CHANNEL_SUFFIXES = {
     'height':     'Height',
     'ao':         'AO',
 }
+
+
+def _remove_stale_pbr_maps(output_dir, object_name, channels):
+    """Delete ``{object_name}_{Suffix}.png`` maps left in *output_dir* by an earlier bake for every channel that is
+    not in *channels*. The baked material wires each map it finds on disk, so a channel switched off since the last
+    bake would otherwise come back. Base colour is always rewritten and is kept."""
+    removed = []
+    for channel, suffix in _PBR_CHANNEL_SUFFIXES.items():
+        if channel == 'base_color' or channel in channels:
+            continue
+        path = os.path.join(output_dir, f"{object_name}_{suffix}.png")
+        if os.path.isfile(path):
+            os.remove(path)
+            removed.append(os.path.basename(path))
+    if removed:
+        print(f"[StableGen] Removed maps from an earlier bake of {object_name}: {', '.join(removed)}")
+    return removed
 
 
 def _find_pbr_bake_sources(mat):
@@ -1967,14 +2933,14 @@ def _has_pbr_channels(mat):
     return any(ch in sources for ch in ('roughness', 'metallic', 'normal', 'emission', 'height', 'ao'))
 
 
-def _restore_materials(obj, original_materials, original_active):
-    """Restore an object's material slots back to their original state."""
-    obj.data.materials.clear()
-    if original_active:
-        obj.data.materials.append(original_active)
-    for m in original_materials:
-        if m != original_active:
-            obj.data.materials.append(m)
+def _object_pbr_channels(obj):
+    channels = []
+    for mat in obj.data.materials:
+        if mat and _has_pbr_channels(mat):
+            for channel in _find_pbr_bake_sources(mat):
+                if channel not in channels:
+                    channels.append(channel)
+    return channels
 
 
 def bake_pbr_channel(context, obj, channel_name, texture_resolution, output_dir):
@@ -1990,134 +2956,136 @@ def bake_pbr_channel(context, obj, channel_name, texture_resolution, output_dir)
     if not obj.data.materials or not obj.active_material:
         return None
 
+    _configure_not_exported_helpers(context)
+    if _is_gltf_not_exported_helper(obj) or _is_bone_custom_shape_object(obj):
+        print(f"[StableGen] Skipping helper mesh during PBR bake: {obj.name}")
+        return None
+
     # ── Save state ─────────────────────────────────────────────────
     orig_vt = context.scene.view_settings.view_transform
     orig_render = obj.hide_render
+    original_material_state = _snapshot_material_state(obj)
+    original_active_uv = (
+        obj.data.uv_layers.active.name
+        if obj.data.uv_layers.active else None
+    )
     context.scene.view_settings.view_transform = 'Standard'
     obj.hide_render = False
+    source_uv_name = _first_source_uv_name(obj)
+    _set_bake_uv_active(obj)
 
     # ── Copy material onto the object ──────────────────────────────
-    original_materials = list(obj.data.materials)
-    original_active = obj.active_material
-    mat_copy = original_active.copy()
-    obj.data.materials.clear()
-    obj.data.materials.append(mat_copy)
-    mat_copy.use_nodes = True
-    nodes = mat_copy.node_tree.nodes
-    links = mat_copy.node_tree.links
+    mat_copy = None
+    try:
+        mat_copy = obj.active_material.copy()
+        obj.data.materials.clear()
+        obj.data.materials.append(mat_copy)
+        mat_copy.use_nodes = True
+        nodes = mat_copy.node_tree.nodes
+        links = mat_copy.node_tree.links
 
-    # ── Find source socket in the copy ─────────────────────────────
-    sources = _find_pbr_bake_sources(mat_copy)
-    source_socket = sources.get(channel_name)
-    if source_socket is None:
-        _restore_materials(obj, original_materials, original_active)
-        bpy.data.materials.remove(mat_copy)
-        context.scene.view_settings.view_transform = orig_vt
-        obj.hide_render = orig_render
-        return None
+        # ── Find source socket in the copy ─────────────────────────
+        sources = _find_pbr_bake_sources(mat_copy)
+        source_socket = sources.get(channel_name)
+        if source_socket is None:
+            return None
 
-    # ── Find Output node ───────────────────────────────────────────
-    output_node = None
-    for n in nodes:
-        if n.type == 'OUTPUT_MATERIAL':
-            output_node = n
-            break
-    if not output_node:
-        _restore_materials(obj, original_materials, original_active)
-        bpy.data.materials.remove(mat_copy)
-        context.scene.view_settings.view_transform = orig_vt
-        obj.hide_render = orig_render
-        return None
-
-    # ── Rewire material for baking ───────────────────────────────
-    # Normal channel: use Cycles' built-in NORMAL bake which automatically
-    # converts to tangent space — game-engine / glTF compatible regardless
-    # of the original normal mode (world, bump, tangent).
-    # All other channels: rewire source → Emission → Output for EMIT bake.
-    bake_type = 'EMIT'
-    if channel_name == 'normal':
-        # Keep the Principled BSDF wired to the Output with the Normal
-        # input connected.  Cycles NORMAL bake evaluates the shader's
-        # final shading normal and converts it to tangent space for us.
-        bake_type = 'NORMAL'
-        # Ensure the normal influence is at full strength for baking
-        principled = None
-        for n in nodes:
-            if n.type == 'BSDF_PRINCIPLED':
-                principled = n
+        # ── Find Output node ───────────────────────────────────────
+        output_node = None
+        for node in nodes:
+            if node.type == 'OUTPUT_MATERIAL':
+                output_node = node
                 break
-        if principled and principled.inputs.get("Normal") and principled.inputs["Normal"].links:
-            nmap_node = principled.inputs["Normal"].links[0].from_node
-            if nmap_node.type == 'NORMAL_MAP':
-                nmap_node.inputs["Strength"].default_value = 1.0
-    else:
-        for link in list(output_node.inputs["Surface"].links):
-            links.remove(link)
+        if not output_node:
+            return None
 
-        emit_node = nodes.new("ShaderNodeEmission")
-        emit_node.location = (output_node.location[0] - 200,
-                              output_node.location[1])
-        links.new(source_socket, emit_node.inputs["Color"])
-        links.new(emit_node.outputs["Emission"],
-                  output_node.inputs["Surface"])
+        # ── Rewire material for baking ─────────────────────────────
+        # Normal channel uses Cycles' tangent-space NORMAL bake. All other
+        # channels route their source through Emission for an exact value bake.
+        bake_type = 'EMIT'
+        if channel_name == 'normal':
+            bake_type = 'NORMAL'
+            principled = next(
+                (node for node in nodes if node.type == 'BSDF_PRINCIPLED'),
+                None,
+            )
+            if (principled and principled.inputs.get("Normal")
+                    and principled.inputs["Normal"].links):
+                nmap_node = principled.inputs["Normal"].links[0].from_node
+                if nmap_node.type == 'NORMAL_MAP':
+                    nmap_node.inputs["Strength"].default_value = 1.0
+        else:
+            for link in list(output_node.inputs["Surface"].links):
+                links.remove(link)
 
-    # ── Bake target image ──────────────────────────────────────────
-    suffix = _PBR_CHANNEL_SUFFIXES.get(channel_name, channel_name)
-    img_name = f"{obj.name}_{suffix}"
-    bake_img = bpy.data.images.new(name=img_name,
-                                   width=texture_resolution,
-                                   height=texture_resolution)
+            emit_node = nodes.new("ShaderNodeEmission")
+            emit_node.location = (
+                output_node.location[0] - 200,
+                output_node.location[1],
+            )
+            links.new(source_socket, emit_node.inputs["Color"])
+            links.new(
+                emit_node.outputs["Emission"],
+                output_node.inputs["Surface"],
+            )
 
-    # Non-color channels (roughness, metallic, normal, height, AO) must be
-    # stored in linear / Non-Color so the round-trip is lossless:
-    #   Cycles linear → raw 8-bit → PNG → load as Non-Color → linear.
-    # Without this, the default sRGB image applies gamma encoding on write,
-    # but add_baked_material() loads them as Non-Color (no decode) →
-    # values are gamma-shifted (e.g. roughness 0.22 → 0.50).
-    if channel_name not in ('base_color', 'emission'):
-        bake_img.colorspace_settings.name = 'Non-Color'
+        # ── Bake target image ──────────────────────────────────────
+        suffix = _PBR_CHANNEL_SUFFIXES.get(channel_name, channel_name)
+        img_name = f"{obj.name}_{suffix}"
+        bake_img = bpy.data.images.new(
+            name=img_name,
+            width=texture_resolution,
+            height=texture_resolution,
+        )
+        if channel_name not in ('base_color', 'emission'):
+            bake_img.colorspace_settings.name = 'Non-Color'
 
-    tex_node = nodes.new("ShaderNodeTexImage")
-    tex_node.image = bake_img
-    nodes.active = tex_node
+        tex_node = nodes.new("ShaderNodeTexImage")
+        tex_node.image = bake_img
+        nodes.active = tex_node
 
-    # ── Select object + non-projection UV ──────────────────────────
-    bpy.ops.object.select_all(action='DESELECT')
-    context.view_layer.objects.active = obj
-    obj.select_set(True)
-    for uv in obj.data.uv_layers:
-        if "ProjectionUV" not in uv.name and uv.name != "_SG_ProjectionBuffer":
-            obj.data.uv_layers.active = uv
-            break
+        # ── Select object + non-projection UV ──────────────────────
+        op_context = _activate_mesh_for_object_ops(obj)
+        _pin_unlinked_image_textures_to_uv(
+            nodes, links, source_uv_name, exclude_nodes={tex_node})
+        _set_bake_uv_active(obj)
 
-    # ── Bake ─────────────────────────────────────────────────────
-    # Ensure OBJECT mode — bake fails silently in EDIT mode
-    if bpy.context.mode != 'OBJECT':
-        bpy.ops.object.mode_set(mode='OBJECT')
-    if bake_type == 'NORMAL':
-        bpy.ops.object.bake(type='NORMAL',
-                            normal_space='TANGENT',
-                            width=texture_resolution,
-                            height=texture_resolution)
-    else:
-        bpy.ops.object.bake(type='EMIT',
-                            width=texture_resolution,
-                            height=texture_resolution)
+        # ── Bake ───────────────────────────────────────────────────
+        with bpy.context.temp_override(**op_context):
+            if bpy.context.mode != 'OBJECT':
+                bpy.ops.object.mode_set(mode='OBJECT')
+            if bake_type == 'NORMAL':
+                bpy.ops.object.bake(
+                    type='NORMAL',
+                    normal_space='TANGENT',
+                    width=texture_resolution,
+                    height=texture_resolution,
+                )
+            else:
+                bpy.ops.object.bake(
+                    type='EMIT',
+                    width=texture_resolution,
+                    height=texture_resolution,
+                )
 
-    # ── Save ───────────────────────────────────────────────────────
-    os.makedirs(output_dir, exist_ok=True)
-    out_path = os.path.join(output_dir, f"{obj.name}_{suffix}.png")
-    bake_img.filepath_raw = out_path
-    bake_img.file_format = 'PNG'
-    bake_img.save()
-    print(f"[StableGen]     Saved PBR channel: {out_path}")
-
-    # ── Cleanup ────────────────────────────────────────────────────
-    _restore_materials(obj, original_materials, original_active)
-    bpy.data.materials.remove(mat_copy)
-    context.scene.view_settings.view_transform = orig_vt
-    obj.hide_render = orig_render
-    return out_path
+        # ── Save ───────────────────────────────────────────────────
+        os.makedirs(output_dir, exist_ok=True)
+        out_path = os.path.join(output_dir, f"{obj.name}_{suffix}.png")
+        bake_img.filepath_raw = out_path
+        bake_img.file_format = 'PNG'
+        bake_img.save()
+        print(f"[StableGen]     Saved PBR channel: {out_path}")
+        return out_path
+    finally:
+        # This must run for missing channels, missing outputs, failed Cycles
+        # bakes, failed image saves, and successful bakes alike.
+        _restore_material_state(obj, original_material_state)
+        if mat_copy and mat_copy.name in bpy.data.materials:
+            bpy.data.materials.remove(mat_copy)
+        if original_active_uv and obj.data.uv_layers.get(original_active_uv):
+            obj.data.uv_layers.active = obj.data.uv_layers[original_active_uv]
+        context.scene.view_settings.view_transform = orig_vt
+        obj.hide_render = orig_render
 
 
 def _flip_normal_green(filepath):
@@ -2190,6 +3158,7 @@ class BakeTextures(bpy.types.Operator):
     - This will make the generated textures available in the Material Preview viewport shading mode."""
     bl_idname = "object.bake_textures"
     bl_label = "Bake Textures"
+    bl_description = "Bake projected textures into UV image maps with Cycles. Opens resolution, UV and material options; saves maps in the output’s baked folder"
     bl_options = {'REGISTER', 'UNDO'}
 
     texture_resolution: bpy.props.IntProperty(
@@ -2323,14 +3292,25 @@ class BakeTextures(bpy.types.Operator):
         :return: {'RUNNING_MODAL'}     
         """
         if context.scene.texture_objects == 'all':
-            self._objects = [obj for obj in context.view_layer.objects if obj.type == 'MESH' and not obj.hide_get()]
+            candidates = [obj for obj in context.view_layer.objects if obj.type == 'MESH']
         else: # 'selected'
-            self._objects = [obj for obj in context.selected_objects if obj.type == 'MESH']
+            candidates = [obj for obj in context.selected_objects if obj.type == 'MESH']
+        self._objects, skipped = _texture_bake_targets(candidates)
+        if skipped:
+            names = ", ".join(obj.name for obj in skipped[:5])
+            more = "" if len(skipped) <= 5 else f", +{len(skipped) - 5} more"
+            print(
+                f"[StableGen] Skipping {len(skipped)} non-texture helper mesh(es) "
+                f"during bake: {names}{more}"
+            )
+        if not self._objects:
+            self.report({'ERROR'}, "No textureable mesh objects found to bake.")
+            return {'CANCELLED'}
         self._current_index = 0
         self._phase = 'unwrap'
         self._total_objects = len(self._objects)
         self._stage = "Preparing"
-        return context.window_manager.invoke_props_dialog(self)
+        return context.window_manager.invoke_props_dialog(self, width=440)
 
     def execute(self, context):
         """     
@@ -2338,6 +3318,19 @@ class BakeTextures(bpy.types.Operator):
         :param context: Blender context.         
         :return: {'RUNNING_MODAL'}     
         """
+
+        _configure_not_exported_helpers(context)
+        self._objects, skipped = _texture_bake_targets(self._objects)
+        if skipped:
+            names = ", ".join(obj.name for obj in skipped[:5])
+            more = "" if len(skipped) <= 5 else f", +{len(skipped) - 5} more"
+            print(
+                f"[StableGen] Skipping {len(skipped)} non-texture helper mesh(es) "
+                f"during bake: {names}{more}"
+            )
+        if not self._objects:
+            self.report({'ERROR'}, "No textureable mesh objects found to bake.")
+            return {'CANCELLED'}
 
         self.original_engine = bpy.context.scene.render.engine
         if bpy.context.space_data and hasattr(bpy.context.space_data, 'shading'):
@@ -2437,14 +3430,29 @@ class BakeTextures(bpy.types.Operator):
                     if self.try_unwrap != 'none':
                         if not _has_non_projection_uv(obj):
                             # No usable UV exists — must unwrap
-                            unwrap(obj, self.try_unwrap, self.overlap_only)
+                            unwrap(
+                                obj,
+                                self.try_unwrap,
+                                self.overlap_only,
+                                self.texture_resolution,
+                            )
                         elif self.overlap_only:
                             # Only re-unwrap if existing UVs overlap
                             if _uvs_likely_overlap(obj):
-                                unwrap(obj, self.try_unwrap, self.overlap_only)
+                                unwrap(
+                                    obj,
+                                    self.try_unwrap,
+                                    self.overlap_only,
+                                    self.texture_resolution,
+                                )
                         else:
                             # Always re-unwrap when overlap_only is disabled
-                            unwrap(obj, self.try_unwrap, self.overlap_only)
+                            unwrap(
+                                obj,
+                                self.try_unwrap,
+                                self.overlap_only,
+                                self.texture_resolution,
+                            )
 
                     self._progress = 100
                 elif self._phase == 'bake':
@@ -2514,10 +3522,14 @@ class BakeTextures(bpy.types.Operator):
                         self.report({'INFO'}, "Baking PBR channels...")
                         self._phase = 'bake_pbr'
                         self._pbr_queue = []
+                        baked_dir = get_dir_path(context, "baked")
                         for obj in self._objects:
+                            channels = []
                             if obj.active_material and _has_pbr_channels(obj.active_material):
-                                for ch in _find_pbr_bake_sources(obj.active_material):
+                                channels = list(_find_pbr_bake_sources(obj.active_material))
+                                for ch in channels:
                                     self._pbr_queue.append((obj, ch))
+                            _remove_stale_pbr_maps(baked_dir, obj.name, channels)
                         self._pbr_queue_idx = 0
                         if not self._pbr_queue:
                             # No PBR sources — skip straight to apply

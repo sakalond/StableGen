@@ -180,6 +180,7 @@ ref/
 AGENTS.md
 scratch/
 stablegen/scratch/
+retarget_runs*/
 script.py
 sg_wheels/
 stablegen/.claude/

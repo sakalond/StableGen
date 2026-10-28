@@ -19,8 +19,1167 @@ from ..utils import get_generation_dirs, sg_modal_active
 from ..timeout_config import get_timeout
 from .._generator_utils import setup_studio_lighting, redraw_ui, upload_image_to_comfyui
 from ..texturing.gallery import _PreviewGalleryOverlay
+from .rig_display import (
+    apply_autorig_bone_display,
+    autorig_gltf_import_kwargs,
+    configure_gltf_not_exported_visibility,
+    record_autorig_bone_heuristic,
+    selected_armatures_for_display,
+)
+from ..core.architectures import DIFFUSION_ARCHITECTURES
 
 _ADDON_PKG = __package__.rsplit('.', 1)[0]
+_GARMENT_STABILIZED_GROUP = "SG_GarmentStabilized"
+
+
+def _autorig_deforming_armature(mesh_object, imported_armatures):
+    """Return the imported armature that supplies this mesh's skin groups."""
+    for modifier in mesh_object.modifiers:
+        if (
+            modifier.type == 'ARMATURE'
+            and modifier.object in imported_armatures
+        ):
+            return modifier.object
+
+    parent = mesh_object.parent
+    while parent:
+        if parent.type == 'ARMATURE' and parent in imported_armatures:
+            return parent
+        parent = parent.parent
+    return None
+
+
+def _is_projection_textured(obj):
+    """Whether a mesh is textured by StableGen's projection material, whose per-camera
+    attributes (ProjectionUV_*, _SG_*) do not survive a glTF round trip."""
+    if obj is None or obj.type != 'MESH':
+        return False
+    return any(attr.name.startswith(('ProjectionUV', '_SG_')) for attr in obj.data.attributes)
+
+
+def _bind_projection_textured_sources(source_names, imported_objects):
+    """Move the new skin weights onto projection-textured source meshes.
+
+    SkinTokens returns a re-imported copy of the input. For a projection-textured
+    character that copy has the projection material but not the attributes it
+    reads, so it renders untextured. Each such source instead receives the copy's
+    vertex groups (nearest-face interpolated, in the rest pose), an Armature
+    modifier and the new armature as parent. Returns the names of the bound
+    sources; the caller retires the copy.
+    """
+    sources = [bpy.data.objects.get(name) for name in source_names]
+    sources = [obj for obj in sources if _is_projection_textured(obj)]
+    armatures = [obj for obj in imported_objects if obj.type == 'ARMATURE']
+    weighted = [obj for obj in imported_objects if obj.type == 'MESH' and obj.vertex_groups]
+    if not sources or not armatures or not weighted:
+        return []
+    armature = armatures[0]
+    weight_source = max(weighted, key=lambda obj: len(obj.data.polygons))
+    previous_pose = armature.data.pose_position
+    armature.data.pose_position = 'REST'
+    bound = []
+    try:
+        for source in sources:
+            source.hide_set(False)
+            source.hide_viewport = False
+            for modifier in [m for m in source.modifiers if m.type == 'ARMATURE']:
+                source.modifiers.remove(modifier)
+            for group in weight_source.vertex_groups:
+                if group.name not in source.vertex_groups:
+                    source.vertex_groups.new(name=group.name)
+            transfer = source.modifiers.new("SG_AutoRigWeights", 'DATA_TRANSFER')
+            transfer.object = weight_source
+            transfer.use_vert_data = True
+            transfer.data_types_verts = {'VGROUP_WEIGHTS'}
+            transfer.vert_mapping = 'POLYINTERP_NEAREST'
+            transfer.layers_vgroup_select_src = 'ALL'
+            transfer.layers_vgroup_select_dst = 'NAME'
+            bpy.context.view_layer.update()
+            with bpy.context.temp_override(object=source, active_object=source, selected_objects=[source]):
+                bpy.ops.object.modifier_apply(modifier=transfer.name)
+            world = source.matrix_world.copy()
+            source.parent = armature
+            source.matrix_world = world
+            deform = source.modifiers.new("Armature", 'ARMATURE')
+            deform.object = armature
+            source["sg_generated"] = True
+            bound.append(source.name)
+    finally:
+        armature.data.pose_position = previous_pose
+    return bound
+
+
+def _sanitize_autorig_cross_limb_weights(imported_objects):
+    """Repair spatially implausible SkinTokens limb weights.
+
+    SkinTokens can assign both feet to the same distal bone groups when the
+    shoes are close, or weight hand vertices to a leg, pelvis, spine, or the
+    opposite hand.  Those errors are often invisible in the bind pose but form
+    long spikes once the limbs move.  This pass uses StableGen's semantic rig
+    characterization plus rest-space bone proximity; it does not depend on
+    generated bone names.
+
+    The established cross-foot correction is retained.  A second general pass
+    classifies only confident distal hand/foot regions and removes any weighted
+    bone that is materially farther from the vertex than the nearest valid
+    local limb bone.  Removed weight is assigned to that nearest bone, keeping
+    the total armature weight unchanged.
+    """
+    from ..animation.retargeting import characterize_armature
+
+    imported_objects = [
+        obj for obj in imported_objects
+        if obj and obj.name in bpy.data.objects
+    ]
+    imported_armatures = {
+        obj for obj in imported_objects if obj.type == 'ARMATURE'
+    }
+    if not imported_armatures:
+        return {"changed_vertices": 0, "moved_weight": 0.0, "meshes": 0}
+
+    total_changed = 0
+    total_moved = 0.0
+    changed_meshes = 0
+
+    for armature in imported_armatures:
+        profile = characterize_armature(armature)
+        chains = dict((profile or {}).get("chains", {}))
+        if (profile or {}).get("orientation_correction") == "ROTATE_180":
+            chains["left_leg"], chains["right_leg"] = (
+                chains.get("right_leg", []),
+                chains.get("left_leg", []),
+            )
+            chains["left_arm"], chains["right_arm"] = (
+                chains.get("right_arm", []),
+                chains.get("left_arm", []),
+            )
+
+        left_chain = [
+            name for name in chains.get("left_leg", [])
+            if armature.data.bones.get(name)
+        ]
+        right_chain = [
+            name for name in chains.get("right_leg", [])
+            if armature.data.bones.get(name)
+        ]
+        if len(left_chain) < 2 or len(right_chain) < 2:
+            print(
+                f"[StableGen] Cross-limb cleanup skipped for {armature.name}: "
+                "paired leg chains were not characterized"
+            )
+            continue
+
+        def bone_point(name, use_tail=False):
+            bone = armature.data.bones[name]
+            return (bone.tail_local if use_tail else bone.head_local).copy()
+
+        left_foot = (
+            bone_point(left_chain[-1]) + bone_point(left_chain[-1], True)
+        ) * 0.5
+        right_foot = (
+            bone_point(right_chain[-1]) + bone_point(right_chain[-1], True)
+        ) * 0.5
+        side_vector = left_foot - right_foot
+        side_separation = side_vector.length
+        if side_separation <= 1e-6:
+            print(
+                f"[StableGen] Cross-limb cleanup skipped for {armature.name}: "
+                "the characterized feet have no usable side separation"
+            )
+            continue
+        side_axis = side_vector / side_separation
+        side_origin = (left_foot + right_foot) * 0.5
+
+        pelvis_bone = armature.data.bones.get((profile or {}).get("pelvis", ""))
+        head_bone = armature.data.bones.get((profile or {}).get("head", ""))
+        if pelvis_bone and head_bone:
+            up_axis = (
+                (head_bone.head_local + head_bone.tail_local) * 0.5
+                - (pelvis_bone.head_local + pelvis_bone.tail_local) * 0.5
+            )
+        else:
+            left_hip = bone_point(left_chain[0])
+            right_hip = bone_point(right_chain[0])
+            up_axis = (left_hip + right_hip) * 0.5 - side_origin
+        if up_axis.length <= 1e-6:
+            continue
+        up_axis.normalize()
+
+        hip_height = sum(
+            bone_point(chain[0]).dot(up_axis)
+            for chain in (left_chain, right_chain)
+        ) * 0.5
+        foot_height = sum(
+            point.dot(up_axis) for point in (left_foot, right_foot)
+        ) * 0.5
+        if hip_height < foot_height:
+            up_axis.negate()
+            hip_height = -hip_height
+            foot_height = -foot_height
+
+        leg_height = hip_height - foot_height
+        if leg_height <= 1e-6:
+            continue
+
+        # Slightly above the anatomical knee on typical 3- or 4-bone chains.
+        # Restricting the pass to this region avoids changing skirt/torso skin.
+        lower_body_cutoff = foot_height + leg_height * 0.58
+        side_margin = side_separation * 0.08
+        armature_inverse = armature.matrix_world.inverted_safe()
+
+        chain_pairs = {}
+        for source_chain, target_chain in (
+            (left_chain, right_chain),
+            (right_chain, left_chain),
+        ):
+            source_last = max(1, len(source_chain) - 1)
+            target_last = max(1, len(target_chain) - 1)
+            for index, source_name in enumerate(source_chain):
+                target_index = round((index / source_last) * target_last)
+                chain_pairs[source_name] = target_chain[target_index]
+
+        def bone_segment_distance(point, bone_name):
+            bone = armature.data.bones[bone_name]
+            start = bone.head_local
+            delta = bone.tail_local - start
+            length_squared = delta.length_squared
+            if length_squared <= 1e-12:
+                return (point - start).length
+            factor = max(
+                0.0,
+                min(1.0, (point - start).dot(delta) / length_squared),
+            )
+            return (point - (start + delta * factor)).length
+
+        def descendants(root_name):
+            result = set()
+            root_bone = armature.data.bones.get(root_name)
+            stack = list(root_bone.children) if root_bone else []
+            while stack:
+                child = stack.pop()
+                if child.name in result:
+                    continue
+                result.add(child.name)
+                stack.extend(child.children)
+            return result
+
+        def make_distal_region(label, chain, region_kind):
+            chain = [
+                name for name in chain if armature.data.bones.get(name)
+            ]
+            if len(chain) < 2:
+                return None
+            terminal_descendants = descendants(chain[-1])
+            if region_kind == "hand":
+                core_names = {chain[-1]} | terminal_descendants
+                allowed_names = core_names | {chain[-2]}
+            else:
+                core_names = set(chain[-2:]) | terminal_descendants
+                allowed_names = set(chain[-3:]) | terminal_descendants
+
+            points = []
+            for name in core_names:
+                bone = armature.data.bones[name]
+                points.extend((bone.head_local.copy(), bone.tail_local.copy()))
+            if not points:
+                return None
+            center = sum(points, mathutils.Vector()) / len(points)
+            extent = max((point - center).length for point in points)
+            proximal_length = armature.data.bones[chain[-2]].length
+            radius = max(extent * 1.35, proximal_length * 0.65)
+            if radius <= 1e-6:
+                return None
+            return {
+                "label": label,
+                "kind": region_kind,
+                "owner_family": label.replace(
+                    region_kind,
+                    "arm" if region_kind == "hand" else "leg",
+                ),
+                "center": center,
+                "radius": radius,
+                "max_local_distance": radius * 0.55,
+                "distance_margin": max(
+                    extent * 0.08,
+                    proximal_length * 0.035,
+                    radius * 0.02,
+                ),
+                "core": core_names,
+                "allowed": allowed_names,
+            }
+
+        distal_region_pairs = []
+        for region_kind, chain_suffix in (("hand", "arm"), ("foot", "leg")):
+            left_region = make_distal_region(
+                f"left_{region_kind}",
+                chains.get(f"left_{chain_suffix}", []),
+                region_kind,
+            )
+            right_region = make_distal_region(
+                f"right_{region_kind}",
+                chains.get(f"right_{chain_suffix}", []),
+                region_kind,
+            )
+            if left_region and right_region:
+                distal_region_pairs.append((left_region, right_region))
+
+        all_bone_names = {bone.name for bone in armature.data.bones}
+        family_bones = {
+            "spine": set(chains.get("spine", []))
+            | {
+                name for name in (
+                    (profile or {}).get("pelvis"),
+                    (profile or {}).get("head"),
+                ) if name
+            },
+            "left_arm": set(chains.get("left_arm", []))
+            | descendants((chains.get("left_arm") or [""])[-1]),
+            "right_arm": set(chains.get("right_arm", []))
+            | descendants((chains.get("right_arm") or [""])[-1]),
+            "left_leg": set(chains.get("left_leg", []))
+            | descendants((chains.get("left_leg") or [""])[-1]),
+            "right_leg": set(chains.get("right_leg", []))
+            | descendants((chains.get("right_leg") or [""])[-1]),
+        }
+        bone_family = {
+            name: family
+            for family, names in family_bones.items()
+            for name in names
+        }
+        spatial_region_stats = {
+            region["label"]: {"vertices": 0, "weight": 0.0}
+            for pair in distal_region_pairs
+            for region in pair
+        }
+
+        for mesh_object in imported_objects:
+            if mesh_object.type != 'MESH':
+                continue
+            if _autorig_deforming_armature(mesh_object, imported_armatures) != armature:
+                continue
+
+            group_by_name = {
+                group.name: group for group in mesh_object.vertex_groups
+            }
+            garment_marker = group_by_name.get(_GARMENT_STABILIZED_GROUP)
+            garment_vertex_indices = set()
+            if garment_marker:
+                marker_index = garment_marker.index
+                garment_vertex_indices = {
+                    vertex.index
+                    for vertex in mesh_object.data.vertices
+                    if any(
+                        element.group == marker_index and element.weight > 0.5
+                        for element in vertex.groups
+                    )
+                }
+            relevant_names = set(left_chain) | set(right_chain)
+            for region_pair in distal_region_pairs:
+                for region in region_pair:
+                    relevant_names.update(region["allowed"])
+                    relevant_names.update(region["core"])
+            if not relevant_names.intersection(group_by_name):
+                continue
+            group_name_by_index = {
+                group.index: group.name for group in mesh_object.vertex_groups
+            }
+
+            # Spatial proximity is ambiguous when hands rest beside a skirt or
+            # coat.  Establish a topology-level owner family before changing
+            # any weights.  A disconnected hand/finger surface is normally
+            # dominated by its arm family, while nearby garment panels are
+            # dominated by spine/leg families even if a few vertices carry bad
+            # finger weights.  This prevents the garment from being reassigned
+            # to the hand merely because the surfaces touch in bind space.
+            component_roots = list(range(len(mesh_object.data.vertices)))
+
+            def component_find(index):
+                while component_roots[index] != index:
+                    component_roots[index] = component_roots[
+                        component_roots[index]
+                    ]
+                    index = component_roots[index]
+                return index
+
+            def component_union(first, second):
+                first_root = component_find(first)
+                second_root = component_find(second)
+                if first_root != second_root:
+                    component_roots[second_root] = first_root
+
+            for edge in mesh_object.data.edges:
+                component_union(edge.vertices[0], edge.vertices[1])
+            component_roots = [
+                component_find(index) for index in range(len(component_roots))
+            ]
+            component_sizes = {}
+            component_family_weights = {}
+            for vertex, component_root in zip(
+                mesh_object.data.vertices, component_roots
+            ):
+                component_sizes[component_root] = (
+                    component_sizes.get(component_root, 0) + 1
+                )
+                weights_by_family = component_family_weights.setdefault(
+                    component_root, {})
+                for element in vertex.groups:
+                    family = bone_family.get(
+                        group_name_by_index.get(element.group)
+                    )
+                    if family:
+                        weights_by_family[family] = (
+                            weights_by_family.get(family, 0.0)
+                            + float(element.weight)
+                        )
+
+            mesh_to_armature = armature_inverse @ mesh_object.matrix_world
+            changed_vertex_indices = set()
+            mesh_moved = 0.0
+            left_set = set(left_chain)
+            right_set = set(right_chain)
+
+            for vertex in mesh_object.data.vertices:
+                if vertex.index in garment_vertex_indices:
+                    continue
+                point = mesh_to_armature @ vertex.co
+                if point.dot(up_axis) > lower_body_cutoff:
+                    continue
+                side_value = (point - side_origin).dot(side_axis)
+                if abs(side_value) <= side_margin:
+                    continue
+
+                correct_set = left_set if side_value > 0.0 else right_set
+                opposite_set = (
+                    right_set - left_set
+                    if side_value > 0.0
+                    else left_set - right_set
+                )
+                weights = {
+                    group_name_by_index.get(element.group): float(element.weight)
+                    for element in vertex.groups
+                    if group_name_by_index.get(element.group) in relevant_names
+                }
+                transfers = {}
+                for opposite_name in opposite_set:
+                    weight = weights.get(opposite_name, 0.0)
+                    if weight <= 1e-6:
+                        continue
+                    target_name = chain_pairs.get(opposite_name)
+                    if target_name not in correct_set:
+                        continue
+                    transfers[target_name] = transfers.get(target_name, 0.0) + weight
+                    group_by_name[opposite_name].remove([vertex.index])
+                    mesh_moved += weight
+
+                if not transfers:
+                    continue
+                for target_name, weight in transfers.items():
+                    if target_name not in group_by_name:
+                        group_by_name[target_name] = mesh_object.vertex_groups.new(
+                            name=target_name
+                        )
+                    current_weight = weights.get(target_name, 0.0)
+                    group_by_name[target_name].add(
+                        [vertex.index], current_weight + weight, 'REPLACE')
+                changed_vertex_indices.add(vertex.index)
+
+            # General rest-space plausibility pass.  It deliberately operates
+            # only inside compact distal regions and requires one side to be a
+            # clearly better geometric match than the other.  This catches
+            # hand-to-leg, hand-to-spine, cross-hand, foot-to-pelvis, and
+            # similar remote influences without imposing a global nearest-bone
+            # rule on clothing or the torso.
+            for vertex in mesh_object.data.vertices:
+                if vertex.index in garment_vertex_indices:
+                    continue
+                point = mesh_to_armature @ vertex.co
+                candidates = []
+                for region_pair in distal_region_pairs:
+                    pair_candidates = []
+                    for region in region_pair:
+                        if (point - region["center"]).length > region["radius"]:
+                            pair_candidates.append(None)
+                            continue
+                        nearest_core_distance = min(
+                            bone_segment_distance(point, name)
+                            for name in region["core"]
+                        )
+                        if nearest_core_distance > region["max_local_distance"]:
+                            pair_candidates.append(None)
+                            continue
+                        pair_candidates.append(
+                            (nearest_core_distance / region["radius"], region)
+                        )
+
+                    valid = [entry for entry in pair_candidates if entry]
+                    if not valid:
+                        continue
+                    valid.sort(key=lambda entry: entry[0])
+                    best_score, best_region = valid[0]
+                    if len(valid) > 1 and best_score + 0.08 >= valid[1][0]:
+                        continue
+                    candidates.append((best_score, best_region))
+
+                if not candidates:
+                    continue
+                candidates.sort(key=lambda entry: entry[0])
+                best_score, region = candidates[0]
+                if len(candidates) > 1 and best_score + 0.06 >= candidates[1][0]:
+                    continue
+
+                component_root = component_roots[vertex.index]
+                component_weights = component_family_weights.get(
+                    component_root, {})
+                component_total = sum(component_weights.values())
+                owner_weight = component_weights.get(
+                    region["owner_family"], 0.0)
+                owner_share = (
+                    owner_weight / component_total
+                    if component_total > 1e-8 else 0.0
+                )
+                # Permit mixed hand/finger components when at least a quarter
+                # of their consensus supports this side.  A tiny disconnected
+                # digit with wholly corrupt weights may use a very strong
+                # spatial match as fallback; large garment/body components may
+                # not, because proximity is ambiguous there.
+                if owner_share < 0.25 and not (
+                    component_sizes.get(component_root, 0) <= 2048
+                    and best_score <= 0.12
+                ):
+                    continue
+
+                target_name, target_distance = min(
+                    (
+                        (name, bone_segment_distance(point, name))
+                        for name in region["allowed"]
+                    ),
+                    key=lambda entry: entry[1],
+                )
+                initial_weights = {
+                    group_name_by_index.get(element.group): float(element.weight)
+                    for element in vertex.groups
+                    if group_name_by_index.get(element.group) in all_bone_names
+                }
+                removed_weight = 0.0
+                for source_name, weight in initial_weights.items():
+                    if source_name in region["allowed"] or weight <= 1e-6:
+                        continue
+                    source_distance = bone_segment_distance(point, source_name)
+                    plausible_limit = max(
+                        target_distance * 1.75,
+                        target_distance + region["distance_margin"],
+                    )
+                    if source_distance <= plausible_limit:
+                        continue
+                    group_by_name[source_name].remove([vertex.index])
+                    removed_weight += weight
+
+                if removed_weight <= 0.0:
+                    continue
+                if target_name not in group_by_name:
+                    group_by_name[target_name] = mesh_object.vertex_groups.new(
+                        name=target_name
+                    )
+                target_weight = initial_weights.get(target_name, 0.0)
+                group_by_name[target_name].add(
+                    [vertex.index], target_weight + removed_weight, 'REPLACE')
+                changed_vertex_indices.add(vertex.index)
+                mesh_moved += removed_weight
+                spatial_region_stats[region["label"]]["vertices"] += 1
+                spatial_region_stats[region["label"]]["weight"] += removed_weight
+
+            if changed_vertex_indices:
+                mesh_object.data.update()
+                changed_meshes += 1
+                total_changed += len(changed_vertex_indices)
+                total_moved += mesh_moved
+
+        for label, region_stats in spatial_region_stats.items():
+            if region_stats["vertices"]:
+                print(
+                    f"[StableGen] Spatial weight cleanup {label}: "
+                    f"{region_stats['vertices']} vertices, "
+                    f"{region_stats['weight']:.3f} weight remapped"
+                )
+
+    stats = {
+        "changed_vertices": total_changed,
+        "moved_weight": total_moved,
+        "meshes": changed_meshes,
+    }
+    print(
+        "[StableGen] Limb-weight plausibility cleanup: "
+        f"{total_changed} vertices across {changed_meshes} mesh(es), "
+        f"{total_moved:.3f} total weight remapped"
+    )
+    return stats
+
+
+def _stabilize_autorig_garment_weights(imported_objects, mode='STABILIZE'):
+    """Create a conservative skeletal blend for long garment surfaces.
+
+    A humanoid skeleton has no representation for free-hanging cloth.  Long
+    dresses therefore inherit discontinuous left/right leg weights and open
+    into a stretched membrane during wide strides.  This optional pass detects
+    large connected lower-body surfaces with mixed spine/leg ownership, then
+    replaces their bone weights with a smooth three-bone blend: pelvis plus
+    both upper legs.  The waist stays mostly pelvis-anchored while the lower
+    garment follows a softened average of the thighs.  ``LEG_FOLLOW`` keeps
+    that waist anchor but gives the lower garment stronger, spatially smooth
+    same-side thigh/shin ownership.  It also absorbs small disconnected
+    surface islands close to a confidently detected garment component.
+    """
+    from ..animation.retargeting import characterize_armature
+    from mathutils import kdtree  # pylint: disable=import-error
+
+    mode = str(mode or 'STABILIZE').upper()
+    if mode not in {'STABILIZE', 'LEG_FOLLOW'}:
+        raise ValueError(f"Unknown garment weighting mode: {mode}")
+
+    imported_objects = [
+        obj for obj in imported_objects
+        if obj and obj.name in bpy.data.objects
+    ]
+    imported_armatures = {
+        obj for obj in imported_objects if obj.type == 'ARMATURE'
+    }
+    total_changed = 0
+    total_components = 0
+    total_absorbed_components = 0
+
+    for armature in imported_armatures:
+        profile = characterize_armature(armature)
+        chains = dict((profile or {}).get("chains", {}))
+        if (profile or {}).get("orientation_correction") == "ROTATE_180":
+            chains["left_leg"], chains["right_leg"] = (
+                chains.get("right_leg", []),
+                chains.get("left_leg", []),
+            )
+        left_leg = [
+            name for name in chains.get("left_leg", [])
+            if armature.data.bones.get(name)
+        ]
+        right_leg = [
+            name for name in chains.get("right_leg", [])
+            if armature.data.bones.get(name)
+        ]
+        spine = [
+            name for name in chains.get("spine", [])
+            if armature.data.bones.get(name)
+        ]
+        pelvis_name = (profile or {}).get("pelvis")
+        if (
+            len(left_leg) < 2
+            or len(right_leg) < 2
+            or not pelvis_name
+            or not armature.data.bones.get(pelvis_name)
+        ):
+            continue
+
+        left_thigh = left_leg[0]
+        right_thigh = right_leg[0]
+        left_shin = left_leg[1]
+        right_shin = right_leg[1]
+        left_hip = armature.data.bones[left_thigh].head_local.copy()
+        right_hip = armature.data.bones[right_thigh].head_local.copy()
+        side_vector = left_hip - right_hip
+        side_separation = side_vector.length
+        if side_separation <= 1e-6:
+            continue
+        side_axis = side_vector / side_separation
+        side_origin = (left_hip + right_hip) * 0.5
+
+        pelvis_bone = armature.data.bones[pelvis_name]
+        head_bone = armature.data.bones.get((profile or {}).get("head", ""))
+        if head_bone:
+            up_axis = (
+                (head_bone.head_local + head_bone.tail_local) * 0.5
+                - (pelvis_bone.head_local + pelvis_bone.tail_local) * 0.5
+            )
+        else:
+            left_foot = armature.data.bones[left_leg[-1]].tail_local
+            right_foot = armature.data.bones[right_leg[-1]].tail_local
+            up_axis = side_origin - (left_foot + right_foot) * 0.5
+        if up_axis.length <= 1e-6:
+            continue
+        up_axis.normalize()
+
+        hip_height = side_origin.dot(up_axis)
+        foot_height = sum(
+            armature.data.bones[chain[-1]].tail_local.dot(up_axis)
+            for chain in (left_leg, right_leg)
+        ) * 0.5
+        if hip_height < foot_height:
+            up_axis.negate()
+            hip_height = -hip_height
+            foot_height = -foot_height
+        leg_height = hip_height - foot_height
+        if leg_height <= 1e-6:
+            continue
+
+        family_bones = {
+            "spine": set(spine) | {pelvis_name},
+            "left_leg": set(left_leg),
+            "right_leg": set(right_leg),
+            "left_arm": set(chains.get("left_arm", [])),
+            "right_arm": set(chains.get("right_arm", [])),
+        }
+        bone_family = {
+            name: family
+            for family, names in family_bones.items()
+            for name in names
+        }
+        all_bone_names = {bone.name for bone in armature.data.bones}
+        armature_inverse = armature.matrix_world.inverted_safe()
+
+        for mesh_object in imported_objects:
+            if mesh_object.type != 'MESH':
+                continue
+            if _autorig_deforming_armature(
+                mesh_object, imported_armatures
+            ) != armature:
+                continue
+            if not mesh_object.data.edges:
+                continue
+
+            group_by_name = {
+                group.name: group for group in mesh_object.vertex_groups
+            }
+            if not set((pelvis_name, left_thigh, right_thigh)).intersection(
+                group_by_name
+            ):
+                continue
+            group_name_by_index = {
+                group.index: group.name for group in mesh_object.vertex_groups
+            }
+            mesh_to_armature = armature_inverse @ mesh_object.matrix_world
+
+            parents = list(range(len(mesh_object.data.vertices)))
+
+            def find(index):
+                while parents[index] != index:
+                    parents[index] = parents[parents[index]]
+                    index = parents[index]
+                return index
+
+            def union(first, second):
+                first_root = find(first)
+                second_root = find(second)
+                if first_root != second_root:
+                    parents[second_root] = first_root
+
+            for edge in mesh_object.data.edges:
+                union(edge.vertices[0], edge.vertices[1])
+            roots = [find(index) for index in range(len(parents))]
+
+            component_data = {}
+            points = [
+                mesh_to_armature @ vertex.co
+                for vertex in mesh_object.data.vertices
+            ]
+            for vertex, root, point in zip(
+                mesh_object.data.vertices, roots, points
+            ):
+                data = component_data.setdefault(
+                    root,
+                    {
+                        "vertices": [],
+                        "families": {},
+                        "min_height": float("inf"),
+                        "max_height": float("-inf"),
+                    },
+                )
+                data["vertices"].append(vertex.index)
+                height = point.dot(up_axis)
+                data["min_height"] = min(data["min_height"], height)
+                data["max_height"] = max(data["max_height"], height)
+                for element in vertex.groups:
+                    family = bone_family.get(
+                        group_name_by_index.get(element.group)
+                    )
+                    if family:
+                        data["families"][family] = (
+                            data["families"].get(family, 0.0)
+                            + float(element.weight)
+                        )
+
+            minimum_component_size = max(
+                300,
+                int(len(mesh_object.data.vertices) * 0.0005),
+            )
+            garment_components = []
+            for root, data in component_data.items():
+                vertex_count = len(data["vertices"])
+                if vertex_count < minimum_component_size:
+                    continue
+                family_total = sum(data["families"].values())
+                if family_total <= 1e-8:
+                    continue
+                share = {
+                    family: data["families"].get(family, 0.0) / family_total
+                    for family in family_bones
+                }
+                leg_share = share["left_leg"] + share["right_leg"]
+                arm_share = share["left_arm"] + share["right_arm"]
+                vertical_span = data["max_height"] - data["min_height"]
+                reaches_upper_leg = (
+                    data["max_height"] >= foot_height + leg_height * 0.55
+                )
+                reaches_below_knee = (
+                    data["min_height"] <= foot_height + leg_height * 0.65
+                )
+                mixed_lower_body = (
+                    min(share["left_leg"], share["right_leg"]) >= 0.02
+                    or share["spine"] >= 0.25
+                )
+                single_leg_surface = (
+                    vertex_count < max(
+                        8000,
+                        int(len(mesh_object.data.vertices) * 0.01),
+                    )
+                    and max(share["left_leg"], share["right_leg"]) >= 0.80
+                    and share["spine"] < 0.15
+                )
+                if not (
+                    share["spine"] >= 0.08
+                    and leg_share >= 0.25
+                    and arm_share <= 0.08
+                    and mixed_lower_body
+                    and vertical_span >= leg_height * 0.22
+                    and reaches_upper_leg
+                    and reaches_below_knee
+                    and not single_leg_surface
+                ):
+                    continue
+                garment_components.append((root, data, share))
+
+            if not garment_components:
+                continue
+
+            absorbed_components = 0
+            if mode == 'LEG_FOLLOW':
+                # Generated garments commonly contain narrow, disconnected
+                # strips along their boundary.  They are too small to pass the
+                # semantic component test above, but leaving their old (or
+                # absent) weights creates the floating triangles visible once
+                # the character leaves its rest pose.  Attach only small
+                # lower-body islands that lie very close to a confident core.
+                core_roots = {root for root, _data, _share in garment_components}
+                core_vertices = [
+                    vertex_index
+                    for _root, data, _share in garment_components
+                    for vertex_index in data["vertices"]
+                ]
+                proximity_tree = kdtree.KDTree(len(core_vertices))
+                for tree_index, vertex_index in enumerate(core_vertices):
+                    proximity_tree.insert(points[vertex_index], tree_index)
+                proximity_tree.balance()
+
+                island_distance = max(
+                    side_separation * 0.16,
+                    leg_height * 0.025,
+                )
+                island_size_limit = max(
+                    minimum_component_size * 8,
+                    int(len(mesh_object.data.vertices) * 0.02),
+                )
+                for root, data in component_data.items():
+                    if root in core_roots:
+                        continue
+                    vertex_count = len(data["vertices"])
+                    if vertex_count > island_size_limit:
+                        continue
+                    if data["max_height"] < foot_height - leg_height * 0.04:
+                        continue
+                    if data["min_height"] > hip_height + leg_height * 0.08:
+                        continue
+
+                    family_total = sum(data["families"].values())
+                    if family_total > 1e-8:
+                        share = {
+                            family: data["families"].get(family, 0.0) / family_total
+                            for family in family_bones
+                        }
+                        leg_share = share["left_leg"] + share["right_leg"]
+                        arm_share = share["left_arm"] + share["right_arm"]
+                        dominant_single_leg = (
+                            max(share["left_leg"], share["right_leg"]) >= 0.72
+                            and min(share["left_leg"], share["right_leg"]) < 0.08
+                            and share["spine"] < 0.18
+                        )
+                        if (
+                            arm_share > 0.35
+                            or share["spine"] + leg_share < 0.45
+                            or dominant_single_leg
+                        ):
+                            continue
+                        allowed_distance = island_distance
+                    else:
+                        # An unweighted island must be almost touching the core
+                        # before StableGen assumes it belongs to the garment.
+                        share = {family: 0.0 for family in family_bones}
+                        allowed_distance = island_distance * 0.45
+
+                    nearest_distance = min(
+                        proximity_tree.find(points[vertex_index])[2]
+                        for vertex_index in data["vertices"]
+                    )
+                    if nearest_distance > allowed_distance:
+                        continue
+                    garment_components.append((root, data, share))
+                    absorbed_components += 1
+
+                total_absorbed_components += absorbed_components
+
+            target_bones = [pelvis_name, left_thigh, right_thigh]
+            if mode == 'LEG_FOLLOW':
+                target_bones.extend((left_shin, right_shin))
+            for target_name in target_bones:
+                if target_name not in group_by_name:
+                    group_by_name[target_name] = mesh_object.vertex_groups.new(
+                        name=target_name
+                    )
+            garment_marker = group_by_name.get(_GARMENT_STABILIZED_GROUP)
+            if not garment_marker:
+                garment_marker = mesh_object.vertex_groups.new(
+                    name=_GARMENT_STABILIZED_GROUP
+                )
+
+            changed_indices = set()
+            if mode == 'LEG_FOLLOW':
+                garment_indices = {
+                    vertex_index
+                    for _root, data, _share in garment_components
+                    for vertex_index in data["vertices"]
+                    if (
+                        points[vertex_index].dot(up_axis)
+                        <= hip_height + leg_height * 0.06
+                        and points[vertex_index].dot(up_axis)
+                        >= foot_height - leg_height * 0.04
+                    )
+                }
+                knee_height = sum(
+                    armature.data.bones[name].tail_local.dot(up_axis)
+                    for name in (left_thigh, right_thigh)
+                ) * 0.5
+                if not foot_height < knee_height < hip_height:
+                    knee_height = foot_height + leg_height * 0.52
+
+                target_fractions = {}
+                bone_totals = {}
+                for vertex_index in garment_indices:
+                    vertex = mesh_object.data.vertices[vertex_index]
+                    point = points[vertex_index]
+                    height = point.dot(up_axis)
+                    downward = max(
+                        0.0,
+                        min(1.0, (hip_height - height) / (leg_height * 0.9)),
+                    )
+                    smooth_downward = downward * downward * (3.0 - 2.0 * downward)
+                    follow_amount = max(
+                        0.0,
+                        min(1.0, (smooth_downward - 0.04) / 0.96),
+                    )
+                    follow_amount = (
+                        follow_amount
+                        * follow_amount
+                        * (3.0 - 2.0 * follow_amount)
+                    )
+                    pelvis_fraction = 0.90 - 0.68 * follow_amount
+                    side_value = (point - side_origin).dot(side_axis)
+                    side_normalized = max(
+                        -1.0,
+                        min(1.0, side_value / max(side_separation * 0.62, 1e-6)),
+                    )
+                    side_strength = 0.12 + 0.36 * follow_amount
+                    left_split = 0.5 + side_strength * side_normalized
+                    left_split = max(0.04, min(0.96, left_split))
+
+                    below_knee = max(
+                        0.0,
+                        min(
+                            1.0,
+                            (knee_height - height)
+                            / max(knee_height - foot_height, 1e-6),
+                        ),
+                    )
+                    below_knee = below_knee * below_knee * (3.0 - 2.0 * below_knee)
+                    shin_share = 0.42 * below_knee * follow_amount
+                    thigh_share = 1.0 - shin_share
+                    leg_fraction = 1.0 - pelvis_fraction
+                    target_fractions[vertex_index] = {
+                        pelvis_name: pelvis_fraction,
+                        left_thigh: leg_fraction * left_split * thigh_share,
+                        right_thigh: leg_fraction * (1.0 - left_split) * thigh_share,
+                        left_shin: leg_fraction * left_split * shin_share,
+                        right_shin: leg_fraction * (1.0 - left_split) * shin_share,
+                    }
+
+                    current_bone_weights = {
+                        group_name_by_index.get(element.group): float(element.weight)
+                        for element in vertex.groups
+                        if group_name_by_index.get(element.group) in all_bone_names
+                    }
+                    bone_total = sum(current_bone_weights.values())
+                    if bone_total <= 1e-8:
+                        bone_total = 1.0
+                    bone_totals[vertex_index] = bone_total
+
+                # Diffuse the analytic field over the garment topology.  This
+                # preserves the broad vertical/lateral motion while removing
+                # sharp per-triangle ownership changes from irregular meshes.
+                neighbors = {index: [] for index in target_fractions}
+                for edge in mesh_object.data.edges:
+                    first, second = edge.vertices
+                    if first in neighbors and second in neighbors:
+                        neighbors[first].append(second)
+                        neighbors[second].append(first)
+                for _iteration in range(4):
+                    smoothed = {}
+                    for vertex_index, fractions in target_fractions.items():
+                        adjacent = neighbors[vertex_index]
+                        if not adjacent:
+                            smoothed[vertex_index] = fractions
+                            continue
+                        adjacent_count = float(len(adjacent))
+                        averaged = {
+                            name: sum(
+                                target_fractions[other][name]
+                                for other in adjacent
+                            ) / adjacent_count
+                            for name in target_bones
+                        }
+                        blended = {
+                            name: fractions[name] * 0.65 + averaged[name] * 0.35
+                            for name in target_bones
+                        }
+                        blend_total = sum(blended.values())
+                        smoothed[vertex_index] = {
+                            name: weight / blend_total
+                            for name, weight in blended.items()
+                        }
+                    target_fractions = smoothed
+
+                changed_roots = set()
+                for vertex_index, fractions in target_fractions.items():
+                    vertex = mesh_object.data.vertices[vertex_index]
+                    current_bone_weights = {
+                        group_name_by_index.get(element.group): float(element.weight)
+                        for element in vertex.groups
+                        if group_name_by_index.get(element.group) in all_bone_names
+                    }
+                    bone_total = bone_totals[vertex_index]
+                    target_weights = {
+                        name: fraction * bone_total
+                        for name, fraction in fractions.items()
+                    }
+                    for name in current_bone_weights:
+                        group_by_name[name].remove([vertex_index])
+                    for name, weight in target_weights.items():
+                        if weight > 1e-8:
+                            group_by_name[name].add(
+                                [vertex_index], weight, 'REPLACE')
+                    changed_indices.add(vertex_index)
+                    changed_roots.add(roots[vertex_index])
+                    garment_marker.add([vertex_index], 1.0, 'REPLACE')
+
+                if changed_indices:
+                    total_components += len(changed_roots)
+                    print(
+                        "[StableGen] Smooth garment leg follow: "
+                        f"{len(changed_indices)} vertices across "
+                        f"{len(changed_roots)} component(s), "
+                        f"{absorbed_components} nearby island(s) absorbed"
+                    )
+            else:
+                for root, data, share in garment_components:
+                    component_changed = 0
+                    for vertex_index in data["vertices"]:
+                        vertex = mesh_object.data.vertices[vertex_index]
+                        point = points[vertex_index]
+                        height = point.dot(up_axis)
+                        if height > hip_height + leg_height * 0.06:
+                            continue
+                        if height < foot_height - leg_height * 0.04:
+                            continue
+
+                        downward = max(
+                            0.0,
+                            min(1.0, (hip_height - height) / (leg_height * 0.9)),
+                        )
+                        smooth_downward = downward * downward * (3.0 - 2.0 * downward)
+                        pelvis_fraction = 0.88 - 0.38 * smooth_downward
+                        side_value = (point - side_origin).dot(side_axis)
+                        side_normalized = max(
+                            -1.0,
+                            min(1.0, side_value / max(side_separation * 0.7, 1e-6)),
+                        )
+                        side_strength = 0.18 + 0.08 * smooth_downward
+                        left_split = 0.5 + side_strength * side_normalized
+                        left_split = max(0.2, min(0.8, left_split))
+
+                        current_bone_weights = {
+                            group_name_by_index.get(element.group): float(element.weight)
+                            for element in vertex.groups
+                            if group_name_by_index.get(element.group) in all_bone_names
+                        }
+                        bone_total = sum(current_bone_weights.values())
+                        if bone_total <= 1e-8:
+                            continue
+
+                        leg_fraction = 1.0 - pelvis_fraction
+                        target_weights = {
+                            pelvis_name: pelvis_fraction * bone_total,
+                            left_thigh: leg_fraction * left_split * bone_total,
+                            right_thigh: leg_fraction * (1.0 - left_split) * bone_total,
+                        }
+                        target_names = set(target_weights)
+                        already_stabilized = all(
+                            (
+                                name in target_names
+                                or weight <= 1e-6
+                            )
+                            for name, weight in current_bone_weights.items()
+                        ) and all(
+                            abs(current_bone_weights.get(name, 0.0) - weight) <= 1e-5
+                            for name, weight in target_weights.items()
+                        )
+                        if already_stabilized:
+                            garment_marker.add([vertex_index], 1.0, 'REPLACE')
+                            continue
+                        for name in current_bone_weights:
+                            group_by_name[name].remove([vertex_index])
+                        for name, weight in target_weights.items():
+                            if weight > 1e-8:
+                                group_by_name[name].add(
+                                    [vertex_index], weight, 'REPLACE')
+                        changed_indices.add(vertex_index)
+                        garment_marker.add([vertex_index], 1.0, 'REPLACE')
+                        component_changed += 1
+
+                    if component_changed:
+                        total_components += 1
+                        print(
+                            "[StableGen] Garment stabilization: "
+                            f"component {root}, {component_changed} vertices, "
+                            f"spine {share['spine']:.0%}, "
+                            f"legs {(share['left_leg'] + share['right_leg']):.0%}"
+                        )
+            if changed_indices:
+                mesh_object.data.update()
+                total_changed += len(changed_indices)
+
+    print(
+        "[StableGen] Garment weighting complete: "
+        f"mode {mode}, {total_changed} vertices across "
+        f"{total_components} component(s), "
+        f"{total_absorbed_components} nearby island(s) absorbed"
+    )
+    return {
+        "changed_vertices": total_changed,
+        "components": total_components,
+        "absorbed_components": total_absorbed_components,
+    }
 
 class Trellis2Generate(bpy.types.Operator):
     """Generate a 3D mesh from a reference image using TRELLIS.2 via ComfyUI.
@@ -62,28 +1221,94 @@ class Trellis2Generate(bpy.types.Operator):
     _detail_stage: str = ""
     _current_phase: int = 0
     _total_phases: int = 3  # 2 when gen_from == 'image'
+    _phase_layout: str = "trellis_only"
+    _autorig_phase: int = 0
+
+    _PHASE_LAYOUTS = {
+        'txt2img+trellis+rigging+texturing': ([1, 2, 3, 4], [0, 15, 60, 75], [15, 45, 15, 25]),
+        'trellis+rigging+texturing': ([1, 2, 3], [0, 60, 75], [60, 15, 25]),
+        'txt2img+trellis+texturing': ([1, 2, 3], [0, 15, 65], [15, 50, 35]),
+        'trellis+texturing': ([1, 2], [0, 65], [65, 35]),
+        'txt2img+trellis+rigging': ([1, 2, 3], [0, 15, 75], [15, 60, 25]),
+        'trellis+rigging': ([1, 2], [0, 75], [75, 25]),
+        'txt2img+trellis': ([1, 2], [0, 15], [15, 85]),
+        'trellis_only': ([1], [0], [100]),
+    }
+
+    def _phase_spec(self):
+        phases, starts, weights = self._PHASE_LAYOUTS.get(
+            getattr(self, '_phase_layout', 'trellis_only'),
+            self._PHASE_LAYOUTS['trellis_only'],
+        )
+        return dict(zip(phases, starts)), dict(zip(phases, weights))
+
+    def _phase_start_pct(self, phase_number):
+        starts, _weights = self._phase_spec()
+        return starts.get(phase_number, 0.0)
 
     def _update_overall(self):
         """Recompute *_overall_progress* from current phase + phase progress."""
-        layout = getattr(self, '_phase_layout', '')
-        if layout == 'txt2img+trellis+texturing':  # 3 phases
-            starts  = {1: 0,  2: 15, 3: 65}
-            weights = {1: 15, 2: 50, 3: 35}
-        elif layout == 'trellis+texturing':  # 2 phases: big mesh, then texturing
-            starts  = {1: 0,  2: 65}
-            weights = {1: 65, 2: 35}
-        elif layout == 'txt2img+trellis':  # 2 phases: quick txt2img, then big mesh+native tex
-            starts  = {1: 0,  2: 15}
-            weights = {1: 15, 2: 85}
-        else:  # Single phase — scale to full 0-100
-            starts  = {1: 0}
-            weights = {1: 100}
+        starts, weights = self._phase_spec()
         s = starts.get(self._current_phase, 0)
         w = weights.get(self._current_phase, 0)
         self._overall_progress = s + (self._phase_progress / 100.0) * w
         self._overall_progress = max(0.0, min(self._overall_progress, 100.0))
         # Keep legacy _progress in sync for any code that reads it
         self._progress = self._overall_progress
+
+    @staticmethod
+    def _clear_imported_custom_normals(mesh_objects):
+        """Clear TRELLIS/GLB custom normals without changing object hierarchy."""
+        if not mesh_objects:
+            return
+
+        previous_active = bpy.context.view_layer.objects.active
+        previous_selection = list(bpy.context.selected_objects)
+        cleared = 0
+
+        try:
+            if bpy.ops.object.mode_set.poll():
+                bpy.ops.object.mode_set(mode='OBJECT')
+        except Exception:
+            pass
+
+        try:
+            for obj in mesh_objects:
+                if obj.type != 'MESH':
+                    continue
+                if hasattr(obj.data, "has_custom_normals") and not obj.data.has_custom_normals:
+                    continue
+
+                bpy.ops.object.select_all(action='DESELECT')
+                obj.select_set(True)
+                bpy.context.view_layer.objects.active = obj
+                try:
+                    bpy.ops.mesh.customdata_custom_splitnormals_clear()
+                    cleared += 1
+                except Exception as err:
+                    print(f"[TRELLIS2] Warning: Could not clear custom normals on {obj.name}: {err}")
+        finally:
+            bpy.ops.object.select_all(action='DESELECT')
+            for obj in previous_selection:
+                if bpy.context.scene.objects.get(obj.name):
+                    obj.select_set(True)
+            if previous_active and bpy.context.scene.objects.get(previous_active.name):
+                bpy.context.view_layer.objects.active = previous_active
+
+        if cleared:
+            print(f"[TRELLIS2] Cleared custom split normals on {cleared} imported mesh object(s)")
+
+    @staticmethod
+    def _configure_not_exported_helpers():
+        """Expose glTF helper visibility through eye/render collection icons."""
+        stats = configure_gltf_not_exported_visibility(bpy.context)
+        if stats["collections"]:
+            print(
+                "[TRELLIS2] Hid glTF not_exported helpers through "
+                f"{stats['layer_collections']} view-layer eye toggle(s) and "
+                f"{stats['collections']} collection render toggle(s); cleared "
+                f"{stats['object_flags_cleared']} buried object flag(s)."
+            )
 
     @classmethod
     def poll(cls, context):
@@ -141,6 +1366,10 @@ class Trellis2Generate(bpy.types.Operator):
             self.report({'WARNING'}, "TRELLIS.2 generation cancelled")
             return {'FINISHED'}
 
+        from ..core.server_api import confirm_server
+        if not confirm_server(self, context):
+            return {'CANCELLED'}
+
         scene = context.scene
         gen_from = getattr(scene, 'trellis2_generate_from', 'image')
         tex_mode = getattr(scene, 'trellis2_texture_mode', 'native')
@@ -160,6 +1389,7 @@ class Trellis2Generate(bpy.types.Operator):
         self._progress = 0.0
         self._stage = "Initializing"
         self._texture_mode = tex_mode
+        self._autorig_enabled = False
         from ..workflows import WorkflowManager
         self.workflow_manager = WorkflowManager(self)
 
@@ -173,10 +1403,23 @@ class Trellis2Generate(bpy.types.Operator):
 
         # 3-tier progress init
         has_txt2img = (gen_from == 'prompt')
-        has_texturing = (tex_mode in ('sdxl', 'flux1', 'qwen_image_edit', 'flux2_klein'))
-        if has_txt2img and has_texturing:
+        has_texturing = (tex_mode in DIFFUSION_ARCHITECTURES)
+        has_autorig = bool(getattr(scene, 'trellis2_autorig_enabled', False))
+        if has_txt2img and has_autorig and has_texturing:
+            self._total_phases = 4
+            self._phase_layout = 'txt2img+trellis+rigging+texturing'
+        elif has_autorig and has_texturing:
+            self._total_phases = 3
+            self._phase_layout = 'trellis+rigging+texturing'
+        elif has_txt2img and has_texturing:
             self._total_phases = 3
             self._phase_layout = 'txt2img+trellis+texturing'
+        elif has_txt2img and has_autorig:
+            self._total_phases = 3
+            self._phase_layout = 'txt2img+trellis+rigging'
+        elif has_autorig:
+            self._total_phases = 2
+            self._phase_layout = 'trellis+rigging'
         elif has_txt2img:
             self._total_phases = 2
             self._phase_layout = 'txt2img+trellis'
@@ -193,6 +1436,8 @@ class Trellis2Generate(bpy.types.Operator):
         self._phase_stage = ""
         self._detail_progress = 0.0
         self._detail_stage = ""
+        self._autorig_enabled = has_autorig
+        self._autorig_phase = (2 if has_txt2img else 1) + 1 if has_autorig else 0
 
         # Compute revision directory on the main thread (may write output_timestamp)
         from ..utils import get_generation_dirs
@@ -347,46 +1592,75 @@ class Trellis2Generate(bpy.types.Operator):
 
             print(f"[TRELLIS2] Saved GLB to: {glb_path} ({len(self._glb_data)} bytes)")
 
-            # Import GLB into Blender
-            bpy.ops.import_scene.gltf(filepath=glb_path)
+            autorig_enabled = getattr(self, '_autorig_enabled', False)
+            autorig_bone_heuristic = getattr(
+                context.scene,
+                'trellis2_autorig_bone_heuristic',
+                'FORTUNE',
+            )
+            # Import rigged SkinTokens joints with child-directed bone tails.
+            # Plain TRELLIS GLBs have no armature, so retain Blender's normal
+            # import defaults for those files.
+            if autorig_enabled:
+                bpy.ops.import_scene.gltf(**autorig_gltf_import_kwargs(
+                    glb_path, autorig_bone_heuristic))
+            else:
+                bpy.ops.import_scene.gltf(filepath=glb_path)
 
             # --- Clean hierarchy, unparent meshes, and remove GLTF/GLB structural empties ---
             imported_objects = [obj for obj in context.selected_objects]
             for obj in imported_objects:
                 obj["sg_generated"] = True
+            if autorig_enabled:
+                record_autorig_bone_heuristic(
+                    imported_objects, autorig_bone_heuristic)
+                apply_autorig_bone_display(
+                    imported_objects,
+                    getattr(
+                        context.scene,
+                        'trellis2_autorig_bone_display_type',
+                        'OCTAHEDRAL',
+                    ),
+                )
+            self._configure_not_exported_helpers()
             mesh_objects = [obj for obj in imported_objects if obj.type == 'MESH']
             empty_objects = [obj for obj in imported_objects if obj.type == 'EMPTY']
 
             if mesh_objects:
-                # 1. Unparent meshes while preserving their world space transforms and clearing broken custom normals
-                for obj in mesh_objects:
-                    # Save world matrix
-                    world_mat = obj.matrix_world.copy()
-                    # Set the object as active so the operator can work on it
-                    bpy.context.view_layer.objects.active = obj
-                    # Clear custom split normals using the official operator to fix broken custom normals & convex shadowing artifacts
-                    try:
-                        bpy.ops.mesh.customdata_custom_splitnormals_clear()
-                    except Exception as err:
-                        print(f"[TRELLIS2] Warning: Could not clear custom normals on {obj.name}: {err}")
-                    # Unparent
-                    obj.parent = None
-                    # Restore world matrix
-                    obj.matrix_world = world_mat
-                    
-                # 2. Delete the structural empties (e.g. "world", "geometry_0")
-                if empty_objects:
-                    bpy.ops.object.select_all(action='DESELECT')
-                    for obj in empty_objects:
-                        obj.select_set(True)
-                    bpy.ops.object.delete()
-                    print(f"[TRELLIS2] Cleaned up {len(empty_objects)} GLB parent empty objects")
+                # TRELLIS.2/GLB exports can carry broken custom split normals.
+                # Clear them for both plain and rigged imports; this only
+                # touches mesh data and leaves armature/object hierarchy intact.
+                self._clear_imported_custom_normals(mesh_objects)
 
-                # 3. Reselect only the imported mesh objects for downstream processing
-                bpy.ops.object.select_all(action='DESELECT')
-                for obj in mesh_objects:
-                    obj.select_set(True)
-                bpy.context.view_layer.objects.active = mesh_objects[0]
+                if autorig_enabled:
+                    # Rigged GLBs need their armature/object hierarchy intact.
+                    bpy.ops.object.select_all(action='DESELECT')
+                    for obj in imported_objects:
+                        obj.select_set(True)
+                    bpy.context.view_layer.objects.active = mesh_objects[0]
+                else:
+                    # 1. Unparent meshes while preserving their world space transforms
+                    for obj in mesh_objects:
+                        # Save world matrix
+                        world_mat = obj.matrix_world.copy()
+                        # Unparent
+                        obj.parent = None
+                        # Restore world matrix
+                        obj.matrix_world = world_mat
+
+                    # 2. Delete the structural empties (e.g. "world", "geometry_0")
+                    if empty_objects:
+                        bpy.ops.object.select_all(action='DESELECT')
+                        for obj in empty_objects:
+                            obj.select_set(True)
+                        bpy.ops.object.delete()
+                        print(f"[TRELLIS2] Cleaned up {len(empty_objects)} GLB parent empty objects")
+
+                    # 3. Reselect only the imported mesh objects for downstream processing
+                    bpy.ops.object.select_all(action='DESELECT')
+                    for obj in mesh_objects:
+                        obj.select_set(True)
+                    bpy.context.view_layer.objects.active = mesh_objects[0]
 
             # --- Normalise imported mesh to a reasonable Blender-unit size ---
             target_bu = getattr(context.scene, 'trellis2_import_scale', 2.0)
@@ -408,18 +1682,67 @@ class Trellis2Generate(bpy.types.Operator):
                         )
                         if extent > 1e-6:
                             scale_factor = target_bu / extent
-                            for obj in imported_meshes:
-                                obj.scale *= scale_factor
-                            # Apply scale so downstream code sees unit scale
-                            bpy.ops.object.select_all(action='DESELECT')
-                            for obj in imported_meshes:
-                                obj.select_set(True)
-                            bpy.context.view_layer.objects.active = imported_meshes[0]
-                            bpy.ops.object.transform_apply(location=False, rotation=False, scale=True)
-                            print(f"[TRELLIS2] Scaled mesh to {target_bu} BU (factor {scale_factor:.4f})")
+                            if autorig_enabled:
+                                root_objects = [obj for obj in imported_objects if obj.parent is None]
+                                if not root_objects:
+                                    root_objects = imported_objects
+                                for obj in root_objects:
+                                    obj.scale *= scale_factor
+                                print(
+                                    f"[TRELLIS2] Scaled rigged import to {target_bu} BU "
+                                    f"(factor {scale_factor:.4f}, unapplied)"
+                                )
+                            else:
+                                for obj in imported_meshes:
+                                    obj.scale *= scale_factor
+                                # Apply scale so downstream code sees unit scale
+                                bpy.ops.object.select_all(action='DESELECT')
+                                for obj in imported_meshes:
+                                    obj.select_set(True)
+                                bpy.context.view_layer.objects.active = imported_meshes[0]
+                                bpy.ops.object.transform_apply(location=False, rotation=False, scale=True)
+                                print(f"[TRELLIS2] Scaled mesh to {target_bu} BU (factor {scale_factor:.4f})")
+
+            if (
+                autorig_enabled
+                and getattr(
+                    context.scene,
+                    'trellis2_autorig_cleanup_cross_limb_weights',
+                    True,
+                )
+            ):
+                try:
+                    _sanitize_autorig_cross_limb_weights(imported_objects)
+                except Exception as exc:
+                    print(
+                        "[StableGen] Cross-limb weight cleanup failed; "
+                        f"keeping the imported SkinTokens weights: {exc}"
+                    )
+                    traceback.print_exc()
+
+            garment_mode = getattr(
+                context.scene,
+                'trellis2_autorig_garment_mode',
+                'NONE',
+            )
+            if autorig_enabled and garment_mode in {'STABILIZE', 'LEG_FOLLOW'}:
+                try:
+                    _stabilize_autorig_garment_weights(
+                        imported_objects,
+                        mode=garment_mode,
+                    )
+                except Exception as exc:
+                    print(
+                        "[StableGen] Garment weighting failed; "
+                        f"keeping the current skin weights: {exc}"
+                    )
+                    traceback.print_exc()
 
             # --- Solidification ---
             solidify_mesh = getattr(context.scene, 'trellis2_solidify', False)
+            if autorig_enabled and solidify_mesh:
+                print("[TRELLIS2] Skipping solidify because SkinTokens auto-rigging is enabled")
+                solidify_mesh = False
             if solidify_mesh:
                 from ..texturing.print_export import _make_solid_mesh_object
                 imported_meshes = [obj for obj in context.selected_objects if obj.type == 'MESH']
@@ -440,7 +1763,7 @@ class Trellis2Generate(bpy.types.Operator):
             remesh_method = getattr(context.scene, 'trellis2_remesh_method', 'qdc')
             
             imported_meshes = [obj for obj in context.selected_objects if obj.type == 'MESH']
-            if imported_meshes:
+            if imported_meshes and not autorig_enabled:
                 # 1. Fallback decimation on main thread if background decimation was requested but didn't run
                 if decimate_method == 'collapse' and not getattr(self, '_trimesh_decimated', False):
                     import trimesh
@@ -474,6 +1797,9 @@ class Trellis2Generate(bpy.types.Operator):
                 # 2. Local remeshing retopology
                 if remesh_method == 'quadriflow':
                     self._perform_retopology(context, imported_meshes, remesh_method)
+            elif imported_meshes and autorig_enabled and (
+                    decimate_method == 'collapse' or remesh_method == 'quadriflow'):
+                print("[TRELLIS2] Skipping local decimation/retopology because SkinTokens auto-rigging is enabled")
 
             # --- Apply shading mode to imported meshes ---
             _shade_mode = getattr(context.scene, 'trellis2_shade_mode', 'flat')
@@ -493,7 +1819,7 @@ class Trellis2Generate(bpy.types.Operator):
                 self._setup_studio_lighting(context, target_bu)
 
             # --- Phase 3: If diffusion texturing, auto-place cameras + start generation ---
-            if tex_mode in ('sdxl', 'flux1', 'qwen_image_edit', 'flux2_klein'):
+            if tex_mode in DIFFUSION_ARCHITECTURES:
                 # Place cameras NOW (while operator context is still valid)
                 camera_count = getattr(context.scene, 'trellis2_camera_count', 8)
                 imported_objects = [obj for obj in context.selected_objects]
@@ -615,12 +1941,7 @@ class Trellis2Generate(bpy.types.Operator):
         progress bar on top of the ComfyUIGenerate bars.
         """
         # Compute the overall-% at which texturing begins
-        if self._total_phases == 3:
-            phase_start = 65.0
-        elif self._total_phases == 2:
-            phase_start = 65.0
-        else:
-            phase_start = 0.0
+        phase_start = float(self._phase_start_pct(self._total_phases))
 
         scene = context.scene
         scene.trellis2_pipeline_active = True
@@ -897,6 +2218,7 @@ class Trellis2Generate(bpy.types.Operator):
 
             # Store the final input image path for later use (IPAdapter/Qwen style)
             self._input_image_path = image_path
+            self._autorig_enabled = bool(getattr(context.scene, 'trellis2_autorig_enabled', False))
 
             result = self.workflow_manager.generate_trellis2(context, image_path)
 
@@ -908,7 +2230,7 @@ class Trellis2Generate(bpy.types.Operator):
                 self._error = result["error"]
             else:
                 self._trimesh_decimated = False
-                if decimate_method == 'collapse':
+                if decimate_method == 'collapse' and not self._autorig_enabled:
                     self._detail_stage = "Decimating mesh via trimesh"
                     self._phase_stage = "Trimesh decimation"
                     self._phase_progress = 90
@@ -923,6 +2245,8 @@ class Trellis2Generate(bpy.types.Operator):
                     except Exception as dec_err:
                         print(f"[TRELLIS2] Background trimesh decimation failed: {dec_err}")
                         # Fallback: result is unmodified raw GLB
+                elif decimate_method == 'collapse' and self._autorig_enabled:
+                    print("[TRELLIS2] Skipping background trimesh decimation because SkinTokens auto-rigging is enabled")
                 self._glb_data = result
 
         except Exception as e:
@@ -930,6 +2254,897 @@ class Trellis2Generate(bpy.types.Operator):
                 return  # Swallow exceptions caused by cancel-time WS close
             self._error = str(e)
             traceback.print_exc()
+
+
+class StableGenApplyBoneDisplay(bpy.types.Operator):
+    """Apply the configured bone presentation to selected generated rigs."""
+
+    bl_idname = "stablegen.apply_autorig_bone_display"
+    bl_label = "Apply Bone Display"
+    bl_description = (
+        "Apply the selected SkinTokens bone display style to the selected "
+        "armature or the armature driving the selected mesh"
+    )
+    bl_options = {'REGISTER', 'UNDO'}
+
+    @classmethod
+    def poll(cls, context):
+        if sg_modal_active(context):
+            return False
+        armatures = selected_armatures_for_display(context)
+        if not armatures:
+            cls.poll_message_set("Select an armature or a rigged mesh")
+            return False
+        return True
+
+    def execute(self, context):
+        armatures = selected_armatures_for_display(context)
+        display_type = getattr(
+            context.scene, 'trellis2_autorig_bone_display_type', 'OCTAHEDRAL')
+        count = apply_autorig_bone_display(armatures, display_type)
+        self.report(
+            {'INFO'},
+            f"Applied {display_type.title()} bone display to {count} armature(s)",
+        )
+        return {'FINISHED'}
+
+
+class StableGenAutoRigSelectedMesh(bpy.types.Operator):
+    """Run SkinTokens auto-rigging on the selected character mesh objects."""
+
+    bl_idname = "object.stablegen_autorig_selected_mesh"
+    bl_label = "Auto-Rig Selected Character"
+    bl_description = (
+        "Join copies of the selected character's mesh parts when needed, export them to GLB, "
+        "run SkinTokens in ComfyUI, and import the rigged GLB"
+    )
+    bl_options = {'REGISTER', 'UNDO'}
+
+    hide_source: bpy.props.BoolProperty(
+        name="Preserve Original Source",
+        description=(
+            "Keep the original mesh objects and hide them with Blender's eye-style "
+            "viewport toggle after the rigged result imports; when disabled, the "
+            "original objects are deleted after a successful import"
+        ),
+        default=True,
+    )  # type: ignore
+    use_transfer: bpy.props.BoolProperty(
+        name="Transfer Original",
+        description="Transfer the generated rig back to the joined source mesh to preserve materials and scale",
+        default=True,
+    )  # type: ignore
+    use_skeleton: bpy.props.BoolProperty(
+        name="Use Existing Skeleton",
+        description=(
+            "Preserve an existing skeleton and generate only skin weights; "
+            "when disabled, any existing armature and skin binding are ignored"
+        ),
+        default=False,
+    )  # type: ignore
+    use_postprocess: bpy.props.BoolProperty(
+        name="Skin Postprocess",
+        description="Enable SkinTokens voxel skin post-processing before export",
+        default=False,
+    )  # type: ignore
+    cleanup_cross_limb_weights: bpy.props.BoolProperty(
+        name="Clean Limb Weights",
+        description=(
+            "After import, repair spatially implausible hand and foot weights "
+            "such as influences from the opposite limb, spine, pelvis, or legs"
+        ),
+        default=True,
+    )  # type: ignore
+    garment_mode: bpy.props.EnumProperty(
+        name="Garment Handling",
+        description="Optional post-import handling for long dresses and skirts",
+        items=(
+            ('NONE', "Original Weights", "Keep the generated garment weights"),
+            (
+                'STABILIZE',
+                "Stabilized Dress",
+                "Detect long garment surfaces and apply a smooth pelvis/thigh blend",
+            ),
+            (
+                'LEG_FOLLOW',
+                "Smooth Leg Follow",
+                "Smoothly drive detected long garments from the pelvis, thighs, and lower legs",
+            ),
+        ),
+        default='NONE',
+    )  # type: ignore
+    bone_display_type: bpy.props.EnumProperty(
+        name="Bone Display",
+        description="Viewport shape used for the imported SkinTokens bones",
+        items=(
+            ('OCTAHEDRAL', "Octahedral (Mixamo-like)", "Classic tapered Blender/Mixamo-style bones"),
+            ('STICK', "Stick / Joint Circles", "Thin bone lines with circular joint markers"),
+            ('BBONE', "B-Bone", "Box-like bendy-bone display"),
+            ('ENVELOPE', "Envelope", "Display bone deformation envelopes"),
+            ('WIRE', "Wire", "Wireframe bone display"),
+            ('IMPORTED', "Imported", "Keep the display and custom shapes from the imported GLB"),
+        ),
+        default='OCTAHEDRAL',
+    )  # type: ignore
+    bone_heuristic: bpy.props.EnumProperty(
+        name="Bone Direction",
+        description=(
+            "How Blender constructs display/deform bone axes from SkinTokens "
+            "glTF joint transforms"
+        ),
+        items=(
+            (
+                'FORTUNE',
+                "Fortune / Child-Directed",
+                "Point one-child bones at their child joints; best-looking default, "
+                "but non-uniform joint scaling can be less accurate",
+            ),
+            (
+                'BLENDER',
+                "Blender / Legacy Round-Trip",
+                "Preserve glTF local joint axes and imported joint-marker shapes; "
+                "best for glTF round trips",
+            ),
+            (
+                'TEMPERANCE',
+                "Temperance / Nearest Axis",
+                "Point toward the closest local axis; safer for non-uniform scaling "
+                "but less anatomically aligned than Fortune",
+            ),
+        ),
+        default='FORTUNE',
+    )  # type: ignore
+    top_k: bpy.props.IntProperty(
+        name="Rig candidate limit (top-k)",
+        description="Maximum candidate choices retained during SkinTokens rig sampling. Lower values constrain choices more; this affects rig prediction, not image generation",
+        default=5,
+        min=1,
+        max=200,
+    )  # type: ignore
+    top_p: bpy.props.FloatProperty(
+        name="Rig probability cutoff (top-p)",
+        description="Probability mass retained during rig sampling (0–1). Lower values discard more low-probability choices",
+        default=0.95,
+        min=0.1,
+        max=1.0,
+        step=0.01,
+    )  # type: ignore
+    temperature: bpy.props.FloatProperty(
+        name="Rig sampling temperature",
+        description="Variability in rig sampling. Lower values favor likely choices; higher values allow more varied choices",
+        default=1.0,
+        min=0.1,
+        max=2.0,
+        step=0.1,
+    )  # type: ignore
+    repetition_penalty: bpy.props.FloatProperty(
+        name="Repetition Penalty",
+        description="Penalty applied to repeated SkinTokens outputs. 1 is neutral; larger values discourage repetition",
+        default=2.0,
+        min=0.5,
+        max=3.0,
+        step=0.1,
+    )  # type: ignore
+    num_beams: bpy.props.IntProperty(
+        name="Rig beam count",
+        description="Candidate rig-token sequences explored by beam search. More increases search breadth and processing cost",
+        default=10,
+        min=1,
+        max=20,
+    )  # type: ignore
+    model_ckpt: bpy.props.StringProperty(
+        name="Rig checkpoint path",
+        description="Optional rig-model checkpoint path relative to SKINTOKENS_ROOT. Empty uses the configured default",
+        default="",
+    )  # type: ignore
+    hf_path: bpy.props.StringProperty(
+        name="Hugging Face model path",
+        description="Optional Hugging Face model source passed to SkinTokens. Empty uses the configured default",
+        default="",
+    )  # type: ignore
+
+    _SETTING_BINDINGS = (
+        ("use_transfer", "trellis2_autorig_use_transfer", True),
+        ("use_skeleton", "trellis2_autorig_use_skeleton", False),
+        ("use_postprocess", "trellis2_autorig_use_postprocess", False),
+        (
+            "cleanup_cross_limb_weights",
+            "trellis2_autorig_cleanup_cross_limb_weights",
+            True,
+        ),
+        ("garment_mode", "trellis2_autorig_garment_mode", "NONE"),
+        (
+            "bone_display_type",
+            "trellis2_autorig_bone_display_type",
+            "OCTAHEDRAL",
+        ),
+        (
+            "bone_heuristic",
+            "trellis2_autorig_bone_heuristic",
+            "FORTUNE",
+        ),
+        ("top_k", "trellis2_autorig_top_k", 5),
+        ("top_p", "trellis2_autorig_top_p", 0.95),
+        ("temperature", "trellis2_autorig_temperature", 1.0),
+        ("repetition_penalty", "trellis2_autorig_repetition_penalty", 2.0),
+        ("num_beams", "trellis2_autorig_num_beams", 10),
+        ("model_ckpt", "trellis2_autorig_model_ckpt", ""),
+        ("hf_path", "trellis2_autorig_hf_path", ""),
+    )
+
+    _timer = None
+    _thread = None
+    _error = None
+    _rigged_data = None
+    _is_running = False
+    _cancelled = False
+    _active_ws = None
+    _progress = 0.0
+    _stage = "Initializing"
+    _overall_progress = 0.0
+    _overall_stage = "Initializing"
+    _phase_progress = 0.0
+    _phase_stage = ""
+    _current_phase = 0
+    _total_phases = 4
+    workflow_manager: object = None
+
+    _PHASE_WEIGHTS = (12.0, 75.0, 11.0, 2.0)
+
+    def _set_pipeline_phase(self, phase, label, percent, detail=None):
+        """Update standalone auto-rig overall and current-phase progress."""
+        phase = max(1, min(int(phase), self._total_phases))
+        percent = max(0.0, min(float(percent), 100.0))
+        start = sum(self._PHASE_WEIGHTS[:phase - 1])
+        overall = start + self._PHASE_WEIGHTS[phase - 1] * percent / 100.0
+
+        self._current_phase = phase
+        self._overall_progress = max(self._overall_progress, overall)
+        self._overall_stage = f"Phase {phase}/{self._total_phases}: {label}"
+        self._phase_progress = percent
+        self._phase_stage = detail or label
+
+        # Keep the original fields synchronized for integrations which still
+        # inspect the standalone operator's legacy single-bar state.
+        self._progress = self._overall_progress
+        self._stage = self._phase_stage
+
+    def _load_settings_from_scene(self, scene):
+        for operator_name, scene_name, fallback in self._SETTING_BINDINGS:
+            setattr(self, operator_name, getattr(scene, scene_name, fallback))
+
+    def _store_settings_in_scene(self, scene):
+        for operator_name, scene_name, _fallback in self._SETTING_BINDINGS:
+            setattr(scene, scene_name, getattr(self, operator_name))
+
+    def invoke(self, context, _event):
+        # The same button doubles as Cancel while a job is running.  Do not put
+        # a confirmation dialog in front of that time-sensitive action.
+        if StableGenAutoRigSelectedMesh._is_running:
+            return self.execute(context)
+        self._load_settings_from_scene(context.scene)
+        return context.window_manager.invoke_props_dialog(self, width=520)
+
+    def draw(self, context):
+        layout = self.layout
+        layout.use_property_split = True
+        layout.use_property_decorate = False
+
+        mesh_count = len(self._collect_character_meshes(context.selected_objects))
+        if mesh_count > 1:
+            layout.label(
+                text=f"{mesh_count} mesh parts will be joined temporarily for SkinTokens",
+                icon='MESH_DATA',
+            )
+
+        behavior_box = layout.box()
+        behavior_box.label(text="Rigging Behavior", icon='ARMATURE_DATA')
+        behavior_box.prop(self, "use_transfer")
+        behavior_box.prop(self, "use_skeleton")
+        behavior_box.prop(self, "use_postprocess")
+        behavior_box.prop(self, "cleanup_cross_limb_weights")
+        behavior_box.prop(self, "garment_mode")
+        behavior_box.prop(self, "bone_heuristic")
+        behavior_box.prop(self, "bone_display_type")
+        behavior_box.prop(self, "hide_source")
+        if self.hide_source:
+            behavior_box.label(
+                text="Original: preserved and hidden with the Outliner eye toggle",
+                icon='HIDE_ON',
+            )
+        else:
+            warning = behavior_box.row()
+            warning.alert = True
+            warning.label(
+                text="Replace mode: original mesh objects are deleted after success",
+                icon='ERROR',
+            )
+
+        sampling_box = layout.box()
+        sampling_box.label(text="Sampling", icon='SETTINGS')
+        grid = sampling_box.grid_flow(
+            row_major=True,
+            columns=2,
+            even_columns=True,
+            even_rows=False,
+            align=True,
+        )
+        grid.prop(self, "top_k")
+        grid.prop(self, "top_p")
+        grid.prop(self, "temperature")
+        grid.prop(self, "repetition_penalty")
+        sampling_box.prop(self, "num_beams")
+
+        model_box = layout.box()
+        model_box.label(text="Optional Model Overrides", icon='FILE_BLEND')
+        model_box.prop(self, "model_ckpt")
+        model_box.prop(self, "hf_path")
+
+    @staticmethod
+    def _collect_character_meshes(selected_objects):
+        """Return selected meshes plus meshes below selected hierarchy roots.
+
+        Imported FBX/GLTF characters commonly expose an Empty or Armature as the
+        convenient selectable root.  Walking its descendants lets the standalone
+        operator handle those characters without requiring every part to be
+        selected manually.  Object identity is used for de-duplication because a
+        mesh can be both explicitly selected and below a selected root.
+        """
+        meshes = []
+        seen = set()
+        explicitly_selected = {
+            obj.as_pointer() if hasattr(obj, "as_pointer") else id(obj)
+            for obj in selected_objects
+        }
+
+        def visit(obj):
+            object_key = obj.as_pointer() if hasattr(obj, "as_pointer") else id(obj)
+            if object_key in seen:
+                return
+            seen.add(object_key)
+            if obj.type == 'MESH':
+                is_explicit = object_key in explicitly_selected
+                preserved_source = bool(
+                    obj.get("sg_autorig_preserved_source", False))
+                disabled = bool(obj.hide_viewport or obj.hide_get())
+                # A selected hierarchy root commonly contains both the visible
+                # rigged result and the source copy hidden by a previous run.
+                # Do not silently join that preserved copy back into the next
+                # SkinTokens input.  Explicitly selecting the mesh itself still
+                # allows the user to rerig the original on purpose.
+                if is_explicit or not (preserved_source or disabled):
+                    meshes.append(obj)
+            for child in obj.children:
+                visit(child)
+
+        for selected in selected_objects:
+            visit(selected)
+        return meshes
+
+    @staticmethod
+    def _related_armatures(selected_objects, meshes):
+        """Find armatures explicitly selected or used by the source meshes."""
+        armatures = []
+        seen = set()
+
+        def add(obj):
+            if not obj or obj.type != 'ARMATURE':
+                return
+            object_key = obj.as_pointer() if hasattr(obj, "as_pointer") else id(obj)
+            if object_key not in seen:
+                seen.add(object_key)
+                armatures.append(obj)
+
+        for obj in selected_objects:
+            add(obj)
+        for mesh in meshes:
+            ancestor = mesh.parent
+            while ancestor is not None:
+                add(ancestor)
+                ancestor = ancestor.parent
+            for modifier in mesh.modifiers:
+                if modifier.type == 'ARMATURE':
+                    add(getattr(modifier, 'object', None))
+        return armatures
+
+    @staticmethod
+    def _make_joined_export_copy(
+            context, source_meshes, strip_existing_rig=False):
+        """Create one temporary mesh from copies of the source mesh objects.
+
+        Blender's join operation keeps the active copy's transform/modifiers and
+        merges material slots and same-named vertex groups from the other copies.
+        This gives SkinTokens the single mesh node it expects while leaving every
+        source object and datablock untouched.  When ``strip_existing_rig`` is
+        true, Armature modifiers and armature ancestry are removed from the
+        copies so a previously rigged character is exported as plain rest mesh.
+
+        Returns ``(joined_object, copied_mesh_datablocks)``.  The caller owns and
+        must remove both after export.
+        """
+        copies = []
+        copied_meshes = []
+        try:
+            for index, source in enumerate(source_meshes):
+                duplicate = source.copy()
+                duplicate.data = source.data.copy()
+                duplicate.name = f"SG_AutoRigPart_{index:03d}"
+                duplicate.data.name = f"SG_AutoRigPartMesh_{index:03d}"
+                context.collection.objects.link(duplicate)
+                duplicate.hide_select = False
+                duplicate.hide_viewport = False
+                duplicate.hide_render = False
+                duplicate.hide_set(False)
+                if strip_existing_rig:
+                    world_matrix = duplicate.matrix_world.copy()
+                    ancestor = duplicate.parent
+                    has_armature_ancestor = False
+                    while ancestor is not None:
+                        if ancestor.type == 'ARMATURE':
+                            has_armature_ancestor = True
+                            break
+                        ancestor = ancestor.parent
+                    if has_armature_ancestor:
+                        duplicate.parent = None
+                        duplicate.matrix_world = world_matrix
+                    for modifier in list(duplicate.modifiers):
+                        if modifier.type == 'ARMATURE':
+                            duplicate.modifiers.remove(modifier)
+                copies.append(duplicate)
+                copied_meshes.append(duplicate.data)
+
+            bpy.ops.object.select_all(action='DESELECT')
+            for duplicate in copies:
+                duplicate.select_set(True)
+
+            # Prefer a mesh already driven by an armature as active so its
+            # Armature modifier survives the join when use_skeleton is enabled.
+            active_copy = next(
+                (
+                    duplicate for duplicate in copies
+                    if any(modifier.type == 'ARMATURE' for modifier in duplicate.modifiers)
+                ),
+                copies[0],
+            )
+            context.view_layer.objects.active = active_copy
+            if len(copies) > 1:
+                bpy.ops.object.join()
+            joined = context.view_layer.objects.active
+            joined.name = "SG_AutoRigJoinedInput"
+            joined.data.name = "SG_AutoRigJoinedInputMesh"
+            joined["sg_autorig_temporary_join"] = True
+            return joined, copied_meshes
+        except Exception:
+            for duplicate in copies:
+                try:
+                    if duplicate and duplicate.name in bpy.data.objects:
+                        bpy.data.objects.remove(duplicate, do_unlink=True)
+                except ReferenceError:
+                    pass
+            for mesh_data in copied_meshes:
+                try:
+                    if mesh_data and mesh_data.name in bpy.data.meshes and mesh_data.users == 0:
+                        bpy.data.meshes.remove(mesh_data)
+                except ReferenceError:
+                    pass
+            raise
+
+    @staticmethod
+    def _remove_joined_export_copy(joined, copied_meshes):
+        try:
+            if joined and joined.name in bpy.data.objects:
+                bpy.data.objects.remove(joined, do_unlink=True)
+        except ReferenceError:
+            pass
+        for mesh_data in copied_meshes:
+            try:
+                if mesh_data and mesh_data.name in bpy.data.meshes and mesh_data.users == 0:
+                    bpy.data.meshes.remove(mesh_data)
+            except ReferenceError:
+                pass
+
+    @staticmethod
+    def _preserve_autorig_sources(source_names):
+        """Keep source meshes with ordinary Outliner eye-style hiding."""
+        preserved = 0
+        for name in source_names:
+            obj = bpy.data.objects.get(name)
+            if not obj or obj.type != 'MESH':
+                continue
+            obj["sg_autorig_preserved_source"] = True
+            # Older StableGen versions used hide_viewport, whose monitor toggle
+            # is independent of the familiar Outliner eye.  Clear it before
+            # applying the reversible eye-style hide.
+            obj.hide_viewport = False
+            obj.hide_set(True)
+            obj.hide_render = True
+            preserved += 1
+        return preserved
+
+    @staticmethod
+    def _replace_autorig_sources(source_names, source_armature_names):
+        """Delete superseded source meshes and now-unused source armatures."""
+        removed_meshes = 0
+        for name in source_names:
+            obj = bpy.data.objects.get(name)
+            if not obj or obj.type != 'MESH':
+                continue
+            bpy.data.objects.remove(obj, do_unlink=True)
+            removed_meshes += 1
+
+        removed_armatures = 0
+        for name in source_armature_names:
+            armature = bpy.data.objects.get(name)
+            if not armature or armature.type != 'ARMATURE':
+                continue
+
+            still_used = False
+            for obj in bpy.data.objects:
+                if obj.type != 'MESH':
+                    continue
+                if any(
+                        modifier.type == 'ARMATURE'
+                        and getattr(modifier, 'object', None) == armature
+                        for modifier in obj.modifiers):
+                    still_used = True
+                    break
+                parent = obj.parent
+                while parent is not None:
+                    if parent == armature:
+                        still_used = True
+                        break
+                    parent = parent.parent
+                if still_used:
+                    break
+
+            if not still_used:
+                bpy.data.objects.remove(armature, do_unlink=True)
+                removed_armatures += 1
+
+        return removed_meshes, removed_armatures
+
+    @classmethod
+    def poll(cls, context):
+        if cls._is_running:
+            return True
+        addon_prefs = context.preferences.addons[_ADDON_PKG].preferences
+        if not addon_prefs.server_address or not addon_prefs.server_online:
+            cls.poll_message_set("ComfyUI server is not connected")
+            return False
+        if bpy.app.online_access == False:
+            cls.poll_message_set("Blender's online access is disabled (File -> Preferences -> System)")
+            return False
+        if not getattr(context.scene, 'skintokens_autorig_available', False):
+            cls.poll_message_set("StableGen SkinTokens node was not detected in ComfyUI")
+            return False
+        if sg_modal_active(context):
+            cls.poll_message_set("Another operation is in progress")
+            return False
+        if not cls._collect_character_meshes(context.selected_objects):
+            cls.poll_message_set("Select a mesh object or an imported character root to auto-rig")
+            return False
+        return True
+
+    def execute(self, context):
+        if StableGenAutoRigSelectedMesh._is_running:
+            StableGenAutoRigSelectedMesh._cancelled = True
+            StableGenAutoRigSelectedMesh._is_running = False
+
+            try:
+                server_address = context.preferences.addons[_ADDON_PKG].preferences.server_address
+                data = json.dumps({"client_id": str(uuid.uuid4())}).encode('utf-8')
+                req = urllib.request.Request(f"http://{server_address}/interrupt", data=data)
+                urllib.request.urlopen(req, timeout=get_timeout('api'))
+            except Exception:
+                pass
+
+            ws = StableGenAutoRigSelectedMesh._active_ws
+            if ws:
+                try:
+                    ws.close()
+                except Exception:
+                    pass
+                StableGenAutoRigSelectedMesh._active_ws = None
+
+            self.report({'WARNING'}, "Auto-rigging cancelled")
+            return {'FINISHED'}
+
+        from ..core.server_api import confirm_server
+        if not confirm_server(self, context):
+            return {'CANCELLED'}
+
+        selected_objects = list(context.selected_objects)
+        selected_meshes = self._collect_character_meshes(selected_objects)
+        if not selected_meshes:
+            self.report({'ERROR'}, "Select a mesh object or an imported character root to auto-rig")
+            return {'CANCELLED'}
+
+        # Commit dialog values only after the user confirms and the selection is
+        # valid.  Cancelling the dialog therefore leaves scene settings intact.
+        self._store_settings_in_scene(context.scene)
+
+        self.report(
+            {'INFO'},
+            "The exported GLB will be uploaded to the ComfyUI input directory",
+        )
+
+        try:
+            gen_dirs = get_generation_dirs(context)
+            save_dir = gen_dirs.get("revision", "") or context.preferences.addons[_ADDON_PKG].preferences.output_dir
+            os.makedirs(save_dir, exist_ok=True)
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            export_path = os.path.join(save_dir, f"stablegen_autorig_source_{timestamp}.glb")
+
+            previous_active = context.view_layer.objects.active
+            joined_export = None
+            copied_mesh_data = []
+            try:
+                related_armatures = self._related_armatures(
+                    selected_objects,
+                    selected_meshes,
+                )
+                strip_existing_rig = not self.use_skeleton
+                needs_export_copy = (
+                    len(selected_meshes) > 1
+                    or (strip_existing_rig and bool(related_armatures))
+                )
+                if needs_export_copy:
+                    joined_export, copied_mesh_data = self._make_joined_export_copy(
+                        context,
+                        selected_meshes,
+                        strip_existing_rig=strip_existing_rig,
+                    )
+                    export_meshes = [joined_export]
+                    if len(selected_meshes) > 1:
+                        print(
+                            f"[StableGen] Auto-rig staging joined {len(selected_meshes)} "
+                            "source mesh objects into one temporary SkinTokens input"
+                        )
+                    if strip_existing_rig and related_armatures:
+                        print(
+                            "[StableGen] Auto-rig staging removed the existing "
+                            "armature and skin binding from the SkinTokens input"
+                        )
+                else:
+                    export_meshes = selected_meshes
+
+                export_objects = list(export_meshes)
+                if self.use_skeleton:
+                    for armature in related_armatures:
+                        if armature not in export_objects:
+                            export_objects.append(armature)
+
+                bpy.ops.object.select_all(action='DESELECT')
+                for obj in export_objects:
+                    obj.select_set(True)
+                context.view_layer.objects.active = export_meshes[0]
+                # A projection-textured character keeps its own mesh and material
+                # (the weights are moved back onto it after import), so its GLB
+                # needs no materials; exporting the projection material's images
+                # took minutes.
+                projection_textured = all(_is_projection_textured(obj) for obj in selected_meshes)
+                bpy.ops.export_scene.gltf(
+                    filepath=export_path,
+                    export_format='GLB',
+                    use_selection=True,
+                    export_materials='NONE' if projection_textured else 'EXPORT',
+                )
+            finally:
+                self._remove_joined_export_copy(joined_export, copied_mesh_data)
+                bpy.ops.object.select_all(action='DESELECT')
+                for obj in selected_objects:
+                    if context.scene.objects.get(obj.name):
+                        obj.select_set(True)
+                if previous_active and context.scene.objects.get(previous_active.name):
+                    context.view_layer.objects.active = previous_active
+
+            if not os.path.isfile(export_path) or os.path.getsize(export_path) == 0:
+                self.report({'ERROR'}, "Selected mesh export did not create a valid GLB")
+                return {'CANCELLED'}
+        except Exception as exc:
+            self.report({'ERROR'}, f"Failed to export selected mesh for auto-rigging: {exc}")
+            traceback.print_exc()
+            return {'CANCELLED'}
+
+        StableGenAutoRigSelectedMesh._is_running = True
+        StableGenAutoRigSelectedMesh._cancelled = False
+        self._error = None
+        self._rigged_data = None
+        self._progress = 0.0
+        self._stage = "Queued"
+        self._overall_progress = 0.0
+        self._overall_stage = "Queued"
+        self._phase_progress = 0.0
+        self._phase_stage = "Preparing source"
+        self._current_phase = 0
+        self._source_names = [obj.name for obj in selected_meshes]
+        self._source_armature_names = [
+            obj.name for obj in related_armatures
+        ]
+        self._source_mesh_count = len(selected_meshes)
+        self._export_path = export_path
+
+        from ..workflows import WorkflowManager
+        self.workflow_manager = WorkflowManager(self)
+        self._thread = threading.Thread(
+            target=self._run_autorig,
+            args=(context, export_path),
+            daemon=True,
+        )
+        self._thread.start()
+
+        context.window_manager.modal_handler_add(self)
+        self._timer = context.window_manager.event_timer_add(0.5, window=context.window)
+        if len(selected_meshes) > 1:
+            self.report(
+                {'INFO'},
+                f"Auto-rigging started with {len(selected_meshes)} joined mesh parts",
+            )
+        else:
+            self.report({'INFO'}, "Auto-rigging started")
+        return {'RUNNING_MODAL'}
+
+    def _run_autorig(self, context, export_path):
+        try:
+            result = self.workflow_manager.generate_skintokens_autorig_file(context, export_path)
+            if self._cancelled:
+                return
+            if isinstance(result, dict) and "error" in result:
+                self._error = result["error"]
+            else:
+                self._rigged_data = result
+        except Exception as exc:
+            if self._cancelled:
+                return
+            self._error = str(exc)
+            traceback.print_exc()
+
+    def modal(self, context, event):
+        if event.type != 'TIMER':
+            return {'PASS_THROUGH'}
+
+        for area in context.screen.areas:
+            area.tag_redraw()
+
+        if self._thread and self._thread.is_alive():
+            return {'RUNNING_MODAL'}
+
+        context.window_manager.event_timer_remove(self._timer)
+        self._timer = None
+        was_cancelled = StableGenAutoRigSelectedMesh._cancelled
+        StableGenAutoRigSelectedMesh._is_running = False
+        StableGenAutoRigSelectedMesh._cancelled = False
+        StableGenAutoRigSelectedMesh._active_ws = None
+
+        if was_cancelled:
+            return {'FINISHED'}
+        if self._error:
+            self.report({'ERROR'}, f"Auto-rigging failed: {self._error}")
+            return {'CANCELLED'}
+        if not self._rigged_data:
+            self.report({'ERROR'}, "Auto-rigging failed: no rigged GLB was returned")
+            return {'CANCELLED'}
+
+        try:
+            self._set_pipeline_phase(4, "Blender Import", 0, "Writing rigged GLB")
+            gen_dirs = get_generation_dirs(context)
+            save_dir = gen_dirs.get("revision", "") or context.preferences.addons[_ADDON_PKG].preferences.output_dir
+            os.makedirs(save_dir, exist_ok=True)
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            output_path = os.path.join(save_dir, f"stablegen_autorig_rigged_{timestamp}.glb")
+            with open(output_path, 'wb') as handle:
+                handle.write(self._rigged_data)
+
+            bpy.ops.import_scene.gltf(**autorig_gltf_import_kwargs(
+                output_path, getattr(self, 'bone_heuristic', 'FORTUNE')))
+            self._set_pipeline_phase(4, "Blender Import", 45, "Preparing imported rig")
+            imported_objects = list(context.selected_objects)
+            for obj in imported_objects:
+                obj["sg_generated"] = True
+            record_autorig_bone_heuristic(
+                imported_objects,
+                getattr(self, 'bone_heuristic', 'FORTUNE'),
+            )
+            apply_autorig_bone_display(
+                imported_objects,
+                getattr(self, 'bone_display_type', 'OCTAHEDRAL'),
+            )
+
+            Trellis2Generate._configure_not_exported_helpers()
+            mesh_objects = [obj for obj in imported_objects if obj.type == 'MESH']
+            if mesh_objects:
+                Trellis2Generate._clear_imported_custom_normals(mesh_objects)
+
+            if self.cleanup_cross_limb_weights:
+                self._set_pipeline_phase(4, "Blender Import", 65, "Cleaning limb weights")
+                try:
+                    _sanitize_autorig_cross_limb_weights(imported_objects)
+                except Exception as exc:
+                    self.report(
+                        {'WARNING'},
+                        "Cross-limb weight cleanup failed; imported the original "
+                        f"SkinTokens weights: {exc}",
+                    )
+                    traceback.print_exc()
+
+            if self.garment_mode in {'STABILIZE', 'LEG_FOLLOW'}:
+                garment_stage = (
+                    "Smoothing garment leg follow"
+                    if self.garment_mode == 'LEG_FOLLOW'
+                    else "Stabilizing garment weights"
+                )
+                self._set_pipeline_phase(4, "Blender Import", 82, garment_stage)
+                try:
+                    _stabilize_autorig_garment_weights(
+                        imported_objects,
+                        mode=self.garment_mode,
+                    )
+                except Exception as exc:
+                    self.report(
+                        {'WARNING'},
+                        "Garment weighting failed; imported the current "
+                        f"skin weights: {exc}",
+                    )
+                    traceback.print_exc()
+
+            bpy.ops.object.select_all(action='DESELECT')
+            for obj in imported_objects:
+                obj.select_set(True)
+            if mesh_objects:
+                context.view_layer.objects.active = mesh_objects[0]
+            elif imported_objects:
+                context.view_layer.objects.active = imported_objects[0]
+
+            source_names = list(getattr(self, '_source_names', []))
+            bound = _bind_projection_textured_sources(source_names, imported_objects)
+            if bound:
+                # The originals carry the texture and now deform with the new rig;
+                # the re-imported copy only supplied the weights.
+                source_names = [name for name in source_names if name not in bound]
+                for obj in mesh_objects:
+                    if self.hide_source:
+                        obj.hide_set(True)
+                        obj.hide_render = True
+                        obj["sg_autorig_weight_source"] = True
+                    else:
+                        bpy.data.objects.remove(obj, do_unlink=True)
+                bpy.ops.object.select_all(action='DESELECT')
+                for name in bound:
+                    bpy.data.objects[name].select_set(True)
+                context.view_layer.objects.active = bpy.data.objects[bound[0]]
+                print(
+                    f"[StableGen] Bound {len(bound)} projection-textured source mesh(es) "
+                    "to the new rig"
+                )
+            if self.hide_source:
+                preserved = self._preserve_autorig_sources(source_names)
+                print(
+                    f"[StableGen] Preserved {preserved} source mesh object(s) "
+                    "with eye-style hiding"
+                )
+            else:
+                removed_meshes, removed_armatures = self._replace_autorig_sources(
+                    source_names,
+                    list(getattr(self, '_source_armature_names', [])),
+                )
+                print(
+                    f"[StableGen] Replace-original mode removed {removed_meshes} "
+                    f"source mesh object(s) and {removed_armatures} unused "
+                    "source armature object(s)"
+                )
+
+            source_count = int(getattr(self, '_source_mesh_count', 1))
+            part_note = f" from {source_count} joined parts" if source_count > 1 else ""
+            self._set_pipeline_phase(4, "Blender Import", 100, "Import complete")
+            self.report(
+                {'INFO'},
+                f"Auto-rigged mesh imported{part_note}: {os.path.basename(output_path)}",
+            )
+            return {'FINISHED'}
+        except Exception as exc:
+            self.report({'ERROR'}, f"Failed to import rigged GLB: {exc}")
+            traceback.print_exc()
+            return {'CANCELLED'}
 
 
 # ---------------------------------------------------------------------------

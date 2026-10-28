@@ -1,5 +1,6 @@
 import bpy
 import os
+import shutil
 import numpy as np
 from PIL import Image
 import mathutils
@@ -8,6 +9,7 @@ from mathutils import Vector
 from ..utils import get_file_path, get_last_material_index, sg_modal_active
 from ..texturing.projection import project_image
 from .color_match import color_match_single
+from ..core.architectures import QWEN_ARCHITECTURES
 
 def _build_mirrored_camera_matrix(
     cam: bpy.types.Object,
@@ -510,7 +512,7 @@ class MirrorReproject(bpy.types.Operator):
             return {'CANCELLED'}
 
         # Branch: local_edit vs everything else
-        if scene.generation_method == 'local_edit' or (scene.model_architecture.startswith('qwen') and scene.qwen_generation_method == 'local_edit'):
+        if scene.generation_method == 'local_edit' or (scene.model_architecture in QWEN_ARCHITECTURES and scene.qwen_generation_method == 'local_edit'):
             return self._do_refine_mirror(context, to_texture)
         else:
             return self._do_standard_mirror(context, to_texture)
@@ -558,15 +560,34 @@ def _get_viewport_ref_np(obj):
 
     return rgb_srgb
 
+def _unmatched_path(image_path):
+    """Where the generated image is kept as generated while a color-matched copy takes its place."""
+    return os.path.join(os.path.dirname(image_path), "unmatched", os.path.basename(image_path))
+
+
+def restore_unmatched_image(image_path):
+    """Put the generated image back after color matching was turned off, so a reprojection uses the original view."""
+    original = _unmatched_path(image_path)
+    if os.path.isfile(original):
+        shutil.copyfile(original, image_path)
+        os.remove(original)
+        print(f"[StableGen] Restored unmatched view: {image_path}")
+
+
 def _apply_color_match_to_file(image_path, ref_rgb, scene):
     """
-    Load image from disk, color-match to ref_rgb if enabled, and overwrite on disk.
+    Color-match the generated image on disk to ref_rgb if enabled. The image as generated is kept in an
+    'unmatched' folder beside it and every match starts from it, so matching never compounds and can be undone.
     """
     if not scene.view_blend_use_color_match:
         return image_path  # no-op
 
     try:
-        with Image.open(image_path) as pil_img:
+        original = _unmatched_path(image_path)
+        if not os.path.isfile(original) and os.path.isfile(image_path):
+            os.makedirs(os.path.dirname(original), exist_ok=True)
+            shutil.copyfile(image_path, original)
+        with Image.open(original if os.path.isfile(original) else image_path) as pil_img:
             pil_img = pil_img.convert("RGBA")
             w, h = pil_img.size
             tgt_np = np.array(pil_img, dtype=np.float32) / 255.0  # [H, W, 4]
