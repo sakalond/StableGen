@@ -4,8 +4,9 @@
 <a href="LICENSE"><img src="https://img.shields.io/badge/license-GPL--3.0-007ec6" alt="License: GPL-3.0"></a>
 <img src="https://img.shields.io/badge/Blender-4.2--4.5%20%7C%205.1%2B-e5722c" alt="Blender 4.2 to 4.5, or 5.1 and later">
 <a href="https://github.com/sakalond/stablegen/releases"><img src="https://img.shields.io/github/downloads/sakalond/stablegen/total" alt="Downloads"></a>
+<a href="https://discord.gg/jhGp9Rsgh3"><img src="https://img.shields.io/badge/Discord-join-5865F2?logo=discord&logoColor=white" alt="Join the StableGen Discord server"></a>
 </p>
-<p align="center"><a href="https://github.com/sakalond/StableGen/wiki">Documentation</a> · <a href="https://github.com/sakalond/StableGen/wiki/Installation">Installation</a> · <a href="https://github.com/sakalond/StableGen/wiki/Quick-start">Quick start</a> · <a href="https://github.com/sakalond/StableGen/discussions">Discussions</a> · <a href="https://github.com/sakalond/stablegen/releases">Releases</a></p>
+<p align="center"><a href="https://github.com/sakalond/StableGen/wiki">Documentation</a> · <a href="https://github.com/sakalond/StableGen/wiki/Installation">Installation</a> · <a href="https://github.com/sakalond/StableGen/wiki/Quick-start">Quick start</a> · <a href="https://github.com/sakalond/StableGen/discussions">Discussions</a> · <a href="https://discord.gg/jhGp9Rsgh3">Discord</a> · <a href="https://github.com/sakalond/stablegen/releases">Releases</a></p>
 
 StableGen is a Blender add-on that textures meshes and whole scenes with diffusion models, and generates new meshes from a prompt or an image. It renders guidance images from cameras in your scene, sends the work to a [ComfyUI](https://github.com/comfyanonymous/ComfyUI) server on the same computer or elsewhere on your network, and projects the results back onto the meshes.
 
@@ -194,4 +195,4 @@ It builds on [ComfyUI](https://github.com/comfyanonymous/ComfyUI), [ComfyUI-TREL
 
 ## Contact
 
-Ask questions and share results in [Discussions](https://github.com/sakalond/StableGen/discussions), and report bugs in [Issues](https://github.com/sakalond/StableGen/issues). Ondřej Sakala: `sakalaondrej@gmail.com`, [@sakalond](https://x.com/sakalond) on X.
+Ask questions and share results in [Discussions](https://github.com/sakalond/StableGen/discussions) or on the [Discord server](https://discord.gg/jhGp9Rsgh3), and report bugs in [Issues](https://github.com/sakalond/StableGen/issues). Ondřej Sakala: `sakalaondrej@gmail.com`, [@sakalond](https://x.com/sakalond) on X.

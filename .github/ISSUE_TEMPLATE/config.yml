@@ -9,3 +9,7 @@ contact_links:
   - name: 💡 Suggest an Idea
     url: https://github.com/sakalond/StableGen/discussions/new?category=ideas
     about: Have a new feature idea? Let's discuss it here first.
+
+  - name: 🎮 Chat on Discord
+    url: https://discord.gg/jhGp9Rsgh3
+    about: Get help in real time, share results and follow releases on the StableGen Discord server.
