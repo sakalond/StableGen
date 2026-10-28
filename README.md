@@ -126,7 +126,7 @@ Texturing works by projection. Each camera gets a generated view that follows th
    python installer.py <path to ComfyUI>
    ```
    Package 3 sets up SDXL texturing, package 13 Qwen Image 2.1, package 8 mesh generation, package 14 auto-rigging, and packages 15 to 17 the experimental architectures.
-3. Download the add-on ZIP from [Releases](https://github.com/sakalond/stablegen/releases). In Blender, open **Edit > Preferences > Get Extensions**, choose **Install from Disk** in the top-right menu, and select the ZIP.
+3. Download the add-on ZIP for your system (Windows x64, Linux x64 or macOS on Apple Silicon) from [Releases](https://github.com/sakalond/stablegen/releases). In Blender, open **Edit > Preferences > Get Extensions**, choose **Install from Disk** in the top-right menu, and select the ZIP.
 4. In the add-on preferences, set **Output Directory** and **Server Address** (`127.0.0.1:8188` by default). Under **System > Network**, enable **Allow Online Access**.
 
 [Installation](https://github.com/sakalond/StableGen/wiki/Installation) covers every installer package, unattended installs, a remote server and manual setup.
