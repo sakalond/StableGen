@@ -1,4 +1,4 @@
-from ..feature_flags import experimental_enabled
+from ..core.feature_flags import experimental_enabled
 """ComfyUI texture generation operator (core pipeline)."""
 
 import os
@@ -31,7 +31,7 @@ from ..cameras.geometry import _SGCameraResolution, _get_camera_resolution, _get
 from ..cameras.overlays import _sg_restore_square_display, _sg_remove_crop_overlay, _sg_ensure_crop_overlay, _sg_hide_label_overlay, _sg_restore_label_overlay
 from .projection import project_image, reinstate_compare_nodes, _bake_visibility_weights, reset_projection_material_nodes, _is_projection_mesh, pop_svm_stack_warning, pop_eevee_attribute_warning
 from .jobs import operation, RenderRequest, MainThreadOperation, run_sync
-from ..utils import get_last_material_index, get_generation_dirs, get_file_path, get_dir_path, remove_empty_dirs, get_compositor_node_tree, configure_output_node_paths, get_eevee_engine_id, sg_modal_active
+from ..utils import get_last_material_index, get_generation_dirs, get_file_path, get_dir_path, remove_empty_dirs, get_compositor_node_tree, new_compositor_math, configure_output_node_paths, get_eevee_engine_id, sg_modal_active
 from ..util.mirror_color import MirrorReproject, _get_viewport_ref_np, _apply_color_match_to_file
 from ..timeout_config import get_timeout
 from .._generator_utils import redraw_ui, setup_studio_lighting, _pbr_setup_studio_lights, upload_image_to_comfyui
@@ -60,7 +60,8 @@ from .pose_lock import (
     restore_active_texturing_frame,
     set_active_texturing_frame,
 )
-from ..feature_flags import active_experiments
+from ..core.feature_flags import active_experiments
+from ..core.architectures import CANVAS_EDIT_ARCHITECTURES, EDIT_ARCHITECTURES, QWEN_ARCHITECTURES
 
 import websocket
 
@@ -509,7 +510,7 @@ class ComfyUIGenerate(_PBRMixin, bpy.types.Operator):
         if context.scene.qwen_context_render_mode in {'REPLACE_STYLE', 'ADDITIONAL'}:
             fallback = tuple(context.scene.qwen_guidance_fallback_color)
             background = tuple(context.scene.qwen_guidance_background_color)
-            if context.scene.model_architecture == 'qwen_image_21':
+            if context.scene.model_architecture in CANVAS_EDIT_ARCHITECTURES:
                 # Qwen 2.1 VAE-encodes projected context as its edit target and
                 # otherwise preserves a magenta canvas. Keep magenta only for
                 # unknown surface regions and make the outer background neutral.
@@ -849,7 +850,7 @@ class ComfyUIGenerate(_PBRMixin, bpy.types.Operator):
         else:
             print("[StableGen] Standard texturing; no research options active")
 
-        if context.scene.model_architecture in ('qwen_image_edit', 'qwen_image_21', 'flux2_klein') and not context.scene.generation_mode == 'project_only':
+        if context.scene.model_architecture in EDIT_ARCHITECTURES and not context.scene.generation_mode == 'project_only':
             context.scene.generation_method = 'sequential' # Force sequential for edit models
 
         render = bpy.context.scene.render
@@ -870,8 +871,8 @@ class ComfyUIGenerate(_PBRMixin, bpy.types.Operator):
 
         # Qwen Image Edit's optional 112px grid follows Qwen2.5-VL; Qwen
         # Image 2.1 uses Qwen3-VL and ComfyUI's native 32px image grid.
-        # FLUX.2 Klein uses 16x latent downscale.
-        if context.scene.model_architecture.startswith('qwen'):
+        # FLUX.2 Klein, MOSS-Image and FIBO use 16x latent downscale.
+        if context.scene.model_architecture in QWEN_ARCHITECTURES | {'moss_image'}:
             align_step = _get_resolution_align(context)
         elif context.scene.model_architecture == 'flux2_klein':
             align_step = 16
@@ -1085,7 +1086,7 @@ class ComfyUIGenerate(_PBRMixin, bpy.types.Operator):
 
         # Check if there is at least one ControlNet unit
         controlnet_units = getattr(context.scene, "controlnet_units", [])
-        if not controlnet_units and not (context.scene.use_flux_lora and context.scene.model_architecture == 'flux1') and context.scene.model_architecture != 'flux2_klein':
+        if not controlnet_units and not (context.scene.use_flux_lora and context.scene.model_architecture == 'flux1') and context.scene.model_architecture not in ('flux2_klein', 'moss_image'):
             self.report({'ERROR'}, "At least one ControlNet unit is required. Add one in the Guidance section below.")
             context.scene.generation_status = 'idle'
             context.scene.sg_last_gen_error = True
@@ -1144,10 +1145,12 @@ class ComfyUIGenerate(_PBRMixin, bpy.types.Operator):
                 self._restore_texturing_pose(context)
                 return {'CANCELLED'}
 
-        if not context.scene.overwrite_material or self._material_id == -1 or (context.scene.generation_method == 'local_edit' or (context.scene.model_architecture.startswith('qwen') and context.scene.qwen_generation_method == 'local_edit')):
+        if not context.scene.overwrite_material or self._material_id == -1 or (context.scene.generation_method == 'local_edit' or (context.scene.model_architecture in QWEN_ARCHITECTURES and context.scene.qwen_generation_method == 'local_edit')):
             self._material_id += 1
 
-        self._controlnet_units = list(controlnet_units)
+        # MOSS-Image has no ControlNet models; skip exporting their guide maps.
+        self._controlnet_units = ([] if context.scene.model_architecture == 'moss_image'
+                                  else list(controlnet_units))
 
         # Prepare for generating
         if context.scene.generation_method == 'grid':
@@ -1420,7 +1423,7 @@ class ComfyUIGenerate(_PBRMixin, bpy.types.Operator):
 
         applicable = (
             getattr(self, '_generation_method_on_start', None) == 'sequential'
-            or context.scene.model_architecture in ('qwen_image_edit', 'qwen_image_21', 'flux2_klein')
+            or context.scene.model_architecture in EDIT_ARCHITECTURES
         )
         reset_angle = (
             context.scene.discard_factor_after_generation
@@ -1630,9 +1633,11 @@ class ComfyUIGenerate(_PBRMixin, bpy.types.Operator):
             need_depth = (
                 any(u["unit_type"] == "depth" for u in controlnet_units)
                 or (context.scene.use_flux_lora and context.scene.model_architecture == 'flux1')
-                or (context.scene.model_architecture in ('qwen_image_edit', 'qwen_image_21', 'flux2_klein')
+                or (context.scene.model_architecture == 'moss_image'
+                    and context.scene.moss_depth_control)
+                or (context.scene.model_architecture in EDIT_ARCHITECTURES
                     and context.scene.qwen_guidance_map_type == 'depth')
-                or (context.scene.model_architecture.startswith('qwen')
+                or (context.scene.model_architecture in QWEN_ARCHITECTURES
                     and context.scene.qwen_generation_method in ('refine', 'local_edit')
                     and context.scene.qwen_refine_use_depth)
                 or (getattr(context.scene, 'sg_rework_projection_guard', False)
@@ -1672,7 +1677,7 @@ class ComfyUIGenerate(_PBRMixin, bpy.types.Operator):
 
             need_normal = (
                 any(u["unit_type"] == "normal" for u in controlnet_units)
-                or (context.scene.model_architecture in ('qwen_image_edit', 'qwen_image_21', 'flux2_klein')
+                or (context.scene.model_architecture in EDIT_ARCHITECTURES
                     and context.scene.qwen_guidance_map_type == 'normal')
             )
             if need_normal and context.scene.generation_method != 'uv_inpaint':
@@ -1693,13 +1698,13 @@ class ComfyUIGenerate(_PBRMixin, bpy.types.Operator):
                         return
 
             # Qwen guidance using Workbench
-            if (context.scene.model_architecture in ('qwen_image_edit', 'qwen_image_21', 'flux2_klein')
+            if (context.scene.model_architecture in EDIT_ARCHITECTURES
                     and context.scene.qwen_guidance_map_type == 'workbench'
                     and context.scene.generation_method != 'uv_inpaint'):
                 workbench_dir = get_dir_path(context, "controlnet")["workbench"]
                 guide_background = (
                     (0.5, 0.5, 0.5)
-                    if context.scene.model_architecture == 'qwen_image_21'
+                    if context.scene.model_architecture in CANVAS_EDIT_ARCHITECTURES
                     else None
                 )
                 for i, camera in enumerate(cameras):
@@ -1721,13 +1726,13 @@ class ComfyUIGenerate(_PBRMixin, bpy.types.Operator):
                         return
 
             # Qwen guidance using Viewport
-            elif (context.scene.model_architecture in ('qwen_image_edit', 'qwen_image_21', 'flux2_klein')
+            elif (context.scene.model_architecture in EDIT_ARCHITECTURES
                   and context.scene.qwen_guidance_map_type == 'viewport'
                   and context.scene.generation_method != 'uv_inpaint'):
                 viewport_dir = get_dir_path(context, "controlnet")["viewport"]
                 guide_background = (
                     (0.5, 0.5, 0.5)
-                    if context.scene.model_architecture == 'qwen_image_21'
+                    if context.scene.model_architecture in CANVAS_EDIT_ARCHITECTURES
                     else None
                 )
                 for i, camera in enumerate(cameras):
@@ -1751,14 +1756,14 @@ class ComfyUIGenerate(_PBRMixin, bpy.types.Operator):
         # Refine / Local Edit mode — emit images + edge feather masks
         is_refine = (
             context.scene.generation_method in ('refine', 'local_edit')
-            or (context.scene.model_architecture.startswith('qwen')
+            or (context.scene.model_architecture in QWEN_ARCHITECTURES
                 and context.scene.qwen_generation_method in ('refine', 'local_edit'))
         )
         if is_refine:
             need_feather = (
                 context.scene.refine_edge_feather_projection
                 and (context.scene.generation_method == 'local_edit'
-                     or (context.scene.model_architecture.startswith('qwen')
+                     or (context.scene.model_architecture in QWEN_ARCHITECTURES
                          and context.scene.qwen_generation_method == 'local_edit'))
             )
             for i, camera in enumerate(cameras):
@@ -1909,7 +1914,7 @@ class ComfyUIGenerate(_PBRMixin, bpy.types.Operator):
                             image = self.workflow_manager.refine_flux(context, controlnet_info=controlnet_info, render_info=render_info, ipadapter_ref_info=ipadapter_ref_info)
                         else:
                             image = self.workflow_manager.refine(context, controlnet_info=controlnet_info, render_info=render_info, ipadapter_ref_info=ipadapter_ref_info)
-                    elif context.scene.model_architecture.startswith('qwen') and context.scene.qwen_generation_method in ('refine', 'local_edit'):
+                    elif context.scene.model_architecture in QWEN_ARCHITECTURES and context.scene.qwen_generation_method in ('refine', 'local_edit'):
                         image = self.workflow_manager.generate_qwen_refine(context, camera_id=camera_id)
                     elif context.scene.generation_method == 'uv_inpaint':
                         if context.scene.model_architecture == 'flux1':
@@ -1920,7 +1925,7 @@ class ComfyUIGenerate(_PBRMixin, bpy.types.Operator):
                         if self._current_image == 0:
                             if context.scene.model_architecture == 'flux1':
                                 image = self.workflow_manager.generate_flux(context, controlnet_info=controlnet_info, ipadapter_ref_info=ipadapter_ref_info)
-                            elif context.scene.model_architecture in ('qwen_image_edit', 'qwen_image_21'):
+                            elif context.scene.model_architecture in QWEN_ARCHITECTURES:
                                 image = self.workflow_manager.generate_qwen_edit(context, camera_id=camera_id)
                             elif context.scene.model_architecture == 'flux2_klein':
                                 image = self.workflow_manager.generate_flux2_klein(context, camera_id=camera_id)
@@ -1954,7 +1959,7 @@ class ComfyUIGenerate(_PBRMixin, bpy.types.Operator):
                                         )
                                     _emit_cam = _cur_cam
                                     with _SGCameraResolution(context, _emit_cam):
-                                        if context.scene.model_architecture in ('qwen_image_edit', 'qwen_image_21', 'flux2_klein'): # export custom bg and fallback for Qwen/Klein image edit
+                                        if context.scene.model_architecture in EDIT_ARCHITECTURES: # export custom bg and fallback for Qwen/Klein image edit
                                             fallback_color, background_color = self._get_qwen_context_colors(context)
                                             yield from export_emit_image(context, self._to_texture, camera_id=self._current_image, bg_color=background_color, fallback_color=fallback_color, _steps=True)
                                             if getattr(context.scene, 'qwen_use_confidence_context', False):
@@ -1986,7 +1991,7 @@ class ComfyUIGenerate(_PBRMixin, bpy.types.Operator):
 
                             if context.scene.model_architecture == 'flux1':
                                 image = self.workflow_manager.refine_flux(context, controlnet_info=controlnet_info, render_info=render_info, mask_info=mask_info, ipadapter_ref_info=ipadapter_ref_info)
-                            elif context.scene.model_architecture in ('qwen_image_edit', 'qwen_image_21'):
+                            elif context.scene.model_architecture in QWEN_ARCHITECTURES:
                                 image = self.workflow_manager.generate_qwen_edit(context, camera_id=camera_id)
                             elif context.scene.model_architecture == 'flux2_klein':
                                 image = self.workflow_manager.generate_flux2_klein(context, camera_id=camera_id)
@@ -1995,7 +2000,7 @@ class ComfyUIGenerate(_PBRMixin, bpy.types.Operator):
                     else: # Grid or Separate
                         if context.scene.model_architecture == 'flux1':
                             image = self.workflow_manager.generate_flux(context, controlnet_info=controlnet_info, ipadapter_ref_info=ipadapter_ref_info)
-                        elif context.scene.model_architecture in ('qwen_image_edit', 'qwen_image_21'):
+                        elif context.scene.model_architecture in QWEN_ARCHITECTURES:
                             image = self.workflow_manager.generate_qwen_edit(context, camera_id=camera_id)
                         elif context.scene.model_architecture == 'flux2_klein':
                             image = self.workflow_manager.generate_flux2_klein(context, camera_id=camera_id)
@@ -2007,7 +2012,7 @@ class ComfyUIGenerate(_PBRMixin, bpy.types.Operator):
                             self._error = "Connection to ComfyUI server failed."
                         return # Error message set
 
-                    if (context.scene.model_architecture in ('qwen_image_edit', 'qwen_image_21', 'flux2_klein')
+                    if (context.scene.model_architecture in EDIT_ARCHITECTURES
                             and context.scene.generation_method == 'sequential'
                             and self._current_image > 0
                             and not getattr(context.scene, 'qwen_use_confidence_context', False)
@@ -2026,7 +2031,7 @@ class ComfyUIGenerate(_PBRMixin, bpy.types.Operator):
                     with open(image_path, 'wb') as f:
                         f.write(image)
 
-                    if (context.scene.model_architecture.startswith('qwen')
+                    if (context.scene.model_architecture in QWEN_ARCHITECTURES
                             and context.scene.generation_method == 'sequential'
                             and self._current_image > 0):
                         fallback_color, _ = self._get_qwen_context_colors(context)
@@ -2100,7 +2105,7 @@ class ComfyUIGenerate(_PBRMixin, bpy.types.Operator):
                 else: # steps == 0, skip generation
                     pass # No image generation needed
 
-                if context.scene.generation_method in ('separate', 'refine', 'local_edit', 'sequential') or (context.scene.model_architecture.startswith('qwen') and context.scene.qwen_generation_method in ('refine', 'local_edit')):
+                if context.scene.generation_method in ('separate', 'refine', 'local_edit', 'sequential') or (context.scene.model_architecture in QWEN_ARCHITECTURES and context.scene.qwen_generation_method in ('refine', 'local_edit')):
                     self._current_image += 1
                     self._threads_left -= 1
                     if self._threads_left > 0:
@@ -2149,62 +2154,68 @@ class ComfyUIGenerate(_PBRMixin, bpy.types.Operator):
             traceback.print_exc()
             return
 
-        # ── PBR Decomposition (runs after ALL cameras are generated) ──
-        if getattr(context.scene, 'pbr_decomposition', False):
-            self._pbr_maps = {}
-            # Collect camera images that need PBR decomposition
-            camera_images = {}  # cam_idx → image_path
-            per_camera_missing = {}  # cam_idx → set of missing map names (reproject only)
-            num_cameras = len(self._cameras)
-            for cam_idx in range(num_cameras):
-                cam_image_path = get_file_path(
-                    context, "generated", camera_id=cam_idx,
-                    material_id=self._material_id,
-                )
-                if os.path.exists(cam_image_path):
-                    # In project_only (reproject) mode, reuse existing PBR
-                    # maps when all enabled maps are already on disk.  This
-                    # avoids re-running the slow ComfyUI decomposition.
-                    if context.scene.generation_mode == 'project_only':
-                        existing, missing = self._find_existing_pbr_maps(
-                            context, cam_idx)
-                        if not missing:
-                            # All maps present — fully reuse
-                            self._ensure_raw_copies(
-                                context, cam_idx, existing)
-                            self._pbr_maps[cam_idx] = existing
-                            print(f"[StableGen] Reusing existing PBR maps "
-                                  f"for camera {cam_idx}")
-                            continue
-                        # Some maps exist, some are missing — seed existing
-                        # maps so the batched function only generates what's
-                        # missing.
-                        if existing:
-                            self._ensure_raw_copies(
-                                context, cam_idx, existing)
-                            self._pbr_maps[cam_idx] = existing
-                        per_camera_missing[cam_idx] = missing
-                        print(f"[StableGen] PBR maps missing for camera "
-                              f"{cam_idx}: {missing}, running selective decomposition…")
-                    camera_images[cam_idx] = cam_image_path
-            if camera_images:
-                self._run_pbr_decomposition_batched(
-                    context, camera_images,
-                    per_camera_missing=per_camera_missing if per_camera_missing else None)
-                if self._error:
-                    return
+        # A failed model call must end the run with an error, not leave stale maps behind silently.
+        try:
+            # ── PBR Decomposition (runs after ALL cameras are generated) ──
+            if getattr(context.scene, 'pbr_decomposition', False):
+                self._pbr_maps = {}
+                # Collect camera images that need PBR decomposition
+                camera_images = {}  # cam_idx → image_path
+                per_camera_missing = {}  # cam_idx → set of missing map names (reproject only)
+                num_cameras = len(self._cameras)
+                for cam_idx in range(num_cameras):
+                    cam_image_path = get_file_path(
+                        context, "generated", camera_id=cam_idx,
+                        material_id=self._material_id,
+                    )
+                    if os.path.exists(cam_image_path):
+                        # In project_only (reproject) mode, reuse existing PBR
+                        # maps when all enabled maps are already on disk.  This
+                        # avoids re-running the slow ComfyUI decomposition.
+                        if context.scene.generation_mode == 'project_only':
+                            existing, missing = self._find_existing_pbr_maps(
+                                context, cam_idx)
+                            if not missing:
+                                # All maps present — fully reuse
+                                self._ensure_raw_copies(
+                                    context, cam_idx, existing)
+                                self._pbr_maps[cam_idx] = existing
+                                print(f"[StableGen] Reusing existing PBR maps "
+                                      f"for camera {cam_idx}")
+                                continue
+                            # Some maps exist, some are missing — seed existing
+                            # maps so the batched function only generates what's
+                            # missing.
+                            if existing:
+                                self._ensure_raw_copies(
+                                    context, cam_idx, existing)
+                                self._pbr_maps[cam_idx] = existing
+                            per_camera_missing[cam_idx] = missing
+                            print(f"[StableGen] PBR maps missing for camera "
+                                  f"{cam_idx}: {missing}, running selective decomposition…")
+                        camera_images[cam_idx] = cam_image_path
+                if camera_images:
+                    self._run_pbr_decomposition_batched(
+                        context, camera_images,
+                        per_camera_missing=per_camera_missing if per_camera_missing else None)
+                    if self._error:
+                        return
 
-            # ── Batch post-processing (albedo sat/contrast, roughness scale) ──
-            # Runs after ALL cameras have raw maps saved, so auto-saturation
-            # can average across all cameras uniformly.
-            if self._pbr_maps:
-                self._apply_albedo_postprocessing_batch(context)
+                # ── Batch post-processing (albedo sat/contrast, roughness scale) ──
+                # Runs after ALL cameras have raw maps saved, so auto-saturation
+                # can average across all cameras uniformly.
+                if self._pbr_maps:
+                    self._apply_albedo_postprocessing_batch(context)
 
-            # ── Persist per-map settings hashes so future reprojects can
-            #    detect stale maps and only regenerate what changed. ──
-            if camera_images:
-                for cam_idx in camera_images:
-                    self._save_pbr_settings(context, cam_idx)
+                # ── Persist per-map settings hashes so future reprojects can
+                #    detect stale maps and only regenerate what changed. ──
+                if camera_images:
+                    for cam_idx in camera_images:
+                        self._save_pbr_settings(context, cam_idx)
+        except Exception as e:
+            self._error = f"PBR decomposition failed: {e}"
+            traceback.print_exc()
+            return
 
         def image_project_callback():
             if context.scene.generation_method == 'sequential':
@@ -2388,11 +2399,14 @@ class ComfyUIGenerate(_PBRMixin, bpy.types.Operator):
 
         original_pass_z = view_layer.use_pass_z
 
-        # Enable depth pass in the render settings
+        # Enable depth pass in the render settings. Workbench keeps Combined:
+        # it draws that image anyway, and Blender 4.5's compositor crashes on a
+        # Render Layers node when a Workbench render has no Combined pass.
         for name in _RenderStateTransaction._PASS_NAMES:
             if hasattr(view_layer, name):
                 setattr(view_layer, name, name == 'use_pass_z' or (
-                    use_part_ids and name in {'use_pass_object_index', 'use_pass_material_index'}))
+                    use_part_ids and name in {'use_pass_object_index', 'use_pass_material_index'}) or (
+                    depth_engine == 'BLENDER_WORKBENCH' and name == 'use_pass_combined'))
         view_layer.use_pass_z = True
         if hasattr(view_layer, 'use_pass_object_index'):
             view_layer.use_pass_object_index = use_part_ids
@@ -2457,11 +2471,7 @@ class ComfyUIGenerate(_PBRMixin, bpy.types.Operator):
             )
             if actual_socket is None:
                 return False
-            # Blender 5 removed the compositor-specific Math node idname.
-            # ShaderNodeMath is the shared Math node accepted by compositor
-            # trees in both the current API and supported Blender 4.x builds.
-            divide = nodes.new(type="ShaderNodeMath")
-            divide.operation = 'DIVIDE'
+            divide = new_compositor_math(nodes, 'DIVIDE')
             divide.inputs[1].default_value = 255.0
             divide.location = (200, y)
             links.new(render_layers_node.outputs[actual_socket], divide.inputs[0])
@@ -2480,8 +2490,7 @@ class ComfyUIGenerate(_PBRMixin, bpy.types.Operator):
                 (obj.matrix_world @ mathutils.Vector(corner) - camera_position).length
                 for obj in context.view_layer.objects if obj.type == 'MESH' and not obj.hide_render
                 for corner in obj.bound_box]) * 1.01
-            distance_node = nodes.new('ShaderNodeMath')
-            distance_node.operation = 'DIVIDE'
+            distance_node = new_compositor_math(nodes, 'DIVIDE')
             distance_node.inputs[1].default_value = distance_scale
             links.new(render_layers_node.outputs['Depth'], distance_node.inputs[0])
             distance_output = nodes.new('CompositorNodeOutputFile')
@@ -2895,7 +2904,7 @@ class ComfyUIGenerate(_PBRMixin, bpy.types.Operator):
         is_recent_mode_ref = (
             file_type == "generated" and
             context.scene.sequential_ipadapter_mode == 'recent' and
-            (context.scene.sequential_ipadapter or context.scene.model_architecture in ('qwen_image_edit', 'qwen_image_21', 'flux2_klein'))
+            (context.scene.sequential_ipadapter or context.scene.model_architecture in EDIT_ARCHITECTURES)
         )
 
         temp_image_path = None

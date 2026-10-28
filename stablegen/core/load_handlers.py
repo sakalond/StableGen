@@ -11,6 +11,7 @@ import bpy  # pylint: disable=import-error
 from bpy.app.handlers import persistent
 
 from . import ADDON_PKG
+from .architectures import QWEN_ARCHITECTURES
 
 
 @persistent
@@ -28,7 +29,9 @@ def load_handler(dummy):
     # Builds saved while Qwen-Image 2.1 shared the Qwen-Image-Edit enum need a
     # one-time architecture migration.  The filename is used only here for
     # compatibility; new generations dispatch exclusively by architecture.
-    from ..texturing.qwen_models import is_qwen_image_21_model
+    from ..texturing.qwen_models import (
+        is_qwen_image_21_model, is_qwen_image_21_turbo_model,
+    )
     saved_model_name = (
         getattr(scene, "sg_model_name_backup", "")
         or getattr(scene, "model_name", "")
@@ -36,14 +39,17 @@ def load_handler(dummy):
     if not getattr(scene, "sg_qwen_21_architecture_migrated", False):
         if (getattr(scene, "model_architecture", "") == 'qwen_image_edit'
                 and is_qwen_image_21_model(saved_model_name)):
-            scene.model_architecture = 'qwen_image_21'
+            target = ('qwen_image_21_turbo'
+                      if is_qwen_image_21_turbo_model(saved_model_name)
+                      else 'qwen_image_21')
+            scene.model_architecture = target
             if getattr(scene, "architecture_mode", "") == 'qwen_image_edit':
-                scene.architecture_mode = 'qwen_image_21'
+                scene.architecture_mode = target
             elif getattr(scene, "architecture_mode", "") == 'trellis2':
                 if getattr(scene, "trellis2_texture_mode", "") == 'qwen_image_edit':
-                    scene.trellis2_texture_mode = 'qwen_image_21'
+                    scene.trellis2_texture_mode = target
                 if getattr(scene, "trellis2_initial_image_arch", "") == 'qwen_image_edit':
-                    scene.trellis2_initial_image_arch = 'qwen_image_21'
+                    scene.trellis2_initial_image_arch = target
             print("[StableGen] Migrated saved Qwen-Image 2.1 model to its dedicated architecture.")
         scene.sg_qwen_21_architecture_migrated = True
 
@@ -61,7 +67,7 @@ def load_handler(dummy):
         current_template = getattr(
             loaded_scene, "qwen_prompt_template", ""
         )
-        if architecture in {'qwen_image_edit', 'qwen_image_21'}:
+        if architecture in QWEN_ARCHITECTURES:
             valid_templates = {
                 'QWEN_EDIT_LEGACY', 'QWEN_21_DEFAULT', 'CANVAS_EDIT',
                 'REFERENCE_RECONSTRUCTION', 'CONCISE_TRANSFER',
@@ -78,9 +84,9 @@ def load_handler(dummy):
                 loaded_scene.qwen_prompt_template = 'CUSTOM'
             elif needs_legacy_migration:
                 loaded_scene.qwen_prompt_template = (
-                    'QWEN_21_DEFAULT'
-                    if architecture == 'qwen_image_21'
-                    else 'QWEN_EDIT_LEGACY'
+                    'QWEN_EDIT_LEGACY'
+                    if architecture == 'qwen_image_edit'
+                    else 'QWEN_21_DEFAULT'
                 )
         loaded_scene.sg_qwen_prompt_template_migrated = True
 

@@ -12,6 +12,7 @@ from .pose_lock import ensure_texturing_frame
 from .jobs import operation, RenderRequest
 from PIL import Image
 import cv2
+from ..core.architectures import QWEN_ARCHITECTURES
 
 _ADDON_PKG = __package__.rsplit('.', 1)[0]
 
@@ -1112,7 +1113,7 @@ def _export_emit_image_impl(context, to_export, camera_id=None, bg_color=(0.5, 0
             else:
                 final_path = os.path.join(output_dir, f"{output_file}0001.png")
 
-            if context.scene.visibility_vignette and (context.scene.generation_method == 'local_edit' or (context.scene.model_architecture.startswith('qwen') and context.scene.qwen_generation_method == 'local_edit')):
+            if context.scene.visibility_vignette and (context.scene.generation_method == 'local_edit' or (context.scene.model_architecture in QWEN_ARCHITECTURES and context.scene.qwen_generation_method == 'local_edit')):
                 # Smooth edge feathering, no blocky mask
                 apply_vignette_to_mask(
                     final_path,
@@ -1827,7 +1828,7 @@ def _export_visibility_impl(context, to_export, obj=None, camera_visibility=None
         # Save the image
         cv2.imwrite(image_path, image)
 
-        if context.scene.visibility_vignette and (context.scene.generation_method == 'local_edit' or (context.scene.model_architecture.startswith('qwen') and context.scene.qwen_generation_method == 'local_edit')):
+        if context.scene.visibility_vignette and (context.scene.generation_method == 'local_edit' or (context.scene.model_architecture in QWEN_ARCHITECTURES and context.scene.qwen_generation_method == 'local_edit')):
             apply_vignette_to_mask(
                 image_path,
                 feather_width=context.scene.visibility_vignette_width,
@@ -3309,7 +3310,7 @@ class BakeTextures(bpy.types.Operator):
         self._phase = 'unwrap'
         self._total_objects = len(self._objects)
         self._stage = "Preparing"
-        return context.window_manager.invoke_props_dialog(self)
+        return context.window_manager.invoke_props_dialog(self, width=440)
 
     def execute(self, context):
         """     

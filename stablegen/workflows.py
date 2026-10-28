@@ -11,8 +11,8 @@ import email.utils
 from datetime import datetime, timezone, timedelta
 
 from .timeout_config import get_timeout
-from .prompt_archive import archive_prompt
-from .generation_status import set_server_stage, node_stage
+from .util.prompt_archive import archive_prompt
+from .core.generation_status import set_server_stage, node_stage
 
 from io import BytesIO
 import numpy as np
@@ -484,7 +484,7 @@ class _WorkflowBase:
                 
                 elif message['type'] == 'executing':
                     data = message['data']
-                    if data['prompt_id'] == prompt_id:
+                    if data.get('prompt_id') == prompt_id:
                         if data['node'] is None:
                             break  # Execution is complete
                         else:

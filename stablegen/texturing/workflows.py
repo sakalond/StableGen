@@ -1,4 +1,4 @@
-from ..feature_flags import experimental_enabled
+from ..core.feature_flags import experimental_enabled
 import bpy
 import os
 import json
@@ -19,8 +19,13 @@ from .graph_validation import (
     sdxl_final_mask_reference,
 )
 from .qwen_models import (
+    FIBO_TEXT_ENCODER,
+    FIBO_VAE,
     QWEN_IMAGE_21_TEXT_ENCODER,
+    QWEN_IMAGE_21_TURBO_SIGMAS,
+    QWEN_IMAGE_21_TURBO_STEPS,
     QWEN_IMAGE_21_VAE,
+    fibo_prompt,
     qwen_prepared_prompt,
     qwen_image_21_prompt,
     qwen_image_21_rgba_prompt,
@@ -30,6 +35,17 @@ from .qwen_models import (
 from io import BytesIO
 import numpy as np
 from PIL import Image
+from ..core.architectures import (
+    CANVAS_EDIT_ARCHITECTURES, DIFFUSION_ARCHITECTURES, SDXL_GRAPH_ARCHITECTURES,
+)
+from .moss_models import (
+    MOSS_CONTROL_NODE,
+    MOSS_IMAGE_ARCHITECTURE,
+    MOSS_IMAGE_TEXT_ENCODER,
+    MOSS_IMAGE_VAE,
+    MOSS_PLUGIN_LOADER,
+    convert_sdxl_graph_to_moss,
+)
 
 _ADDON_PKG = __package__.rsplit('.', 1)[0]
 
@@ -100,6 +116,60 @@ class _TexturingWorkflowMixin:
         return super()._queue_prompt(prompt, client_id, server_address)
 
     """Texturing workflow methods for WorkflowManager."""
+
+    def _moss_support(self, server_address):
+        """Return ``(native_loaders, depth_control)`` for a ComfyUI server."""
+        cache = self.__dict__.setdefault("_moss_server_support", {})
+        if server_address not in cache:
+            from ..core.server_api import fetch_node_info
+            clip_loader = fetch_node_info(server_address, 'CLIPLoader') or {}
+            clip_type = (clip_loader.get('input', {}).get('required', {})
+                         .get('type', [[]])[0])
+            native = 'moss_image' in (clip_type if isinstance(clip_type, list) else [])
+            if not native and not fetch_node_info(server_address, MOSS_PLUGIN_LOADER):
+                raise RuntimeError(
+                    'ComfyUI has no MOSS-Image support. Update ComfyUI to 0.42 or later, '
+                    'or install the OpenMOSS moss-image custom node.'
+                )
+            control = native and fetch_node_info(server_address, MOSS_CONTROL_NODE) is not None
+            # Probed once per manager, so a ComfyUI update is seen on the next run.
+            cache[server_address] = (native, control)
+        return cache[server_address]
+
+    def _apply_sdxl_graph_architecture(self, prompt, context, depth_info=None):
+        """Run a finished SDXL graph on the selected SDXL-workflow model."""
+        if context.scene.model_architecture != MOSS_IMAGE_ARCHITECTURE:
+            return
+        scene = context.scene
+        server = context.preferences.addons[_ADDON_PKG].preferences.server_address
+        native, control = self._moss_support(server)
+        depth_image = None
+        if getattr(scene, 'moss_depth_control', False) and depth_info:
+            if control:
+                depth_image = depth_info['name']
+            else:
+                print('[StableGen] MOSS-Image depth control needs ComfyUI 0.42.3 or later '
+                      'with core MOSS-Image support; generating without it.')
+        removed = convert_sdxl_graph_to_moss(
+            prompt, scene.model_name, native=native, depth_image=depth_image,
+            depth_strength=getattr(scene, 'moss_depth_strength', 1.0),
+            depth_end=getattr(scene, 'moss_depth_end', 0.5),
+        )
+        print(
+            '[StableGen] MOSS-Image architecture: '
+            f'{"core" if native else "custom-node"} loaders, '
+            f'{MOSS_IMAGE_TEXT_ENCODER} and {MOSS_IMAGE_VAE}'
+            + (', depth control' if depth_image else '')
+            + (f'; ignored SDXL-only {", ".join(sorted(set(removed)))}' if removed else '')
+            + '.'
+        )
+
+    def _convert_native_edit_graph(self, prompt, nodes, context, **options):
+        """Swap the legacy Qwen Edit graph for the selected native edit model."""
+        if context.scene.model_architecture == 'fibo_edit':
+            self._convert_to_fibo_edit(prompt, nodes, context, **options)
+        else:
+            self._convert_to_qwen_image_21(prompt, nodes, context, **options)
 
     def _convert_to_qwen_image_21(
         self, prompt, nodes, context, *, projected_context_target=False
@@ -237,12 +307,182 @@ class _TexturingWorkflowMixin:
             retain_reference(reference)
             graph[nodes['pos_prompt']]['inputs'][f'images.image_{index}'] = reference
 
+        schedule = ''
+        if (context.scene.model_architecture == 'qwen_image_21_turbo'
+                and context.scene.steps == QWEN_IMAGE_21_TURBO_STEPS):
+            self._use_manual_sigmas(
+                graph, nodes['sampler'], QWEN_IMAGE_21_TURBO_SIGMAS
+            )
+            schedule = ' on the trained Turbo schedule'
+
         prompt.clear()
         prompt.update(graph)
         print(
             '[StableGen] Qwen-Image 2.1 architecture: using '
             f'{QWEN_IMAGE_21_TEXT_ENCODER}, {QWEN_IMAGE_21_VAE}, '
-            f'{graph[nodes["sampler"]]["inputs"]["steps"]} steps and no legacy LoRA.'
+            f'{context.scene.steps} steps{schedule} and no legacy LoRA.'
+        )
+
+    @staticmethod
+    def _use_manual_sigmas(graph, sampler_id, sigmas):
+        """Replace a KSampler with SamplerCustomAdvanced on fixed sigmas.
+
+        The sampler keeps its node id, so decoders and latent locks that link
+        to it, and seed overrides through ``noise_seed``, continue to work.
+        """
+        inputs = graph[sampler_id]['inputs']
+        base = int(sampler_id) * 10 + 900
+        noise_id, guider_id, select_id, sigmas_id = (
+            str(base + offset) for offset in range(4)
+        )
+        graph[noise_id] = {
+            'inputs': {'noise_seed': inputs['seed']},
+            'class_type': 'RandomNoise',
+            '_meta': {'title': 'Random Noise'},
+        }
+        graph[guider_id] = {
+            'inputs': {
+                'model': inputs['model'],
+                'positive': inputs['positive'],
+                'negative': inputs['negative'],
+                'cfg': inputs['cfg'],
+            },
+            'class_type': 'CFGGuider',
+            '_meta': {'title': 'CFG Guider'},
+        }
+        graph[select_id] = {
+            'inputs': {'sampler_name': inputs['sampler_name']},
+            'class_type': 'KSamplerSelect',
+            '_meta': {'title': 'Sampler'},
+        }
+        graph[sigmas_id] = {
+            'inputs': {'sigmas': sigmas},
+            'class_type': 'ManualSigmas',
+            '_meta': {'title': 'Trained Sigmas'},
+        }
+        graph[sampler_id] = {
+            'inputs': {
+                'noise': [noise_id, 0],
+                'guider': [guider_id, 0],
+                'sampler': [select_id, 0],
+                'sigmas': [sigmas_id, 0],
+                'latent_image': inputs['latent_image'],
+            },
+            'class_type': 'SamplerCustomAdvanced',
+            '_meta': {'title': 'Sampler (Custom Advanced)'},
+        }
+
+    def _convert_to_fibo_edit(
+        self, prompt, nodes, context, *, projected_context_target=False
+    ):
+        """Replace the legacy Qwen Edit graph with Bria FIBO 2.0 nodes.
+
+        Like the Qwen 2.1 adapter, this keeps StableGen's semantic image
+        routing and swaps only the model layer. FIBO edits its first image,
+        so projected context moves into that slot, and its prompts index
+        images explicitly as ``<image_N>``. The first image also fixes the
+        output size: FIBO would otherwise crop it to its ~1 MP trained size,
+        which would no longer register with the camera.
+        """
+        old_inputs = prompt[nodes['pos_prompt']].get('inputs', {})
+        image_refs = [
+            old_inputs[key]
+            for key in ('image1', 'image2', 'image3')
+            if key in old_inputs
+        ]
+        mapping = {}
+        if projected_context_target and len(image_refs) >= 2:
+            image_refs[0], image_refs[1] = image_refs[1], image_refs[0]
+            mapping = {1: 2, 2: 1}
+        final_prompt = fibo_prompt(old_inputs.get('prompt', ''), mapping)
+
+        encoder = {
+            'clip': ['3', 0],
+            'prompt': final_prompt,
+            'negative_prompt': getattr(context.scene, 'comfyui_negative_prompt', ''),
+            'vae': ['4', 0],
+            'width': 0,
+            'height': 0,
+            'batch_size': 1,
+        }
+        graph = {
+            nodes['unet_loader']: {
+                'inputs': {'unet_name': context.scene.model_name, 'weight_dtype': 'default'},
+                'class_type': 'UNETLoader',
+                '_meta': {'title': 'Load FIBO 2.0 Diffusion Model'},
+            },
+            '3': {
+                'inputs': {'clip_name': FIBO_TEXT_ENCODER, 'type': 'fibo2', 'device': 'default'},
+                'class_type': 'CLIPLoader',
+                '_meta': {'title': 'Load Qwen3-VL 4B Text Encoder'},
+            },
+            '4': {
+                'inputs': {'vae_name': FIBO_VAE},
+                'class_type': 'VAELoader',
+                '_meta': {'title': 'Load FIBO 2.0 VAE'},
+            },
+            nodes['pos_prompt']: {
+                'inputs': encoder,
+                'class_type': 'TextEncodeFibo2',
+                '_meta': {'title': 'FIBO 2.0 Edit Conditioning'},
+            },
+            nodes['sampler']: {
+                'inputs': {
+                    'model': [nodes['unet_loader'], 0],
+                    'seed': context.scene.seed,
+                    'steps': context.scene.steps,
+                    'cfg': context.scene.cfg,
+                    'sampler_name': context.scene.sampler,
+                    'scheduler': context.scene.scheduler,
+                    'positive': [nodes['pos_prompt'], 0],
+                    'negative': [nodes['pos_prompt'], 1],
+                    'latent_image': [nodes['pos_prompt'], 2],
+                    'denoise': 1.0,
+                },
+                'class_type': 'KSampler',
+                '_meta': {'title': 'FIBO 2.0 Sampler'},
+            },
+            '2': {
+                'inputs': {'samples': [nodes['sampler'], 0], 'vae': ['4', 0]},
+                'class_type': 'VAEDecode',
+                '_meta': {'title': 'VAE Decode'},
+            },
+            nodes['save_image']: {
+                'inputs': {'images': ['2', 0]},
+                'class_type': 'SaveImageWebsocket',
+                '_meta': {'title': 'SaveImageWebsocket'},
+            },
+        }
+
+        def retain_reference(reference):
+            node_id = str(reference[0])
+            if node_id in graph or node_id not in prompt:
+                return
+            graph[node_id] = prompt[node_id]
+            for value in prompt[node_id].get('inputs', {}).values():
+                if (isinstance(value, list) and len(value) == 2
+                        and isinstance(value[0], (str, int))
+                        and isinstance(value[1], int)):
+                    retain_reference(value)
+
+        for index, reference in enumerate(image_refs, 1):
+            retain_reference(reference)
+            encoder[f'images.image_{index}'] = reference
+        if image_refs:
+            graph['17'] = {
+                'inputs': {'image': image_refs[0]},
+                'class_type': 'GetImageSize',
+                '_meta': {'title': 'Edited Image Size'},
+            }
+            encoder['width'] = ['17', 0]
+            encoder['height'] = ['17', 1]
+
+        prompt.clear()
+        prompt.update(graph)
+        print(
+            '[StableGen] FIBO 2.0 architecture: using '
+            f'{FIBO_TEXT_ENCODER}, {FIBO_VAE}, {len(image_refs)} image(s) '
+            f'and {context.scene.steps} steps.'
         )
 
     def _crop_and_vignette(
@@ -624,10 +864,10 @@ class _TexturingWorkflowMixin:
                 context_mode in {'REPLACE_STYLE', 'ADDITIONAL'} or
                 (_t2_style and not getattr(context.scene, 'qwen_trellis2_style_initial_only', False))
             )
-        is_qwen21 = context.scene.model_architecture == 'qwen_image_21'
+        native_graph = context.scene.model_architecture in CANVAS_EDIT_ARCHITECTURES
 
         architecture_default = (
-            'QWEN_21_DEFAULT' if is_qwen21 else 'QWEN_EDIT_LEGACY'
+            'QWEN_21_DEFAULT' if native_graph else 'QWEN_EDIT_LEGACY'
         )
         selected_template = template_id or getattr(
             context.scene, 'qwen_prompt_template', architecture_default
@@ -675,7 +915,7 @@ class _TexturingWorkflowMixin:
                 has_magenta_regions=has_context_canvas,
                 gray_background=(
                     has_context_canvas
-                    and not is_qwen21
+                    and not native_graph
                     and getattr(
                         context.scene, 'qwen_prompt_gray_background', True
                     )
@@ -759,14 +999,14 @@ class _TexturingWorkflowMixin:
             'style_map_loader': "15",   # Image 2 (style)
             'context_render_loader': "16", # Image 3 (context render)
         }
-        is_qwen21 = context.scene.model_architecture == 'qwen_image_21'
+        native_graph = context.scene.model_architecture in CANVAS_EDIT_ARCHITECTURES
 
         # --- Build LoRA chain ---
         is_nunchaku = (
-            not is_qwen21
+            not native_graph
             and context.scene.model_name.lower().endswith('.safetensors')
         )
-        if not is_qwen21:
+        if not native_graph:
             initial_model_input = [NODES['unet_loader'], 0]
             dummy_clip_input = [NODES['unet_loader'], 0]
             lora_class = (
@@ -851,8 +1091,8 @@ class _TexturingWorkflowMixin:
         
         prompt[NODES['pos_prompt']]['inputs']['prompt'] = final_prompt
 
-        if is_qwen21:
-            self._convert_to_qwen_image_21(prompt, NODES, context)
+        if native_graph:
+            self._convert_native_edit_graph(prompt, NODES, context)
         else:
             # --- Reference Latent chain (Qwen unzoom fix) ---
             # The overlay is a semantic selection guide, never an appearance latent.
@@ -878,12 +1118,12 @@ class _TexturingWorkflowMixin:
                 "class_type": "NunchakuQwenImageDiTLoader",
                 "_meta": {"title": "Nunchaku Qwen-Image DiT Loader"},
             }
-        elif not is_qwen21:
+        elif not native_graph:
             prompt[NODES['unet_loader']]['inputs']['unet_name'] = context.scene.model_name
 
         graph_issues = (validate_workflow_graph(
             prompt,
-            ((NODES['pos_prompt'],) if is_qwen21
+            ((NODES['pos_prompt'],) if native_graph
              else (NODES['pos_prompt'], NODES['neg_prompt'])),
         ))
         if graph_issues:
@@ -933,16 +1173,16 @@ class _TexturingWorkflowMixin:
             'style_map_loader': "15",   # Image 2 (style)
             'context_render_loader': "16", # Image 3 (context render)
         }
-        is_qwen21 = context.scene.model_architecture == 'qwen_image_21'
+        native_graph = context.scene.model_architecture in CANVAS_EDIT_ARCHITECTURES
 
         # --- Build LoRA chain ---
         # The Qwen workflow uses model-only LoRAs. We can reuse the existing
         # chain builder by providing a dummy CLIP input that won't be used.
         is_nunchaku = (
-            not is_qwen21
+            not native_graph
             and context.scene.model_name.lower().endswith('.safetensors')
         )
-        if not is_qwen21:
+        if not native_graph:
             initial_model_input = [NODES['unet_loader'], 0]
             dummy_clip_input = [NODES['unet_loader'], 0]
             lora_class = (
@@ -1139,8 +1379,8 @@ class _TexturingWorkflowMixin:
                 prompt[NODES['pos_prompt']]['inputs'][style_slot] = [scale_node_key, 0]
                 prompt[NODES['neg_prompt']]['inputs'][style_slot] = [scale_node_key, 0]
 
-        if is_qwen21:
-            self._convert_to_qwen_image_21(
+        if native_graph:
+            self._convert_native_edit_graph(
                 prompt,
                 NODES,
                 context,
@@ -1226,7 +1466,7 @@ class _TexturingWorkflowMixin:
             )
 
         # --- Configure Sampler ---
-        if not is_qwen21:
+        if not native_graph:
             prompt[NODES['sampler']]['inputs']['seed'] = context.scene.seed
             prompt[NODES['sampler']]['inputs']['steps'] = context.scene.steps
             prompt[NODES['sampler']]['inputs']['cfg'] = context.scene.cfg
@@ -1248,12 +1488,12 @@ class _TexturingWorkflowMixin:
                     "title": "Nunchaku Qwen-Image DiT Loader"
                 }
              }
-        elif not is_qwen21:
+        elif not native_graph:
             prompt[NODES['unet_loader']]['inputs']['unet_name'] = context.scene.model_name
 
         graph_issues = (validate_workflow_graph(
             prompt,
-            ((NODES['pos_prompt'],) if is_qwen21
+            ((NODES['pos_prompt'],) if native_graph
              else (NODES['pos_prompt'], NODES['neg_prompt'])),
         ))
         if graph_issues:
@@ -1555,6 +1795,8 @@ class _TexturingWorkflowMixin:
         prompt = self._build_controlnet_chain(prompt, context, controlnet_info, NODES)
         
         # Save prompt for debugging (in revision dir)
+        self._apply_sdxl_graph_architecture(
+            prompt, context, depth_info=(controlnet_info or {}).get('depth'))
         self._save_prompt_to_file(prompt, revision_dir, workflow="sdxl_generate")
 
         # Execute generation and get results
@@ -1604,10 +1846,10 @@ class _TexturingWorkflowMixin:
         # Double-check here in case the property wasn't synced yet.
         if getattr(scene, 'architecture_mode', '') == 'trellis2':
             tex_mode = getattr(scene, 'trellis2_texture_mode', 'native')
-            if tex_mode not in ('sdxl', 'flux1', 'qwen_image_edit', 'qwen_image_21', 'flux2_klein'):
+            if tex_mode not in DIFFUSION_ARCHITECTURES:
                 architecture = getattr(scene, 'trellis2_initial_image_arch', 'sdxl')
 
-        if architecture == 'qwen_image_21':
+        if architecture in CANVAS_EDIT_ARCHITECTURES:
             prompt, save_node = self._build_qwen_image_21_txt2img(context)
         elif architecture == 'qwen_image_edit':
             prompt, save_node = self._build_qwen_txt2img(context)
@@ -1715,6 +1957,7 @@ class _TexturingWorkflowMixin:
         prompt["2"]["inputs"]["clip"] = final_clip
         prompt["3"]["inputs"]["clip"] = final_clip
 
+        self._apply_sdxl_graph_architecture(prompt, context)
         return prompt, "7"
 
     # ── PBR Decomposition (Marigold IID) ───────────────────────────────
@@ -2491,7 +2734,7 @@ class _TexturingWorkflowMixin:
         return prompt, "7"
 
     def _build_qwen_image_21_txt2img(self, context):
-        """Return a native Qwen-Image 2.1 text-to-image graph."""
+        """Return a native Qwen-Image 2.1, 2.1 Turbo or FIBO text-to-image graph."""
         prompt = json.loads(prompt_text_qwen_image_edit)
         nodes = {
             'sampler': "1",
@@ -2516,7 +2759,7 @@ class _TexturingWorkflowMixin:
         ):
             prompt.pop(loader_id, None)
 
-        self._convert_to_qwen_image_21(prompt, nodes, context)
+        self._convert_native_edit_graph(prompt, nodes, context)
         return prompt, nodes['save_image']
 
     def _create_base_prompt(self, context):
@@ -2673,6 +2916,8 @@ class _TexturingWorkflowMixin:
         
         # Get the dynamic collection of ControlNet units
         controlnet_units = getattr(context.scene, "controlnet_units", [])
+        if context.scene.model_architecture == MOSS_IMAGE_ARCHITECTURE:
+            controlnet_units = []
         current_pos = pos_input
         current_neg = neg_input
         has_union = False
@@ -2718,7 +2963,7 @@ class _TexturingWorkflowMixin:
                     "negative": [current_neg, 1] if (idx > 0 or current_neg == "228" or current_neg == "51") else [current_neg, 0],
                     "control_net": [loader_key, 0],
                     "image": [load_key, 0],
-                    "vae": [vae_input, 2] if context.scene.model_architecture == "sdxl" else [vae_input, 0],
+                    "vae": [vae_input, 2] if context.scene.model_architecture in SDXL_GRAPH_ARCHITECTURES else [vae_input, 0],
                 },
                 "class_type": "ControlNetApplyAdvanced",
                 "_meta": {
@@ -2816,9 +3061,12 @@ class _TexturingWorkflowMixin:
             controlnet_info
         )
         
-        # Connect final node outputs to the KSampler
+        # Connect final node outputs to the KSampler. Without any applied unit
+        # (MOSS-Image has no ControlNet) the text encoders connect directly.
         prompt[NODES['sampler']]["inputs"]["positive"] = [final_node, 0]
-        prompt[NODES['sampler']]["inputs"]["negative"] = [final_node, 1]
+        prompt[NODES['sampler']]["inputs"]["negative"] = (
+            [NODES['neg_prompt'], 0] if final_node == NODES['pos_prompt'] else [final_node, 1]
+        )
         
         return prompt
 
@@ -2847,6 +3095,7 @@ class _TexturingWorkflowMixin:
         sampler['positive'] = [nodes['pos_prompt'], 0]
         sampler['negative'] = [nodes['neg_prompt'], 0]
         sampler['denoise'] = context.scene.sg_masked_strength
+        self._apply_sdxl_graph_architecture(prompt, context)
         self._save_prompt_to_file(prompt, get_generation_dirs(context)['revision'], workflow='masked_sdxl')
         server = context.preferences.addons[_ADDON_PKG].preferences.server_address
         client_id = str(uuid.uuid4())
@@ -2911,6 +3160,8 @@ class _TexturingWorkflowMixin:
                 prompt[NODES['sampler']]["inputs"]["negative"] = [NODES['neg_prompt'], 0]
         
         # Save prompt for debugging
+        self._apply_sdxl_graph_architecture(
+            prompt, context, depth_info=(controlnet_info or {}).get('depth'))
         self._save_prompt_to_file(prompt, output_dir, workflow="sdxl_refine")
         
         # Execute generation and get results

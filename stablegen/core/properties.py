@@ -17,6 +17,7 @@ from .callbacks import (
     update_trellis2_generate_from,
     update_trellis2_initial_image_arch,
     update_trellis2_texture_mode,
+    update_pbr_albedo_source,
     update_print_preset,
     update_print_dithered,
     update_qwen_prompt_dependencies,
@@ -24,10 +25,10 @@ from .callbacks import (
     update_qwen_prompt_template,
 )
 from . import ADDON_PKG
-from ..feature_flags import TEXTURING_DEFAULTS
-from ..architecture_options import (
+from .feature_flags import TEXTURING_DEFAULTS
+from .architectures import (
     architecture_items, model_architecture_items,
-    trellis_texture_items, trellis_initial_image_items,
+    trellis_texture_items, trellis_initial_image_items, QWEN_ARCHITECTURES,
 )
 from ..texturing.qwen_models import QWEN_PROMPT_TEMPLATE_ITEMS
 
@@ -42,7 +43,7 @@ def _get_ipadapter_mode_items(self, context):
     if context:
         is_local_edit = (
             context.scene.generation_method == 'local_edit'
-            or (context.scene.model_architecture.startswith('qwen')
+            or (context.scene.model_architecture in QWEN_ARCHITECTURES
                 and context.scene.qwen_generation_method == 'local_edit')
         )
         if is_local_edit:
@@ -433,6 +434,32 @@ def register_properties(update_model_list, ControlNetUnit, LoRAUnit,
             "projection. Disable it to let the prompt and model choose the background"
         ),
         default=True,
+        update=update_parameters,
+    )
+    bpy.types.Scene.moss_depth_control = bpy.props.BoolProperty(
+        name="Depth Control",
+        description=(
+            "Guide MOSS-Image with each camera's depth map through the color/depth "
+            "control adapter (moss_image_color_depth_control.safetensors in "
+            "models/loras). Needs ComfyUI 0.42.3 or later; without it, MOSS follows "
+            "only the prompt and any projected context"
+        ),
+        default=True,
+        update=update_parameters,
+    )
+    bpy.types.Scene.moss_depth_strength = bpy.props.FloatProperty(
+        name="Depth Strength",
+        description="Scale of the depth map's contribution. 1.0 is the trained strength",
+        default=1.0, min=0.0, max=10.0, soft_max=2.0,
+        update=update_parameters,
+    )
+    bpy.types.Scene.moss_depth_end = bpy.props.FloatProperty(
+        name="Depth End",
+        description=(
+            "Sampling fraction at which depth control stops. The adapter recommends "
+            "0.5 for rendered 3D depth maps, letting later steps refine the shapes"
+        ),
+        default=0.5, min=0.0, max=1.0,
         update=update_parameters,
     )
     bpy.types.Scene.auto_rescale_target_mp = bpy.props.FloatProperty(
@@ -1834,7 +1861,7 @@ def register_properties(update_model_list, ControlNetUnit, LoRAUnit,
             ('lighting', "Marigold IID-Lighting (Vibrant)", "Albedo from Marigold IID-Lighting \u2014 tends to produce more vibrant, saturated colours than IID-Appearance"),
             ('marigold_v2', "Marigold V2 (Sharp Albedo)", "Albedo from Marigold V2 at up to the Marigold V2 resolution \u2014 removes lighting while keeping fine texture detail and colour. Needs the Marigold V2 models (about 24 GB with normals) and a September 2026 or newer ComfyUI. Roughness and metallic still come from Marigold IID-Appearance"),
         ],
-        default='marigold', update=update_parameters,
+        default='marigold', update=update_pbr_albedo_source,
     )
     bpy.types.Scene.pbr_normal_model = bpy.props.EnumProperty(
         name="Normal Model", description="Model used to estimate the normal map",
@@ -2008,7 +2035,7 @@ def register_properties(update_model_list, ControlNetUnit, LoRAUnit,
     )
     bpy.types.Scene.pbr_albedo_auto_saturation = bpy.props.BoolProperty(
         name="Correct Albedo Saturation",
-        description="Automatically correct albedo saturation by comparing the PBR albedo against the original rendered image and boosting to match. Averaged across all cameras for uniform results by default. Recommended for Marigold IID (Flat Albedo) which tends to desaturate. Usually not needed for StableDelight or IID-Lighting",
+        description="Automatically correct albedo saturation by comparing the PBR albedo against the original rendered image and boosting to match. Averaged across all cameras for uniform results by default. Recommended for Marigold IID (Flat Albedo) which tends to desaturate. Usually not needed for StableDelight or IID-Lighting. Choosing an albedo source turns it on for Marigold IID and off for Marigold V2, which already keeps the generated colors",
         default=True, update=update_parameters
     )
     bpy.types.Scene.pbr_albedo_saturation_mode = bpy.props.EnumProperty(
@@ -2064,6 +2091,9 @@ def unregister_properties(load_handler, _sg_queue_load_handler):
         'auto_rescale',
         'qwen_rescale_alignment',
         'qwen_image_21_native_rgba',
+        'moss_depth_control',
+        'moss_depth_strength',
+        'moss_depth_end',
         'auto_rescale_target_mp',
         'generation_method',
         'use_ipadapter',

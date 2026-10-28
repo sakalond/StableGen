@@ -31,7 +31,8 @@ def experiments_enabled(context=None):
         if context is None:
             import bpy
             context = bpy.context
-        addon = context.preferences.addons.get(__package__)
+        # The add-on package owns the preferences; this module lives in its core package.
+        addon = context.preferences.addons.get((__package__ or '').rpartition('.')[0])
         return bool(addon and addon.preferences.enable_texturing_experiments)
     except (AttributeError, ImportError, KeyError, ReferenceError):
         return False

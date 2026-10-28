@@ -437,6 +437,13 @@ class Painter:
             text = text[:-1]
         return text + '…' if text else ''
 
+    def tag(self, text, right, y, *, enabled=True):
+        """A small rounded label ending at *right*; returns its width."""
+        width = self.measure(text, 9) + 10
+        self.outline(right - width, y, width, 15, 'hover_soft', 'line', 3)
+        self.text(text, right - width + 5, y + 2, 9, 'secondary' if enabled else 'disabled')
+        return width
+
     def text(self, text, x, y, size=FONT_SIZE, tint='text', width=None):
         text = str(text)
         if width is not None:

@@ -208,7 +208,15 @@ def register_overlays():
             handlers.append(callback)
     if not bpy.app.timers.is_registered(_tick):
         bpy.app.timers.register(_tick, first_interval=.1, persistent=True)
-    display_settings_changed(bpy.context.scene)
+    # Enabling the add-on in Preferences registers it with a restricted context that has no scene, so the first
+    # sync waits until registration is over.
+    bpy.app.timers.register(_sync_after_register, first_interval=0)
+
+
+def _sync_after_register():
+    if _registered:
+        display_settings_changed(bpy.context.scene)
+    return None
 
 
 def unregister_overlays():
@@ -216,8 +224,9 @@ def unregister_overlays():
     _registered = False
     _sg_remove_crop_overlay()
     _sg_hide_label_overlay()
-    if bpy.app.timers.is_registered(_tick):
-        bpy.app.timers.unregister(_tick)
+    for timer in (_tick, _sync_after_register):
+        if bpy.app.timers.is_registered(timer):
+            bpy.app.timers.unregister(timer)
     for handlers, callback in [(bpy.app.handlers.depsgraph_update_post, _invalidate),
                                (bpy.app.handlers.load_pre, _load_pre),
                                (bpy.app.handlers.load_post, _load_post)]:

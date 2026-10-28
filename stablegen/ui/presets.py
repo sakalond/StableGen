@@ -4,10 +4,11 @@ import math
 import bpy  # pylint: disable=import-error
 import mathutils  # pylint: disable=import-error
 from ..utils import sg_modal_active
-from ..feature_flags import TEXTURING_DEFAULTS, EXPERIMENTAL_FEATURE_DEFAULTS, experiments_enabled
-from ..architecture_options import (
-    DEPRECATION_NOTICE, deprecated_architectures_enabled,
-    preset_uses_deprecated_architecture,
+from ..core.feature_flags import TEXTURING_DEFAULTS, EXPERIMENTAL_FEATURE_DEFAULTS, experiments_enabled
+from ..core.architectures import (
+    DEPRECATION_NOTICE, deprecated_architectures_enabled, experimental_architectures_enabled,
+    preset_uses_deprecated_architecture, preset_uses_experimental_architecture, DIFFUSION_ARCHITECTURES,
+    QWEN_ARCHITECTURES,
 )
 
 PRESETS = {
@@ -250,15 +251,133 @@ PRESETS["REFINE (QWEN 2.1)"] = {
     "lora_units": [],
 }
 
+# Qwen-Image 2.1 Turbo keeps every Qwen 2.1 view, context and projection
+# strategy and changes only the sampling: its trained 8-step schedule at CFG 1
+# with Euler. The scheduler is unused at 8 steps; Simple applies otherwise.
+_QWEN_21_TURBO_PURPOSES = {
+    "QWEN 2.1 PRECISE": "multi-view texturing with projected context renders that preserve textured regions and repair uncovered areas",
+    "QWEN 2.1 PRECISE+": "Precise with Confidence-Gated Context, Acquisition Quality Weighting and Depth/Part Projection Guard",
+    "QWEN 2.1 SAFE": "multi-view texturing that uses the initial generated view as the appearance reference for every later camera",
+    "QWEN 2.1 CONTEXT + REFERENCE": "sequential texturing combining the projected context with the first view as a persistent appearance reference",
+    "LOCAL EDIT (QWEN 2.1)": "targeted changes to an existing texture through detail cameras pointed at the area to edit",
+    "REFINE (QWEN 2.1)": "restyling or modifying the existing texture across the scene's camera views",
+}
+for _base_name, _purpose in _QWEN_21_TURBO_PURPOSES.items():
+    PRESETS[_base_name.replace("QWEN 2.1", "QWEN 2.1 TURBO")] = {
+        **PRESETS[_base_name],
+        "description": (
+            f"Qwen-Image 2.1 Turbo {_purpose}. Matches {_base_name.title()} except "
+            "for sampling: the Turbo model's trained 8-step schedule at CFG 1 with "
+            "Euler, several times faster than 20 DPM++ SDE steps. Native RGBA "
+            "output is on and transparent pixels are excluded from projection."
+        ),
+        "architecture_mode": "qwen_image_21_turbo",
+        "model_architecture": "qwen_image_21_turbo",
+        "steps": 8,
+        "cfg": 1.0,
+        "sampler": "euler",
+        "scheduler": "simple",
+    }
+
+# Bria FIBO 2.0 Edit reuses the Qwen 2.1 strategies: like Qwen 2.1 it edits
+# its first image, so projected context becomes that image. FIBO 2.0 Edit
+# Turbo samples 4 Euler steps at CFG 1 and has no transparency output. Its
+# presets set 1 MP, since a scene raised for Qwen 2.1's 2K would otherwise keep
+# its target: at 2.5 MP FIBO redraws the edited subject at its ~1 MP trained
+# scale in the top of the canvas, so the view no longer registers.
+_FIBO_PURPOSES = {
+    "QWEN 2.1 PRECISE": ("FIBO PRECISE", "multi-view texturing with projected context renders that preserve textured regions and repair uncovered areas"),
+    "QWEN 2.1 SAFE": ("FIBO SAFE", "multi-view texturing that uses the initial generated view as the appearance reference for every later camera"),
+    "LOCAL EDIT (QWEN 2.1)": ("LOCAL EDIT (FIBO)", "targeted changes to an existing texture through detail cameras pointed at the area to edit"),
+    "REFINE (QWEN 2.1)": ("REFINE (FIBO)", "restyling or modifying the existing texture across the scene's camera views"),
+}
+for _base_name, (_fibo_name, _purpose) in _FIBO_PURPOSES.items():
+    _values = {key: value for key, value in PRESETS[_base_name].items()
+               if key != "qwen_image_21_native_rgba"}
+    PRESETS[_fibo_name] = {
+        **_values,
+        "description": (
+            f"Experimental Bria FIBO 2.0 Edit {_purpose}. Matches "
+            f"{_base_name.title()}'s camera, context and projection settings and "
+            "samples FIBO 2.0 Edit Turbo with 4 Euler steps at CFG 1 and 1 MP. Image "
+            "references are written as <image_N>. Needs a ComfyUI build with core "
+            "FIBO 2.0 support (master from 2026-10-21), the fibo2 edit model, "
+            "qwen3vl_4b_int8_convrot and flux2-vae."
+        ),
+        "architecture_mode": "fibo_edit",
+        "model_architecture": "fibo_edit",
+        "auto_rescale_target_mp": 1.0,
+        "steps": 4,
+        "cfg": 1.0,
+        "sampler": "euler",
+        "scheduler": "simple",
+    }
+
+# MOSS-Image runs the SDXL workflows (classical inpainting, Differential
+# Diffusion) with the model card's sampler: 50 steps, CFG 3, Euler, SGM
+# Uniform. Geometry comes from its color/depth control adapter instead of
+# ControlNet; IPAdapter and LoRA do not exist for it. Existing ControlNet
+# units are kept untouched for switching back to SDXL.
+_MOSS_SAMPLING = {
+    "moss_depth_control": True,
+    "moss_depth_strength": 1.0,
+    "moss_depth_end": 0.5,
+    "architecture_mode": "moss_image",
+    "model_architecture": "moss_image",
+    "steps": 50,
+    "cfg": 3.0,
+    "sampler": "euler",
+    "scheduler": "sgm_uniform",
+    "refine_steps": 50,
+    "refine_cfg": 3.0,
+    "refine_sampler": "euler",
+    "refine_scheduler": "sgm_uniform",
+    "sequential_ipadapter": False,
+    "sequential_ipadapter_regenerate": False,
+    "lora_units": [],
+}
+
+
+def _moss_preset(base, description, **overrides):
+    values = {key: value for key, value in PRESETS[base].items()
+              if key != "controlnet_units"}
+    return {**values, **_MOSS_SAMPLING, "description": description, **overrides}
+
+
+PRESETS["MOSS SEQUENTIAL"] = _moss_preset(
+    "DEFAULT",
+    "MOSS-Image sequential texturing using the SDXL workflow: each later "
+    "camera inpaints only the surface not yet covered, with Differential "
+    "Diffusion and a blurred, grown visibility mask so new texture continues "
+    "the projected context. Every view follows its depth map through the "
+    "MOSS color/depth control adapter until half of sampling. Uses the model "
+    "card's 50 steps, CFG 3, Euler and SGM Uniform. Depth control needs "
+    "ComfyUI 0.42.3 or later and the adapter in models/loras; without it the "
+    "first view follows only the prompt.",
+)
+PRESETS["LOCAL REFINE (MOSS)"] = _moss_preset(
+    "LOCAL REFINE",
+    "MOSS-Image local refinement using the SDXL local edit mode: point new "
+    "cameras at the area to improve and the current texture is re-rendered "
+    "at the edit strength with depth control, then projected back with "
+    "feathered edges. Uses 50 steps, CFG 3, Euler and SGM Uniform.",
+)
+PRESETS["UV INPAINTING (MOSS)"] = _moss_preset(
+    "UV INPAINTING",
+    "MOSS-Image UV inpainting: fills untextured areas directly in the baked UV "
+    "texture with Differential Diffusion. Bake textures manually first to "
+    "fine-tune the unwrap. Uses 50 steps, CFG 3, Euler and SGM Uniform.",
+)
+
 # Stock presets select their architecture's native guidance wording. Including
 # the enum makes applying one reset a previously selected comparison template.
 for _preset_values in PRESETS.values():
     _preset_architecture = _preset_values.get("model_architecture")
     if _preset_architecture == "qwen_image_edit":
         _preset_values.setdefault("qwen_prompt_template", "QWEN_EDIT_LEGACY")
-    elif _preset_architecture == "qwen_image_21":
+    elif _preset_architecture in QWEN_ARCHITECTURES:
         _preset_values.setdefault("qwen_prompt_template", "QWEN_21_DEFAULT")
-    if _preset_architecture in {"qwen_image_edit", "qwen_image_21"}:
+    if _preset_architecture in QWEN_ARCHITECTURES:
         # Prepared-template fields are derived live. Keeping stale copies in a
         # stock preset would overwrite them after the template is selected.
         for _prompt_field in (
@@ -368,6 +487,9 @@ GEN_PARAMETERS = [
     'qwen_prompt_gray_background',
     'qwen_rescale_alignment',
     'qwen_image_21_native_rgba',
+    'moss_depth_control',
+    'moss_depth_strength',
+    'moss_depth_end',
     'qwen_generation_method',
     'qwen_refine_use_prev_ref',
     'qwen_refine_use_depth',
@@ -469,7 +591,9 @@ GEN_PARAMETERS = [
 # ── Preset diff preview helpers ──────────────────────────────────────────
 
 
-def _build_preset_items(context, include_deprecated, selected=None):
+def _build_preset_items(context, include_deprecated, selected=None, include_experimental=None):
+    if include_experimental is None:
+        include_experimental = experimental_architectures_enabled(context)
     # Group presets by architecture for easier navigation.
     _ARCH_GROUP_ORDER = [
         ('sdxl',            'SDXL'),
@@ -477,6 +601,10 @@ def _build_preset_items(context, include_deprecated, selected=None):
         ('qwen_image_21',   'Qwen Image 2.1'),
         ('flux2_klein',     'FLUX.2 Klein (Deprecated)'),
         ('trellis2',        'TRELLIS.2 Pipeline'),
+        # Later architectures follow so saved preset numbers above stay put.
+        ('qwen_image_21_turbo', 'Qwen Image 2.1 Turbo (Experimental)'),
+        ('moss_image',      'MOSS Image (Experimental)'),
+        ('fibo_edit',       'FIBO 2.0 Edit (Experimental)'),
     ]
     _known_groups = {k for k, _ in _ARCH_GROUP_ORDER}
 
@@ -487,6 +615,9 @@ def _build_preset_items(context, include_deprecated, selected=None):
             continue
         deprecated = preset_uses_deprecated_architecture(preset)
         if deprecated and not include_deprecated and key != selected:
+            continue
+        if (not include_experimental and key != selected
+                and preset_uses_experimental_architecture(preset)):
             continue
         if preset.get('architecture_mode') == 'trellis2':
             grp = 'trellis2'
@@ -541,7 +672,7 @@ def get_preset_items(self, context):
     global _READING_PRESET_SELECTION
     # Keep the old, unfiltered menu's numeric values. Hiding Klein presets must
     # not silently turn a saved TRELLIS preset (or Custom) into another preset.
-    full_items = _build_preset_items(context, include_deprecated=True)
+    full_items = _build_preset_items(context, include_deprecated=True, include_experimental=True)
     numbers = {item[0]: index for index, item in enumerate(full_items) if item[0]}
     if _READING_PRESET_SELECTION:
         items = tuple(item + (numbers[item[0]],) if item[0] else item
@@ -556,6 +687,7 @@ def get_preset_items(self, context):
         _READING_PRESET_SELECTION = False
     visible_items = _build_preset_items(
         context, deprecated_architectures_enabled(context), selected=selected,
+        include_experimental=experimental_architectures_enabled(context),
     )
     items = tuple(item + (numbers[item[0]],) if item[0] else item
                   for item in visible_items)
@@ -578,6 +710,12 @@ def update_parameters(self, context):
             continue
         if (preset_uses_deprecated_architecture(preset)
                 and not deprecated_architectures_enabled(context)):
+            continue
+        if (preset_uses_experimental_architecture(preset)
+                and not experimental_architectures_enabled(context)):
+            continue
+        # A texturing preset can share every stored value with a TRELLIS.2 one; never match across the two modes.
+        if (preset.get('architecture_mode') == 'trellis2') != (getattr(scene, 'architecture_mode', '') == 'trellis2'):
             continue
         expected = preset if preset.get('custom', False) else {**TEXTURING_DEFAULTS, **preset}
         # First check regular parameters
@@ -690,7 +828,7 @@ class ResetQwenPrompt(bpy.types.Operator):
             if selected == 'CUSTOM':
                 selected = (
                     'QWEN_21_DEFAULT'
-                    if context.scene.model_architecture == 'qwen_image_21'
+                    if context.scene.model_architecture != 'qwen_image_edit'
                     else 'QWEN_EDIT_LEGACY'
                 )
             return get_defaults(
@@ -753,6 +891,10 @@ class ApplyPreset(bpy.types.Operator):
             if (preset_uses_deprecated_architecture(values)
                     and not deprecated_architectures_enabled(context)):
                 self.report({'ERROR'}, "Enable deprecated architectures in add-on preferences first; these architectures no longer receive support")
+                return {'CANCELLED'}
+            if (preset_uses_experimental_architecture(values)
+                    and not experimental_architectures_enabled(context)):
+                self.report({'ERROR'}, "Enable experimental architectures in add-on preferences first")
                 return {'CANCELLED'}
 
             if not values.get("custom", False):
@@ -841,7 +983,7 @@ class ApplyPreset(bpy.types.Operator):
             # include architecture_mode, update the visible dropdown to match.
             if "architecture_mode" not in values:
                 arch = context.scene.model_architecture
-                if arch in ('sdxl', 'flux1', 'qwen_image_edit', 'qwen_image_21', 'flux2_klein'):
+                if arch in DIFFUSION_ARCHITECTURES:
                     context.scene.architecture_mode = arch
 
             if skipped:

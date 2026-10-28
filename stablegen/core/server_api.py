@@ -153,6 +153,21 @@ def check_skintokens_autorig_available(server_address, timeout=1.0):
         return False
 
 
+def fetch_node_info(server_address, node_class, timeout=1.0):
+    """Return a node's ``/object_info`` entry, or ``None`` if it is not installed."""
+    if not server_address:
+        return None
+    try:
+        response = requests.get(
+            f"http://{server_address}/object_info/{node_class}", timeout=timeout
+        )
+        if response.status_code == 200:
+            return response.json().get(node_class)
+    except Exception as e:
+        print(f"[StableGen] Could not query ComfyUI node {node_class}: {e}")
+    return None
+
+
 # ── API data retrieval ─────────────────────────────────────────────────────
 
 def fetch_from_comfyui_api(context, endpoint):

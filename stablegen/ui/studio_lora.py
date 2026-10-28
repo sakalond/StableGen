@@ -140,7 +140,7 @@ def folders(s):
 
     s.menu = {'anchor': parent['folder_rect'], 'items': [('__all__', 'All folders', '')]
               + [(value, 'Root folder' if value == '.' else value, value) for value in values],
-              'query': '', 'binding': None, 'index': 0, 'scroll': 0, 'callback': choose}
+              'query': '', 'binding': None, 'index': 0, 'scroll': 0, 'callback': choose, 'parent': parent, 'drop_down': True}
 
 
 def keyboard(s, event):
@@ -289,13 +289,27 @@ def draw_menu(s, p):
     menu, items = s.menu, s.menu_items()
     ax, ay, aw, ah = menu['anchor']
     width = min(p.width - 30, max(280, aw))
-    rows = min(8, len(items), max(1, int((p.height - 150) / 45)))
-    menu['rows'] = rows
-    height = 109 + max(1, rows) * 45 + 29
+    chrome = 109 + 29
+    if not menu.get('placed'):
+        # The picker always opens downward. When the anchor sits too low for a few rows, scroll the page once so
+        # the anchor moves up, and keep the anchor attached to it.
+        menu['placed'] = True
+        want = ay + ah + 5 + chrome + min(len(items), 6) * 45 - (p.height - 10)
+        shift = max(0, min(want, s.max_scroll - s.scroll.get(s.page, 0)))
+        if shift:
+            s.scroll[s.page] = s.scroll.get(s.page, 0) + shift
+            ay -= shift
+            menu['anchor'] = (ax, ay, aw, ah)
+            s.area.tag_redraw()
     x = min(max(15, ax), p.width - width - 15)
     y = ay + ah + 5
-    if y + height > p.height - 10:
-        y = max(10, ay - height - 5)
+    rows = min(len(items), max(1, int((p.height - 10 - y - chrome) / 45)))
+    if rows < min(len(items), 2):
+        # Last resort at the very end of the page: open upward.
+        rows = min(len(items), max(1, int((ay - 15 - chrome) / 45)))
+        y = max(10, ay - chrome - rows * 45 - 5)
+    menu['rows'] = rows
+    height = chrome + max(1, rows) * 45
     menu['rect'] = (x, y, width, height)
     p.rect(x - 1, y + 2, width + 2, height + 2, 'panel_shadow', 4)
     p.outline(x, y, width, height, 'tooltip', 'section_border', 4)

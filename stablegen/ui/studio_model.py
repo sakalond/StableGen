@@ -8,7 +8,7 @@ import bpy
 from .presentation import Layout, Control, capture_panel
 from .presets import get_preset_items
 from .model_units import update_model_list, get_lora_models, get_controlnet_models
-from ..architecture_options import (architecture_items, model_architecture_items,
+from ..core.architectures import (architecture_items, model_architecture_items,
                                     trellis_texture_items, trellis_initial_image_items)
 
 

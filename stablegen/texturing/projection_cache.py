@@ -4,6 +4,7 @@ import os
 import hashlib
 from array import array
 import bpy
+from ..core.architectures import EDIT_ARCHITECTURES, QWEN_ARCHITECTURES
 
 
 def _plain(value):
@@ -65,10 +66,10 @@ def eligible(scene):
     # Edit passes, baked fields and joint surface solves change topology. Base
     # sequential projection is shared by all texturing architectures; late
     # write-mask/image resources are bound before activating their view.
-    qwen = scene.model_architecture.startswith('qwen')
+    qwen = scene.model_architecture in QWEN_ARCHITECTURES
     confidence = (qwen and scene.qwen_use_confidence_context
                   and scene.qwen_context_render_mode in {'REPLACE_STYLE', 'ADDITIONAL'})
-    voronoi = (scene.model_architecture in {'qwen_image_edit', 'qwen_image_21', 'flux2_klein'}
+    voronoi = (scene.model_architecture in EDIT_ARCHITECTURES
                and scene.qwen_voronoi_mode)
     surface = (scene.sg_guard_feather_method == 'SURFACE_BLEND'
                and scene.sg_rework_projection_guard and scene.sg_silhouette_feather > 0)
@@ -91,7 +92,7 @@ def configuration(scene, cameras, mat_id, assets, meshes):
     # the active camera is runtime state. Include each effective projection
     # resolution, including the scene fallback for cameras without overrides.
     from ..cameras.geometry import _get_camera_resolution
-    from ..feature_flags import experimental_enabled
+    from ..core.feature_flags import experimental_enabled
     prefixes = ('sg_guard_', 'sg_rework_', 'sg_silhouette_', 'sg_projection_',
                 'discard_', 'weight_', 'early_', 'visibility_', 'refine_',
                 'qwen_', 'bake_visibility', 'sg_allow_backface', 'sequential_', 'use_ipadapter',

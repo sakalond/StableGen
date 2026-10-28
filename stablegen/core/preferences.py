@@ -10,7 +10,7 @@ Contains:
 
 import bpy  # pylint: disable=import-error
 
-from ..architecture_options import redraw_architecture_menus
+from .architectures import redraw_architecture_menus
 from ..ui.presets import update_parameters
 from ..utils import sg_modal_active
 from . import ADDON_PKG
@@ -71,6 +71,13 @@ class StableGenAddonPreferences(bpy.types.AddonPreferences):
         name="Enable Deprecated Architectures",
         description="Show FLUX.1 and FLUX.2 Klein architectures and their settings; these architectures no longer receive further support",
         default=False,
+        update=redraw_architecture_menus,
+    )  # type: ignore
+
+    enable_experimental_architectures: bpy.props.BoolProperty(
+        name="Enable Experimental Architectures",
+        description="Show Qwen Image 2.1 Turbo, MOSS Image and FIBO 2.0 Edit; these architectures are new and their results and settings may still change",
+        default=True,
         update=redraw_architecture_menus,
     )  # type: ignore
 
@@ -220,6 +227,7 @@ class StableGenAddonPreferences(bpy.types.AddonPreferences):
         layout.prop(self, "save_blend_file")
         layout.prop(self, "enable_print_tab")
         layout.prop(self, "enable_texturing_experiments")
+        layout.prop(self, "enable_experimental_architectures")
         layout.prop(self, "enable_deprecated_architectures")
         if self.enable_deprecated_architectures:
             layout.label(text="FLUX.1 and FLUX.2 Klein no longer receive support.", icon='INFO')

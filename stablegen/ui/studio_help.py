@@ -2,6 +2,7 @@
 import bpy
 
 from . import studio_model as model
+from ..core.architectures import EDIT_ARCHITECTURES
 
 
 def property_hint(binding, context):
@@ -23,7 +24,7 @@ def property_hint(binding, context):
                 ('This also drives per-camera diffusion textures.' if shared else
                  'Diffusion textures use the separate prompt on the Texture tab.'))
     if key == 'sequential_ipadapter':
-        if scene.model_architecture in {'qwen_image_edit', 'qwen_image_21', 'flux2_klein'}:
+        if scene.model_architecture in EDIT_ARCHITECTURES:
             return ('Use the first or most recent generated view as an image reference for style continuity. '
                     'An enabled external style reference can take precedence.')
         return ('Use IPAdapter with the first or most recent generated view for style continuity. '

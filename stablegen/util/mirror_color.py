@@ -8,6 +8,7 @@ from mathutils import Vector
 from ..utils import get_file_path, get_last_material_index, sg_modal_active
 from ..texturing.projection import project_image
 from .color_match import color_match_single
+from ..core.architectures import QWEN_ARCHITECTURES
 
 def _build_mirrored_camera_matrix(
     cam: bpy.types.Object,
@@ -510,7 +511,7 @@ class MirrorReproject(bpy.types.Operator):
             return {'CANCELLED'}
 
         # Branch: local_edit vs everything else
-        if scene.generation_method == 'local_edit' or (scene.model_architecture.startswith('qwen') and scene.qwen_generation_method == 'local_edit'):
+        if scene.generation_method == 'local_edit' or (scene.model_architecture in QWEN_ARCHITECTURES and scene.qwen_generation_method == 'local_edit'):
             return self._do_refine_mirror(context, to_texture)
         else:
             return self._do_standard_mirror(context, to_texture)

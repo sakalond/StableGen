@@ -1,4 +1,4 @@
-"""Create editable ComfyUI workflow files from StableGen Qwen 2.1 prompts."""
+"""Create editable ComfyUI workflow files from StableGen Qwen 2.1 and FIBO prompts."""
 
 from __future__ import annotations
 
@@ -16,7 +16,20 @@ _OUTPUTS = {
         ('negative', 'CONDITIONING'),
         ('latent', 'LATENT'),
     ],
+    'TextEncodeFibo2': [
+        ('positive', 'CONDITIONING'),
+        ('negative', 'CONDITIONING'),
+        ('latent', 'LATENT'),
+    ],
+    'GetImageSize': [('width', 'INT'), ('height', 'INT'), ('batch_size', 'INT')],
     'KSampler': [('LATENT', 'LATENT')],
+    'RandomNoise': [('NOISE', 'NOISE')],
+    'CFGGuider': [('GUIDER', 'GUIDER')],
+    'KSamplerSelect': [('SAMPLER', 'SAMPLER')],
+    'ManualSigmas': [('SIGMAS', 'SIGMAS')],
+    'SamplerCustomAdvanced': [
+        ('output', 'LATENT'), ('denoised_output', 'LATENT'),
+    ],
     'VAEDecode': [('IMAGE', 'IMAGE')],
     'SaveImage': [('images', 'IMAGE')],
     'SaveImageWebsocket': [],
@@ -30,6 +43,13 @@ _WIDGETS = {
     'VAELoader': ['vae_name'],
     'QwenImage21Cache': ['device', 'dtype'],
     'TextEncodeQwenImage21': ['prompt', 'negative_prompt', 'resolution'],
+    'TextEncodeFibo2': [
+        'prompt', 'negative_prompt', 'width', 'height', 'batch_size'
+    ],
+    'RandomNoise': ['noise_seed'],
+    'CFGGuider': ['cfg'],
+    'KSamplerSelect': ['sampler_name'],
+    'ManualSigmas': ['sigmas'],
     'KSampler': [
         'seed', 'steps', 'cfg', 'sampler_name', 'scheduler', 'denoise'
     ],
@@ -46,6 +66,26 @@ _LINK_INPUT_TYPES = {
         'clip': 'CLIP',
         'vae': 'VAE',
         **{f'images.image_{index}': 'IMAGE' for index in range(1, 17)},
+    },
+    'TextEncodeFibo2': {
+        'clip': 'CLIP',
+        'vae': 'VAE',
+        'width': 'INT',
+        'height': 'INT',
+        **{f'images.image_{index}': 'IMAGE' for index in range(1, 17)},
+    },
+    'GetImageSize': {'image': 'IMAGE'},
+    'CFGGuider': {
+        'model': 'MODEL',
+        'positive': 'CONDITIONING',
+        'negative': 'CONDITIONING',
+    },
+    'SamplerCustomAdvanced': {
+        'noise': 'NOISE',
+        'guider': 'GUIDER',
+        'sampler': 'SAMPLER',
+        'sigmas': 'SIGMAS',
+        'latent_image': 'LATENT',
     },
     'KSampler': {
         'model': 'MODEL',
@@ -65,6 +105,19 @@ _INPUT_ORDER = {
         'prompt', 'negative_prompt', 'resolution',
         *[f'images.image_{index}' for index in range(2, 17)],
     ],
+    'TextEncodeFibo2': [
+        'clip', 'prompt', 'negative_prompt', 'vae',
+        *[f'images.image_{index}' for index in range(1, 17)],
+        'width', 'height', 'batch_size',
+    ],
+    'GetImageSize': ['image'],
+    'RandomNoise': ['noise_seed'],
+    'CFGGuider': ['model', 'positive', 'negative', 'cfg'],
+    'KSamplerSelect': ['sampler_name'],
+    'ManualSigmas': ['sigmas'],
+    'SamplerCustomAdvanced': [
+        'noise', 'guider', 'sampler', 'sigmas', 'latent_image'
+    ],
     'KSampler': [
         'model', 'seed', 'steps', 'cfg', 'sampler_name', 'scheduler',
         'positive', 'negative', 'latent_image', 'denoise',
@@ -82,6 +135,11 @@ _WIDGET_TYPES = {
     'cfg': 'FLOAT',
     'denoise': 'FLOAT',
     'resolution': 'INT',
+    'noise_seed': 'INT',
+    'width': 'INT',
+    'height': 'INT',
+    'batch_size': 'INT',
+    'sigmas': 'STRING',
     'megapixels': 'FLOAT',
     'resolution_steps': 'INT',
     'prompt': 'STRING',
@@ -97,7 +155,14 @@ _POSITIONS = {
     'ImageScaleToTotalPixels': (330, 650),
     'QwenImage21Cache': (360, 0),
     'TextEncodeQwenImage21': (360, 220),
+    'TextEncodeFibo2': (360, 220),
+    'GetImageSize': (360, 860),
     'KSampler': (920, 0),
+    'RandomNoise': (920, 0),
+    'CFGGuider': (920, 140),
+    'KSamplerSelect': (920, 300),
+    'ManualSigmas': (920, 400),
+    'SamplerCustomAdvanced': (1220, 0),
     'VAEDecode': (1260, 0),
     'SaveImage': (1540, 0),
 }
@@ -122,11 +187,14 @@ def _integer_node_id(node_id):
 def _widget_value(class_type, name, api_inputs):
     if class_type == 'SaveImage' and name == 'filename_prefix':
         return api_inputs.get(name, 'StableGen_test')
-    return api_inputs.get(name)
+    value = api_inputs.get(name)
+    # A widget driven by a link (FIBO's size from GetImageSize) keeps a
+    # placeholder value; the link supplies the real one.
+    return 0 if _is_link(value) else value
 
 
 def _node_size(class_type):
-    if class_type == 'TextEncodeQwenImage21':
+    if class_type in ('TextEncodeQwenImage21', 'TextEncodeFibo2'):
         return [500, 610]
     if class_type == 'LoadImage':
         return [300, 300]
@@ -136,7 +204,7 @@ def _node_size(class_type):
 
 
 def qwen_image_21_ui_workflow(prompt):
-    """Return a frontend workflow for a Qwen 2.1 API prompt, or ``None``.
+    """Return a frontend workflow for a Qwen 2.1 or FIBO API prompt, or ``None``.
 
     ComfyUI API prompts normally import through ``loadApiJson``. Frontend
     1.53.x currently throws while reconstructing Qwen 2.1's COMFY_AUTOGROW_V3
@@ -144,7 +212,7 @@ def qwen_image_21_ui_workflow(prompt):
     remains editable and runnable in the browser.
     """
     if not any(
-        node.get('class_type') == 'TextEncodeQwenImage21'
+        node.get('class_type') in ('TextEncodeQwenImage21', 'TextEncodeFibo2')
         for node in prompt.values()
         if isinstance(node, dict)
     ):
@@ -186,7 +254,14 @@ def qwen_image_21_ui_workflow(prompt):
         link_types = _LINK_INPUT_TYPES.get(class_type, {})
         ui_inputs = []
         for name in input_order:
-            if name in link_types:
+            if name in link_types and name in widgets:
+                ui_inputs.append({
+                    'name': name,
+                    'type': link_types[name],
+                    'widget': {'name': name},
+                    'link': None,
+                })
+            elif name in link_types:
                 ui_inputs.append({
                     'name': name,
                     'type': link_types[name],
@@ -213,7 +288,7 @@ def qwen_image_21_ui_workflow(prompt):
         widget_values = [
             _widget_value(class_type, name, api_inputs) for name in widgets
         ]
-        if class_type == 'KSampler':
+        if class_type in ('KSampler', 'RandomNoise'):
             widget_values.insert(1, 'fixed')
         if class_type == 'LoadImage':
             widget_values.append('image')

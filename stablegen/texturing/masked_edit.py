@@ -18,7 +18,9 @@ import numpy as np
 
 from ..core import ADDON_PKG, legacy_panel_enabled
 from ..utils import sg_modal_active, get_file_path
+from .pbr_emission import emission_from_hsv, emission_from_residual
 from .rendering import _RenderStateTransaction
+from ..core.architectures import MASKED_EDIT_ARCHITECTURES, QWEN_ARCHITECTURES, SDXL_GRAPH_ARCHITECTURES
 
 MASK_UV = 'SG Edit Mask UV'
 COVERAGE = 'SG Masked Edit Coverage'
@@ -69,6 +71,17 @@ def output_node(material):
                  if n.type == 'OUTPUT_MATERIAL' and n.is_active_output), None)
 
 
+def color_input(shader):
+    """Where the colour graph enters *shader*: its Base Color (or Color), or the colour input of
+    StableGen's 'AO Multiply' node when ambient occlusion is multiplied on top. Edits enter there,
+    so the AO still darkens them and the context renders show the colour before AO."""
+    socket = shader.inputs['Base Color' if shader.type == 'BSDF_PRINCIPLED' else 'Color']
+    ao = socket.links[0].from_node if socket.links else None
+    if ao is not None and ao.type == 'MIX' and ao.label == 'AO Multiply' and ao.inputs[6].links:
+        return ao.inputs[6]                     # A: the colour, B is the AO factor
+    return socket
+
+
 def color_socket(material):
     """Support StableGen colour graphs, baked Principled materials and emission."""
     nodes, links = material.node_tree.nodes, material.node_tree.links
@@ -78,7 +91,7 @@ def color_socket(material):
     socket = out.inputs['Surface'].links[0].from_socket
     source = socket.node
     if source.type in {'BSDF_PRINCIPLED', 'EMISSION'}:
-        color = source.inputs['Base Color' if source.type == 'BSDF_PRINCIPLED' else 'Color']
+        color = color_input(source)
         if color.links:
             return color.links[0].from_socket
         rgb = nodes.new('ShaderNodeRGB')
@@ -87,6 +100,14 @@ def color_socket(material):
     if socket.type not in {'RGBA', 'VALUE'}:
         raise ValueError('Masked Edit needs a StableGen, Principled, or emission material')
     return socket
+
+
+def pack_image(image):
+    """Pack *image* unless it is already packed and unchanged. Blender 4.x empties a packed image
+    whose pixels are not loaded (a fresh copy, or a mask not yet drawn) when it is packed again."""
+    if image.packed_file and not image.is_dirty:
+        return
+    image.pack()
 
 
 def mask_socket(material, image, label=FROZEN):
@@ -211,7 +232,7 @@ def paint_session_valid(context):
 
 
 def is_masked_edit_mode(scene):
-    if scene.model_architecture.startswith('qwen'):
+    if scene.model_architecture in QWEN_ARCHITECTURES:
         return scene.qwen_generation_method == 'masked_edit'
     return scene.generation_method == 'masked_edit'
 
@@ -305,7 +326,7 @@ def finish_paint(context):
             del obj['_sg_mask_paint_hidden']
             del obj['_sg_mask_paint_render_hidden']
             if obj.sg_edit_mask:
-                obj.sg_edit_mask.pack()
+                pack_image(obj.sg_edit_mask)
     if '_sg_mask_paint_selected' in context.scene:
         selected = json.loads(context.scene['_sg_mask_paint_selected'])
         for obj in context.view_layer.objects:
@@ -324,7 +345,7 @@ def finish_paint(context):
         obj.active_material = obj.sg_mask_paint_original
         obj.sg_mask_paint_original = None
         if obj.sg_edit_mask:
-            obj.sg_edit_mask.pack()
+            pack_image(obj.sg_edit_mask)
         old_uv = obj.get('_sg_mask_old_uv', '')
         if old_uv in obj.data.uv_layers:
             obj.data.uv_layers.active = obj.data.uv_layers[old_uv]
@@ -646,7 +667,7 @@ def begin_layers(objects):
                 node.name = COVERAGE + ' Previous'
         frozen = obj.sg_edit_mask.copy()
         frozen.name = obj.name + ' Edit Selection Snapshot'
-        frozen.pack()
+        pack_image(frozen)
         mask_socket(material, frozen)
         # Give the legacy local projector a colour node, retaining original shader
         # separately so its lighting/PBR inputs can be restored around each layer.
@@ -654,7 +675,7 @@ def begin_layers(objects):
         before = output_node(material).inputs['Surface'].links[0].from_node
         material['_sg_mask_shader'] = before.name if before.type in {'BSDF_PRINCIPLED', 'EMISSION'} else ''
         if before.type in {'BSDF_PRINCIPLED', 'EMISSION'}:
-            material.node_tree.links.new(source, before.inputs['Base Color' if before.type == 'BSDF_PRINCIPLED' else 'Color'])
+            material.node_tree.links.new(source, color_input(before))
 
 
 def resolve_layers(scene, apply):
@@ -681,10 +702,12 @@ def resolve_layers(scene, apply):
 
 
 def pbr_targets(material):
-    """Principled inputs that carry projected PBR maps: {'roughness'|'metallic'|'normal': input socket}.
+    """Inputs that carry projected PBR maps: {channel: input socket}.
 
-    The normal entry is the Normal Map node's Color input. Only linked inputs are returned,
-    so unlinked constant values are left alone.
+    roughness and metallic are Principled inputs, normal is the Normal Map node's Color input and
+    height the Displacement node's Height input; these are returned only when linked, so unlinked
+    constant values are left alone. emission is the Principled Emission Color, returned even when
+    unlinked: a material without an emission map is black there, and an edit may add the glow.
     """
     shader = material.node_tree.nodes.get(material.get('_sg_mask_shader', ''))
     if not shader or shader.type != 'BSDF_PRINCIPLED':
@@ -696,6 +719,15 @@ def pbr_targets(material):
     normal = shader.inputs['Normal'].links[0].from_node if shader.inputs['Normal'].links else None
     if normal and normal.type == 'NORMAL_MAP' and normal.inputs['Color'].links:
         targets['normal'] = normal.inputs['Color']
+    out = output_node(material)
+    displacement = (out.inputs['Displacement'].links[0].from_node
+                    if out and 'Displacement' in out.inputs and out.inputs['Displacement'].links else None)
+    if displacement and displacement.type == 'DISPLACEMENT' and displacement.inputs['Height'].links:
+        targets['height'] = displacement.inputs['Height']
+    for name in ('Emission Color', 'Emission'):         # 'Emission' before Blender 4.0
+        if name in shader.inputs:
+            targets['emission'] = shader.inputs[name]
+            break
     return targets
 
 
@@ -730,8 +762,9 @@ def extract_pbr_maps(manager, context, jobs, settings, progress=None):
 
     *jobs* are dicts with 'image' (the composited edit), 'mask' (write mask), 'dir' and
     'rotation' (camera-to-world 3x3); maps are written into each job's 'dir' as
-    pbr-<channel>.png and listed in job['maps']. *settings* names the channels wanted and
-    the models, mirroring the scene's PBR settings. Raises RuntimeError on a model error.
+    pbr-<channel>.png and listed in job['maps']. *settings* names the channels wanted
+    (albedo, roughness, metallic, normal, height, emission) and the models and emission
+    detector, mirroring the scene's PBR settings. Raises RuntimeError on a model error.
     """
     from PIL import Image, ImageEnhance
     import io
@@ -751,18 +784,22 @@ def extract_pbr_maps(manager, context, jobs, settings, progress=None):
     passes = []
     want = settings['channels']
     source, normal_model = settings.get('albedo_source', 'marigold'), settings.get('normal_model', 'marigold')
+    emission = settings.get('emission', {})
+    residual_emission = 'emission' in want and emission.get('method', 'residual') == 'residual'
     if 'albedo' in want and source == 'marigold_v2':
         passes.append('v2_albedo')
     if 'normal' in want and normal_model == 'marigold_v2':
         passes.append('v2_normals')
     if want & {'roughness', 'metallic'} or ('albedo' in want and source == 'marigold'):
         passes.append('appearance')
-    if 'albedo' in want and source == 'lighting':
+    if ('albedo' in want and source == 'lighting') or residual_emission:
         passes.append('lighting')
     if 'albedo' in want and source == 'delight':
         passes.append('delight')
     if 'normal' in want and normal_model != 'marigold_v2':
         passes.append('v1_normals')
+    if 'height' in want:
+        passes.append('depth')
     total = max(len(passes) * len(jobs), 1)
     done = 0
 
@@ -775,8 +812,8 @@ def extract_pbr_maps(manager, context, jobs, settings, progress=None):
 
     # The edit model (Qwen or SDXL) is still loaded; free it before the PBR models load.
     flush('Masked Edit PBR pre-load')
-    for name in passes:
-        if name == 'appearance' and done and passes[0].startswith('v2'):
+    for index, name in enumerate(passes):
+        if index and passes[index - 1].startswith('v2') and not name.startswith('v2'):
             # The Qwen-Image-Edit base used by Marigold V2 must leave memory for Marigold v1.
             flush('Masked Edit PBR before Marigold v1')
         for job in jobs:
@@ -803,14 +840,44 @@ def extract_pbr_maps(manager, context, jobs, settings, progress=None):
             elif name == 'lighting':
                 maps = check(manager.generate_pbr_maps(context, image, model_name='prs-eth/marigold-iid-lighting-v1-1'),
                              'Marigold IID-Lighting')
-                save(job, 'albedo', maps[0])
+                if 'albedo' in want and source == 'lighting':
+                    save(job, 'albedo', maps[0])
+                if residual_emission:
+                    # albedo, shading, non-diffuse residual; the residual becomes emission below
+                    path = Path(job['dir']) / 'pbr-lighting-residual.png'
+                    path.write_bytes(check(maps[2] if len(maps) > 2 else None, 'Marigold IID-Lighting residual'))
+                    job['residual'] = str(path)
             elif name == 'delight':
                 save(job, 'albedo', check(manager.generate_delight_map(context, image), 'StableDelight'))
             elif name == 'v1_normals':
                 maps = check(manager.generate_pbr_maps(context, image, model_name='prs-eth/marigold-normals-lcm-v0-1'),
                              'Marigold normals')
                 save(job, 'normal', world_normals(maps[0], job['rotation']))
+            elif name == 'depth':
+                maps = check(manager.generate_pbr_maps(context, image, model_name='prs-eth/marigold-depth-lcm-v1-0'),
+                             'Marigold depth')
+                save(job, 'height', maps[0])
             done += 1
+    if 'emission' in want:
+        # The same detectors as generation (pbr_emission.py), on each edited view.
+        threshold = emission.get('threshold', 0.2)
+        for job in jobs:
+            if residual_emission:
+                # Gated by the view's metallic when that map is being updated, as in generation.
+                metallic_path = job.get('maps', {}).get('metallic')
+                with Image.open(job['residual']) as residual:
+                    metallic = None
+                    if metallic_path:
+                        with Image.open(metallic_path) as metal:
+                            metallic = metal.convert('L')
+                    result = emission_from_residual(residual, metallic, threshold)
+            else:
+                with Image.open(job['image']) as view:
+                    result = emission_from_hsv(view, emission.get('saturation_min', 0.5),
+                                               emission.get('value_min', 0.85), emission.get('bloom', 5.0), threshold)
+            buf = io.BytesIO()
+            result.save(buf, format='PNG')
+            save(job, 'emission', buf.getvalue())
     if 'albedo' in want and settings.get('auto_saturation'):
         from .pbr import _PBRMixin
         for job in jobs:
@@ -829,13 +896,15 @@ def extract_pbr_maps(manager, context, jobs, settings, progress=None):
     return jobs
 
 
-def add_pbr_layers(material, layer, maps, use_albedo):
+def add_pbr_layers(material, layer, maps, use_albedo, emission_strength=2.5):
     """Layer one edited view's PBR maps over the material's existing channels.
 
     *layer* names the view's colour mix and its projected texture (from project_view). Each
     channel gets a mix with the same factor as the colour layer, so the maps change exactly
     where the colour did. With *use_albedo*, the colour layer shows the edit's albedo instead
-    of its lit image, matching a material whose base colour is extracted albedo.
+    of its lit image, matching a material whose base colour is extracted albedo. A material
+    without an emission map gets one that is black outside the edit, and an Emission Strength
+    of *emission_strength* if it had none.
     """
     nodes, links = material.node_tree.nodes, material.node_tree.links
     mix, texture = nodes.get(layer['mix']), nodes.get(layer['texture'])
@@ -854,9 +923,23 @@ def add_pbr_layers(material, layer, maps, use_albedo):
         texture.image = load(maps['albedo'], 'sRGB')
         added.append('albedo')
     for channel, target in pbr_targets(material).items():
-        if not maps.get(channel) or not target.links:
+        if not maps.get(channel):
             continue
-        previous = target.links[0].from_socket
+        if target.links:
+            previous = target.links[0].from_socket
+        elif channel == 'emission':
+            # No emission map yet: black elsewhere (not the input's default colour, which
+            # would glow over the whole object once the strength is raised).
+            black = nodes.new('ShaderNodeRGB')
+            black.outputs[0].default_value = (0.0, 0.0, 0.0, 1.0)
+            black.label = 'Masked Edit no emission'
+            previous = black.outputs[0]
+            shader = target.node
+            strength = shader.inputs.get('Emission Strength')
+            if strength is not None and not strength.links and strength.default_value == 0.0:
+                strength.default_value = emission_strength
+        else:
+            continue
         tex = nodes.new('ShaderNodeTexImage')
         tex.image = load(maps[channel], 'Non-Color')
         tex.label = f'Masked Edit {channel}'
@@ -925,7 +1008,7 @@ def project_view(context, objects, camera, image_path, write_path, material_id, 
         coverage.node.name = COVERAGE
         original_shader = nodes.get(material.get('_sg_mask_shader', ''))
         if original_shader:
-            links.new(mix.outputs[0], original_shader.inputs['Base Color' if original_shader.type == 'BSDF_PRINCIPLED' else 'Color'])
+            links.new(mix.outputs[0], color_input(original_shader))
             links.new(original_shader.outputs[0], output_node(material).inputs['Surface'])
         # Embed input assets so saving the blend preserves the edit preview.
         for node in nodes:
@@ -943,7 +1026,7 @@ class SG_OT_MaskedEdit(bpy.types.Operator):
     @classmethod
     def poll(cls, context):
         return (cls._active is None and not sg_modal_active(context)
-                and context.scene.model_architecture in {'sdxl', 'qwen_image_edit', 'qwen_image_21'}
+                and context.scene.model_architecture in MASKED_EDIT_ARCHITECTURES
                 and not any(o.sg_mask_original for o in context.scene.objects))
 
     def execute(self, context):
@@ -1016,8 +1099,12 @@ class SG_OT_MaskedEdit(bpy.types.Operator):
                 for obj in self.objects:
                     if obj.active_material.get('_sg_mask_shader'):
                         targets = pbr_targets(obj.active_material)
-                        channels |= {c for c in targets if getattr(self.scene, f'pbr_map_{c}', True)}
-                        if targets and self.pbr_use_albedo:
+                        mapped = {c for c, socket in targets.items() if socket.links}
+                        channels |= {c for c in mapped if getattr(self.scene, f'pbr_map_{c}', True)}
+                        if ('emission' in targets and self.scene.pbr_decomposition
+                                and self.scene.pbr_map_emission):
+                            channels.add('emission')    # an edit may add glow where there was none
+                        if mapped and self.pbr_use_albedo:
                             channels.add('albedo')
             self.pbr_channels = channels
             type(self)._active = self
@@ -1096,7 +1183,7 @@ class SG_OT_MaskedEdit(bpy.types.Operator):
             server = context.preferences.addons[ADDON_PKG].preferences.server_address
             self.uploads = {}
             paths = {'render': render, 'mask': generation}
-            if context.scene.model_architecture.startswith('qwen') and context.scene.sg_masked_overlay:
+            if context.scene.model_architecture in QWEN_ARCHITECTURES and context.scene.sg_masked_overlay:
                 paths['overlay'] = overlay
             if depth:
                 paths['depth'] = depth
@@ -1109,7 +1196,7 @@ class SG_OT_MaskedEdit(bpy.types.Operator):
                     uploaded['name'] = subfolder.rstrip('/') + '/' + uploaded['name']
                 self.uploads[key] = uploaded
             manager = WorkflowManager(self)
-            if context.scene.model_architecture.startswith('qwen'):
+            if context.scene.model_architecture in QWEN_ARCHITECTURES:
                 data = manager.generate_qwen_refine(context, camera_id=0, masked_edit={
                     'prompt': context.scene.sg_masked_prompt,
                     'overlay': self.uploads.get('overlay'),
@@ -1189,7 +1276,7 @@ class SG_OT_MaskedEdit(bpy.types.Operator):
                 render, mask, self.current_dir,
                 self.scene.sg_masked_feather, self.scene.sg_masked_expand)
             depth = None
-            if self.scene.model_architecture.startswith('qwen') and self.scene.sg_masked_use_depth:
+            if self.scene.model_architecture in QWEN_ARCHITECTURES and self.scene.sg_masked_use_depth:
                 self.scene.sg_masked_status = f'Preparing depth {self.index+1}/{len(self.ranked)}: {camera.name}'
                 depth = render_depth_view(context, camera, self.current_dir)
             self.result = self.current_dir / 'generated.png'
@@ -1245,7 +1332,12 @@ class SG_OT_MaskedEdit(bpy.types.Operator):
         scene = self.scene
         settings = {'channels': set(self.pbr_channels), 'albedo_source': scene.pbr_albedo_source,
                     'normal_model': getattr(scene, 'pbr_normal_model', 'marigold'),
-                    'auto_saturation': bool(scene.pbr_albedo_auto_saturation)}
+                    'auto_saturation': bool(scene.pbr_albedo_auto_saturation),
+                    'emission': {'method': scene.pbr_emission_method,
+                                 'threshold': scene.pbr_emission_threshold,
+                                 'saturation_min': scene.pbr_emission_saturation_min,
+                                 'value_min': scene.pbr_emission_value_min,
+                                 'bloom': scene.pbr_emission_bloom}}
         self.phase = 'pbr'
         self._error = ''
         self._stage = 'Updating PBR Maps'
@@ -1283,7 +1375,8 @@ class SG_OT_MaskedEdit(bpy.types.Operator):
                 for name, layer in job['layers'].items():
                     obj = by_name.get(name)
                     if obj:
-                        added = add_pbr_layers(obj.active_material, layer, job.get('maps', {}), self.pbr_use_albedo)
+                        added = add_pbr_layers(obj.active_material, layer, job.get('maps', {}), self.pbr_use_albedo,
+                                               self.scene.pbr_emission_strength)
                         job.setdefault('added', {})[name] = added
             channels = ', '.join(sorted(self.pbr_channels))
             self.report_rows.append({'status': 'pbr_updated', 'channels': sorted(self.pbr_channels),
@@ -1411,7 +1504,7 @@ def draw_masked_edit_controls(layout, context):
     layout.prop(scene, 'sg_masked_feather')
     if scene.pbr_decomposition:
         layout.prop(scene, 'sg_masked_update_pbr')
-    if scene.model_architecture.startswith('qwen'):
+    if scene.model_architecture in QWEN_ARCHITECTURES:
         layout.prop(scene, 'sg_masked_overlay')
         layout.prop(scene, 'sg_masked_use_depth')
         layout.prop(scene, 'sg_masked_use_custom_prompt', text='Custom Guidance Prompt', toggle=True, icon='TEXT')
@@ -1421,10 +1514,10 @@ def draw_masked_edit_controls(layout, context):
             row = box.row(align=True)
             row.prop(scene, 'sg_masked_custom_prompt', text='')
             row.operator('stablegen.reset_masked_prompt', text='', icon='FILE_REFRESH')
-    elif scene.model_architecture == 'sdxl':
+    elif scene.model_architecture in SDXL_GRAPH_ARCHITECTURES:
         layout.prop(scene, 'sg_masked_strength')
     else:
-        layout.label(text='Masked Edit supports Qwen Image Edit and SDXL.', icon='INFO')
+        layout.label(text='Masked Edit supports Qwen, FIBO, MOSS and SDXL.', icon='INFO')
     layout.label(text='Uses the current model and existing cameras.')
     if scene.sg_masked_status:
         layout.label(text=scene.sg_masked_status)
@@ -1482,9 +1575,11 @@ def register_properties():
     bpy.types.Scene.sg_masked_strength = bpy.props.FloatProperty(description="Denoising strength inside the prepared selection. Lower values preserve more of the source image; higher values allow larger changes. Selection expansion and feathering control the boundary separately.", name="Edit strength", default=0.85, min=0.05, max=1.0)
     bpy.types.Scene.sg_masked_update_pbr = bpy.props.BoolProperty(
         name='Update PBR Maps', default=True,
-        description='On PBR materials, extract roughness, metallic and normal (and albedo, when it is the base '
-                    'colour) from the edited views with the PBR map settings, so the edited region gets its new '
-                    'material instead of the old surface\'s. Runs once after all views are edited')
+        description='On PBR materials, extract the material\'s maps (roughness, metallic, normal, height, and '
+                    'albedo when it is the base colour) from the edited views with the PBR map settings, so the '
+                    'edited region gets its new material instead of the old surface\'s. With Emission enabled in '
+                    'the PBR settings, glowing parts of the edit also become emission. Runs once after all views '
+                    'are edited')
     bpy.types.Scene.sg_masked_status = bpy.props.StringProperty(default='')
     keyconfig = bpy.context.window_manager.keyconfigs.addon
     if keyconfig:

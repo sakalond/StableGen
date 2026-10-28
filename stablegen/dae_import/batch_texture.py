@@ -18,6 +18,7 @@ from .batch_manifest import (
     filename_contains_model_stem,
     load_batch_manifest,
 )
+from ..core.architectures import EDIT_ARCHITECTURES
 
 # Reference image filenames (checked in order)
 _REF_NAMES = ('ref.png', 'ref.jpg', 'ref.jpeg')
@@ -492,7 +493,7 @@ def _do_set_ref_image():
         if arch == 'sdxl':
             scene.use_ipadapter = True
             scene.ipadapter_image = ref
-        elif arch in ('qwen_image_edit', 'qwen_image_21', 'flux2_klein'):
+        elif arch in EDIT_ARCHITECTURES:
             scene.qwen_use_external_style_image = True
             scene.qwen_external_style_image = ref
         elif arch == 'flux1':

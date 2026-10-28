@@ -500,6 +500,14 @@ def get_compositor_node_tree(scene):
 	return None
 
 
+def new_compositor_math(nodes, operation):
+	"""Add a Math node to a compositor tree. Blender 4.x has its own CompositorNodeMath (4.2-4.4 accept
+	no other); Blender 5 removed it in favour of the shared ShaderNodeMath."""
+	node = nodes.new('CompositorNodeMath' if hasattr(bpy.types, 'CompositorNodeMath') else 'ShaderNodeMath')
+	node.operation = operation
+	return node
+
+
 def configure_output_node_paths(node, directory, filename):
 	"""Configure output node paths using Blender 5.0+ image-mode semantics with 4.x fallback."""
 

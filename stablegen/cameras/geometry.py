@@ -5,6 +5,7 @@ import bpy, bmesh  # pylint: disable=import-error
 import numpy as np
 import mathutils
 from mathutils import Matrix
+from ..core.architectures import QWEN_21_ARCHITECTURES
 
 def _existing_camera_directions(mesh_center):
     """Return unit-direction vectors from *mesh_center* toward each existing
@@ -793,8 +794,11 @@ def _resolution_from_aspect(aspect, total_px, align=8):
 def _get_resolution_align(context):
     """Use each Qwen encoder's image grid for camera resolution planning."""
     architecture = context.scene.model_architecture
-    if architecture == 'qwen_image_21':
+    if architecture in QWEN_21_ARCHITECTURES:
         return 32
+    if architecture in {'moss_image', 'fibo_edit'}:
+        # Both use 16px latent patches (8x VAE with 2x2 patchify).
+        return 16
     if (architecture == 'qwen_image_edit'
             and getattr(context.scene, 'qwen_rescale_alignment', False)):
         return 112

@@ -18,6 +18,7 @@ from PIL import Image, ImageEnhance
 import bpy  # pylint: disable=import-error
 from ..utils import get_file_path, get_dir_path, get_generation_dirs
 from ..timeout_config import get_timeout
+from .pbr_emission import emission_from_hsv, emission_from_residual
 
 _ADDON_PKG = __package__.rsplit('.', 1)[0]
 
@@ -1458,12 +1459,12 @@ class _PBRMixin:
     # ── Emission extraction methods ───────────────────────────────────
 
     def _gate_emission_residual(self, context, camera_id):
-        """Gate the IID-Lighting residual with roughness/metallic to
-        produce a cleaner emission map.
+        """Gate the IID-Lighting residual with metallic to produce a
+        cleaner emission map (see emission_from_residual).
 
-        emission = residual × (1 − metallic) × roughness_mask, then
-        threshold.  High-metallic + low-roughness regions are likely
-        specular reflections, not true emission.
+        emission = residual × (1 − metallic), then a soft threshold.
+        High-metallic regions are likely specular reflections, not true
+        emission.
         """
         scene = context.scene
         cam_maps = self._pbr_maps.get(camera_id, {})
@@ -1475,33 +1476,13 @@ class _PBRMixin:
         threshold = getattr(scene, 'pbr_emission_threshold', 0.2)
 
         try:
-            residual = np.array(Image.open(residual_path).convert('RGB')).astype(np.float32) / 255.0
-
-            # Optionally gate with metallic if available — high metallic
-            # surfaces produce strong specular that isn't true emission.
+            # Gate with metallic when available (it may differ in size when
+            # tiling/super-res settings aren't identical; it is resized).
             metal_path = cam_maps.get('metallic')
-            if metal_path and os.path.exists(metal_path):
-                metal_img = Image.open(metal_path).convert('L')
-                # Resize metallic to match residual dims (they may differ
-                # when tiling/super-res settings aren't identical).
-                res_h, res_w = residual.shape[:2]
-                if metal_img.size != (res_w, res_h):
-                    metal_img = metal_img.resize(
-                        (res_w, res_h), Image.Resampling.BILINEAR)
-                metallic = np.array(metal_img).astype(np.float32) / 255.0
-                gate = (1.0 - metallic)[:, :, np.newaxis]
-                residual = residual * gate
-
-            # Apply soft threshold — pixels below the threshold are
-            # smoothly faded out rather than hard-clipped.
-            luminance = np.mean(residual, axis=2)
-            # Smooth fade: rescale [0, threshold] → 0, [threshold, 1] → preserved
-            fade = np.clip((luminance - threshold * 0.5) / max(threshold * 0.5, 1e-6),
-                           0.0, 1.0)[:, :, np.newaxis]
-            emission = residual * fade
-
-            emission_img = Image.fromarray(
-                np.clip(emission * 255, 0, 255).astype(np.uint8), mode='RGB')
+            metal_img = (Image.open(metal_path).convert('L')
+                         if metal_path and os.path.exists(metal_path) else None)
+            emission_img = emission_from_residual(
+                Image.open(residual_path), metal_img, threshold)
             emission_path = get_file_path(
                 context, "pbr", subtype="emission",
                 camera_id=camera_id,
@@ -1526,42 +1507,8 @@ class _PBRMixin:
         threshold = getattr(scene, 'pbr_emission_threshold', 0.3)
 
         try:
-            original = np.array(Image.open(image_path).convert('RGB'))
-            rgb_f = original.astype(np.float32) / 255.0
-
-            # RGB → HSV
-            maxc = rgb_f.max(axis=2)
-            minc = rgb_f.min(axis=2)
-            delta = maxc - minc
-            saturation = np.where(maxc > 1e-6, delta / maxc, 0.0)
-            value = maxc
-
-            # Build binary mask: high saturation AND high value
-            mask = ((saturation >= sat_min) & (value >= val_min)).astype(np.float32)
-
-            # Apply bloom (Gaussian blur) to soften edges
-            if bloom_radius > 0:
-                try:
-                    import cv2
-                    ksize = int(bloom_radius * 4) | 1  # must be odd
-                    mask = cv2.GaussianBlur(mask, (ksize, ksize), bloom_radius)
-                except ImportError:
-                    # Fallback: simple box blur via PIL
-                    from PIL import ImageFilter
-                    mask_pil = Image.fromarray(
-                        (mask * 255).astype(np.uint8), mode='L')
-                    mask_pil = mask_pil.filter(
-                        ImageFilter.GaussianBlur(radius=bloom_radius))
-                    mask = np.array(mask_pil).astype(np.float32) / 255.0
-
-            # Apply threshold on the blurred mask
-            mask = np.where(mask > threshold, mask, 0.0)
-
-            # Multiply mask by original RGB to get coloured emission
-            emission = rgb_f * mask[:, :, np.newaxis]
-
-            emission_img = Image.fromarray(
-                np.clip(emission * 255, 0, 255).astype(np.uint8), mode='RGB')
+            emission_img = emission_from_hsv(
+                Image.open(image_path), sat_min, val_min, bloom_radius, threshold)
             emission_path = get_file_path(
                 context, "pbr", subtype="emission",
                 camera_id=camera_id,

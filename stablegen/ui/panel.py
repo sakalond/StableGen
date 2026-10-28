@@ -3,15 +3,20 @@
 import os
 import bpy  # pylint: disable=import-error
 import mathutils  # pylint: disable=import-error
-from ..generation_status import draw_stage_progress, server_status_active
+from ..core.generation_status import draw_stage_progress, server_status_active
 import math
 from ..utils import sg_modal_active
 from ..core import get_addon_prefs, legacy_panel_enabled
 from .presets import PRESETS, GEN_PARAMETERS
-from ..feature_flags import experiments_enabled, active_experiments
-from ..architecture_options import (
+from ..core.feature_flags import experiments_enabled, active_experiments
+from ..core.architectures import (
     active_deprecated_architectures, deprecated_architectures_enabled,
+    active_experimental_architectures, experimental_architectures_enabled,
+    CANVAS_EDIT_ARCHITECTURES, DIFFUSION_ARCHITECTURES, EDIT_ARCHITECTURES,
+    MASKED_EDIT_ARCHITECTURES, NATIVE_GRAPH_ARCHITECTURES, QWEN_21_ARCHITECTURES,
+    QWEN_ARCHITECTURES,
 )
+from ..texturing.qwen_models import QWEN_IMAGE_21_TURBO_STEPS
 from . import queue as _queue_mod
 
 _ADDON_PKG = __package__.rsplit('.', 1)[0]
@@ -51,6 +56,9 @@ _DISPLAY_NAMES = {
     'flux1': 'FLUX.1',
     'qwen_image_edit': 'Qwen Image Edit',
     'qwen_image_21': 'Qwen Image 2.1',
+    'qwen_image_21_turbo': 'Qwen Image 2.1 Turbo',
+    'moss_image': 'MOSS Image',
+    'fibo_edit': 'FIBO 2.0 Edit',
     'flux2_klein': 'FLUX.2 Klein',
     'trellis2': 'TRELLIS.2',
     'standard': 'Standard',
@@ -72,7 +80,7 @@ def _fmt_diff_val(v):
 
 
 def _is_masked_edit_mode(scene):
-    if scene.model_architecture.startswith('qwen'):
+    if scene.model_architecture in QWEN_ARCHITECTURES:
         return scene.qwen_generation_method == 'masked_edit'
     return scene.generation_method == 'masked_edit'
 
@@ -193,6 +201,17 @@ class StableGenPanel(bpy.types.Panel):
                 # Saved FLUX scenes remain intact, but their settings and actions
                 # are hidden until the user opts in or chooses a supported model.
                 return
+        if active_experimental_architectures(scene) and not experimental_architectures_enabled(context):
+            box = layout.box()
+            box.label(text="Experimental architecture hidden", icon='INFO')
+            box.label(text="Enable experimental architectures in add-on preferences.")
+            box.prop(scene, "architecture_mode")
+            if scene.architecture_mode == 'trellis2':
+                box.prop(scene, "trellis2_texture_mode")
+                if (scene.trellis2_texture_mode in ('none', 'native')
+                        and scene.trellis2_generate_from == 'prompt'):
+                    box.prop(scene, "trellis2_initial_image_arch")
+            return
         config_error_message = None
 
         if not os.path.exists(addon_prefs.output_dir):
@@ -496,8 +515,8 @@ class StableGenPanel(bpy.types.Panel):
                 elif masked_preview:
                     action_row.operator('stablegen.resolve_masked_edit', text='Apply', icon='CHECKMARK').apply = True
                     action_row.operator('stablegen.resolve_masked_edit', text='Discard', icon='LOOP_BACK').apply = False
-                elif scene.model_architecture not in {'sdxl', 'qwen_image_edit', 'qwen_image_21'}:
-                    action_row.operator('stablegen.masked_edit', text='Masked Edit requires Qwen or SDXL', icon='ERROR')
+                elif scene.model_architecture not in MASKED_EDIT_ARCHITECTURES:
+                    action_row.operator('stablegen.masked_edit', text='Masked Edit requires Qwen, FIBO, MOSS or SDXL', icon='ERROR')
                     action_row.enabled = False
                 elif not bpy.app.online_access:
                     action_row.operator('stablegen.masked_edit', text='Enable online access in preferences', icon='ERROR')
@@ -729,7 +748,7 @@ class StableGenPanel(bpy.types.Panel):
 
         is_trellis2 = getattr(scene, 'architecture_mode', 'sdxl') == 'trellis2'
         trellis2_tex_mode = getattr(scene, 'trellis2_texture_mode', 'native')
-        trellis2_diffusion_texturing = is_trellis2 and trellis2_tex_mode in ('sdxl', 'flux1', 'qwen_image_edit', 'qwen_image_21', 'flux2_klein')
+        trellis2_diffusion_texturing = is_trellis2 and trellis2_tex_mode in DIFFUSION_ARCHITECTURES
             
         main_params_box = layout.box()
         main_params_col = main_params_box.column()
@@ -861,7 +880,7 @@ class StableGenPanel(bpy.types.Panel):
                     if 'generation_method' in _diff_props or 'qwen_generation_method' in _diff_props:
                         split.alert = True
                     split.label(text="Generation Mode:")
-                    if scene.model_architecture.startswith("qwen"):
+                    if scene.model_architecture in QWEN_ARCHITECTURES:
                         split.prop(scene, "qwen_generation_method", text="")
                     else:
                         split.prop(scene, "generation_method", text="")
@@ -882,7 +901,7 @@ class StableGenPanel(bpy.types.Panel):
                 if 'generation_method' in _diff_props or 'qwen_generation_method' in _diff_props:
                     split.alert = True
                 split.label(text="Generation Mode:")
-                if scene.model_architecture.startswith("qwen"):
+                if scene.model_architecture in QWEN_ARCHITECTURES:
                     split.prop(scene, "qwen_generation_method", text="")
                 else:
                     split.prop(scene, "generation_method", text="")
@@ -1278,7 +1297,22 @@ class StableGenPanel(bpy.types.Panel):
                 if 'scheduler' in _diff_props:
                     split.label(text="→ " + _diff_props['scheduler'])
 
-                if scene.model_architecture == 'qwen_image_21':
+                if (scene.model_architecture == 'qwen_image_21_turbo'
+                        and scene.steps == QWEN_IMAGE_21_TURBO_STEPS):
+                    content_box.label(text="Turbo samples its trained 8-step schedule", icon='INFO')
+
+                if scene.model_architecture == 'moss_image':
+                    row = content_box.row()
+                    for prop in ('moss_depth_control', 'moss_depth_strength', 'moss_depth_end'):
+                        if prop in _diff_props:
+                            row.alert = True
+                    row.prop(scene, "moss_depth_control", text="Depth Control", toggle=True)
+                    if scene.moss_depth_control:
+                        row = content_box.row(align=True)
+                        row.prop(scene, "moss_depth_strength", text="Strength")
+                        row.prop(scene, "moss_depth_end", text="End")
+
+                if scene.model_architecture in QWEN_21_ARCHITECTURES:
                     row = content_box.row()
                     if 'qwen_image_21_native_rgba' in _diff_props:
                         row.alert = True
@@ -1291,13 +1325,13 @@ class StableGenPanel(bpy.types.Panel):
                     if 'qwen_image_21_native_rgba' in _diff_props:
                         row.label(text="→ " + _diff_props['qwen_image_21_native_rgba'])
                 
-                if scene.model_architecture != 'qwen_image_21':
+                if scene.model_architecture not in NATIVE_GRAPH_ARCHITECTURES:
                     row = content_box.row()
                     row.prop(scene, "clip_skip", text="CLIP layer skip")
 
            # --- LoRA Settings ---
             if ((_show_diffusion_sections or _show_initial_image_settings)
-                    and scene.model_architecture != 'qwen_image_21'):
+                    and scene.model_architecture not in NATIVE_GRAPH_ARCHITECTURES):
                 content_box = draw_collapsible_section(advanced_params_box, "show_lora_settings", "LoRA Management", icon="MODIFIER")
             else:
                 content_box = None
@@ -1315,7 +1349,7 @@ class StableGenPanel(bpy.types.Panel):
                         
                         sub_row = unit_box.row(align=True)
                         sub_row.prop(lora_unit, "model_strength", text="Model Strength")
-                        if not scene.model_architecture.startswith("qwen") and scene.model_architecture != 'flux2_klein': # Qwen/Klein use model only loras
+                        if not scene.model_architecture in QWEN_ARCHITECTURES and scene.model_architecture != 'flux2_klein': # Qwen/Klein use model only loras
                             sub_row.prop(lora_unit, "clip_strength", text="CLIP Strength")
 
                         # Icon to indicate selection more clearly alongside the alert state
@@ -1400,7 +1434,7 @@ class StableGenPanel(bpy.types.Panel):
                     sub.label(text="→" + _diff_props['weight_exponent'])
 
                 # Row 2 & 3: Reset toggles and values (only for sequential / qwen)
-                if scene.generation_method == 'sequential' or scene.model_architecture in ('qwen_image_edit', 'qwen_image_21', 'flux2_klein'):
+                if scene.generation_method == 'sequential' or scene.model_architecture in EDIT_ARCHITECTURES:
                     split = content_box.split(factor=0.5, align=False)
                     split.prop(scene, "discard_factor_generation_only", text="Resets", toggle=True)
                     split.prop(scene, "weight_exponent_generation_only", text="Resets", toggle=True)
@@ -1476,7 +1510,7 @@ class StableGenPanel(bpy.types.Panel):
                     if scene.sg_auto_view_sequence:
                         experiments.prop(scene, "sg_anchor_camera")
                     qwen_exp = experiments.column()
-                    qwen_exp.enabled = scene.model_architecture.startswith('qwen') and scene.qwen_generation_method == 'generate'
+                    qwen_exp.enabled = scene.model_architecture in QWEN_ARCHITECTURES and scene.qwen_generation_method == 'generate'
                     style = qwen_exp.row()
                     style.enabled = scene.qwen_context_render_mode == 'ADDITIONAL'
                     style.prop(scene, "qwen_global_style_vlm_only", toggle=True)
@@ -1618,8 +1652,10 @@ class StableGenPanel(bpy.types.Panel):
                     if scene.model_architecture == 'qwen_image_edit':
                         row = sub_box_rescale.row()
                         row.prop(scene, "qwen_rescale_alignment", text="Qwen VL-Aligned Rescale (112px)", toggle=True, icon="SNAP_INCREMENT")
-                    elif scene.model_architecture == 'qwen_image_21':
+                    elif scene.model_architecture in QWEN_21_ARCHITECTURES:
                         sub_box_rescale.label(text="Qwen 2.1 aligns to 32px", icon="SNAP_INCREMENT")
+                    elif scene.model_architecture in ('moss_image', 'fibo_edit'):
+                        sub_box_rescale.label(text="Aligns to 16px latent patches", icon="SNAP_INCREMENT")
                 row = content_box.row()
                 if 'overwrite_material' in _diff_props:
                     row.alert = True
@@ -1628,17 +1664,19 @@ class StableGenPanel(bpy.types.Panel):
                     row.label(text="→ " + _diff_props['overwrite_material'])
 
             # --- Image Guidance (IPAdapter & ControlNet) ---
-            if _show_diffusion_sections:
+            # MOSS-Image has neither IPAdapter nor ControlNet models.
+            if _show_diffusion_sections and scene.model_architecture != 'moss_image':
                 if scene.model_architecture in ['sdxl', 'flux1']:
                     content_box = draw_collapsible_section(advanced_params_box, "show_image_guidance_settings", "Image Guidance (IPAdapter & ControlNet)", icon="MODIFIER")
                 elif scene.model_architecture == 'flux2_klein':
                     content_box = draw_collapsible_section(advanced_params_box, "show_image_guidance_settings", "FLUX.2 Klein Guidance", icon="MODIFIER")
-                else: # Qwen Image
-                    content_box = draw_collapsible_section(advanced_params_box, "show_image_guidance_settings", "Qwen Image Guidance", icon="MODIFIER")
+                else: # Qwen Image and FIBO
+                    guidance_title = "FIBO Guidance" if scene.model_architecture == 'fibo_edit' else "Qwen Image Guidance"
+                    content_box = draw_collapsible_section(advanced_params_box, "show_image_guidance_settings", guidance_title, icon="MODIFIER")
             else:
                 content_box = None
             if content_box:
-                if scene.model_architecture in ('qwen_image_edit', 'qwen_image_21', 'flux2_klein'):
+                if scene.model_architecture in EDIT_ARCHITECTURES:
                     if scene.model_architecture == 'flux2_klein' or scene.qwen_generation_method == 'generate':
                         split = content_box.split(factor=0.5)
                         split.label(text="Guidance Map:")
@@ -1725,7 +1763,7 @@ class StableGenPanel(bpy.types.Panel):
                     row = content_box.row()
                     row.prop(scene, "qwen_timestep_zero_ref", text="Timestep-Zero References (color shift fix)", toggle=True, icon="COLORSET_08_VEC")
 
-                    if scene.model_architecture in {'qwen_image_edit', 'qwen_image_21'}:
+                    if scene.model_architecture in QWEN_ARCHITECTURES:
                         split = content_box.split(factor=0.5)
                         split.label(text="Prompt Template:")
                         split.prop(scene, "qwen_prompt_template", text="")
@@ -1736,9 +1774,8 @@ class StableGenPanel(bpy.types.Panel):
                         row.prop(scene, "qwen_use_custom_prompts", text="Custom Guidance Prompts", toggle=True, icon="TEXT")
                         custom_guidance_enabled = scene.qwen_use_custom_prompts
 
-                    if (scene.model_architecture in {
-                            'qwen_image_edit', 'qwen_image_21'
-                        } or custom_guidance_enabled):
+                    if (scene.model_architecture in QWEN_ARCHITECTURES
+                            or custom_guidance_enabled):
                         custom_prompt_box = content_box.box()
                         
                         # Initial Image Prompt
@@ -1776,7 +1813,7 @@ class StableGenPanel(bpy.types.Panel):
                         context_box = content_box.box()
                         context_box.label(text="Context Render Options")
 
-                        if scene.model_architecture != 'qwen_image_21':
+                        if scene.model_architecture not in CANVAS_EDIT_ARCHITECTURES:
                             row = context_box.row()
                             row.prop(scene, "qwen_prompt_gray_background", text="Prompt: Gray Background", toggle=True)
 
@@ -1884,7 +1921,7 @@ class StableGenPanel(bpy.types.Panel):
                             cn_box.operator("stablegen.add_controlnet_unit", text="Add ControlNet Unit", icon="ADD")
                             cn_box.operator("stablegen.remove_controlnet_unit", text="Remove Last ControlNet Unit", icon="REMOVE")
 
-            if _show_diffusion_sections and scene.model_architecture not in ('qwen_image_edit', 'qwen_image_21', 'flux2_klein'):
+            if _show_diffusion_sections and scene.model_architecture not in EDIT_ARCHITECTURES:
                 # --- Inpainting Options (Conditional) ---
                 if scene.generation_method == 'uv_inpaint' or scene.generation_method == 'sequential':
                     content_box = draw_collapsible_section(advanced_params_box, "show_masking_inpainting_settings", "Inpainting Options", icon="MOD_MASK")
@@ -1934,7 +1971,7 @@ class StableGenPanel(bpy.types.Panel):
                     draw_masked_edit_controls(mode_specific_outer_box, context)
 
                 # Qwen Local Edit Mode Parameters
-                elif scene.model_architecture.startswith('qwen') and scene.qwen_generation_method == 'local_edit':
+                elif scene.model_architecture in QWEN_ARCHITECTURES and scene.qwen_generation_method == 'local_edit':
                     row = mode_specific_outer_box.row()
                     row.alignment = 'CENTER'
                     row.label(text="Qwen Local Edit Parameters", icon='BRUSH_DATA')
@@ -1991,7 +2028,7 @@ class StableGenPanel(bpy.types.Panel):
                         row.prop(scene, "view_blend_color_match_strength", text="Strength")
 
                 # Qwen Refine Mode Parameters
-                elif scene.model_architecture.startswith('qwen') and scene.qwen_generation_method == 'refine':
+                elif scene.model_architecture in QWEN_ARCHITECTURES and scene.qwen_generation_method == 'refine':
                     row = mode_specific_outer_box.row()
                     row.alignment = 'CENTER'
                     row.label(text="Qwen Refine Parameters", icon='SHADERFX')
@@ -2061,7 +2098,7 @@ class StableGenPanel(bpy.types.Panel):
                             sub_ip_box_separate.prop(scene, "sequential_desaturate_factor", text="Reference desaturation")
                             sub_ip_box_separate.prop(scene, "sequential_contrast_factor", text="Reference contrast reduction")
 
-                        if context.scene.model_architecture not in ('qwen_image_edit', 'qwen_image_21', 'flux2_klein'):
+                        if context.scene.model_architecture not in EDIT_ARCHITECTURES:
                             split = sub_ip_box_separate.split(factor=0.5) 
                             if context.scene.model_architecture == 'sdxl':
                                 split.label(text="Weight Type:")
@@ -2261,7 +2298,7 @@ class StableGenPanel(bpy.types.Panel):
                             sub_ip_seq_box.prop(scene, "sequential_desaturate_factor", text="Reference desaturation")
                             sub_ip_seq_box.prop(scene, "sequential_contrast_factor", text="Reference contrast reduction")
 
-                        if context.scene.model_architecture not in ('qwen_image_edit', 'qwen_image_21', 'flux2_klein'):
+                        if context.scene.model_architecture not in EDIT_ARCHITECTURES:
                             split = sub_ip_seq_box.split(factor=0.5)
                             if context.scene.model_architecture == 'sdxl':
                                 split.label(text="Weight Type:")
@@ -2352,7 +2389,7 @@ class StableGenPanel(bpy.types.Panel):
             context_box = preview_box.box()
             context_box.label(text="Context Render Options")
 
-            if scene.model_architecture != 'qwen_image_21':
+            if scene.model_architecture not in CANVAS_EDIT_ARCHITECTURES:
                 context_box.prop(
                     scene,
                     "qwen_prompt_gray_background",
@@ -2362,7 +2399,7 @@ class StableGenPanel(bpy.types.Panel):
 
             colors_box = context_box.box()
             colors_box.label(text="Context Render Colors")
-            if scene.model_architecture != 'qwen_image_21':
+            if scene.model_architecture not in CANVAS_EDIT_ARCHITECTURES:
                 colors_box.prop(
                     scene, "qwen_guidance_background_color", text="Image background"
                 )

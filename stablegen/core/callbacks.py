@@ -23,6 +23,7 @@ from .server_api import (
 )
 from ..timeout_config import get_timeout
 from ..texturing.qwen_models import QWEN_PROMPT_TEMPLATE_ITEMS
+from .architectures import DIFFUSION_ARCHITECTURES, QWEN_ARCHITECTURES
 
 
 # ── Architecture-mode helpers ──────────────────────────────────────────────
@@ -30,6 +31,9 @@ from ..texturing.qwen_models import QWEN_PROMPT_TEMPLATE_ITEMS
 _QWEN_DEFAULT_PROMPT_TEMPLATES = {
     'qwen_image_edit': 'QWEN_EDIT_LEGACY',
     'qwen_image_21': 'QWEN_21_DEFAULT',
+    'qwen_image_21_turbo': 'QWEN_21_DEFAULT',
+    # FIBO also edits its first image, so it shares the Qwen 2.1 image roles.
+    'fibo_edit': 'QWEN_21_DEFAULT',
 }
 _QWEN_PROMPT_FIELDS = (
     ('qwen_custom_prompt_initial', True, None),
@@ -63,9 +67,7 @@ def refresh_qwen_prompt_template_fields(scene):
     global _qwen_prompt_sync_active
     if _qwen_prompt_sync_active:
         return
-    if getattr(scene, 'model_architecture', '') not in {
-        'qwen_image_edit', 'qwen_image_21'
-    }:
+    if getattr(scene, 'model_architecture', '') not in QWEN_ARCHITECTURES:
         return
     template_id = getattr(scene, 'qwen_prompt_template', 'CUSTOM')
     if template_id == 'CUSTOM':
@@ -97,9 +99,7 @@ def update_qwen_prompt_field(self, context):
     if _qwen_prompt_sync_active:
         return
     scene = context.scene
-    if getattr(scene, 'model_architecture', '') not in {
-        'qwen_image_edit', 'qwen_image_21'
-    }:
+    if getattr(scene, 'model_architecture', '') not in QWEN_ARCHITECTURES:
         update_parameters(self, context)
         return
 
@@ -168,7 +168,7 @@ def update_architecture_mode(self, context):
 def _sync_trellis2_backbone(scene):
     """Pick the right diffusion backbone for the current TRELLIS.2 state."""
     tex_mode = getattr(scene, 'trellis2_texture_mode', 'native')
-    if tex_mode in ('sdxl', 'flux1', 'qwen_image_edit', 'qwen_image_21', 'flux2_klein'):
+    if tex_mode in DIFFUSION_ARCHITECTURES:
         target = tex_mode
     elif getattr(scene, 'trellis2_generate_from', 'image') == 'prompt':
         target = getattr(scene, 'trellis2_initial_image_arch', 'sdxl')
@@ -209,6 +209,20 @@ def update_trellis2_generate_from(self, context):
     if scene.trellis2_generate_from == 'prompt':
         _sync_trellis2_backbone(scene)
 
+    update_parameters(self, context)
+
+
+def update_pbr_albedo_source(self, context):
+    """Set the saturation correction to suit the chosen albedo source.
+
+    Marigold IID-Appearance desaturates and needs the correction; Marigold V2
+    already keeps the generated colors, so the correction would only dull it.
+    """
+    source = context.scene.pbr_albedo_source
+    if source == 'marigold_v2':
+        context.scene.pbr_albedo_auto_saturation = False
+    elif source == 'marigold':
+        context.scene.pbr_albedo_auto_saturation = True
     update_parameters(self, context)
 
 

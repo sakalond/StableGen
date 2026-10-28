@@ -14,7 +14,7 @@ import uuid
 import requests
 
 from .timeout_config import get_timeout
-from .generation_status import reporting_upload
+from .core.generation_status import reporting_upload
 
 def redraw_ui(context):
     """Redraws the UI to reflect changes in the operator's progress and status."""

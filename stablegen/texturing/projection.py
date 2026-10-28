@@ -1,4 +1,4 @@
-from ..feature_flags import experimental_enabled
+from ..core.feature_flags import experimental_enabled
 import bpy
 import os
 from math import atan, tan, pi
@@ -10,6 +10,7 @@ from mathutils import Matrix, Vector
 from .jobs import operation
 from .projection_cache import eligible as _cache_eligible, configuration as _cache_configuration, graph_state as _graph_state, asset_state as _asset_state
 from .svm_budget import SVM_STACK_SIZE, estimate_svm_stack
+from ..core.architectures import EDIT_ARCHITECTURES, QWEN_21_ARCHITECTURES, QWEN_ARCHITECTURES, SDXL_GRAPH_ARCHITECTURES
 
 
 _SG_BUFFER_UV_NAME = "_SG_ProjectionBuffer"
@@ -1807,7 +1808,7 @@ def project_image(
                      and getattr(context.scene, 'sg_silhouette_feather', 0) > 0)
     if surface_blend:
         if (context.scene.generation_method in {'local_edit', 'refine'}
-                or (context.scene.model_architecture.startswith('qwen')
+                or (context.scene.model_architecture in QWEN_ARCHITECTURES
                     and context.scene.qwen_generation_method == 'local_edit')):
             raise ValueError('Surface Blend preview supports base multi-view projection; use Local Unsharpen for local refinement')
         # A newly generated view changes the joint solution. Do not reuse a
@@ -1872,7 +1873,7 @@ def project_image(
             return mult
 
         # Compute offsets based on recursion level
-        is_local_edit = (context.scene.generation_method == 'local_edit' or (context.scene.model_architecture.startswith('qwen') and context.scene.qwen_generation_method == 'local_edit'))
+        is_local_edit = (context.scene.generation_method == 'local_edit' or (context.scene.model_architecture in QWEN_ARCHITECTURES and context.scene.qwen_generation_method == 'local_edit'))
         if is_local_edit:
             last_node_x = last_node.location[0] if last_node else 0
             x_offset = 1000 + level * 800 + last_node_x + 200 if context.scene.early_priority else 1000 + level * 600 + last_node_x + 200
@@ -2535,7 +2536,7 @@ def project_image(
 
         # Create the material
         to_switch = False
-        is_local_edit = (context.scene.generation_method == 'local_edit' or (context.scene.model_architecture.startswith('qwen') and context.scene.qwen_generation_method == 'local_edit'))
+        is_local_edit = (context.scene.generation_method == 'local_edit' or (context.scene.model_architecture in QWEN_ARCHITECTURES and context.scene.qwen_generation_method == 'local_edit'))
         if is_local_edit and not context.scene.overwrite_material:
             # Copy active material
             mat = obj.active_material.copy()
@@ -2630,8 +2631,8 @@ def project_image(
             getattr(context.scene, 'sg_rework_projection_guard', False),
             getattr(context.scene, 'qwen_use_confidence_context', False),
             experimental_enabled(context.scene, 'qwen_use_projection_write_masks'),
-            context.scene.model_architecture == 'sdxl',
-            context.scene.model_architecture == 'qwen_image_21',
+            context.scene.model_architecture in SDXL_GRAPH_ARCHITECTURES,
+            context.scene.model_architecture in QWEN_21_ARCHITECTURES,
         ))
         legacy_incremental_update = (
             ((context.scene.generation_method == 'sequential' and stop_index > 0)
@@ -2887,12 +2888,12 @@ def project_image(
             return acquisition
 
         # Voronoi mode flag: keep natural weights for non-generated cameras
-        voronoi_active = (context.scene.model_architecture in ('qwen_image_edit', 'qwen_image_21', 'flux2_klein')
+        voronoi_active = (context.scene.model_architecture in EDIT_ARCHITECTURES
                           and getattr(context.scene, 'qwen_voronoi_mode', False)
                           and context.scene.generation_method == 'sequential')
         confidence_context_active = (
             getattr(context.scene, 'qwen_use_confidence_context', False)
-            and context.scene.model_architecture.startswith('qwen')
+            and context.scene.model_architecture in QWEN_ARCHITECTURES
             and context.scene.generation_method == 'sequential'
             and context.scene.qwen_generation_method == 'generate'
             and context.scene.qwen_context_render_mode
@@ -2991,7 +2992,7 @@ def project_image(
 
             elif use_native_raycast:
                 # ── Native Raycast path (Blender 5.1+) ──
-                is_local_edit_mode = (context.scene.generation_method == 'local_edit' or (context.scene.model_architecture.startswith('qwen') and context.scene.qwen_generation_method == 'local_edit'))
+                is_local_edit_mode = (context.scene.generation_method == 'local_edit' or (context.scene.model_architecture in QWEN_ARCHITECTURES and context.scene.qwen_generation_method == 'local_edit'))
                 native_pre_factors = None
                 if (not is_local_edit_mode
                         and getattr(context.scene, 'sg_rework_acquisition_quality', False)):
@@ -3116,7 +3117,7 @@ def project_image(
 
                 is_local_edit_mode = (
                     context.scene.generation_method == 'local_edit'
-                    or (context.scene.model_architecture.startswith('qwen')
+                    or (context.scene.model_architecture in QWEN_ARCHITECTURES
                         and context.scene.qwen_generation_method == 'local_edit')
                 )
                 needs_frame_quality = (
@@ -3258,7 +3259,7 @@ def project_image(
             use_qwen_write_mask = (
                 i > 0
                 and (i <= stop_index or stable_sequential)
-                and context.scene.model_architecture.startswith('qwen')
+                and context.scene.model_architecture in QWEN_ARCHITECTURES
                 and context.scene.generation_method == 'sequential'
                 and context.scene.qwen_generation_method == 'generate'
                 and context.scene.qwen_context_render_mode in {'REPLACE_STYLE', 'ADDITIONAL'}
@@ -3266,11 +3267,11 @@ def project_image(
             )
             qwen_write_weight = None
             use_sdxl_write_mask = (
-                i > 0 and (i <= stop_index or stable_sequential) and (context.scene.model_architecture == 'sdxl') and (context.scene.generation_method == 'sequential')
+                i > 0 and (i <= stop_index or stable_sequential) and (context.scene.model_architecture in SDXL_GRAPH_ARCHITECTURES) and (context.scene.generation_method == 'sequential')
             )
             use_qwen21_generated_alpha = (
                 (i <= stop_index or stable_sequential)
-                and context.scene.model_architecture == 'qwen_image_21'
+                and context.scene.model_architecture in QWEN_21_ARCHITECTURES
             )
             if (use_qwen_write_mask or use_sdxl_write_mask) and script_nodes_outputs:
                 current_weight = script_nodes_outputs[-1]

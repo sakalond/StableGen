@@ -15,7 +15,10 @@ from .presets import update_parameters
 from ..utils import sg_modal_active
 from ..core import ADDON_PKG
 from ..core.server_api import _fetch_api_list, fetch_diffusion_models
-from ..texturing.qwen_models import is_qwen_image_21_model
+from ..texturing.qwen_models import (
+    is_fibo_model, is_moss_image_model,
+    is_qwen_image_21_model, is_qwen_image_21_turbo_model,
+)
 from ..core.state import (
     _cached_checkpoint_list,
     _cached_checkpoint_architecture,
@@ -24,6 +27,23 @@ from ..core.state import (
     _inc_pending_refreshes,
     _run_async,
 )
+
+# Architectures whose model is listed from the diffusion-model folders:
+# (accepts filename, description used in refresh reports).
+_DIFFUSION_MODEL_FILTERS = {
+    'flux1': (lambda name: True, "UNET"),
+    'qwen_image_edit': (
+        lambda name: not (is_qwen_image_21_model(name)
+                          or is_moss_image_model(name) or is_fibo_model(name)),
+        "Qwen-Image-Edit model"),
+    'qwen_image_21': (
+        lambda name: (is_qwen_image_21_model(name)
+                      and not is_qwen_image_21_turbo_model(name)),
+        "Qwen-Image 2.1 model"),
+    'qwen_image_21_turbo': (is_qwen_image_21_turbo_model, "Qwen-Image 2.1 Turbo model"),
+    'moss_image': (is_moss_image_model, "MOSS-Image model"),
+    'fibo_edit': (is_fibo_model, "FIBO model"),
+}
 
 
 # ── Enum callbacks for model dropdowns ─────────────────────────────────────
@@ -209,19 +229,11 @@ class RefreshCheckpointList(bpy.types.Operator):
             if architecture == 'sdxl':
                 model_list = _fetch_api_list(server_address, "/models/checkpoints")
                 model_type_desc = "Checkpoint"
-            elif architecture in ('flux1', 'qwen_image_edit', 'qwen_image_21'):
+            elif architecture in _DIFFUSION_MODEL_FILTERS:
                 model_list = fetch_diffusion_models(server_address)
-                if model_list is not None and architecture == 'qwen_image_21':
-                    model_list = [name for name in model_list
-                                  if is_qwen_image_21_model(name)]
-                elif model_list is not None and architecture == 'qwen_image_edit':
-                    model_list = [name for name in model_list
-                                  if not is_qwen_image_21_model(name)]
-                model_type_desc = (
-                    "UNET" if architecture == 'flux1'
-                    else "Qwen-Image 2.1 model" if architecture == 'qwen_image_21'
-                    else "Qwen-Image-Edit model"
-                )
+                accepts, model_type_desc = _DIFFUSION_MODEL_FILTERS[architecture]
+                if model_list is not None:
+                    model_list = [name for name in model_list if accepts(name)]
             elif architecture == 'flux2_klein':
                 model_list = _fetch_api_list(server_address, "/models/diffusion_models")
                 model_type_desc = "Diffusion Model"

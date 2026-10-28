@@ -9,6 +9,18 @@ QWEN_IMAGE_21_TEXT_ENCODER = "qwen3vl_8b_w4a8.safetensors"
 QWEN_IMAGE_21_VAE = "qwen_image_2.1_vae_bf16.safetensors"
 QWEN_IMAGE_EDIT_ARCHITECTURE = "qwen_image_edit"
 QWEN_IMAGE_21_ARCHITECTURE = "qwen_image_21"
+QWEN_IMAGE_21_TURBO_ARCHITECTURE = "qwen_image_21_turbo"
+FIBO_EDIT_ARCHITECTURE = "fibo_edit"
+# Qwen-Image 2.1 Turbo is distilled to one fixed 8-step schedule
+# (``sample_sigmas`` in its model_index.json, used by the official ComfyUI
+# templates through ManualSigmas). Standard schedulers do not reproduce it.
+QWEN_IMAGE_21_TURBO_STEPS = 8
+QWEN_IMAGE_21_TURBO_SIGMAS = (
+    "1.0, 0.978453, 0.95418, 0.926626, 0.89508, 0.845148, 0.704534, 0.414568, 0"
+)
+# Bria FIBO 2.0, as packaged by Comfy-Org/Fibo-2.0 for ComfyUI's core nodes.
+FIBO_TEXT_ENCODER = "qwen3vl_4b_int8_convrot.safetensors"
+FIBO_VAE = "flux2-vae.safetensors"
 QWEN_IMAGE_21_RGBA_PREFIX = "This is an RGBA format image with transparency."
 QWEN_IMAGE_21_RGBA_SUFFIX = (
     "The image has an alpha channel and a transparent background."
@@ -73,8 +85,26 @@ def is_qwen_image_21_model(model_name: str) -> bool:
     retained for filtering model choices and migrating files saved before the
     dedicated architecture existed; generation dispatch uses the architecture.
     """
-    normalized = (model_name or "").replace("\\", "/").rsplit("/", 1)[-1].lower()
-    return bool(re.search(r"qwen[-_. ]*image[-_. ]*2[-_. ]*1(?:\D|$)", normalized))
+    return bool(re.search(r"qwen[-_. ]*image[-_. ]*2[-_. ]*1(?:\D|$)", _model_basename(model_name)))
+
+
+def is_qwen_image_21_turbo_model(model_name: str) -> bool:
+    """Return whether a Qwen-Image 2.1 model file is the few-step Turbo variant."""
+    return is_qwen_image_21_model(model_name) and "turbo" in _model_basename(model_name)
+
+
+def is_moss_image_model(model_name: str) -> bool:
+    """Return whether a diffusion model file belongs to MOSS-Image."""
+    return bool(re.search(r"moss[-_. ]*image", _model_basename(model_name)))
+
+
+def is_fibo_model(model_name: str) -> bool:
+    """Return whether a diffusion model file belongs to Bria FIBO."""
+    return "fibo" in _model_basename(model_name)
+
+
+def _model_basename(model_name: str) -> str:
+    return (model_name or "").replace("\\", "/").rsplit("/", 1)[-1].lower()
 
 
 def is_qwen_architecture(architecture: str) -> bool:
@@ -82,6 +112,8 @@ def is_qwen_architecture(architecture: str) -> bool:
     return architecture in {
         QWEN_IMAGE_EDIT_ARCHITECTURE,
         QWEN_IMAGE_21_ARCHITECTURE,
+        QWEN_IMAGE_21_TURBO_ARCHITECTURE,
+        FIBO_EDIT_ARCHITECTURE,
     }
 
 
@@ -272,3 +304,14 @@ def remap_qwen_image_21_prompt(text: str, image_mapping: dict[int, int]) -> str:
         converted,
         flags=re.IGNORECASE,
     )
+
+
+def fibo_prompt(text: str, image_mapping: dict[int, int] | None = None) -> str:
+    """Convert image references to FIBO 2.0's explicit ``<image_N>`` indices.
+
+    FIBO refers to its inputs by position only, so every reference is made
+    explicit. ``image_mapping`` renumbers them after the graph adapter has
+    moved the projected context into the first (edited) slot.
+    """
+    converted = remap_qwen_image_21_prompt(text, image_mapping or {})
+    return re.sub(r"<image([1-9]\d*)>", r"<image_\1>", converted, flags=re.IGNORECASE)

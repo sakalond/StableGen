@@ -54,6 +54,7 @@ from .mesh_gen.rig_display import (
     fortune_conversion_risks,
     selected_armatures_for_display,
 )
+from .core.architectures import CANVAS_EDIT_ARCHITECTURES, EDIT_ARCHITECTURES, QWEN_ARCHITECTURES
 
 
 # ─── Shared helpers ──────────────────────────────────────────────────────
@@ -2188,11 +2189,7 @@ _INTERACTIVE_DISCARD_BUILD_SETTINGS = (
     'qwen_voronoi_mode',
 )
 
-_MAGENTA_EDIT_ARCHITECTURES = {
-    'qwen_image_edit',
-    'qwen_image_21',
-    'flux2_klein',
-}
+_MAGENTA_EDIT_ARCHITECTURES = EDIT_ARCHITECTURES
 
 
 def _copy_scene_value(value):
@@ -2572,7 +2569,7 @@ class SG_OT_InteractiveDiscardCheck(bpy.types.Operator):
         )
         fallback = tuple(scene.qwen_guidance_fallback_color)
         background = tuple(scene.qwen_guidance_background_color)
-        if scene.model_architecture == 'qwen_image_21':
+        if scene.model_architecture in CANVAS_EDIT_ARCHITECTURES:
             background = (0.5, 0.5, 0.5)
 
         # Blender's write_still render also writes to scene.render.filepath in
@@ -2973,7 +2970,7 @@ class SG_OT_DebugProjectionLine(bpy.types.Operator):
             self.report({'ERROR'}, 'Current material uses baked Surface Blend weights; reproject with Boundary Crossfade or Local Unsharpen for this comparison')
             return {'CANCELLED'}
         if context.scene.generation_method == 'local_edit' or (
-                context.scene.model_architecture.startswith('qwen')
+                context.scene.model_architecture in QWEN_ARCHITECTURES
                 and context.scene.qwen_generation_method == 'local_edit'):
             self.report({'ERROR'}, 'Line diagnostics currently require an ordinary multi-view projection, not a local edit pass')
             return {'CANCELLED'}

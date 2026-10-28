@@ -389,7 +389,9 @@ class StableGenClearQuantizationPreview(bpy.types.Operator):
                                     pass
                             except Exception:
                                 pass
-                            
+        return {'FINISHED'}
+
+
 def _generate_blue_noise_tile(size=64, seed=42):
     """Generate a toroidal blue noise threshold tile via FFT spectral shaping.
 

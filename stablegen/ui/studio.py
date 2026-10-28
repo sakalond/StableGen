@@ -29,12 +29,108 @@ from .studio_widgets import (Painter, FONT_SIZE, CONTROL_HEIGHT, CONTROL_GAP,
 from .presets import PRESETS
 from ..utils import sg_modal_active
 from ..core import ADDON_PKG, legacy_panel_enabled
-from ..generation_status import WAITING_STAGES
+from ..core.generation_status import WAITING_STAGES
+from ..core.architectures import ARCHITECTURE_ITEMS, QWEN_ARCHITECTURES, architecture_status
 
 TAB = 'StableGen'
 PAGES = [('GENERATE', 'Texture'), ('CAMERAS', 'Cameras'), ('BLEND', 'Blending')]
 MORE = [('TOOLS', 'Tools'), ('QUEUE', 'Scene queue'), ('DEBUG', 'Diagnostics'),
         ('MESH', 'Mesh & rig'), ('PRINT', '3D printing'), ('EXPERIMENTS', 'Experiments')]
+# Architectures that generate the asset itself rather than texturing an existing mesh.
+ASSET_ARCHITECTURES = {'trellis2'}
+
+
+ARCHITECTURE_PROPERTIES = {'architecture_mode', 'model_architecture', 'trellis2_texture_mode', 'trellis2_initial_image_arch'}
+
+
+def _architecture_tags(prop, identifier):
+    """Tags for an architecture choice, drawn right to left: its role, then its support status."""
+    if prop not in ARCHITECTURE_PROPERTIES:
+        return []
+    tags = ['Asset generation' if identifier in ASSET_ARCHITECTURES else 'Texturing'] if prop == 'architecture_mode' else []
+    status = architecture_status(identifier)
+    return tags + [status] if status else tags
+
+
+# Preset names repeat their model and variant, which the panel shows as tags instead: it lists only the current
+# architecture's presets, so the model name is redundant there.
+PRESET_MODEL_NAMES = {'qwen_image_edit': 'qwen', 'qwen_image_21': 'qwen 2.1', 'qwen_image_21_turbo': 'qwen 2.1 turbo',
+                      'fibo_edit': 'fibo', 'moss_image': 'moss', 'flux2_klein': 'klein'}
+PRESET_VARIANTS = {'nunchaku': 'Nunchaku', 'experimental': 'Experimental'}
+PRESET_WORKFLOWS = ('New texture', 'Refine', 'Local edit', 'UV inpaint', 'Mesh + texture', 'Mesh only')
+
+
+def _preset_workflow(preset):
+    if preset.get('architecture_mode') == 'trellis2':
+        return 'Mesh only' if preset.get('trellis2_texture_mode') == 'none' else 'Mesh + texture'
+    if preset.get('generation_method') == 'uv_inpaint':
+        return 'UV inpaint'
+    if 'local_edit' in (preset.get('generation_method'), preset.get('qwen_generation_method')):
+        return 'Local edit'
+    if preset.get('qwen_generation_method') == 'refine':
+        return 'Refine'
+    return 'New texture'
+
+
+def _preset_model(preset):
+    if preset.get('architecture_mode') == 'trellis2':
+        return preset.get('trellis2_texture_mode', 'none')
+    return preset.get('model_architecture', 'sdxl')
+
+
+def _strip(label, word):
+    lower = label.casefold()
+    if lower.endswith(' (' + word + ')'):
+        return label[:-len(word) - 3], True
+    if lower.startswith(word + ' '):
+        return label[len(word) + 1:], True
+    return label, False
+
+
+def _preset_label(identifier, label):
+    preset = PRESETS.get(identifier)
+    if not preset:
+        return label
+    trellis = preset.get('architecture_mode') == 'trellis2'
+    for word in ('mesh + texture', 'mesh only', *PRESET_VARIANTS) if trellis else PRESET_VARIANTS:
+        label = _strip(label, word)[0]
+    name = PRESET_MODEL_NAMES.get(_preset_model(preset))
+    if name:
+        label = _strip(label, name)[0]
+    if label.startswith('Uv '):         # title() case of UV
+        label = 'UV ' + label[3:]
+    # TRELLIS.2 (MESH ONLY) is the stock mesh preset once its tag says what it does.
+    return 'Default' if trellis and label.casefold() == 'trellis.2' else label
+
+
+def _preset_tags(identifier):
+    """Tags for a preset, drawn right to left: its workflow, then its texture model (TRELLIS.2) and variant."""
+    preset = PRESETS.get(identifier)
+    if not preset:
+        return []
+    tags = [_preset_workflow(preset)]
+    if preset.get('architecture_mode') == 'trellis2' and preset.get('trellis2_texture_mode') not in (None, 'none', 'native'):
+        tags.append(_architecture_label(preset['trellis2_texture_mode']))
+    tags += [tag for word, tag in PRESET_VARIANTS.items() if _strip(identifier, word)[1]]
+    return tags
+
+
+def _architecture_label(identifier):
+    return next((item[1] for item in ARCHITECTURE_ITEMS if item[0] == identifier), identifier)
+
+
+def _choice_tags(prop, identifier):
+    return _preset_tags(identifier) if prop == 'stablegen_preset' else _architecture_tags(prop, identifier)
+
+
+def _draw_tags(p, tags, right, y, enabled=True):
+    """Draw *tags* ending at *right*; returns the width they take, gaps included."""
+    used = 0
+    for tag in tags:
+        used += p.tag(tag, right - used, y, enabled=enabled) + 4
+    return used
+
+
 PROJECTION_KEYS = {'discard_factor', 'weight_exponent', 'early_priority', 'early_priority_strength',
                    'bake_visibility_weights', 'sg_texturing_frame', 'sg_allow_backface_projection',
                    'sg_rework_acquisition_quality', 'sg_rework_projection_guard', 'sg_guard_directional',
@@ -402,6 +498,11 @@ class StudioSession:
                           (PRESETS[item[0]].get('architecture_mode') or PRESETS[item[0]].get('model_architecture', 'sdxl')) == arch))]
             value = binding.value(bpy.context)
         items = [(item[0], item[1], item[2] if len(item) > 2 else '') for item in items if item and item[0]]
+        if binding.property == 'stablegen_preset':
+            # Group by workflow (new texture, refine, local edit, ...); Custom stays last.
+            order = {w: n for n, w in enumerate(PRESET_WORKFLOWS)}
+            items = sorted(((i, _preset_label(i, label), d) for i, label, d in items),
+                           key=lambda item: order.get(_preset_workflow(PRESETS[item[0]]), 99) if item[0] in PRESETS else 100)
         if not items:
             self.native(binding=binding)
             return
@@ -698,7 +799,7 @@ class StudioSession:
             return {'PASS_THROUGH'}
         if self.menu:
             if event.value == 'PRESS' and event.type == 'ESC':
-                self.menu = None
+                self.menu = self.menu.get('parent')
                 self.area.tag_redraw()
                 self.update_hover()
                 return {'RUNNING_MODAL'}
@@ -749,7 +850,7 @@ class StudioSession:
         if event.type == 'LEFTMOUSE' and event.value in {'PRESS', 'DOUBLE_CLICK'}:
             target = self.hit_target()
             if self.menu and (target is None or not isinstance(target.action, tuple) or not target.action[0].startswith('menu-')):
-                self.menu = None
+                self.menu = self.menu.get('parent')
                 self.area.tag_redraw()
                 return {'RUNNING_MODAL'}
             if self.edit and target and target.key == self.edit['key']:
@@ -758,7 +859,9 @@ class StudioSession:
             else:
                 self.commit()
                 self.activate(target)
-                if self.edit and target and target.action[2]:
+                # Only a field's own click places the caret; buttons such as Search also start an edit.
+                if (self.edit and target and isinstance(target.action, tuple) and target.action[0] == 'edit'
+                        and target.action[2]):
                     self.select_caret(x, y)
                     self.edit['selecting'] = True
             self.area.tag_redraw()
@@ -832,9 +935,18 @@ class StudioSession:
             return height + label_height + 24
         if prop.type == 'ENUM':
             label_value = model.enum_label(binding, ctx)
+            if binding.property == 'stablegen_preset':
+                label_value = _preset_label(value, label_value)
             painter.outline(x, y, width, CONTROL_HEIGHT, fill='menu',
                             border='hover_border' if enabled and self.hovered(key) else 'menu_border', corners=corners)
-            painter.text(label_value, x + 8, y + 5, FONT_SIZE, 'menu_text' if enabled else 'disabled', width - 33)
+            text_width = width - 33
+            tags = _choice_tags(binding.property, value)
+            # In a narrow field an architecture drops its role tag before its support status; a preset keeps its
+            # workflow tag longest.
+            while tags and painter.measure(label_value) + sum(painter.measure(t, 9) + 14 for t in tags) + 40 > width:
+                tags.pop(-1 if binding.property == 'stablegen_preset' else 0)
+            text_width -= _draw_tags(painter, tags, x + width - 24, y + 4, enabled)
+            painter.text(label_value, x + 8, y + 5, FONT_SIZE, 'menu_text' if enabled else 'disabled', text_width)
             painter.icon('down', x + width - 16, y + 6, 10, 'menu_text' if enabled else 'disabled')
             painter.target(key, (x, y, width, CONTROL_HEIGHT), ('enum', binding), enabled, hint)
         elif prop.type in {'STRING', 'INT', 'FLOAT'} and not getattr(prop, 'is_array', False):
@@ -1286,30 +1398,28 @@ class StudioSession:
             p.text(dict(MORE).get(current_page, 'Search'), x + 26, 29, 10, 'muted', width - 80)
         scene = bpy.context.scene
         y = 42
-        native = scene.architecture_mode == 'trellis2' and scene.trellis2_texture_mode in {'native', 'none'}
-        if not native:
-            p.outline(x, y, width, 46, 'raised')
-            tools = [('object.add_cameras', 'Add cameras', 'camera'),
-                     ('object.collect_camera_prompts', 'Collect camera prompts' if width >= 360 else 'Collect prompts', 'document')]
-            for i, (name, text, icon) in enumerate(tools):
-                with _viewport(self):
-                    enabled = model.operator(name).poll() and not self.busy
-                key = 'toolbar:' + name
-                p.button(key, (x + i * width / 2 + 1, y + 1, width / 2 - 2, CONTROL_HEIGHT), text,
-                         ('operator', name, {}), icon=icon, enabled=enabled, hover=self.hovered(key),
-                         hint=help_text.operator_hint(name, bpy.context, enabled, busy=self.busy))
-            p.rect(x + width / 2, y + 1, 1, CONTROL_HEIGHT, 'line')
-            p.rect(x + 1, y + 24, width - 2, 1, 'divider')
-            tools = [('object.clone_camera', 'Clone', 'clone'), ('object.mirror_camera', 'Mirror', 'mirror'),
-                     ('object.apply_auto_aspect', 'Auto aspect' if width >= 360 else 'Aspect', 'expand'), ('stablegen.camera_display', 'Display', 'labels')]
-            for i, (name, text, icon) in enumerate(tools):
-                with _viewport(self):
-                    enabled = model.operator(name).poll() and (not self.busy or name == 'stablegen.camera_display')
-                key = 'toolbar:' + name
-                p.button(key, (x + i * width / 4 + 1, y + 25, width / 4 - 2, 20), text,
-                         ('operator', name, {}), icon=icon, enabled=enabled, hover=self.hovered(key),
-                         hint=help_text.operator_hint(name, bpy.context, enabled, busy=self.busy))
-            y += 56
+        p.outline(x, y, width, 46, 'raised')
+        tools = [('object.add_cameras', 'Add cameras', 'camera'),
+                 ('object.collect_camera_prompts', 'Collect camera prompts' if width >= 360 else 'Collect prompts', 'document')]
+        for i, (name, text, icon) in enumerate(tools):
+            with _viewport(self):
+                enabled = model.operator(name).poll() and not self.busy
+            key = 'toolbar:' + name
+            p.button(key, (x + i * width / 2 + 1, y + 1, width / 2 - 2, CONTROL_HEIGHT), text,
+                     ('operator', name, {}), icon=icon, enabled=enabled, hover=self.hovered(key),
+                     hint=help_text.operator_hint(name, bpy.context, enabled, busy=self.busy))
+        p.rect(x + width / 2, y + 1, 1, CONTROL_HEIGHT, 'line')
+        p.rect(x + 1, y + 24, width - 2, 1, 'divider')
+        tools = [('object.clone_camera', 'Clone', 'clone'), ('object.mirror_camera', 'Mirror', 'mirror'),
+                 ('object.apply_auto_aspect', 'Auto aspect' if width >= 360 else 'Aspect', 'expand'), ('stablegen.camera_display', 'Display', 'labels')]
+        for i, (name, text, icon) in enumerate(tools):
+            with _viewport(self):
+                enabled = model.operator(name).poll() and (not self.busy or name == 'stablegen.camera_display')
+            key = 'toolbar:' + name
+            p.button(key, (x + i * width / 4 + 1, y + 25, width / 4 - 2, 20), text,
+                     ('operator', name, {}), icon=icon, enabled=enabled, hover=self.hovered(key),
+                     hint=help_text.operator_hint(name, bpy.context, enabled, busy=self.busy))
+        y += 56
         cw = (width - 12) / 2
         left = self.draw_binding(p, self.binding('architecture_mode'), 'Architecture', x, y, cw)
         actions = [item for item in model.controls(self.document.presets)
@@ -1715,7 +1825,7 @@ class StudioSession:
             p.button('refresh-models', (x + width - 25, y - CONTROL_HEIGHT - CONTROL_GAP, 25, CONTROL_HEIGHT), '',
                      ('operator', 'stablegen.refresh_checkpoint_list', {}), icon='reset', enabled=not self.busy,
                      hint='Refresh the available ComfyUI models after connecting the server or adding model files')
-        masked = (scene.qwen_generation_method if scene.model_architecture.startswith('qwen') else scene.generation_method) == 'masked_edit' and scene.architecture_mode != 'trellis2'
+        masked = (scene.qwen_generation_method if scene.model_architecture in QWEN_ARCHITECTURES else scene.generation_method) == 'masked_edit' and scene.architecture_mode != 'trellis2'
         prompt = 'sg_masked_prompt' if masked else 'comfyui_prompt'
         if hasattr(scene, prompt) and not trellis:
             y += self.draw_binding(p, self.binding(prompt), 'Edit instructions' if masked else 'Object prompt' if native else 'Texture prompt', x, y + 4, width, multiline=True, height=112) + 6
@@ -1725,7 +1835,7 @@ class StudioSession:
             handled.discard('comfyui_prompt')
         mask_commands = {'stablegen.paint_edit_mask', 'stablegen.finish_edit_mask', 'stablegen.clear_edit_mask'}
         if not native:
-            mode_key = 'qwen_generation_method' if scene.model_architecture.startswith('qwen') else 'generation_method'
+            mode_key = 'qwen_generation_method' if scene.model_architecture in QWEN_ARCHITECTURES else 'generation_method'
             cw = (width - 12) / 2
             left = self.draw_binding(p, self.binding(mode_key), 'Texture workflow', x, y, cw)
             right = self.draw_binding(p, self.binding('texture_objects'), 'Target objects', x + cw + 12, y, cw)
@@ -1858,7 +1968,7 @@ class StudioSession:
             p.target('camera-drag:' + camera.name, grip, ('camera-drag', camera.name), not self.busy,
                               'Drag to change generation order. Dropping enables custom order; Esc cancels.')
             p.button('look:' + camera.name, (x + width - 37, y + (10 if selected else 28), 25, CONTROL_HEIGHT), '',
-                     ('operator', 'stablegen.panel_camera', {'camera_name': camera.name}), icon='eye', enabled=not self.busy,
+                     ('operator', 'stablegen.studio_look_camera', {'camera_name': camera.name}), icon='eye', enabled=not self.busy,
                      hint='Look through ' + camera.name)
             image_rect = (x + 12, y + 43, 70, 160) if selected else (x + 30, y + 12, 60, 60)
             p.outline(*image_rect, 'menu', 'menu_border', 2)
@@ -1903,13 +2013,22 @@ class StudioSession:
         menu = self.menu
         items = self.menu_items()
         ax, ay, aw, ah = menu['anchor']
-        width = min(p.width - 30, max(220, aw))
-        rows = min(9, len(items), max(1, int((p.height - 100) / 24)))
-        menu['rows'] = rows
-        height = 30 + max(1, rows) * 24 + 6
+        width = max(220, aw)
+        if menu.get('binding'):
+            # Room for each label and its tags.
+            width = max([width] + [p.measure(label) + sum(p.measure(t, 9) + 14 for t in _choice_tags(menu['binding'].property, i)) + 40
+                                   for i, label, _ in items])
+        width = min(p.width - 30, width)
         x = min(max(15, ax), p.width - width - 15)
         y = ay + ah + 5
-        if y + height > p.height - 10:
+        if menu.get('drop_down'):
+            # Always open below the anchor and fill the space to the bottom; the rest scrolls.
+            rows = min(len(items), max(1, int((p.height - 10 - y - 36) / 24)))
+        else:
+            rows = min(9, len(items), max(1, int((p.height - 100) / 24)))
+        menu['rows'] = rows
+        height = 30 + max(1, rows) * 24 + 6
+        if not menu.get('drop_down') and y + height > p.height - 10:
             y = max(10, ay - height - 5)
         menu['rect'] = (x, y, width, height)
         p.outline(x, y, width, height, 'raised', 'line', 6)
@@ -1923,7 +2042,11 @@ class StudioSession:
             key = 'choice:' + identifier
             if i == menu['index'] or self.hovered(key):
                 p.rect(*rect, 'selected')
-            p.text(label, rect[0] + 8, rect[1] + 5, FONT_SIZE, 'text', width - 26)
+            label_width = width - 26
+            if menu.get('binding'):
+                label_width -= _draw_tags(p, _choice_tags(menu['binding'].property, identifier),
+                                          rect[0] + rect[2] - 6, rect[1] + 4)
+            p.text(label, rect[0] + 8, rect[1] + 5, FONT_SIZE, 'text', label_width)
             p.target(key, rect, ('menu-item', identifier), True, description)
         if len(items) > rows:
             p.rect(x + width - 5, y + 31 + start / len(items) * (height - 36), 2,
@@ -2046,6 +2169,16 @@ class StudioSession:
                     self.callout_width = width if self.callout_width is None else min(self.callout_width, width)
                     self.draw_widen_callout(p, top, width)
             if self.menu:
+                parent = self.menu.get('parent')
+                if parent:
+                    # A submenu (the LoRA folder filter) opens over its picker, which stays visible but inert.
+                    menu, before = self.menu, len(p.targets)
+                    self.menu = parent
+                    try:
+                        self.draw_menu(p)
+                    finally:
+                        self.menu = menu
+                    del p.targets[before:]
                 self.draw_menu(p)
             # Layout changes can put a different control under a stationary mouse.
             self.update_hover(p.targets, cursor=False)
@@ -2265,6 +2398,32 @@ class SG_OT_StudioSelectCamera(bpy.types.Operator):
         return {'FINISHED'}
 
 
+class SG_OT_StudioLookCamera(bpy.types.Operator):
+    bl_idname = 'stablegen.studio_look_camera'
+    bl_label = 'View Camera'
+    bl_description = 'Select this camera and look through it in the viewport'
+    bl_options = {'INTERNAL'}
+    camera_name: bpy.props.StringProperty()
+
+    @classmethod
+    def poll(cls, context):
+        return not sg_modal_active(context)
+
+    def execute(self, context):
+        camera = context.scene.objects.get(self.camera_name)
+        if camera is None or camera.type != 'CAMERA':
+            self.report({'ERROR'}, 'Camera is no longer in this scene')
+            return {'CANCELLED'}
+        from ..cameras.operators import switch_viewport_to_camera
+        switch_viewport_to_camera(context, camera)
+        if camera.name in context.view_layer.objects:
+            for obj in context.selected_objects:
+                obj.select_set(False)
+            camera.select_set(True)
+            context.view_layer.objects.active = camera
+        return {'FINISHED'}
+
+
 class SG_OT_StudioPreferences(bpy.types.Operator):
     bl_idname = 'stablegen.studio_preferences'
     bl_label = 'StableGen Preferences'
@@ -2371,7 +2530,7 @@ def _load_pre(_):
     _pending.clear()
 
 
-STUDIO_UI_CLASSES = diagnostics.CLASSES + [lora.SG_OT_StudioLoRA, SG_OT_StudioSession, SG_OT_StudioNative, SG_OT_StudioSelectCamera,
+STUDIO_UI_CLASSES = diagnostics.CLASSES + [lora.SG_OT_StudioLoRA, SG_OT_StudioSession, SG_OT_StudioNative, SG_OT_StudioSelectCamera, SG_OT_StudioLookCamera,
                      SG_OT_StudioReorderCamera, SG_OT_StudioSortCameras,
                      SG_OT_StudioPreferences, tips.SG_OT_ResetTips, SG_PT_StudioCanvas]
 

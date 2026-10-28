@@ -1513,7 +1513,7 @@ class _Trellis2WorkflowMixin:
 
                     if message['type'] == 'executing':
                         data = message['data']
-                        if data['prompt_id'] == prompt_id:
+                        if data.get('prompt_id') == prompt_id:
                             if data['node'] is None:
                                 self.operator._phase_progress = 100
                                 self.operator._detail_progress = 100
