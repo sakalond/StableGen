@@ -92,7 +92,7 @@ Texturing works by projection. Each camera gets a generated view that follows th
 
 - [ComfyUI](https://github.com/comfyanonymous/ComfyUI) runs every model, locally or on another machine.
 - [TRELLIS.2](https://github.com/microsoft/TRELLIS.2) generates meshes, through [ComfyUI-TRELLIS2](https://github.com/PozzettiAndrea/ComfyUI-TRELLIS2).
-- [SDXL](https://huggingface.co/stabilityai/stable-diffusion-xl-base-1.0) with ControlNet and IPAdapter, and [Qwen Image](https://github.com/QwenLM/Qwen-Image), generate the texture views.
+- [SDXL](https://huggingface.co/stabilityai/stable-diffusion-xl-base-1.0) with ControlNet and IPAdapter, and [Qwen Image](https://github.com/QwenLM/Qwen-Image), generate the texture views. [MOSS-Image](https://huggingface.co/OpenMOSS-Team/MOSS-Image-SFT) and [Bria FIBO 2.0](https://huggingface.co/briaai/Fibo-2.0-edit-turbo) are available as experimental architectures.
 - [SkinTokens](https://github.com/VAST-AI-Research/SkinTokens) rigs characters.
 - [Marigold](https://github.com/prs-eth/Marigold) and [StableDelight](https://github.com/Stable-X/StableDelight) estimate the PBR maps.
 
@@ -107,7 +107,7 @@ Texturing works by projection. Each camera gets a generated view that follows th
 <img src="https://raw.githubusercontent.com/sakalond/stablegen-media/main/readme/g5.webp" width="150" alt="Market stall with a striped awning and baskets of produce">
 <img src="https://raw.githubusercontent.com/sakalond/stablegen-media/main/readme/g6.webp" width="150" alt="White mecha robot">
 <img src="https://raw.githubusercontent.com/sakalond/stablegen-media/main/readme/g7.webp" width="150" alt="Treasure chest full of gold coins">
-<img src="https://raw.githubusercontent.com/sakalond/stablegen-media/main/readme/g8.webp" width="150" alt="Cyberpunk vending machine covered in graffiti">
+<img src="https://raw.githubusercontent.com/sakalond/stablegen-media/main/readme/g8.webp" width="150" alt="Mossy stone obelisk with glowing green runes">
 <img src="https://raw.githubusercontent.com/sakalond/stablegen-media/main/readme/g9.webp" width="150" alt="Hollow tree stump with glowing mushrooms">
 </p>
 
@@ -125,7 +125,7 @@ Texturing works by projection. Each camera gets a generated view that follows th
    ```bash
    python installer.py <path to ComfyUI>
    ```
-   Package 3 sets up SDXL texturing, package 13 Qwen Image 2.1, package 8 mesh generation and package 14 auto-rigging.
+   Package 3 sets up SDXL texturing, package 13 Qwen Image 2.1, package 8 mesh generation, package 14 auto-rigging, and packages 15 to 17 the experimental architectures.
 3. Download the add-on ZIP from [Releases](https://github.com/sakalond/stablegen/releases). In Blender, open **Edit > Preferences > Get Extensions**, choose **Install from Disk** in the top-right menu, and select the ZIP.
 4. In the add-on preferences, set **Output Directory** and **Server Address** (`127.0.0.1:8188` by default). Under **System > Network**, enable **Allow Online Access**.
 
@@ -144,7 +144,7 @@ Press <kbd>N</kbd> in the 3D Viewport and open the **StableGen** tab.
 
 **Generate an asset**
 
-1. Set **Architecture** to **TRELLIS.2** and choose a **(Mesh + Texture)** preset.
+1. Set **Architecture** to **TRELLIS.2** and choose a preset tagged **Mesh + texture**.
 2. On the **Mesh** page, set **Generate mesh from** to **Prompt**, describe the object and enable **Preview gallery**.
 3. To rig a character in the same run, enable **Auto-rig** under **Rigging & Animation**.
 4. Click **Generate asset**, then pick a preview image.
@@ -156,15 +156,16 @@ Press <kbd>N</kbd> in the 3D Viewport and open the **StableGen** tab.
 The [StableGen wiki](https://github.com/sakalond/StableGen/wiki) covers every feature in detail:
 
 - **Getting started:** [Installation](https://github.com/sakalond/StableGen/wiki/Installation) · [Manual installation](https://github.com/sakalond/StableGen/wiki/Manual-installation) · [Quick start](https://github.com/sakalond/StableGen/wiki/Quick-start)
-- **Texturing:** [Architectures and presets](https://github.com/sakalond/StableGen/wiki/Architectures-and-presets) · [Generation modes](https://github.com/sakalond/StableGen/wiki/Generation-modes) · [Masked Edit](https://github.com/sakalond/StableGen/wiki/Masked-Edit) · [Cameras](https://github.com/sakalond/StableGen/wiki/Cameras) · [PBR maps](https://github.com/sakalond/StableGen/wiki/PBR-maps)
+- **Texturing:** [Architectures and presets](https://github.com/sakalond/StableGen/wiki/Architectures-and-presets) · [Generation modes](https://github.com/sakalond/StableGen/wiki/Generation-modes) · [Masked Edit](https://github.com/sakalond/StableGen/wiki/Masked-Edit) · [Cameras](https://github.com/sakalond/StableGen/wiki/Cameras) · [Blending and projection](https://github.com/sakalond/StableGen/wiki/Blending-and-projection) · [PBR maps](https://github.com/sakalond/StableGen/wiki/PBR-maps)
 - **Mesh generation and rigging:** [TRELLIS.2 mesh generation](https://github.com/sakalond/StableGen/wiki/TRELLIS.2-mesh-generation) · [Rigging and animation](https://github.com/sakalond/StableGen/wiki/Rigging-and-animation)
 - **Output and automation:** [Export](https://github.com/sakalond/StableGen/wiki/Export) · [Batch processing and the Scene Queue](https://github.com/sakalond/StableGen/wiki/Batch-processing-and-the-Scene-Queue) · [Output files](https://github.com/sakalond/StableGen/wiki/Output-files) · [Troubleshooting](https://github.com/sakalond/StableGen/wiki/Troubleshooting)
 
 ## License
 
-StableGen is released under the [GNU General Public License v3.0](LICENSE). The models and nodes it runs on ComfyUI have their own licenses, and two of them are for non-commercial use only:
+StableGen is released under the [GNU General Public License v3.0](LICENSE). The models and nodes it runs on ComfyUI have their own licenses, and three of them are for non-commercial use only:
 
-- Qwen Image 2.1 is released under the [Qwen Research License](https://huggingface.co/Qwen/Qwen-Image-2.1/blob/main/LICENSE). Qwen Image Edit and SDXL are not affected.
+- Qwen Image 2.1 and Qwen Image 2.1 Turbo are released under the [Qwen Research License](https://huggingface.co/Qwen/Qwen-Image-2.1/blob/main/LICENSE). Qwen Image Edit and SDXL are not affected.
+- Bria FIBO 2.0 is released under [CC BY-NC 4.0](https://huggingface.co/briaai/Fibo-2.0-edit-turbo); commercial use needs an agreement with Bria.
 - The TRELLIS.2 **Native** texture mode uses NVIDIA's nvdiffrast and nvdiffrec. The other modes do not use them. See [TRELLIS.2 third-party licenses](https://github.com/sakalond/StableGen/wiki/TRELLIS.2-mesh-generation#third-party-licenses).
 
 ## Acknowledgements
