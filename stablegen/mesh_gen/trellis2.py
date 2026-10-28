@@ -49,6 +49,66 @@ def _autorig_deforming_armature(mesh_object, imported_armatures):
     return None
 
 
+def _is_projection_textured(obj):
+    """Whether a mesh is textured by StableGen's projection material, whose per-camera
+    attributes (ProjectionUV_*, _SG_*) do not survive a glTF round trip."""
+    if obj is None or obj.type != 'MESH':
+        return False
+    return any(attr.name.startswith(('ProjectionUV', '_SG_')) for attr in obj.data.attributes)
+
+
+def _bind_projection_textured_sources(source_names, imported_objects):
+    """Move the new skin weights onto projection-textured source meshes.
+
+    SkinTokens returns a re-imported copy of the input. For a projection-textured
+    character that copy has the projection material but not the attributes it
+    reads, so it renders untextured. Each such source instead receives the copy's
+    vertex groups (nearest-face interpolated, in the rest pose), an Armature
+    modifier and the new armature as parent. Returns the names of the bound
+    sources; the caller retires the copy.
+    """
+    sources = [bpy.data.objects.get(name) for name in source_names]
+    sources = [obj for obj in sources if _is_projection_textured(obj)]
+    armatures = [obj for obj in imported_objects if obj.type == 'ARMATURE']
+    weighted = [obj for obj in imported_objects if obj.type == 'MESH' and obj.vertex_groups]
+    if not sources or not armatures or not weighted:
+        return []
+    armature = armatures[0]
+    weight_source = max(weighted, key=lambda obj: len(obj.data.polygons))
+    previous_pose = armature.data.pose_position
+    armature.data.pose_position = 'REST'
+    bound = []
+    try:
+        for source in sources:
+            source.hide_set(False)
+            source.hide_viewport = False
+            for modifier in [m for m in source.modifiers if m.type == 'ARMATURE']:
+                source.modifiers.remove(modifier)
+            for group in weight_source.vertex_groups:
+                if group.name not in source.vertex_groups:
+                    source.vertex_groups.new(name=group.name)
+            transfer = source.modifiers.new("SG_AutoRigWeights", 'DATA_TRANSFER')
+            transfer.object = weight_source
+            transfer.use_vert_data = True
+            transfer.data_types_verts = {'VGROUP_WEIGHTS'}
+            transfer.vert_mapping = 'POLYINTERP_NEAREST'
+            transfer.layers_vgroup_select_src = 'ALL'
+            transfer.layers_vgroup_select_dst = 'NAME'
+            bpy.context.view_layer.update()
+            with bpy.context.temp_override(object=source, active_object=source, selected_objects=[source]):
+                bpy.ops.object.modifier_apply(modifier=transfer.name)
+            world = source.matrix_world.copy()
+            source.parent = armature
+            source.matrix_world = world
+            deform = source.modifiers.new("Armature", 'ARMATURE')
+            deform.object = armature
+            source["sg_generated"] = True
+            bound.append(source.name)
+    finally:
+        armature.data.pose_position = previous_pose
+    return bound
+
+
 def _sanitize_autorig_cross_limb_weights(imported_objects):
     """Repair spatially implausible SkinTokens limb weights.
 
@@ -2858,10 +2918,16 @@ class StableGenAutoRigSelectedMesh(bpy.types.Operator):
                 for obj in export_objects:
                     obj.select_set(True)
                 context.view_layer.objects.active = export_meshes[0]
+                # A projection-textured character keeps its own mesh and material
+                # (the weights are moved back onto it after import), so its GLB
+                # needs no materials; exporting the projection material's images
+                # took minutes.
+                projection_textured = all(_is_projection_textured(obj) for obj in selected_meshes)
                 bpy.ops.export_scene.gltf(
                     filepath=export_path,
                     export_format='GLB',
                     use_selection=True,
+                    export_materials='NONE' if projection_textured else 'EXPORT',
                 )
             finally:
                 self._remove_joined_export_copy(joined_export, copied_mesh_data)
@@ -3030,6 +3096,26 @@ class StableGenAutoRigSelectedMesh(bpy.types.Operator):
                 context.view_layer.objects.active = imported_objects[0]
 
             source_names = list(getattr(self, '_source_names', []))
+            bound = _bind_projection_textured_sources(source_names, imported_objects)
+            if bound:
+                # The originals carry the texture and now deform with the new rig;
+                # the re-imported copy only supplied the weights.
+                source_names = [name for name in source_names if name not in bound]
+                for obj in mesh_objects:
+                    if self.hide_source:
+                        obj.hide_set(True)
+                        obj.hide_render = True
+                        obj["sg_autorig_weight_source"] = True
+                    else:
+                        bpy.data.objects.remove(obj, do_unlink=True)
+                bpy.ops.object.select_all(action='DESELECT')
+                for name in bound:
+                    bpy.data.objects[name].select_set(True)
+                context.view_layer.objects.active = bpy.data.objects[bound[0]]
+                print(
+                    f"[StableGen] Bound {len(bound)} projection-textured source mesh(es) "
+                    "to the new rig"
+                )
             if self.hide_source:
                 preserved = self._preserve_autorig_sources(source_names)
                 print(
