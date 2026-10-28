@@ -1,6 +1,6 @@
 schema_version = "1.0.0"
 id = "stablegen"
-version = "0.3.1"
+version = "0.4.0"
 name = "StableGen"
 tagline = "AI-Powered 3D Asset Generation & Texturing"
 maintainer = "Ondrej Sakala <sakalaondrej@gmail.com>"
@@ -35,7 +35,7 @@ wheels = [
   "./wheels/opencv_python_headless-4.11.0.86-cp37-abi3-manylinux_2_17_x86_64.manylinux2014_x86_64.whl",
   "./wheels/pillow-11.2.1-cp311-cp311-manylinux_2_17_x86_64.manylinux2014_x86_64.whl",
   "./wheels/pillow-11.2.1-cp313-cp313-manylinux_2_17_x86_64.manylinux2014_x86_64.whl",
-  "./wheels/fast_simplification-0.1.12-cp311-cp311-manylinux_2_17_x86_64.manylinux2014_x86_64.whl",
+  "./wheels/fast_simplification-0.1.13-cp311-abi3-manylinux_2_24_x86_64.manylinux_2_28_x86_64.whl",
 
   # macOS Apple Silicon
 
