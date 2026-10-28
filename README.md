@@ -195,4 +195,6 @@ It builds on [ComfyUI](https://github.com/comfyanonymous/ComfyUI), [ComfyUI-TREL
 
 ## Contact
 
-Ask questions and share results in [Discussions](https://github.com/sakalond/StableGen/discussions) or on the [Discord server](https://discord.gg/jhGp9Rsgh3), and report bugs in [Issues](https://github.com/sakalond/StableGen/issues). Ondřej Sakala: `sakalaondrej@gmail.com`, [@sakalond](https://x.com/sakalond) on X.
+- **Questions, help and results:** the [Discord server](https://discord.gg/jhGp9Rsgh3) or [GitHub Discussions](https://github.com/sakalond/StableGen/discussions)
+- **Bug reports:** [GitHub Issues](https://github.com/sakalond/StableGen/issues), with your Blender and StableGen versions and the console output
+- **Author:** Ondřej Sakala, [sakalaondrej@gmail.com](mailto:sakalaondrej@gmail.com), [@sakalond](https://x.com/sakalond) on X
