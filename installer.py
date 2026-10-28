@@ -668,11 +668,11 @@ DEPENDENCIES: Dict[str, Dict[str, Any]] = {
     },
     "model_flux2_vae": {
         "id": "model_flux2_vae", "type": "model",
-        "name": "FLUX.2 Klein VAE",
+        "name": "FLUX.2 VAE",
         "url": "https://huggingface.co/Comfy-Org/flux2-dev/resolve/main/split_files/vae/flux2-vae.safetensors?download=true",
         "target_path_relative": "models/vae",
         "filename": "flux2-vae.safetensors",
-        "license": "Apache 2.0", "size_mb": 321, "packages": ["flux2_klein"],
+        "license": "Apache 2.0", "size_mb": 321, "packages": ["flux2_klein", "fibo_edit"],
     },
     # --- Qwen Image 2.1 (ComfyUI core nodes; StableGen expects these text encoder and VAE file names) ---
     "model_qwen21_diffusion": {
@@ -685,13 +685,58 @@ DEPENDENCIES: Dict[str, Dict[str, Any]] = {
         "id": "model_qwen21_text_encoder", "type": "model", "name": "Qwen Image 2.1 Text Encoder (Qwen3-VL 8B, w4a8)",
         "url": "https://huggingface.co/Comfy-Org/Qwen-Image-2.1/resolve/main/text_encoders/qwen3vl_8b_w4a8.safetensors?download=true",
         "target_path_relative": "models/text_encoders", "filename": "qwen3vl_8b_w4a8.safetensors",
-        "license": "Qwen Research License (non-commercial)", "size_mb": 6310, "packages": ["qwen_image_21"],
+        "license": "Qwen Research License (non-commercial)", "size_mb": 6310,
+        "packages": ["qwen_image_21", "qwen_image_21_turbo"],
     },
     "model_qwen21_vae": {
         "id": "model_qwen21_vae", "type": "model", "name": "Qwen Image 2.1 VAE",
         "url": "https://huggingface.co/Comfy-Org/Qwen-Image-2.1/resolve/main/vae/qwen_image_2.1_vae_bf16.safetensors?download=true",
         "target_path_relative": "models/vae", "filename": "qwen_image_2.1_vae_bf16.safetensors",
-        "license": "Qwen Research License (non-commercial)", "size_mb": 680, "packages": ["qwen_image_21"],
+        "license": "Qwen Research License (non-commercial)", "size_mb": 680,
+        "packages": ["qwen_image_21", "qwen_image_21_turbo"],
+    },
+    # --- Experimental architectures (ComfyUI core nodes, Comfy-Org repacks; file names as StableGen loads them) ---
+    "model_qwen21_turbo_diffusion": {
+        "id": "model_qwen21_turbo_diffusion", "type": "model", "name": "Qwen Image 2.1 Turbo Diffusion Model (int8)",
+        "url": "https://huggingface.co/Comfy-Org/Qwen-Image-2.1/resolve/main/diffusion_models/qwen_image_2.1_turbo_int8_convrot.safetensors?download=true",
+        "target_path_relative": "models/diffusion_models", "filename": "qwen_image_2.1_turbo_int8_convrot.safetensors",
+        "license": "Qwen Research License (non-commercial)", "size_mb": 6920, "packages": ["qwen_image_21_turbo"],
+    },
+    "model_moss_diffusion": {
+        "id": "model_moss_diffusion", "type": "model", "name": "MOSS-Image Diffusion Model (int8)",
+        "url": "https://huggingface.co/Comfy-Org/MOSS-Image/resolve/main/diffusion_models/moss_image_sft_int8_convrot.safetensors?download=true",
+        "target_path_relative": "models/diffusion_models", "filename": "moss_image_sft_int8_convrot.safetensors",
+        "license": "Apache 2.0", "size_mb": 5162, "packages": ["moss_image"],
+    },
+    "model_moss_text_encoder": {
+        "id": "model_moss_text_encoder", "type": "model", "name": "MOSS-Image Text Encoder (Qwen3.5 9B, int8)",
+        "url": "https://huggingface.co/Comfy-Org/MOSS-Image/resolve/main/text_encoders/qwen3.5_9b_int8_convrot.safetensors?download=true",
+        "target_path_relative": "models/text_encoders", "filename": "qwen3.5_9b_int8_convrot.safetensors",
+        "license": "Apache 2.0", "size_mb": 9296, "packages": ["moss_image"],
+    },
+    "model_moss_vae": {
+        "id": "model_moss_vae", "type": "model", "name": "MOSS-Image VAE (FLUX.2 small)",
+        "url": "https://huggingface.co/Comfy-Org/MOSS-Image/resolve/main/vae/flux2-vae_small.safetensors?download=true",
+        "target_path_relative": "models/vae", "filename": "flux2-vae_small.safetensors",
+        "license": "Apache 2.0", "size_mb": 237, "packages": ["moss_image"],
+    },
+    "model_moss_depth_control": {
+        "id": "model_moss_depth_control", "type": "model", "name": "MOSS-Image Color/Depth Control Adapter",
+        "url": "https://huggingface.co/Comfy-Org/MOSS-Image/resolve/main/loras/moss_image_color_depth_control.safetensors?download=true",
+        "target_path_relative": "models/loras", "filename": "moss_image_color_depth_control.safetensors",
+        "license": "Apache 2.0", "size_mb": 298, "packages": ["moss_image"],
+    },
+    "model_fibo_diffusion": {
+        "id": "model_fibo_diffusion", "type": "model", "name": "FIBO 2.0 Edit Turbo Diffusion Model (int8)",
+        "url": "https://huggingface.co/Comfy-Org/Fibo-2.0/resolve/main/diffusion_models/fibo2_edit_turbo_int8_convrot.safetensors?download=true",
+        "target_path_relative": "models/diffusion_models", "filename": "fibo2_edit_turbo_int8_convrot.safetensors",
+        "license": "CC BY-NC 4.0 (non-commercial)", "size_mb": 8019, "packages": ["fibo_edit"],
+    },
+    "model_fibo_text_encoder": {
+        "id": "model_fibo_text_encoder", "type": "model", "name": "FIBO 2.0 Text Encoder (Qwen3-VL 4B, int8)",
+        "url": "https://huggingface.co/Comfy-Org/Fibo-2.0/resolve/main/text_encoders/qwen3vl_4b_int8_convrot.safetensors?download=true",
+        "target_path_relative": "models/text_encoders", "filename": "qwen3vl_4b_int8_convrot.safetensors",
+        "license": "CC BY-NC 4.0 (non-commercial)", "size_mb": 4633, "packages": ["fibo_edit"],
     },
     # --- SkinTokens auto-rigging ---
     "cn_skintokens": {
@@ -722,12 +767,18 @@ PACKAGE_NODES: Dict[str, List[str]] = {
     "flux2_klein": ["Flux2Scheduler", "EmptyFlux2LatentImage"],
     "qwen_image_21": ["TextEncodeQwenImage21", "QwenImage21Cache"],
     "skintokens": ["StableGenSkinTokensAutoRig"],
+    "qwen_image_21_turbo": ["TextEncodeQwenImage21", "QwenImage21Cache"],
+    "moss_image": ["MOSSImageControl", "EmptyFlux2LatentImage"],
+    "fibo_edit": ["TextEncodeFibo2"],
 }
 CORE_NODES: Dict[str, List[str]] = {
     "qwen_core": ["TextEncodeQwenImageEditPlus"],
     "pbr_marigold_v2": ["MarigoldV2PostProcess", "ConditioningLoader"],
     "flux2_klein": ["Flux2Scheduler", "EmptyFlux2LatentImage"],
     "qwen_image_21": ["TextEncodeQwenImage21", "QwenImage21Cache"],
+    "qwen_image_21_turbo": ["TextEncodeQwenImage21", "QwenImage21Cache"],
+    "moss_image": ["MOSSImageControl", "EmptyFlux2LatentImage"],     # ComfyUI 0.42.3 or newer
+    "fibo_edit": ["TextEncodeFibo2"],                                   # ComfyUI master from 2026-10-21
 }
 
 # Define what items each menu option entails by listing package tags
@@ -782,11 +833,12 @@ MENU_PACKAGES: Dict[str, Dict[str, Any]] = {
         "description_suffix": "*Installs ComfyUI_StableDelight_ll custom node + downloads the*\n"
                               "    *Stable-X/yoso-delight-v0-4-base model (~3.3GB fp16) for specular-free albedo.*",
     },
-    '11': {"name": "[FLUX.2 KLEIN] Klein 4B FP8 + Qwen 3 Text Encoder + VAE",
+    '11': {"name": "[DEPRECATED] FLUX.2 Klein 4B FP8 + Qwen 3 Text Encoder + VAE",
         "tags": ["flux2_klein"],
         "size_gb": 12.4,
         "description_suffix": "*Downloads FLUX.2 Klein 4B FP8 diffusion model (~4.1GB), Qwen 3 4B text encoder bf16 (~8.0GB),*\n"
                               "    *and FLUX.2 VAE (~0.3GB). All ComfyUI nodes are built-in (no custom nodes needed).*\n"
+                              "    *Deprecated: StableGen shows FLUX.2 Klein only with Enable Deprecated Architectures.*\n"
                               "    *Apache 2.0 license. Requires ~13GB VRAM.*",
     },
     '12': {"name": "[PBR DECOMPOSITION] Marigold V2 Models (Albedo + Normals)",
@@ -810,6 +862,28 @@ MENU_PACKAGES: Dict[str, Dict[str, Any]] = {
         "description_suffix": "*Installs the StableGen SkinTokens node and builds SkinTokens in its own environment*\n"
                               "    *(PyTorch, flash-attn when available, checkpoints ~1.6GB). Rigs TRELLIS.2 meshes; NVIDIA GPU.*",
     },
+    '15': {"name": "[EXPERIMENTAL] Qwen Image 2.1 Turbo",
+        "tags": ["qwen_image_21_turbo"],
+        "size_gb": 13.9,
+        "notice": "qwen21",
+        "description_suffix": "*Downloads the Qwen Image 2.1 Turbo int8 model (~6.9GB) and, unless package 13 already did,*\n"
+                              "    *the Qwen Image 2.1 text encoder and VAE (~7.0GB). Uses ComfyUI core nodes.*\n"
+                              "    *LICENSE NOTICE: Qwen Research License, non-commercial use only.*",
+    },
+    '16': {"name": "[EXPERIMENTAL] MOSS Image + Depth Control",
+        "tags": ["moss_image"],
+        "size_gb": 15.0,
+        "description_suffix": "*Downloads MOSS-Image int8 (~5.2GB), its Qwen3.5 9B text encoder (~9.3GB), VAE (~0.2GB) and*\n"
+                              "    *color/depth control adapter (~0.3GB). Needs ComfyUI 0.42.3 or newer. Apache 2.0.*",
+    },
+    '17': {"name": "[EXPERIMENTAL] FIBO 2.0 Edit",
+        "tags": ["fibo_edit"],
+        "size_gb": 13.0,
+        "notice": "fibo",
+        "description_suffix": "*Downloads Bria FIBO 2.0 Edit Turbo int8 (~8.0GB), its Qwen3-VL 4B text encoder (~4.6GB) and*\n"
+                              "    *the FLUX.2 VAE (~0.3GB). Needs a ComfyUI build with core FIBO 2.0 support (master, October 2026).*\n"
+                              "    *LICENSE NOTICE: CC BY-NC 4.0, non-commercial use only.*",
+    },
 }
 
 LICENSE_NOTICES: Dict[str, List[str]] = {
@@ -831,6 +905,13 @@ LICENSE_NOTICES: Dict[str, List[str]] = {
         "Qwen Image Edit 2509 (packages 5-7) is Apache 2.0 and not affected.",
         "",
         "License: https://huggingface.co/Qwen/Qwen-Image-2.1/blob/main/LICENSE",
+    ],
+    "fibo": [
+        "FIBO 2.0 LICENSE NOTICE",
+        "Bria FIBO 2.0 is released under CC BY-NC 4.0, which allows non-commercial use only.",
+        "Commercial use needs an agreement with Bria.",
+        "",
+        "License: https://huggingface.co/briaai/Fibo-2.0-edit-turbo",
     ],
 }
 
@@ -1979,7 +2060,7 @@ def display_menu(comfyui_path: Path):
     print(f"Target ComfyUI Directory: {comfyui_path}")
     print_separator()
     print("This script downloads and sets up the custom nodes and models StableGen uses.")
-    print("For FLUX.1 (manual download because of its license) see the manual installation guide:")
+    print("To install components by hand instead, see the manual installation guide:")
     print("https://github.com/sakalond/StableGen/wiki/Manual-installation")
     print_separator()
     print("Download sizes are estimates. The full list of components is shown for approval before anything changes.")
@@ -2049,6 +2130,7 @@ TAG_LABELS = {
     "qwen_nunchaku": "Qwen Nunchaku", "pbr_marigold": "Marigold IID", "pbr_stabledelight": "StableDelight",
     "pbr_marigold_v2": "Marigold V2", "trellis2": "TRELLIS.2", "flux2_klein": "FLUX.2 Klein",
     "qwen_image_21": "Qwen Image 2.1", "skintokens": "SkinTokens",
+    "qwen_image_21_turbo": "Qwen Image 2.1 Turbo", "moss_image": "MOSS Image", "fibo_edit": "FIBO 2.0 Edit",
 }
 
 
@@ -2349,12 +2431,16 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     # License notices and the Python 3.13 check can drop packages
     accepted = []
+    answers: Dict[str, bool] = {}       # a notice shared by two packages (Qwen 2.1 and Turbo) is asked once
     for key in keys:
         package = MENU_PACKAGES[key]
         if "trellis2" in package["tags"] and not trellis_python_ok(comfyui_base_path):
             print(f"Skipping package {key}.")
             continue
-        if package.get("notice") and not show_notice(package["notice"]):
+        notice = package.get("notice")
+        if notice and notice not in answers:
+            answers[notice] = show_notice(notice)
+        if notice and not answers[notice]:
             print(f"Skipping package {key}.")
             continue
         accepted.append(key)
