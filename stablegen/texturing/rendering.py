@@ -3294,26 +3294,23 @@ class BakeTextures(bpy.types.Operator):
         :param event: Blender event.         
         :return: {'RUNNING_MODAL'}     
         """
+        self._collect_targets(context)
+        if not _texture_bake_targets(self._objects)[0]:
+            self.report({'ERROR'}, "No textureable mesh objects found to bake.")
+            return {'CANCELLED'}
+        return context.window_manager.invoke_props_dialog(self, width=440)
+
+    def _collect_targets(self, context):
+        """The meshes to bake, from the Texture Objects setting."""
         if context.scene.texture_objects == 'all':
             candidates = [obj for obj in context.view_layer.objects if obj.type == 'MESH']
         else: # 'selected'
             candidates = [obj for obj in context.selected_objects if obj.type == 'MESH']
-        self._objects, skipped = _texture_bake_targets(candidates)
-        if skipped:
-            names = ", ".join(obj.name for obj in skipped[:5])
-            more = "" if len(skipped) <= 5 else f", +{len(skipped) - 5} more"
-            print(
-                f"[StableGen] Skipping {len(skipped)} non-texture helper mesh(es) "
-                f"during bake: {names}{more}"
-            )
-        if not self._objects:
-            self.report({'ERROR'}, "No textureable mesh objects found to bake.")
-            return {'CANCELLED'}
+        self._objects = candidates
         self._current_index = 0
         self._phase = 'unwrap'
         self._total_objects = len(self._objects)
         self._stage = "Preparing"
-        return context.window_manager.invoke_props_dialog(self, width=440)
 
     def execute(self, context):
         """     
@@ -3323,7 +3320,11 @@ class BakeTextures(bpy.types.Operator):
         """
 
         _configure_not_exported_helpers(context)
+        if not self._objects:
+            # Called without invoke (scripts, EXEC_DEFAULT): no dialog collected the targets
+            self._collect_targets(context)
         self._objects, skipped = _texture_bake_targets(self._objects)
+        self._total_objects = len(self._objects)
         if skipped:
             names = ", ".join(obj.name for obj in skipped[:5])
             more = "" if len(skipped) <= 5 else f", +{len(skipped) - 5} more"
