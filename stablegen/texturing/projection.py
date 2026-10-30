@@ -245,14 +245,28 @@ def _scene_projection_scale(context):
 
 
 def _multiply_projection_weight_by_alpha(
-    nodes, links, weight_node, image_node, label
+    nodes, links, weight_node, image_node, label, threshold=None
 ):
-    """Return a projection weight multiplied by an image's alpha channel."""
+    """Return a projection weight multiplied by an image's alpha channel.
+
+    With ``threshold`` the weight is gated on alpha instead: the weights are
+    normalized afterwards, so a nearly transparent pixel that is the only
+    view of a surface would otherwise count fully, with its color already
+    multiplied by that alpha (Cycles premultiplies straight-alpha images).
+    """
+    alpha = image_node.outputs["Alpha"]
+    if threshold is not None:
+        gate = nodes.new("ShaderNodeMath")
+        gate.operation = 'GREATER_THAN'
+        gate.inputs[1].default_value = threshold
+        gate.label = f"{label} gate"
+        links.new(alpha, gate.inputs[0])
+        alpha = gate.outputs[0]
     alpha_weighted = nodes.new("ShaderNodeMath")
     alpha_weighted.operation = 'MULTIPLY'
     alpha_weighted.label = label
     links.new(weight_node.outputs[0], alpha_weighted.inputs[0])
-    links.new(image_node.outputs["Alpha"], alpha_weighted.inputs[1])
+    links.new(alpha, alpha_weighted.inputs[1])
     return alpha_weighted
 
 
@@ -3303,6 +3317,8 @@ def project_image(
                         if use_qwen21_generated_alpha
                         else f"SDXLFeatherAlpha-{i}-{mat_id}"
                     ),
+                    # Qwen 2.1's transparency is a cutout; SDXL's alpha is a feather
+                    threshold=0.5 if use_qwen21_generated_alpha else None,
                 )
 
             if stable_sequential:
