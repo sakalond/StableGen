@@ -906,6 +906,23 @@ def flatten_projection_material_for_refine(context, obj, baked_image_path):
 
     print(f"[StableGen] Flattened ProjectionMaterial for '{obj.name}' to baked texture '{os.path.basename(baked_image_path)}'")
 
+def _surface_color_socket(surface_link, nodes):
+    """The color socket behind a material's surface: the input feeding a BSDF's base color (a constant becomes an
+    RGB node), or the socket itself when a color node is wired straight to the output."""
+    node = surface_link.from_node
+    if surface_link.from_socket.type != 'SHADER':
+        return surface_link.from_socket
+    color_input = node.inputs.get("Base Color") or node.inputs.get("Color")
+    if color_input is None:
+        return None
+    if color_input.is_linked:
+        return color_input.links[0].from_socket
+    constant = nodes.new("ShaderNodeRGB")
+    constant.location = (node.location.x - 200, node.location.y)
+    constant.outputs[0].default_value = color_input.default_value
+    return constant.outputs[0]
+
+
 @operation
 def _export_emit_image_impl(context, to_export, camera_id=None, bg_color=(0.5, 0.5, 0.5), view_transform='Standard', fallback_color=(0,0,0), restore_materials=True):
         """
@@ -965,40 +982,23 @@ def _export_emit_image_impl(context, to_export, camera_id=None, bg_color=(0.5, 0
             if not output or not output.inputs[0].links:
                 continue
 
-                # Check the type of the node which connects to output
-            before_output = output.inputs[0].links[0].from_node
-            if before_output.type == 'BSDF_PRINCIPLED':
-                # Find the last color mix node
-                color_mix = output.inputs[0].links[0].from_node.inputs[0].links[0].from_node
-                # Set color 2 to fallback color
-                if not "visibility" in str(camera_id):
-                    color_mix.inputs["Color2"].default_value = (fallback_color[0], fallback_color[1], fallback_color[2], 1.0)
-            else:
-                # Already a color mix node
-                color_mix = before_output
-                # Set color 2 to fallback color
-                if not "visibility" in str(camera_id):
-                    color_mix.inputs["Color2"].default_value = (fallback_color[0], fallback_color[1], fallback_color[2], 1.0)
-
-                # Blender 5.0+: Wrap color output with Emission shader so the Emit pass picks it up
-                if bpy.app.version >= (5, 0, 0):
-                    emission_node = nodes.new("ShaderNodeEmission")
-                    emission_node.location = (output.location.x - 200, output.location.y)
-                    links.new(color_mix.outputs[0], emission_node.inputs["Color"])
-                    links.new(emission_node.outputs[0], output.inputs["Surface"])
+            color = _surface_color_socket(output.inputs[0].links[0], nodes)
+            if color is None:
                 continue
-
-            # Find the last color mix node
-            color_mix = output.inputs[0].links[0].from_node.inputs[0].links[0].from_node
-            # Connect the color mix node directly to the output
+            # StableGen's projection chain ends in a MixRGB whose Color2 is the
+            # fallback for unprojected surfaces. Other materials (Refine on an
+            # imported model) have no such node and render their own color.
+            color_mix = color.node
+            if "visibility" not in str(camera_id) and color_mix.bl_idname == 'ShaderNodeMixRGB':
+                color_mix.inputs["Color2"].default_value = (fallback_color[0], fallback_color[1], fallback_color[2], 1.0)
             if bpy.app.version >= (5, 0, 0):
-                # Blender 5.0+: Wrap in Emission shader for Emit pass
+                # Blender 5.0+: Wrap color output with Emission shader so the Emit pass picks it up
                 emission_node = nodes.new("ShaderNodeEmission")
                 emission_node.location = (output.location.x - 200, output.location.y)
-                links.new(color_mix.outputs[0], emission_node.inputs["Color"])
+                links.new(color, emission_node.inputs["Color"])
                 links.new(emission_node.outputs[0], output.inputs["Surface"])
             else:
-                links.new(color_mix.outputs[0], output.inputs[0])
+                links.new(color, output.inputs[0])
 
         output_dir = get_dir_path(context, "inpaint")["visibility"] if "visibility" in str(camera_id) else get_dir_path(context, "inpaint")["render"]
         output_file = f"ctx_render{camera_id}" if camera_id is not None else "ctx_render"
@@ -1624,12 +1624,8 @@ def _export_visibility_impl(context, to_export, obj=None, camera_visibility=None
         # Determine which input to used based on existence of BSDF node before the output
         if output.inputs[0].links and output.inputs[0].links[0].from_node.type == 'BSDF_PRINCIPLED':
             principled = output.inputs[0].links[0].from_node
-            if not principled.inputs[0].links:
-                # Principled BSDF exists but nothing is connected to its
-                # Base Color – this is not a projection material.
-                bpy.data.materials.remove(mat_copy)
-                return False
-            color_mix = principled.inputs[0].links[0].from_node
+            # Nothing on Base Color: not a projection material (handled below)
+            color_mix = principled.inputs[0].links[0].from_node if principled.inputs[0].links else principled
             input = principled.inputs[0]
         else:
             color_mix = output.inputs[0].links[0].from_node
@@ -1641,6 +1637,13 @@ def _export_visibility_impl(context, to_export, obj=None, camera_visibility=None
         obj.data.materials.append(mat_copy)
         temporary_materials[obj] = mat_copy
         prepared_materials[source_pointer] = mat_copy
+        if color_mix.bl_idname != 'ShaderNodeMixRGB':
+            # Not a projection chain (Refine on the model's own material):
+            # no view covers it yet, so all of it is visible to this camera.
+            uncovered = nodes.new("ShaderNodeRGB")
+            uncovered.outputs[0].default_value = (1, 1, 1, 1)
+            links.new(uncovered.outputs[0], input)
+            return True
         # Add equal node between color mix and bsdf
         equal = nodes.new("ShaderNodeMath")
         
