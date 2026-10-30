@@ -958,6 +958,18 @@ def add_pbr_layers(material, layer, maps, use_albedo, emission_strength=2.5):
     return added
 
 
+def opaque_write_mask(mask, alpha):
+    """The write mask without the pixels a view returned transparent.
+
+    Qwen 2.1's native RGBA output can cut a foreground object out and leave the
+    masked surface behind it transparent; projected, those pixels wrote black.
+    They keep the existing texture instead, as in generation.
+    """
+    from PIL import Image
+    opaque = np.where(np.asarray(alpha) >= 128, 255, 0).astype(np.uint8)
+    return Image.fromarray(np.minimum(np.asarray(mask), opaque))
+
+
 def project_view(context, objects, camera, image_path, write_path, material_id, expand=0):
     """Reuse raycast projection, then gate its weight with the frozen surface mask.
 
@@ -1300,8 +1312,12 @@ class SG_OT_MaskedEdit(bpy.types.Operator):
             with Image.open(self.result) as generated, Image.open(self.current_dir / 'context.png') as original:
                 if generated.size != original.size:
                     raise RuntimeError('Generated image dimensions differ from the camera render; refusing misaligned projection')
-                # Preserve original RGB outside the mask even in saved camera outputs.
                 mask = Image.open(self.write_mask).convert('L')
+                if 'A' in generated.getbands():
+                    mask = opaque_write_mask(mask, generated.getchannel('A'))
+                    self.write_mask = self.current_dir / 'write_mask_opaque.png'
+                    mask.save(self.write_mask)
+                # Preserve original RGB outside the mask even in saved camera outputs.
                 Image.composite(generated.convert('RGB'), original.convert('RGB'), mask).save(self.current_dir / 'composited.png')
             # Use raw generated RGB: the surface shader applies the feather once.
             self._stage = 'Projecting Result'
