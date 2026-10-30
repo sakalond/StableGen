@@ -89,16 +89,14 @@ PRESETS["QWEN 2.1 PRECISE"] = {
         "DPM++ SDE and SGM Uniform with no Lightning LoRA. This combination "
         "produced broad, coherent panels that followed the model silhouette and "
         "continued well into later views. Best when adjacent cameras overlap "
-        "well; sparse coverage can still introduce artifacts. Qwen 2.1 is also "
-        "prompted to generate native RGBA views, independently of the sampler, "
-        "and transparent pixels are excluded from texture projection."
+        "well; sparse coverage can still introduce artifacts."
     ),
     "model_architecture": "qwen_image_21",
     "steps": 20,
     "cfg": 1.0,
     "sampler": "dpmpp_sde",
     "scheduler": "sgm_uniform",
-    "qwen_image_21_native_rgba": True,
+    "qwen_image_21_native_rgba": False,
     "qwen_guidance_background_color": mathutils.Color((0.5, 0.5, 0.5)),
     "lora_units": [],
 }
@@ -115,8 +113,7 @@ PRESETS["QWEN 2.1 PRECISE+"] = {
         "Uses a 0.50 context trust threshold, a 3 px silhouette margin and "
         "backface projection. Retains Qwen 2.1 Precise's projected-context "
         "strategy, 20 steps, CFG 1.0, DPM++ SDE, SGM Uniform, blending exponent "
-        "7 and native RGBA output, with no Lightning LoRA. Transparent pixels "
-        "are excluded from projection. Research options are off. Best suited "
+        "7, with no Lightning LoRA. Research options are off. Best suited "
         "to overlapping camera views; fine patterns and material continuity "
         "can still vary, and standard Precise can work better on some assets."
     ),
@@ -141,8 +138,6 @@ PRESETS["QWEN 2.1 SAFE"] = {
         "and details around the object. Uses the tested projection-oriented "
         "configuration of 20 steps, CFG 1, DPM++ SDE and SGM Uniform with no "
         "Lightning LoRA. It favors broad, geometry-following texture regions. "
-        "Qwen 2.1 is prompted to generate native RGBA views independently of the "
-        "sampler, and transparent pixels are excluded from texture projection. "
         "It is slower when the initial reference is tall or large."
     ),
     "model_architecture": "qwen_image_21",
@@ -150,7 +145,7 @@ PRESETS["QWEN 2.1 SAFE"] = {
     "cfg": 1.0,
     "sampler": "dpmpp_sde",
     "scheduler": "sgm_uniform",
-    "qwen_image_21_native_rgba": True,
+    "qwen_image_21_native_rgba": False,
     "sequential_ipadapter": True,
     "sequential_ipadapter_mode": "first",
     "qwen_context_render_mode": "NONE",
@@ -168,8 +163,7 @@ PRESETS["QWEN 2.1 CONTEXT + REFERENCE"] = {
         "depth guide for geometry and the initial view for overall appearance. "
         "A 50-degree discard angle excludes grazing projections during generation, "
         "then resets to 90 degrees for the final material; blending exponent is 7. "
-        "Uses 20 steps, CFG 1.0, DPM++ SDE, SGM Uniform, native RGBA output and no "
-        "LoRA. Transparent generated pixels are excluded from projection. "
+        "Uses 20 steps, CFG 1.0, DPM++ SDE, SGM Uniform and no LoRA. "
         "Confidence-Gated Context, Acquisition Quality Weighting and Depth/Part "
         "Projection Guard are off; legacy fallback dilation is 1 px, cleanup is "
         "off and backface projection is allowed. Captures the current manually "
@@ -208,9 +202,8 @@ PRESETS["LOCAL EDIT (QWEN 2.1)"] = {
         "Preserves the original Local Edit camera coverage and edge-feathering "
         "settings so the edited projections blend into the existing material. "
         "Uses 20 steps, CFG 1.0, DPM++ SDE, SGM Uniform, blending exponent 7 "
-        "and native RGBA output, with no Lightning LoRA. Transparent generated "
-        "pixels do not contribute to projection. This edits camera-selected "
-        "areas; use Masked Edit generation mode for painted-mask selection."
+        "and no Lightning LoRA. This edits camera-selected areas; use Masked "
+        "Edit generation mode for painted-mask selection."
     ),
     "architecture_mode": "qwen_image_21",
     "model_architecture": "qwen_image_21",
@@ -220,7 +213,7 @@ PRESETS["LOCAL EDIT (QWEN 2.1)"] = {
     "cfg": 1.0,
     "sampler": "dpmpp_sde",
     "scheduler": "sgm_uniform",
-    "qwen_image_21_native_rgba": True,
+    "qwen_image_21_native_rgba": False,
     "qwen_guidance_background_color": mathutils.Color((0.5, 0.5, 0.5)),
     "lora_units": [],
 }
@@ -233,10 +226,9 @@ PRESETS["REFINE (QWEN 2.1)"] = {
         "as its editing input, making this suitable for overall color, art "
         "style or surface-appearance changes. Preserves the original Qwen "
         "Refine workflow settings. Uses 20 steps, CFG 1.0, DPM++ SDE, SGM "
-        "Uniform, blending exponent 7 and native RGBA output, with no Lightning "
-        "LoRA. Transparent generated pixels are excluded from projection. "
-        "Use Local Edit for camera-targeted changes or Masked Edit generation "
-        "mode to select an area by painting."
+        "Uniform, blending exponent 7 and no Lightning LoRA. Use Local Edit for "
+        "camera-targeted changes or Masked Edit generation mode to select an "
+        "area by painting."
     ),
     "architecture_mode": "qwen_image_21",
     "model_architecture": "qwen_image_21",
@@ -246,7 +238,7 @@ PRESETS["REFINE (QWEN 2.1)"] = {
     "cfg": 1.0,
     "sampler": "dpmpp_sde",
     "scheduler": "sgm_uniform",
-    "qwen_image_21_native_rgba": True,
+    "qwen_image_21_native_rgba": False,
     "qwen_guidance_background_color": mathutils.Color((0.5, 0.5, 0.5)),
     "lora_units": [],
 }
@@ -268,8 +260,7 @@ for _base_name, _purpose in _QWEN_21_TURBO_PURPOSES.items():
         "description": (
             f"Qwen-Image 2.1 Turbo {_purpose}. Matches {_base_name.title()} except "
             "for sampling: the Turbo model's trained 8-step schedule at CFG 1 with "
-            "Euler, several times faster than 20 DPM++ SDE steps. Native RGBA "
-            "output is on and transparent pixels are excluded from projection."
+            "Euler, several times faster than 20 DPM++ SDE steps."
         ),
         "architecture_mode": "qwen_image_21_turbo",
         "model_architecture": "qwen_image_21_turbo",

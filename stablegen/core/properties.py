@@ -429,11 +429,13 @@ def register_properties(update_model_list, ControlNetUnit, LoRAUnit,
     bpy.types.Scene.qwen_image_21_native_rgba = bpy.props.BoolProperty(
         name="Native RGBA Output",
         description=(
-            "Wrap Qwen-Image 2.1 prompts with the native transparency instruction. "
-            "When enabled, transparent generated pixels are excluded from texture "
-            "projection. Disable it to let the prompt and model choose the background"
+            "Wrap Qwen-Image 2.1 prompts with the native transparency instruction, "
+            "so the model cuts the subject out on a transparent background. Off by "
+            "default: the model also cuts away surfaces it should paint, such as "
+            "ground and walls, which leaves them for worse-angled views. "
+            "Transparent generated pixels are never projected"
         ),
-        default=True,
+        default=False,
         update=update_parameters,
     )
     bpy.types.Scene.moss_depth_control = bpy.props.BoolProperty(
