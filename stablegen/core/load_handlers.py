@@ -15,8 +15,12 @@ from .architectures import QWEN_ARCHITECTURES
 
 
 @persistent
-def load_handler(dummy):
-    """Set default ControlNet/LoRA units and sync checkpoint cache on file load."""
+def load_handler(dummy, file_loaded=True):
+    """Set default ControlNet/LoRA units and sync checkpoint cache on file load.
+
+    Server checks reuse it with file_loaded=False: a generation may be
+    running then, so its status must not be reset.
+    """
     from ..ui.model_units import get_lora_models
     from . import state as _state
     from ..texturing.print_export import prepopulate_palette
@@ -95,7 +99,7 @@ def load_handler(dummy):
     # "running" or "waiting", which leaves the Generate button permanently
     # stuck after reopening. Runtime status is SKIP_SAVE now, but normalize
     # legacy files as well.
-    for loaded_scene in bpy.data.scenes:
+    for loaded_scene in (bpy.data.scenes if file_loaded else ()):
         if getattr(loaded_scene, "generation_status", 'idle') != 'idle':
             loaded_scene.generation_status = 'idle'
         if hasattr(loaded_scene, "generation_progress"):

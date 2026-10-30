@@ -335,7 +335,7 @@ class CheckServerStatus(bpy.types.Operator):
 
             if result.get('online', False):
                 print(f"[StableGen] ComfyUI server is online at {server_addr}.")
-                load_handler(None)
+                load_handler(None, file_loaded=False)
                 def _deferred_refresh():
                     try:
                         bpy.ops.stablegen.refresh_checkpoint_list('INVOKE_DEFAULT')

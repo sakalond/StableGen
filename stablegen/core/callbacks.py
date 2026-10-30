@@ -295,7 +295,7 @@ def update_combined(self, context):
             return
 
         update_parameters(None, bpy.context)
-        load_handler(None)
+        load_handler(None, file_loaded=False)
 
         def _deferred_refresh():
             try:
@@ -310,7 +310,7 @@ def update_combined(self, context):
     _run_async(_bg_work, _on_done, track_generation=True)
 
     update_parameters(self, context)
-    load_handler(None)
+    load_handler(None, file_loaded=False)
 
     return None
 
