@@ -900,11 +900,12 @@ def _bake_visibility_weights(
                     _scene_projection_scale(context) * focal_pixels
                     / np.maximum(dists, 1e-8)
                 )
-            density_confidence = np.clip(
+            # Unclamped and only with view-quality weighting, like the live
+            # material's density term (see there).
+            density_confidence = np.power(
                 projected_span / max(0.5 * min(cam_res_x_n, cam_res_y_n), 1.0),
-                0.0,
-                1.0,
-            )
+                getattr(scene, 'sg_view_density_exponent', 1.0),
+            ) if getattr(scene, 'sg_rework_acquisition_quality', False) else 1.0
             # Store unsharpened acquisition quality.  The material owns the
             # single authoritative SharpW exponent stage.
             w = np.maximum(dot_dn, 0.0) * density_confidence
@@ -2873,7 +2874,14 @@ def project_image(
             return guard_weight
 
         def _acquisition_quality(weight, length_node, camera, cam_index):
-            """Multiply a projection weight by the view's projected pixel density."""
+            """Multiply a projection weight by the view's projected pixel density.
+
+            The density used to be clamped at 1, which every camera within
+            about four scene scales reached, so distance never decided between
+            views and a far view at a slightly better angle beat a near one.
+            Only ratios between views matter after normalization, so the
+            unclamped density is raised to the scene's distance weight.
+            """
             cam_res_x, cam_res_y = _get_camera_resolution(camera, context.scene)
             fov_for_density = camera.data.angle_x
             if cam_res_y > cam_res_x:
@@ -2891,8 +2899,9 @@ def project_image(
             density.label = f"ProjectedDensity-{cam_index}-{mat_id}"
             links.new(length_node.outputs["Value"], density.inputs[1])
             clamp_density = nodes.new("ShaderNodeMath")
-            clamp_density.operation = 'MINIMUM'
-            clamp_density.inputs[1].default_value = 1.0
+            clamp_density.operation = 'POWER'
+            clamp_density.label = f"DistanceWeight-{cam_index}-{mat_id}"
+            clamp_density.inputs[1].default_value = getattr(context.scene, 'sg_view_density_exponent', 1.0)
             links.new(density.outputs[0], clamp_density.inputs[0])
             acquisition = nodes.new("ShaderNodeMath")
             acquisition.operation = 'MULTIPLY'
@@ -3008,13 +3017,15 @@ def project_image(
                 # ── Native Raycast path (Blender 5.1+) ──
                 is_local_edit_mode = (context.scene.generation_method == 'local_edit' or (context.scene.model_architecture in QWEN_ARCHITECTURES and context.scene.qwen_generation_method == 'local_edit'))
                 native_pre_factors = None
-                if (not is_local_edit_mode
-                        and getattr(context.scene, 'sg_rework_acquisition_quality', False)):
+                acquisition = getattr(context.scene, 'sg_rework_acquisition_quality', False)
+                if not is_local_edit_mode and (acquisition or context.scene.visibility_vignette):
                     # Frame-edge and density terms do not depend on the
-                    # raycast; they are combined before it (see there).
+                    # raycast; they are combined before it (see there). The
+                    # frame fade applies on its own: without it a view's
+                    # frame edge is a hard seam wherever another view
+                    # continues the surface.
                     def native_pre_factors(weight, parts, camera=camera, i=i):
-                        if (context.scene.generation_method == 'sequential'
-                                and context.scene.visibility_vignette):
+                        if context.scene.visibility_vignette:
                             frame_weight = create_native_feather(
                                 nodes, links, parts['normalize'], parts['fov'],
                                 parts['aspect'], parts['direction'], parts['up'],
@@ -3026,6 +3037,8 @@ def project_image(
                             links.new(weight, frame_quality.inputs[0])
                             links.new(frame_weight.outputs[0], frame_quality.inputs[1])
                             weight = frame_quality.outputs[0]
+                        if not acquisition:
+                            return weight
                         return _acquisition_quality(weight, parts['length'], camera, i).outputs[0]
                 result = create_native_raycast_visibility(
                     nodes, links, camera, geometry, context, i, mat_id, stop_index,
@@ -3134,10 +3147,7 @@ def project_image(
                     or (context.scene.model_architecture in QWEN_ARCHITECTURES
                         and context.scene.qwen_generation_method == 'local_edit')
                 )
-                needs_frame_quality = (
-                    context.scene.generation_method == 'sequential'
-                    and context.scene.visibility_vignette
-                )
+                needs_frame_quality = context.scene.visibility_vignette
                 if is_local_edit_mode or needs_frame_quality:
                     # Add Feather script
                     script_feather = nodes.new("ShaderNodeScript")
@@ -3180,7 +3190,7 @@ def project_image(
                             final_weight_node = (script_angle, script_feather)
                     elif is_local_edit_mode:
                         final_weight_node = (script_angle, script_feather)
-                    elif getattr(context.scene, 'sg_rework_acquisition_quality', False):
+                    elif needs_frame_quality:
                         frame_quality = nodes.new("ShaderNodeMath")
                         frame_quality.operation = 'MULTIPLY'
                         frame_quality.label = f"FrameEdgeQuality-{i}-{mat_id}"

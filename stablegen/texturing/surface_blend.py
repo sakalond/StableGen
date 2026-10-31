@@ -284,7 +284,8 @@ def build(context, objects, cameras, images, material, mat_id, stop_index):
             widths.append(world_pixel * scene.sg_silhouette_feather)
             quality = cosine * visible
             if scene.sg_rework_acquisition_quality:
-                quality *= np.clip(scale/np.maximum(world_pixel,epsilon)/(max(.5*min(x,y),1)),0,1)
+                quality *= (scale/np.maximum(world_pixel,epsilon)/(max(.5*min(x,y),1))) ** getattr(
+                    scene, 'sg_view_density_exponent', 1.)
             if scene.visibility_vignette:
                 w = max(min(scene.visibility_vignette_width,.49),1e-9)
                 edge = np.max(np.abs(uv*2-1),axis=1)

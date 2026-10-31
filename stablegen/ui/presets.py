@@ -432,6 +432,7 @@ GEN_PARAMETERS = [
     'sg_rework_aligned_resolution',
     'sg_rework_full_resolution_scale',
     'sg_rework_acquisition_quality',
+    'sg_view_density_exponent',
     'sg_rework_projection_guard',
     'qwen_global_style_vlm_only',
     'qwen_context_vlm_only',

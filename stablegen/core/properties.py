@@ -894,6 +894,13 @@ def register_properties(update_model_list, ControlNetUnit, LoRAUnit,
         description="Prefer views that observe the surface more directly and with more projected detail. Estimates geometric observation quality, not the artistic quality of generated images.",
         default=TEXTURING_DEFAULTS["sg_rework_acquisition_quality"], update=update_parameters,
     )
+    bpy.types.Scene.sg_view_density_exponent = bpy.props.FloatProperty(
+        name="Distance weight",
+        description="With Weight by view quality: how much nearer views win where views overlap. Each view's weight "
+                    "is multiplied by its projected pixel density raised to this power; 0 ignores distance, 1 weighs "
+                    "a view at half the distance twice as much",
+        default=1.0, min=0.0, max=4.0, update=update_parameters,
+    )
     bpy.types.Scene.sg_rework_projection_guard = bpy.props.BoolProperty(
         name="Depth/Part Projection Guard",
         description="Reduce projection near depth and object/material boundaries to prevent foreground colors spilling onto surfaces behind them. DPPG controls source acceptance separately from ordinary view weighting.",
@@ -2155,6 +2162,7 @@ def unregister_properties(load_handler, _sg_queue_load_handler):
         'sg_rework_aligned_resolution',
         'sg_rework_full_resolution_scale',
         'sg_rework_acquisition_quality',
+        'sg_view_density_exponent',
         'sg_rework_projection_guard',
         'qwen_global_style_vlm_only',
         'qwen_context_vlm_only',

@@ -1468,6 +1468,8 @@ class StableGenPanel(bpy.types.Panel):
                 if width_mode == 'narrow':
                     row = content_box.row(align=True)
                 row.prop(scene, "sg_rework_acquisition_quality", text="Weight by view quality", toggle=True)
+                if scene.sg_rework_acquisition_quality:
+                    content_box.prop(scene, "sg_view_density_exponent")
                 content_box.prop(scene, "sg_rework_projection_guard", text="Depth/Part Projection Guard", toggle=True)
                 if scene.sg_rework_projection_guard:
                     guard_box = content_box.box()
