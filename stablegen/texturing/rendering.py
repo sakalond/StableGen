@@ -2372,26 +2372,29 @@ def _pin_unlinked_image_textures_to_uv(nodes, links, uv_name, exclude_nodes=()):
     return uv_node
 
 
+def _replace_material_slots(obj, materials):
+    """Put *materials* in the mesh's slots, keeping every face on its slot. Clearing the slots resets the faces to
+    slot 0, and a skipped empty slot would shift the rest, so a bake took slot 0 instead of the faces' material."""
+    mesh = obj.data
+    face_slots = np.empty(len(mesh.polygons), dtype=np.int32)
+    mesh.polygons.foreach_get("material_index", face_slots)
+    mesh.materials.clear()
+    for mat in materials:
+        mesh.materials.append(mat)
+    mesh.polygons.foreach_set("material_index", face_slots)
+    mesh.update()
+
+
 def _copy_material_slots_for_bake(obj):
     original_materials = list(obj.data.materials)
     original_active_index = obj.active_material_index
-    copied_materials = []
-
-    obj.data.materials.clear()
-    for mat in original_materials:
-        if mat:
-            mat_copy = mat.copy()
-            obj.data.materials.append(mat_copy)
-            copied_materials.append(mat_copy)
-
-    return original_materials, original_active_index, copied_materials
+    copied_materials = [mat.copy() if mat else None for mat in original_materials]
+    _replace_material_slots(obj, copied_materials)
+    return original_materials, original_active_index, [mat for mat in copied_materials if mat]
 
 
 def _restore_material_slots_after_bake(obj, original_materials, original_active_index, copied_materials):
-    obj.data.materials.clear()
-    for mat in original_materials:
-        if mat:
-            obj.data.materials.append(mat)
+    _replace_material_slots(obj, original_materials)
     if obj.data.materials:
         obj.active_material_index = min(max(0, original_active_index), len(obj.data.materials) - 1)
     for mat in copied_materials:
