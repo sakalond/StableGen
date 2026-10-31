@@ -219,7 +219,7 @@ class Reproject(bpy.types.Operator):
         # Search for largest material id
         max_id = -1
         for obj in to_texture:
-            mat_id = get_last_material_index(obj)
+            mat_id = get_last_material_index(obj, include_edits=False)
             if mat_id > max_id:
                 max_id = mat_id
 
@@ -1125,9 +1125,11 @@ class ComfyUIGenerate(_PBRMixin, bpy.types.Operator):
             self._to_texture = [obj for obj in bpy.context.view_layer.objects if obj.type == 'MESH' and not obj.hide_get()]
 
         # Find all mesh objects, check their material ids and store the highest one
+        # (a reprojection reads generated views, which Masked Edit layers do not have)
+        reproject = context.scene.generation_mode == 'project_only'
         for obj in self._to_texture:
             for slot in obj.material_slots:
-                material_id = get_last_material_index(obj)
+                material_id = get_last_material_index(obj, include_edits=not reproject)
                 if (material_id > self._material_id):
                     self._material_id = material_id
             # Check if there's room for the projection buffer UV map (only 1 slot needed)
