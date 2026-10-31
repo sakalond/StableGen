@@ -2559,7 +2559,13 @@ def project_image(
         # the active material after Bake Textures) replaced the bake with a new
         # projection graph; project into the object's projection material
         # again, or a new one, and leave the bake for the user to switch back to.
-        if obj.active_material is not None and is_baked_material(obj.active_material):
+        # Local edits (Masked Edit, local refine) edit the active material on
+        # purpose, a bake included, and keep doing so.
+        local_edit = (context.scene.generation_method == 'local_edit'
+                      or (context.scene.model_architecture in QWEN_ARCHITECTURES
+                          and context.scene.qwen_generation_method == 'local_edit'))
+        if (not local_edit and obj.active_material is not None
+                and is_baked_material(obj.active_material)):
             baked = obj.active_material
             index = next((k for k, m in enumerate(obj.data.materials)
                           if m and m is not baked and not is_baked_material(m)), -1)
