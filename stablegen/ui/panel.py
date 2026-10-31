@@ -1758,7 +1758,11 @@ class StableGenPanel(bpy.types.Panel):
                             style_box = content_box.box()
                             row = style_box.row()
                             row.prop(scene, "qwen_external_style_image", text="Style Image")
-                    
+                            if (scene.model_architecture == 'qwen_image_edit' and scene.qwen_refine_use_prev_ref
+                                    and scene.qwen_refine_use_depth):
+                                style_box.label(text="Qwen Image Edit takes three images: the style image replaces the depth map.",
+                                                icon='INFO')
+
                     # Timestep-zero reference method — shared across all Qwen modes
                     row = content_box.row()
                     row.prop(scene, "qwen_timestep_zero_ref", text="Timestep-Zero References (color shift fix)", toggle=True, icon="COLORSET_08_VEC")

@@ -42,6 +42,13 @@ def unified_paint(scene):
             else settings.unified_paint_settings)
 
 
+def reference_path(scene):
+    """The reference image the edit follows (an absolute path), or None when none is used."""
+    if scene.model_architecture not in QWEN_ARCHITECTURES or not scene.sg_masked_use_reference:
+        return None
+    return bpy.path.abspath(scene.sg_masked_reference_image) if scene.sg_masked_reference_image else ''
+
+
 def qwen_edit_instruction(instruction, overlay, template=None):
     instruction = instruction.strip()
     if template is not None:
@@ -1058,7 +1065,10 @@ class SG_OT_MaskedEdit(bpy.types.Operator):
                 raise ValueError('Set a valid output directory in StableGen preferences')
             if not context.scene.sg_masked_prompt.strip():
                 raise ValueError('Describe the requested edit first')
-            self.objects = [o for o in eligible_objects(context) if o.sg_edit_mask and MASK_UV in o.data.uv_layers]
+            reference = reference_path(context.scene)
+            if reference is not None and not Path(reference).is_file():
+                raise ValueError('Choose a reference image, or turn off Use Reference Image')
+            self.objects =[o for o in eligible_objects(context) if o.sg_edit_mask and MASK_UV in o.data.uv_layers]
             if not self.objects:
                 raise ValueError('Paint a selection on a target mesh first')
             for obj in self.objects:
@@ -1139,6 +1149,7 @@ class SG_OT_MaskedEdit(bpy.types.Operator):
             'expand_selection_px': int(self.scene.sg_masked_expand),
             'edge_softness_px': int(self.scene.sg_masked_feather),
             'use_depth': bool(self.scene.sg_masked_use_depth),
+            'reference_image': reference_path(self.scene),
             'custom_prompt': bool(self.scene.sg_masked_use_custom_prompt),
             'pbr_channels': sorted(getattr(self, 'pbr_channels', ())),
             'prompt_template': (self.scene.sg_masked_custom_prompt
@@ -1199,6 +1210,8 @@ class SG_OT_MaskedEdit(bpy.types.Operator):
                 paths['overlay'] = overlay
             if depth:
                 paths['depth'] = depth
+            if reference_path(context.scene):
+                paths['reference'] = reference_path(context.scene)
             for key, path in paths.items():
                 uploaded = upload_image_to_comfyui(server, str(path), operator=self)
                 if not uploaded:
@@ -1213,7 +1226,8 @@ class SG_OT_MaskedEdit(bpy.types.Operator):
                     'prompt': context.scene.sg_masked_prompt,
                     'overlay': self.uploads.get('overlay'),
                     'depth': self.uploads.get('depth'),
-                    'prompt_template': (context.scene.sg_masked_custom_prompt
+                    'reference': self.uploads.get('reference'),
+                    'prompt_template':(context.scene.sg_masked_custom_prompt
                                         if context.scene.sg_masked_use_custom_prompt else None),
                 })
             else:
@@ -1523,6 +1537,13 @@ def draw_masked_edit_controls(layout, context):
     if scene.model_architecture in QWEN_ARCHITECTURES:
         layout.prop(scene, 'sg_masked_overlay')
         layout.prop(scene, 'sg_masked_use_depth')
+        layout.prop(scene, 'sg_masked_use_reference', toggle=True, icon='FILE_IMAGE')
+        if scene.sg_masked_use_reference:
+            box = layout.box()
+            box.prop(scene, 'sg_masked_reference_image', text='Image')
+            if scene.model_architecture == 'qwen_image_edit' and scene.sg_masked_use_depth:
+                box.label(text='Qwen Image Edit takes three images: the reference replaces the depth map.',
+                          icon='INFO')
         layout.prop(scene, 'sg_masked_use_custom_prompt', text='Custom Guidance Prompt', toggle=True, icon='TEXT')
         if scene.sg_masked_use_custom_prompt:
             box = layout.box()
@@ -1573,6 +1594,14 @@ def register_properties():
     bpy.types.Scene.sg_masked_use_depth = bpy.props.BoolProperty(
         name='Use Depth Map', default=False,
         description='Send the current camera depth as Image3 for structural guidance; useful for shape-sensitive edits but may weaken material or additive changes')
+    bpy.types.Scene.sg_masked_use_reference = bpy.props.BoolProperty(
+        name='Use Reference Image', default=False,
+        description='Send an image whose design the edit follows inside the selection, such as a logo, a pattern '
+                    'or a print, fitted to the surface. Qwen Image Edit takes three images, so the reference '
+                    'replaces the depth map there')
+    bpy.types.Scene.sg_masked_reference_image = bpy.props.StringProperty(
+        name='Reference Image', default='', subtype='FILE_PATH',
+        description='Image the edit follows, scaled to about 1 MP for the model')
     bpy.types.Scene.sg_masked_use_custom_prompt = bpy.props.BoolProperty(
         name='Use Custom Guidance Prompt', default=False,
         description='Override the default Qwen Masked Edit guidance prompt')
@@ -1609,6 +1638,6 @@ def unregister_properties():
         keymap.keymap_items.remove(item)
     _paint_keymaps.clear()
     for owner, names in ((bpy.types.Object, ('sg_edit_mask', 'sg_mask_paint_original', 'sg_mask_original', 'sg_mask_original_mesh')),
-                         (bpy.types.Scene, ('sg_mask_previous_canvas', 'sg_masked_prompt', 'sg_masked_overlay', 'sg_masked_use_depth', 'sg_masked_use_custom_prompt', 'sg_masked_custom_prompt', 'sg_masked_resolution', 'sg_masked_expand', 'sg_masked_feather', 'sg_masked_strength', 'sg_masked_update_pbr', 'sg_masked_status'))):
+                         (bpy.types.Scene, ('sg_mask_previous_canvas', 'sg_masked_prompt', 'sg_masked_overlay', 'sg_masked_use_depth', 'sg_masked_use_reference', 'sg_masked_reference_image', 'sg_masked_use_custom_prompt', 'sg_masked_custom_prompt', 'sg_masked_resolution', 'sg_masked_expand', 'sg_masked_feather', 'sg_masked_strength', 'sg_masked_update_pbr', 'sg_masked_status'))):
         for name in names:
             delattr(owner, name)

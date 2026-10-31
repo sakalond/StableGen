@@ -2,6 +2,7 @@ from ..core.feature_flags import experimental_enabled
 import bpy
 import os
 import json
+import re
 import uuid
 import random
 import urllib.request
@@ -67,6 +68,11 @@ def _immutable_view_prompt(operator):
         )
         return item.prompt if item and item.prompt else ""
     return ""
+
+
+def _image_slots(inputs):
+    """The legacy encoder's image inputs (image1, image2, ...) in slot order."""
+    return sorted((key for key in inputs if re.fullmatch(r'image\d+', key)), key=lambda key: int(key[5:]))
 
 
 def _texturing_prompt(scene):
@@ -184,11 +190,7 @@ class _TexturingWorkflowMixin:
         """
         old_encoder = prompt[nodes['pos_prompt']]
         old_inputs = old_encoder.get('inputs', {})
-        image_refs = [
-            old_inputs[key]
-            for key in ('image1', 'image2', 'image3')
-            if key in old_inputs
-        ]
+        image_refs = [old_inputs[key] for key in _image_slots(old_inputs)]
         prompt_text = old_inputs.get('prompt', '')
         if projected_context_target and len(image_refs) >= 2:
             # The legacy graph routes structure/depth as image 1 and projected
@@ -385,11 +387,7 @@ class _TexturingWorkflowMixin:
         which would no longer register with the camera.
         """
         old_inputs = prompt[nodes['pos_prompt']].get('inputs', {})
-        image_refs = [
-            old_inputs[key]
-            for key in ('image1', 'image2', 'image3')
-            if key in old_inputs
-        ]
+        image_refs = [old_inputs[key] for key in _image_slots(old_inputs)]
         mapping = {}
         if projected_context_target and len(image_refs) >= 2:
             image_refs[0], image_refs[1] = image_refs[1], image_refs[0]
@@ -1092,13 +1090,33 @@ class _TexturingWorkflowMixin:
                 del prompt[NODES['pos_prompt']]['inputs']['image2']
                 del prompt[NODES['neg_prompt']]['inputs']['image2']
 
+        # --- Reference images the edit follows ---
+        # Masked Edit sends its own reference (a logo, a pattern). Refine sends
+        # the external style image next to the previous refined view, which
+        # used to take its slot and drop it on every view after the first.
+        references = []
+        if masked_edit is not None:
+            if masked_edit.get('reference'):
+                references.append(('edit', masked_edit['reference']))
+        elif (context.scene.qwen_use_external_style_image and use_prev_ref
+              and style_image_info is not None):
+            external = self.operator._get_uploaded_image_info(
+                context, "custom", filename=bpy.path.abspath(context.scene.qwen_external_style_image))
+            if external:
+                references.append(('style', external))
+
         # --- Configure Depth Map (Image 3) ---
         use_depth = (bool(masked_edit.get('depth')) if masked_edit is not None
                      else context.scene.qwen_refine_use_depth)
         depth_info = masked_edit.get('depth') if masked_edit is not None else None
         if use_depth and masked_edit is None:
             depth_info = self.operator._get_uploaded_image_info(context, "controlnet", subtype="depth", camera_id=camera_id)
-        
+        if (depth_info and references and not native_graph
+                and 'image2' in prompt[NODES['pos_prompt']]['inputs']):
+            # Qwen Image Edit takes three images: the reference takes the depth map's place.
+            print("[StableGen] Qwen Image Edit takes three images; the reference image replaces the depth map")
+            depth_info = None
+
         if depth_info:
             prompt[NODES['context_render_loader']]['inputs']['image'] = depth_info['name']
         else:
@@ -1106,6 +1124,30 @@ class _TexturingWorkflowMixin:
             del prompt[NODES['context_render_loader']]
             del prompt[NODES['pos_prompt']]['inputs']['image3']
             del prompt[NODES['neg_prompt']]['inputs']['image3']
+
+        # Each reference takes the next free image slot, scaled to ~1 MP like
+        # the external style image (user files can be arbitrarily large).
+        reference_slots = []
+        for kind, info in references:
+            used = {int(key[5:]) for key in prompt[NODES['pos_prompt']]['inputs']
+                    if re.fullmatch(r'image\d+', key)}
+            slot = min(set(range(1, len(used) + 2)) - used)
+            loader = str(max(int(key) for key in prompt if key.isdigit()) + 1)
+            prompt[loader] = {
+                "inputs": {"image": info['name']},
+                "class_type": "LoadImage",
+                "_meta": {"title": f"Reference Image {slot}"},
+            }
+            scale = str(int(loader) + 1)
+            prompt[scale] = {
+                "inputs": {"upscale_method": "lanczos", "megapixels": 1,
+                           "resolution_steps": 1, "image": [loader, 0]},
+                "class_type": "ImageScaleToTotalPixels",
+                "_meta": {"title": "Scale Reference to 1MP"},
+            }
+            for encoder in (NODES['pos_prompt'], NODES['neg_prompt']):
+                prompt[encoder]['inputs'][f'image{slot}'] = [scale, 0]
+            reference_slots.append((kind, slot))
 
         # --- Prompt ---
         user_prompt = _texturing_prompt(context.scene)
@@ -1116,17 +1158,27 @@ class _TexturingWorkflowMixin:
                 masked_edit['prompt'], bool(style_image_info), masked_edit.get('prompt_template'))
         if depth_info:
             final_prompt += "\n\nImage3 is a depth map of the same view; use it to preserve scene geometry."
-        
+        for kind, slot in reference_slots:
+            if kind == 'edit':
+                final_prompt += (
+                    f"\n\nImage{slot} is a reference for the edit: follow its design, shapes, colours and "
+                    "any lettering inside the highlighted region, fitted to the surface's perspective, "
+                    "material and lighting.")
+            else:
+                final_prompt += f"\n\nImage{slot} is the appearance reference."
+
         prompt[NODES['pos_prompt']]['inputs']['prompt'] = final_prompt
 
         if native_graph:
             self._convert_native_edit_graph(prompt, NODES, context)
         else:
             # --- Reference Latent chain (Qwen unzoom fix) ---
-            # The overlay is a semantic selection guide, never an appearance latent.
+            # The overlay is a semantic selection guide, never an appearance
+            # latent; a reference image is one, since its design is reproduced.
             self._build_qwen_reference_latent_chain(
                 prompt, NODES,
-                **({'latent_slots': ('image1',)} if masked_edit is not None else {}),
+                **({'latent_slots': ('image1',) + tuple(f'image{slot}' for _, slot in reference_slots)}
+                   if masked_edit is not None else {}),
             )
             prompt[NODES['sampler']]['inputs']['seed'] = context.scene.seed
             prompt[NODES['sampler']]['inputs']['steps'] = context.scene.steps
