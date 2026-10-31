@@ -2781,6 +2781,8 @@ def bake_texture(context, obj, texture_resolution, suffix = "", view_transform =
             else:
                 image.filepath_raw = os.path.join(
                     output_dir, f"{obj.name}_baked{suffix}.png")
+            if suffix == "":
+                _keep_earlier_bake(image.filepath_raw, keep=image)
             image.file_format = 'PNG'
             image.save()
             return True
@@ -2837,6 +2839,39 @@ _PBR_CHANNEL_SUFFIXES = {
 }
 
 
+def _keep_earlier_bake(path, keep=None):
+    """Give each image a material still reads from *path* its own copy before a new bake replaces that file.
+
+    Every bake of an object writes the same files (``{object}.png``, ``{object}_Roughness.png``, ...) and an
+    image reads its file again on reload, a packed one included, so an earlier baked material would show the new
+    bake. The newest bake keeps the canonical name, which export reads; the earlier image moves to
+    ``{name} {n}.png``, written from its own pixels."""
+    target = os.path.normcase(os.path.normpath(os.path.abspath(path)))
+    stem, ext = os.path.splitext(path)
+    kept = []
+    for image in bpy.data.images:
+        if image is keep or image.users == 0 or image.source != 'FILE' or not image.filepath:
+            continue
+        try:
+            source = os.path.normcase(os.path.normpath(bpy.path.abspath(image.filepath)))
+        except (TypeError, ValueError):
+            continue
+        if source != target:
+            continue
+        index = 1
+        while os.path.exists(f"{stem} {index}{ext}"):
+            index += 1
+        copy_path = f"{stem} {index}{ext}"
+        image.save(filepath=copy_path)
+        image.filepath_raw = copy_path
+        for packed in image.packed_files:       # a packed image packs this file again on reload
+            packed.filepath = copy_path
+        kept.append(os.path.basename(copy_path))
+    if kept:
+        print(f"[StableGen] Kept an earlier bake of {os.path.basename(path)} as {', '.join(kept)}")
+    return kept
+
+
 def _remove_stale_pbr_maps(output_dir, object_name, channels):
     """Delete ``{object_name}_{Suffix}.png`` maps left in *output_dir* by an earlier bake for every channel that is
     not in *channels*. The baked material wires each map it finds on disk, so a channel switched off since the last
@@ -2847,6 +2882,7 @@ def _remove_stale_pbr_maps(output_dir, object_name, channels):
             continue
         path = os.path.join(output_dir, f"{object_name}_{suffix}.png")
         if os.path.isfile(path):
+            _keep_earlier_bake(path)
             os.remove(path)
             removed.append(os.path.basename(path))
     if removed:
@@ -3115,6 +3151,7 @@ def bake_pbr_channel(context, obj, channel_name, texture_resolution, output_dir)
         # ── Save ───────────────────────────────────────────────────
         os.makedirs(output_dir, exist_ok=True)
         out_path = os.path.join(output_dir, f"{obj.name}_{suffix}.png")
+        _keep_earlier_bake(out_path, keep=bake_img)
         bake_img.filepath_raw = out_path
         bake_img.file_format = 'PNG'
         bake_img.save()
@@ -3187,6 +3224,7 @@ def _pack_orm_texture(output_dir, obj_name):
     orm_img.pixels = orm.flatten().tolist()
 
     orm_path = os.path.join(output_dir, f"{obj_name}_ORM.png")
+    _keep_earlier_bake(orm_path, keep=orm_img)
     orm_img.filepath_raw = orm_path
     orm_img.file_format = 'PNG'
     orm_img.save()
@@ -3527,6 +3565,7 @@ class BakeTextures(bpy.types.Operator):
                             if os.path.exists(src_path):
                                 import shutil
                                 try:
+                                    _keep_earlier_bake(dst_path)
                                     shutil.copy(src_path, dst_path)
                                     print(f"[StableGen] Copied fallback diffuse bake to PBR BaseColor: {dst_path}")
                                 except Exception as e:
