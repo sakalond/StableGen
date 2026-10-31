@@ -783,7 +783,34 @@ class _TexturingWorkflowMixin:
         prompt[guider_node]['inputs']['positive'] = pos_cond_ref
         prompt[guider_node]['inputs']['negative'] = neg_cond_ref
 
-    def _get_klein_default_prompts(self, context, is_initial_image):
+    def _context_mode_for_view(self, context, is_initial_image):
+        """The context render mode one view routes its reference images with.
+
+        Replace Style puts the context render in the style image's slot. A
+        style image used on every view (the external one, or the TRELLIS.2
+        input) took that slot instead, so the context render was dropped
+        while the prompt still asked to edit it, and the model repainted the
+        style image. Such a view routes as Additional Context: the context
+        render as image 2, the style image as image 3.
+        """
+        scene = context.scene
+        mode = scene.qwen_context_render_mode
+        if mode != 'REPLACE_STYLE' or is_initial_image:
+            return mode
+        external = (scene.qwen_use_external_style_image
+                    and not scene.qwen_external_style_initial_only)
+        trellis_path = getattr(scene, 'trellis2_last_input_image', '')
+        trellis = (
+            not external
+            and getattr(scene, 'architecture_mode', '') == 'trellis2'
+            and getattr(scene, 'qwen_use_trellis2_style', False)
+            and not getattr(scene, 'qwen_trellis2_style_initial_only', False)
+            and bool(trellis_path)
+            and os.path.exists(bpy.path.abspath(trellis_path))
+        )
+        return 'ADDITIONAL' if external or trellis else mode
+
+    def _get_klein_default_prompts(self, context, is_initial_image, context_mode=None):
         """Gets the default Klein prompts based on the current context.
 
         Follows BFL's official Klein prompting guide: write like a novelist,
@@ -791,10 +818,12 @@ class _TexturingWorkflowMixin:
         describe the desired transformation rather than the image contents.
         Camera prompts are placed after the main prompt via {camera_suffix}
         to reduce their weighting (Klein pays more attention to what comes
-        first).
+        first). ``context_mode`` is the view's routing from
+        ``_context_mode_for_view``; the scene's setting when omitted.
         """
         is_generating = hasattr(self.operator, '_current_image')
         is_subsequent_in_sequence = is_generating and self.operator._current_image > 0
+        context_mode = context_mode or context.scene.qwen_context_render_mode
 
         if is_initial_image:
             style_image_provided = context.scene.qwen_use_external_style_image
@@ -802,9 +831,8 @@ class _TexturingWorkflowMixin:
             style_image_provided = (
                 context.scene.qwen_use_external_style_image or
                 context.scene.sequential_ipadapter or
-                context.scene.qwen_context_render_mode in {'REPLACE_STYLE', 'ADDITIONAL'}
+                context_mode in {'REPLACE_STYLE', 'ADDITIONAL'}
             )
-        context_mode = context.scene.qwen_context_render_mode
 
         if is_initial_image:
             if not style_image_provided:
@@ -1211,7 +1239,8 @@ class _TexturingWorkflowMixin:
         user_prompt = _texturing_prompt(context.scene)
         style_image_info = None
         context_render_info = None
-        context_mode = context.scene.qwen_context_render_mode
+        is_initial_image = not self.operator._current_image > 0
+        context_mode = self._context_mode_for_view(context, is_initial_image)
         remove_context = False
 
         # --- Camera Prompt Injection ---
@@ -1223,7 +1252,6 @@ class _TexturingWorkflowMixin:
 
         # --- Handle Context Render (Image 3) ---
         # This is only active in sequential mode after the first image
-        is_initial_image = not self.operator._current_image > 0
         if not is_initial_image and context_mode != 'NONE':
             context_render_info = self.operator._get_uploaded_image_info(context, "inpaint", subtype="render", camera_id=camera_id)
             if not context_render_info:
@@ -1236,7 +1264,7 @@ class _TexturingWorkflowMixin:
                 prompt[NODES['context_render_loader']]['inputs']['image'] = context_render_info['name']
                 # The prompt needs to reference image 3
                 pos_prompt_text = self._get_qwen_default_prompts(
-                    context, is_initial_image
+                    context, is_initial_image, context_mode_override=context_mode
                 ).format(main_prompt=user_prompt)
                 prompt[NODES['pos_prompt']]['inputs']['prompt'] = pos_prompt_text
             # If mode is REPLACE_STYLE, we will handle it in the style image section below.
@@ -1267,12 +1295,12 @@ class _TexturingWorkflowMixin:
                 return {"error": "conn_failed"}
             if context_mode != 'ADDITIONAL':
                 pos_prompt_text = self._get_qwen_default_prompts(
-                    context, is_initial_image
+                    context, is_initial_image, context_mode_override=context_mode
                 ).format(main_prompt=user_prompt)
                 prompt[NODES['pos_prompt']]['inputs']['prompt'] = pos_prompt_text
             else: # Additional mode
                 pos_prompt_text = self._get_qwen_default_prompts(
-                    context, is_initial_image
+                    context, is_initial_image, context_mode_override=context_mode
                 ).format(main_prompt=user_prompt)
                 prompt[NODES['pos_prompt']]['inputs']['prompt'] = pos_prompt_text
 
@@ -1293,7 +1321,7 @@ class _TexturingWorkflowMixin:
                     style_image_info = self.operator._get_uploaded_image_info(context, "custom", filename=bpy.path.abspath(t2_path))
                 if style_image_info:
                     pos_prompt_text = self._get_qwen_default_prompts(
-                        context, is_initial_image
+                        context, is_initial_image, context_mode_override=context_mode
                     ).format(main_prompt=user_prompt)
                     prompt[NODES['pos_prompt']]['inputs']['prompt'] = pos_prompt_text
 
@@ -1307,7 +1335,7 @@ class _TexturingWorkflowMixin:
                 # The context render becomes the style image
                 style_image_info = context_render_info
                 pos_prompt_text = self._get_qwen_default_prompts(
-                    context, is_initial_image
+                    context, is_initial_image, context_mode_override=context_mode
                 ).format(main_prompt=user_prompt)
                 prompt[NODES['pos_prompt']]['inputs']['prompt'] = pos_prompt_text
             elif context.scene.sequential_ipadapter: # Use previous generated image
@@ -1323,7 +1351,7 @@ class _TexturingWorkflowMixin:
                     return {"error": "conn_failed"}
                 if context_mode != 'ADDITIONAL':
                     pos_prompt_text = self._get_qwen_default_prompts(
-                        context, is_initial_image
+                        context, is_initial_image, context_mode_override=context_mode
                     ).format(main_prompt=user_prompt)
                     prompt[NODES['pos_prompt']]['inputs']['prompt'] = pos_prompt_text
             # If neither of the above, style_image_info remains None, handled below
@@ -1344,7 +1372,7 @@ class _TexturingWorkflowMixin:
                 del prompt[NODES['pos_prompt']]['inputs']['image2']
                 del prompt[NODES['neg_prompt']]['inputs']['image2']
             pos_prompt_text = self._get_qwen_default_prompts(
-                context, is_initial_image
+                context, is_initial_image, context_mode_override=context_mode
             ).format(main_prompt=user_prompt)
             prompt[NODES['pos_prompt']]['inputs']['prompt'] = pos_prompt_text
         else:
@@ -1610,7 +1638,7 @@ class _TexturingWorkflowMixin:
         remove_ref3 = True
 
         is_initial_image = not self.operator._current_image > 0
-        context_mode = context.scene.qwen_context_render_mode
+        context_mode = self._context_mode_for_view(context, is_initial_image)
         context_render_info = None
         style_image_info = None
 
@@ -1641,7 +1669,7 @@ class _TexturingWorkflowMixin:
                 if context.scene.qwen_use_custom_prompts:
                     pos_prompt_text = context.scene.qwen_custom_prompt_seq_additional.format(main_prompt=user_prompt, camera_suffix=camera_suffix)
                 else:
-                    pos_prompt_text = self._get_klein_default_prompts(context, is_initial_image).format(main_prompt=user_prompt, camera_suffix=camera_suffix)
+                    pos_prompt_text = self._get_klein_default_prompts(context, is_initial_image, context_mode).format(main_prompt=user_prompt, camera_suffix=camera_suffix)
                 prompt[NODES['pos_prompt']]['inputs']['text'] = pos_prompt_text
 
         if remove_context and not remove_ref3:
@@ -1666,7 +1694,7 @@ class _TexturingWorkflowMixin:
                     pos_prompt_text = (context.scene.qwen_custom_prompt_initial if is_initial_image
                                        else context.scene.qwen_custom_prompt_seq_none).format(main_prompt=user_prompt, camera_suffix=camera_suffix)
                 else:
-                    pos_prompt_text = self._get_klein_default_prompts(context, is_initial_image).format(main_prompt=user_prompt, camera_suffix=camera_suffix)
+                    pos_prompt_text = self._get_klein_default_prompts(context, is_initial_image, context_mode).format(main_prompt=user_prompt, camera_suffix=camera_suffix)
                 prompt[NODES['pos_prompt']]['inputs']['text'] = pos_prompt_text
 
         # Case 1b: TRELLIS.2 input image as style
@@ -1684,7 +1712,7 @@ class _TexturingWorkflowMixin:
                         if context.scene.qwen_use_custom_prompts:
                             pos_prompt_text = context.scene.qwen_custom_prompt_initial.format(main_prompt=user_prompt, camera_suffix=camera_suffix)
                         else:
-                            pos_prompt_text = self._get_klein_default_prompts(context, is_initial_image).format(main_prompt=user_prompt, camera_suffix=camera_suffix)
+                            pos_prompt_text = self._get_klein_default_prompts(context, is_initial_image, context_mode).format(main_prompt=user_prompt, camera_suffix=camera_suffix)
                         prompt[NODES['pos_prompt']]['inputs']['text'] = pos_prompt_text
 
         # Case 2: Sequential (after first image)
@@ -1694,7 +1722,7 @@ class _TexturingWorkflowMixin:
                 if context.scene.qwen_use_custom_prompts:
                     pos_prompt_text = context.scene.qwen_custom_prompt_seq_replace.format(main_prompt=user_prompt, camera_suffix=camera_suffix)
                 else:
-                    pos_prompt_text = self._get_klein_default_prompts(context, is_initial_image).format(main_prompt=user_prompt, camera_suffix=camera_suffix)
+                    pos_prompt_text = self._get_klein_default_prompts(context, is_initial_image, context_mode).format(main_prompt=user_prompt, camera_suffix=camera_suffix)
                 prompt[NODES['pos_prompt']]['inputs']['text'] = pos_prompt_text
             elif context.scene.sequential_ipadapter:
                 if context.scene.sequential_ipadapter_mode == 'original_render':
@@ -1711,7 +1739,7 @@ class _TexturingWorkflowMixin:
                     if context.scene.qwen_use_custom_prompts:
                         pos_prompt_text = context.scene.qwen_custom_prompt_seq_none.format(main_prompt=user_prompt, camera_suffix=camera_suffix)
                     else:
-                        pos_prompt_text = self._get_klein_default_prompts(context, is_initial_image).format(main_prompt=user_prompt, camera_suffix=camera_suffix)
+                        pos_prompt_text = self._get_klein_default_prompts(context, is_initial_image, context_mode).format(main_prompt=user_prompt, camera_suffix=camera_suffix)
                     prompt[NODES['pos_prompt']]['inputs']['text'] = pos_prompt_text
 
         # Case 3: No style image – first image or no style source
@@ -1720,7 +1748,7 @@ class _TexturingWorkflowMixin:
                 pos_prompt_text = (context.scene.qwen_custom_prompt_initial if is_initial_image
                                    else context.scene.qwen_custom_prompt_seq_none).format(main_prompt=user_prompt, camera_suffix=camera_suffix)
             else:
-                pos_prompt_text = self._get_klein_default_prompts(context, is_initial_image).format(main_prompt=user_prompt, camera_suffix=camera_suffix)
+                pos_prompt_text = self._get_klein_default_prompts(context, is_initial_image, context_mode).format(main_prompt=user_prompt, camera_suffix=camera_suffix)
             prompt[NODES['pos_prompt']]['inputs']['text'] = pos_prompt_text
         else:
             prompt[NODES['ref2_loader']]['inputs']['image'] = style_image_info['name']
