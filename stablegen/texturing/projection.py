@@ -7,6 +7,7 @@ from ..utils import get_last_material_index, get_file_path, get_dir_path
 from .rendering import prepare_baking, bake_texture, unwrap
 from ..cameras.geometry import _get_camera_resolution
 from mathutils import Matrix, Vector
+from .graph_controls import early_priority_share as _early_priority_share
 from .jobs import operation
 from .projection_cache import eligible as _cache_eligible, configuration as _cache_configuration, graph_state as _graph_state, asset_state as _asset_state
 from .svm_budget import SVM_STACK_SIZE, estimate_svm_stack
@@ -2331,11 +2332,10 @@ def project_image(
                 links.new(sum_node.outputs[0], div_node.inputs[1])
 
                 if legacy_priority:
-                    map_range_node = nodes_collection.new("ShaderNodeMapRange")
-                    map_range_node.label = f'EarlyPriorityMap-{level}-{i}'
+                    map_range_node = _early_priority_share(
+                        nodes_collection, links, div_node.outputs[0],
+                        context.scene.early_priority_strength, f'EarlyPriorityMap-{level}-{i}')
                     map_range_node.location = (x_offset - 400, y_offset + vert_offset)
-                    map_range_node.inputs[1].default_value = context.scene.early_priority_strength
-                    links.new(div_node.outputs[0], map_range_node.inputs[0])
 
                 # Create a MixRGB node for color blending of the two inputs
                 mix_node = nodes_collection.new("ShaderNodeMixRGB")
