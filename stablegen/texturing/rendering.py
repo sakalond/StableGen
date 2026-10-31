@@ -2035,6 +2035,46 @@ def _ensure_bake_uv(obj):
     return bake_uv
 
 
+def _uv_map_readers(obj, uv_name):
+    """Nodes of the object's materials that read the named UV map."""
+    readers = []
+    for material in obj.data.materials:
+        if not material or not material.use_nodes:
+            continue
+        for node in material.node_tree.nodes:
+            if node.type in {'UVMAP', 'NORMAL_MAP'} and getattr(node, 'uv_map', '') == uv_name:
+                readers.append(node)
+            elif node.type == 'ATTRIBUTE' and node.attribute_name == uv_name:
+                readers.append(node)
+    return readers
+
+
+def _keep_sampled_bake_uv(obj):
+    """Before BakeUV is unwrapped again: give the materials that read it (an earlier bake, a Masked Edit of one)
+    their own copy of its current layout, so the new bake reads their textures where they are. Unwrapping in place
+    made them read their baked image at the new layout's coordinates, which scrambled what they baked into.
+    Returns the copy's name, or None when nothing reads BakeUV. Raises RuntimeError without a free UV slot."""
+    uv_layers = obj.data.uv_layers
+    bake_uv = uv_layers.get(_SG_BAKE_UV_NAME)
+    readers = _uv_map_readers(obj, _SG_BAKE_UV_NAME) if bake_uv else []
+    if not readers:
+        return None
+    if len(uv_layers) >= 8:
+        raise RuntimeError(f"{obj.name}: no free UV slot to keep BakeUV for its baked material; bake without unwrap")
+    index = 1
+    while uv_layers.get(f"{_SG_BAKE_UV_NAME} {index}"):
+        index += 1
+    keep = uv_layers.new(name=f"{_SG_BAKE_UV_NAME} {index}", do_init=False)
+    keep.data.foreach_set("uv", [v for loop in bake_uv.data for v in loop.uv])
+    for node in readers:
+        if node.type == 'ATTRIBUTE':
+            node.attribute_name = keep.name
+        else:
+            node.uv_map = keep.name
+    print(f"[StableGen] Kept BakeUV as {keep.name} for {len(readers)} node(s) on {obj.name}")
+    return keep.name
+
+
 def _set_bake_uv_active(obj):
     uv_layers = obj.data.uv_layers
     bake_uv = uv_layers.get(_SG_BAKE_UV_NAME)
@@ -2514,6 +2554,7 @@ def unwrap(obj, method, overlap_only, texture_resolution=2048):
             return
         
         op_context = _activate_mesh_for_object_ops(obj)
+        _keep_sampled_bake_uv(obj)
         _ensure_projection_visibility_for_bake(obj)
         covered_faces = _projection_bake_face_mask(obj)
         projection_coverage_pack = covered_faces is not None
