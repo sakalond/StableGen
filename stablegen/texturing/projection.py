@@ -1,6 +1,7 @@
 from ..core.feature_flags import experimental_enabled
 import bpy
 import os
+import re
 from math import atan, tan, pi
 
 from ..utils import get_last_material_index, get_file_path, get_dir_path
@@ -1593,6 +1594,11 @@ def create_native_feather(nodes, links, normalize_node, camera_fov_node, camera_
 
 _SG_VORONOI_PLACEHOLDER_NAME = "_SG_Voronoi_Placeholder"
 
+def is_baked_material(material):
+    """A material made by Bake Textures, or a Masked Edit of one: its baked image is the texture."""
+    return bool(material.get('sg_baked')) or re.search(r'_baked(\.\d+)?( Masked Edit)*$', material.name) is not None
+
+
 def _get_voronoi_placeholder(color=(1.0, 0.0, 1.0)):
     """Get or create a 1x1 solid-colour image used as placeholder for
     non-generated cameras in Voronoi projection mode.  The colour is
@@ -2549,9 +2555,24 @@ def project_image(
         context.view_layer.objects.active = obj
         obj.select_set(True)
 
+        # A bake's material holds its final texture. Projecting into it (it is
+        # the active material after Bake Textures) replaced the bake with a new
+        # projection graph; project into the object's projection material
+        # again, or a new one, and leave the bake for the user to switch back to.
+        if obj.active_material is not None and is_baked_material(obj.active_material):
+            baked = obj.active_material
+            index = next((k for k, m in enumerate(obj.data.materials)
+                          if m and m is not baked and not is_baked_material(m)), -1)
+            if index < 0:
+                obj.data.materials.append(bpy.data.materials.new(name="ProjectionMaterial"))
+                index = len(obj.data.materials) - 1
+            obj.active_material_index = index
+            obj.data.polygons.foreach_set("material_index", [index] * len(obj.data.polygons))
+            obj.data.update()
+
         # Create the material
         to_switch = False
-        is_local_edit = (context.scene.generation_method == 'local_edit' or (context.scene.model_architecture in QWEN_ARCHITECTURES and context.scene.qwen_generation_method == 'local_edit'))
+        is_local_edit =(context.scene.generation_method == 'local_edit' or (context.scene.model_architecture in QWEN_ARCHITECTURES and context.scene.qwen_generation_method == 'local_edit'))
         if is_local_edit and not context.scene.overwrite_material:
             # Copy active material
             mat = obj.active_material.copy()

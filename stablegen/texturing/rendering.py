@@ -3623,6 +3623,7 @@ class BakeTextures(bpy.types.Operator):
         output_dir = get_dir_path(context, "baked")
 
         mat = bpy.data.materials.new(name=f"{obj.name}_baked")
+        mat['sg_baked'] = True          # later projections leave it alone (see projection.is_baked_material)
         obj.data.materials.append(mat)
         mat.use_nodes = True
         nodes = mat.node_tree.nodes
