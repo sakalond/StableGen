@@ -1254,8 +1254,8 @@ def register_properties(update_model_list, ControlNetUnit, LoRAUnit,
         subtype='COLOR', default=(1.0, 0.0, 1.0), min=0.0, max=1.0, update=update_parameters
     )
     bpy.types.Scene.qwen_context_cleanup = bpy.props.BoolProperty(
-        name="Legacy fallback cleanup",
-        description="Clean fallback-color residue before projecting subsequent Qwen outputs in the legacy context path. Used when confidence-gated context is off.",
+        name="Fallback cleanup",
+        description="Recolor missing-context-color residue in each later Qwen output before it is projected.",
         default=False, update=update_parameters
     )
     bpy.types.Scene.qwen_context_cleanup_hue_tolerance = bpy.props.FloatProperty(
@@ -1264,12 +1264,12 @@ def register_properties(update_model_list, ControlNetUnit, LoRAUnit,
     )
     bpy.types.Scene.qwen_context_cleanup_value_adjust = bpy.props.FloatProperty(
         name="Brightness adjustment",
-        description="Brightness adjustment applied during legacy fallback cleanup. -1 darkens toward black; 0 preserves brightness; 1 brightens toward white.",
+        description="Brightness adjustment applied during fallback cleanup. -1 darkens toward black; 0 preserves brightness; 1 brightens toward white.",
         default=0.0, min=-1.0, max=1.0, update=update_parameters
     )
     bpy.types.Scene.qwen_context_fallback_dilation = bpy.props.IntProperty(
-        name="Legacy context expansion (px)",
-        description="In the legacy context path, expand missing-context regions by this many image pixels before sending the render to the model. Used when confidence-gated context is off.",
+        name="Context expansion (px)",
+        description="Expand the missing-context regions of each context render by this many image pixels before sending it to the model.",
         default=1, min=0, max=64, update=update_parameters
     )
     bpy.types.Scene.qwen_use_confidence_context = bpy.props.BoolProperty(
@@ -1278,8 +1278,8 @@ def register_properties(update_model_list, ControlNetUnit, LoRAUnit,
         default=TEXTURING_DEFAULTS["qwen_use_confidence_context"], update=update_parameters,
     )
     bpy.types.Scene.qwen_regularize_context_mask = bpy.props.BoolProperty(
-        name="Clean repair-mask boundaries",
-        description="Clean fragmented repair-mask boundaries using the island, hole, strip and expansion controls below. Experimental.",
+        name="Regularize Context Boundary",
+        description="Clean up the missing-context mask of each context render before it is blanked: drop small kept islands, fill small missing holes, close thin kept strips and expand missing regions by the settings below, separately within each object and material.",
         default=TEXTURING_DEFAULTS["qwen_regularize_context_mask"], update=update_parameters,
     )
     bpy.types.Scene.qwen_trust_threshold = bpy.props.FloatProperty(

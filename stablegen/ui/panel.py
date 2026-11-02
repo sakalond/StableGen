@@ -1529,12 +1529,6 @@ class StableGenPanel(bpy.types.Panel):
                     neutral = context_exp.row()
                     neutral.enabled = scene.qwen_latent_locked_context
                     neutral.prop(scene, "qwen_latent_lock_neutral_fill", toggle=True)
-                    regularize = context_exp.column()
-                    regularize.enabled = scene.qwen_use_confidence_context
-                    regularize.prop(scene, "qwen_regularize_context_mask", toggle=True)
-                    if scene.qwen_regularize_context_mask:
-                        for key in ("qwen_mask_min_island_area", "qwen_mask_min_hole_area", "qwen_mask_min_strip_width", "qwen_mask_uncertainty_dilation", "qwen_mask_keep_largest_components"):
-                            regularize.prop(scene, key)
                     context_exp.prop(scene, "qwen_use_projection_write_masks", text="Restrict Projection to Write Mask", toggle=True)
                     context_exp.prop(scene, "qwen_reject_residual_fallback", toggle=True)
                     if scene.qwen_reject_residual_fallback:
@@ -1849,16 +1843,19 @@ class StableGenPanel(bpy.types.Panel):
                             threshold_row.prop(
                                 scene, "qwen_trust_threshold", text="Minimum trusted view quality"
                             )
-                        else:
-                            dilation_row = context_box.row()
-                            dilation_row.prop(scene, "qwen_context_fallback_dilation", text="Legacy context expansion (px)")
-                            cleanup_row = context_box.row()
-                            cleanup_row.prop(scene, "qwen_context_cleanup", text="Legacy fallback cleanup", toggle=True, icon="BRUSH_DATA")
-                            if scene.qwen_context_cleanup:
-                                row = context_box.row()
-                                row.prop(scene, "qwen_context_cleanup_hue_tolerance", text="Hue tolerance (°)")
-                                row = context_box.row()
-                                row.prop(scene, "qwen_context_cleanup_value_adjust", text="Brightness adjustment")
+                        context_box.prop(scene, "qwen_regularize_context_mask", text="Regularize Context Boundary", toggle=True)
+                        if scene.qwen_regularize_context_mask:
+                            for key in ("qwen_mask_min_island_area", "qwen_mask_min_hole_area", "qwen_mask_min_strip_width", "qwen_mask_uncertainty_dilation", "qwen_mask_keep_largest_components"):
+                                context_box.prop(scene, key)
+                        dilation_row = context_box.row()
+                        dilation_row.prop(scene, "qwen_context_fallback_dilation", text="Context expansion (px)")
+                        cleanup_row = context_box.row()
+                        cleanup_row.prop(scene, "qwen_context_cleanup", text="Fallback cleanup", toggle=True, icon="BRUSH_DATA")
+                        if scene.qwen_context_cleanup:
+                            row = context_box.row()
+                            row.prop(scene, "qwen_context_cleanup_hue_tolerance", text="Hue tolerance (°)")
+                            row = context_box.row()
+                            row.prop(scene, "qwen_context_cleanup_value_adjust", text="Brightness adjustment")
 
                 elif scene.model_architecture == 'sdxl' or scene.model_architecture == 'flux1':
                     # IPAdapter Parameters
@@ -2430,33 +2427,43 @@ class StableGenPanel(bpy.types.Panel):
                 context_box.prop(
                     scene, "qwen_trust_threshold", text="Minimum trusted view quality", slider=True
                 )
-            else:
+            context_box.prop(
+                scene,
+                "qwen_regularize_context_mask",
+                text="Regularize Context Boundary",
+                toggle=True,
+            )
+            if scene.qwen_regularize_context_mask:
+                for key in ("qwen_mask_min_island_area", "qwen_mask_min_hole_area",
+                            "qwen_mask_min_strip_width", "qwen_mask_uncertainty_dilation",
+                            "qwen_mask_keep_largest_components"):
+                    context_box.prop(scene, key)
+            context_box.prop(
+                scene,
+                "qwen_context_fallback_dilation",
+                text="Context expansion (px)",
+                slider=True,
+            )
+            context_box.prop(
+                scene,
+                "qwen_context_cleanup",
+                text="Fallback cleanup",
+                toggle=True,
+                icon="BRUSH_DATA",
+            )
+            if scene.qwen_context_cleanup:
                 context_box.prop(
                     scene,
-                    "qwen_context_fallback_dilation",
-                    text="Legacy context expansion (px)",
+                    "qwen_context_cleanup_hue_tolerance",
+                    text="Hue tolerance (°)",
                     slider=True,
                 )
                 context_box.prop(
                     scene,
-                    "qwen_context_cleanup",
-                    text="Legacy fallback cleanup",
-                    toggle=True,
-                    icon="BRUSH_DATA",
+                    "qwen_context_cleanup_value_adjust",
+                    text="Brightness adjustment",
+                    slider=True,
                 )
-                if scene.qwen_context_cleanup:
-                    context_box.prop(
-                        scene,
-                        "qwen_context_cleanup_hue_tolerance",
-                        text="Hue tolerance (°)",
-                        slider=True,
-                    )
-                    context_box.prop(
-                        scene,
-                        "qwen_context_cleanup_value_adjust",
-                        text="Brightness adjustment",
-                        slider=True,
-                    )
 
             actions = preview_box.row(align=True)
             actions.operator(

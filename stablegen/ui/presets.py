@@ -165,7 +165,7 @@ PRESETS["QWEN 2.1 CONTEXT + REFERENCE"] = {
         "then resets to 90 degrees for the final material; blending exponent is 7. "
         "Uses 20 steps, CFG 1.0, DPM++ SDE, SGM Uniform and no LoRA. "
         "Confidence-Gated Context, Acquisition Quality Weighting and Depth/Part "
-        "Projection Guard are off; legacy fallback dilation is 1 px, cleanup is "
+        "Projection Guard are off; context expansion is 1 px, fallback cleanup is "
         "off and backface projection is allowed. Captures the current manually "
         "tuned setup; intended for comparing context coverage and appearance "
         "consistency across overlapping views."
