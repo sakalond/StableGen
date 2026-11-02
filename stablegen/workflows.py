@@ -193,7 +193,12 @@ class _WorkflowBase:
             camera_lookup_index = camera_id
             if camera_lookup_index is None:
                 camera_lookup_index = view_index
-            if isinstance(camera_lookup_index, int) and 0 <= camera_lookup_index < len(cameras):
+            # Masked Edit writes every view as camera 0 of its own folder;
+            # its operator names the view's camera.
+            current_camera = getattr(operator, "current_camera", None)
+            if current_camera is not None:
+                camera_name = getattr(current_camera, "name", None)
+            elif isinstance(camera_lookup_index, int) and 0 <= camera_lookup_index < len(cameras):
                 camera_name = getattr(cameras[camera_lookup_index], "name", None)
 
             _, archive_path = archive_prompt(
