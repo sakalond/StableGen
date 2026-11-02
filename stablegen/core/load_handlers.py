@@ -45,6 +45,11 @@ def load_handler(dummy, _second=None, file_loaded=True):
         repaired = repair_baked_normal_maps(bpy.data.materials)
         if repaired:
             print(f"[StableGen] Baked normal maps now decode with their bake UV map: {repaired}")
+        # Masked Edits on a bake mixed world-space normals into its tangent-space map (black edits).
+        from ..texturing.masked_edit import repair_edit_normal_layers
+        repaired = repair_edit_normal_layers(bpy.data.materials)
+        if repaired:
+            print(f"[StableGen] Masked Edit normal layers now mix decoded normals: {repaired}")
 
     # Builds saved while Qwen-Image 2.1 shared the Qwen-Image-Edit enum need a
     # one-time architecture migration.  The filename is used only here for

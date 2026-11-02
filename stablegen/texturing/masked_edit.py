@@ -708,13 +708,20 @@ def resolve_layers(scene, apply):
         del scene['_sg_mask_original_engine']
 
 
+NORMAL_LAYER = 'Masked Edit normal'
+
+
 def pbr_targets(material):
     """Inputs that carry projected PBR maps: {channel: input socket}.
 
-    roughness and metallic are Principled inputs, normal is the Normal Map node's Color input and
-    height the Displacement node's Height input; these are returned only when linked, so unlinked
-    constant values are left alone. emission is the Principled Emission Color, returned even when
-    unlinked: a material without an emission map is black there, and an edit may add the glow.
+    roughness and metallic are Principled inputs, height the Displacement node's Height input;
+    these are returned only when linked, so unlinked constant values are left alone. normal is the
+    Normal Map node's Color input when that node decodes world space (a projection material: the
+    edit's world-space normal colours mix in directly), and the Principled Normal input when it
+    decodes tangent space (a bake) or comes from an earlier edit's decoded layer: there the edit's
+    normals mix in decoded (world_normal_layer). emission is the Principled Emission Color,
+    returned even when unlinked: a material without an emission map is black there, and an edit
+    may add the glow.
     """
     shader = material.node_tree.nodes.get(material.get('_sg_mask_shader', ''))
     if not shader or shader.type != 'BSDF_PRINCIPLED':
@@ -725,7 +732,9 @@ def pbr_targets(material):
             targets[channel] = shader.inputs[name]
     normal = shader.inputs['Normal'].links[0].from_node if shader.inputs['Normal'].links else None
     if normal and normal.type == 'NORMAL_MAP' and normal.inputs['Color'].links:
-        targets['normal'] = normal.inputs['Color']
+        targets['normal'] = normal.inputs['Color'] if normal.space == 'WORLD' else shader.inputs['Normal']
+    elif normal and normal.label == NORMAL_LAYER:
+        targets['normal'] = shader.inputs['Normal']
     out = output_node(material)
     displacement = (out.inputs['Displacement'].links[0].from_node
                     if out and 'Displacement' in out.inputs and out.inputs['Displacement'].links else None)
@@ -954,6 +963,12 @@ def add_pbr_layers(material, layer, maps, use_albedo, emission_strength=2.5):
         if texture.inputs['Vector'].links:
             links.new(texture.inputs['Vector'].links[0].from_socket, tex.inputs['Vector'])
         tex.location = (texture.location[0], texture.location[1] - 300 * (len(added) + 1))
+        if channel == 'normal' and target.node.type == 'BSDF_PRINCIPLED':
+            location = (mix.location[0], mix.location[1] - 300 * (len(added) + 1))
+            links.new(world_normal_layer(material.node_tree, factor, tex.outputs['Color'], previous, location),
+                      target)
+            added.append(channel)
+            continue
         layer_mix = nodes.new('ShaderNodeMixRGB')
         layer_mix.label = f'Masked Edit {channel}'
         layer_mix.location = (mix.location[0], mix.location[1] - 300 * (len(added) + 1))
@@ -963,6 +978,69 @@ def add_pbr_layers(material, layer, maps, use_albedo, emission_strength=2.5):
         links.new(layer_mix.outputs['Color'], target)
         added.append(channel)
     return added
+
+
+def world_normal_layer(tree, factor, edit_color, previous, location=(0, 0)):
+    """One edit view's normals over *previous* (a shading normal), mixed as decoded vectors.
+
+    The edit's normal maps hold world-space normals as colours. A bake's Normal Map node decodes
+    tangent space, so mixing those colours into its input shaded the edit black (a wall's world
+    normal read as a tangent normal lies flat in the surface). The edit's colours are decoded in
+    world space instead and mixed with *previous* by the layer's *factor* (0 shows the edit, as in
+    the colour layer). Returns the normalized result socket.
+    """
+    nodes, links = tree.nodes, tree.links
+    decode = nodes.new('ShaderNodeNormalMap')
+    decode.space = 'WORLD'
+    decode.label = NORMAL_LAYER
+    decode.location = (location[0] - 200, location[1])
+    links.new(edit_color, decode.inputs['Color'])
+    blend = nodes.new('ShaderNodeMix')
+    blend.data_type = 'VECTOR'
+    blend.label = NORMAL_LAYER
+    blend.location = location
+    socket = {s.identifier: s for s in blend.inputs}
+    links.new(factor, socket['Factor_Float'])
+    links.new(decode.outputs['Normal'], socket['A_Vector'])
+    links.new(previous, socket['B_Vector'])
+    unit = nodes.new('ShaderNodeVectorMath')
+    unit.operation = 'NORMALIZE'
+    unit.label = NORMAL_LAYER
+    unit.location = (location[0] + 200, location[1])
+    links.new(next(s for s in blend.outputs if s.identifier == 'Result_Vector'), unit.inputs[0])
+    return unit.outputs['Vector']
+
+
+def repair_edit_normal_layers(materials):
+    """Masked Edits made before world_normal_layer mixed their world-space normal colours into a
+    tangent-space Normal Map's input, which shaded the edited region black. Rebuild those layers
+    as decoded ones. Returns the names of the repaired materials."""
+    repaired = []
+    for material in materials:
+        if not material or not material.use_nodes or not material.node_tree:
+            continue
+        tree = material.node_tree
+        for decode in [n for n in tree.nodes if n.type == 'NORMAL_MAP' and n.space != 'WORLD']:
+            chain, socket = [], decode.inputs['Color']
+            while (socket.links and socket.links[0].from_node.type == 'MIX_RGB'
+                   and socket.links[0].from_node.label == NORMAL_LAYER):
+                chain.append(socket.links[0].from_node)
+                socket = chain[-1].inputs['Color2']
+            if not chain or not socket.links:
+                continue
+            if any(not m.inputs['Fac'].links or not m.inputs['Color1'].links for m in chain):
+                continue
+            consumers = [link.to_socket for link in decode.outputs['Normal'].links]
+            tree.links.new(socket.links[0].from_socket, decode.inputs['Color'])
+            result = decode.outputs['Normal']
+            for old in reversed(chain):                     # the earliest edit view first
+                result = world_normal_layer(tree, old.inputs['Fac'].links[0].from_socket,
+                                            old.inputs['Color1'].links[0].from_socket, result, old.location)
+                tree.nodes.remove(old)
+            for to_socket in consumers:
+                tree.links.new(result, to_socket)
+            repaired.append(material.name)
+    return repaired
 
 
 def opaque_write_mask(mask, alpha):
