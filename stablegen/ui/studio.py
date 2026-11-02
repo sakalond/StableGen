@@ -481,7 +481,10 @@ class StudioSession:
                     raise ReferenceError('The adapter list changed while this value was being edited.')
                 binding, text = edit['binding'], edit['buffer'].text
                 prop = binding.rna(bpy.context)
-                value = float(text) if prop.type == 'FLOAT' else int(text) if prop.type == 'INT' else text
+                if prop.type in {'INT', 'FLOAT'} and not text.strip():
+                    value = prop.default  # an emptied number resets to its default
+                else:
+                    value = float(text) if prop.type == 'FLOAT' else int(text) if prop.type == 'INT' else text
                 if binding.value(bpy.context) != value:
                     self.write_binding(binding, value)
             self.refresh()
