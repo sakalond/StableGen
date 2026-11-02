@@ -3811,6 +3811,10 @@ class BakeTextures(bpy.types.Operator):
             # so the texture is always tangent-space regardless of the
             # original projection material's normal mode (world/bump/tangent).
             nmap.space = 'TANGENT'
+            # In the tangents of the UV map it was baked in: without one the
+            # node used the render-active UV map's, a different frame on every
+            # island of a TRELLIS mesh's own UVs (a triangle mosaic).
+            nmap.uv_map = uv_node.uv_map
 
             links.new(tex.outputs["Color"], nmap.inputs["Color"])
             if "Normal" in principled.inputs:
