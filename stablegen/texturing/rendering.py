@@ -2842,6 +2842,28 @@ _PBR_CHANNEL_SUFFIXES = {
 }
 
 
+def repair_baked_normal_maps(materials):
+    """Give the tangent Normal Map nodes of baked materials made before they named a UV map the UV map their
+    normal texture is sampled with. They decoded in the render-active UV map's tangents, a triangle mosaic on
+    meshes whose own UVs differ from the bake's. Returns the number of nodes repaired."""
+    repaired = 0
+    for mat in materials:
+        if not mat or not mat.use_nodes or not mat.get('sg_baked'):
+            continue
+        for nmap in mat.node_tree.nodes:
+            if nmap.type != 'NORMAL_MAP' or nmap.space != 'TANGENT' or nmap.uv_map:
+                continue
+            color = nmap.inputs['Color']
+            texture = color.links[0].from_node if color.links else None
+            if texture is None or texture.type != 'TEX_IMAGE' or not texture.inputs['Vector'].links:
+                continue
+            uv = texture.inputs['Vector'].links[0].from_node
+            if uv.type == 'UVMAP' and uv.uv_map:
+                nmap.uv_map = uv.uv_map
+                repaired += 1
+    return repaired
+
+
 def _keep_earlier_bake(path, keep=None):
     """Give each image a material still reads from *path* its own copy before a new bake replaces that file.
 
