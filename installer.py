@@ -32,6 +32,13 @@ try:
 except ImportError:
     TQDM_AVAILABLE = False
 
+# Captured subprocess output is read as UTF-8 and child Pythons are asked to write
+# it: the console codepage (cp1251 on a Russian Windows) cannot decode what pip, git
+# and a Python print for a non-ASCII path, and the reader thread's crash lost the
+# output (#115).
+UTF8_TEXT = dict(text=True, encoding="utf-8", errors="replace")
+UTF8_ENV = dict(os.environ, PYTHONIOENCODING="utf-8", PYTHONUTF8="1")
+
 # --- Compatibility Patches ---
 # Polyfill for Path.is_junction() which requires Python 3.12+.
 # comfy_env uses it but many ComfyUI installs still run Python 3.10/3.11.
@@ -116,6 +123,10 @@ from pathlib import Path
 
 TAG = "[StableGen env sync]"
 SKIP_DIRS = {".git", ".pixi", "node_modules", "__pycache__"}
+# Captured output is read as UTF-8 and the env Pythons are asked to write it: the
+# console codepage (cp1251 on a Russian Windows) cannot decode what pip prints
+# for a non-ASCII path, and the reader thread's crash lost the result (#115).
+UTF8_ENV = dict(os.environ, PYTHONNOUSERSITE="1", PYTHONIOENCODING="utf-8", PYTHONUTF8="1")
 
 
 def _norm(name):
@@ -269,7 +280,7 @@ def _pip_install(python, installed, wanted):
         return subprocess.run(
             [str(python), "-m", "pip", "install", "--disable-pip-version-check", "--no-input",
              "-c", constraints, *wanted.values()],
-            env=dict(os.environ, PYTHONNOUSERSITE="1"), capture_output=True, text=True, timeout=900)
+            env=UTF8_ENV, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=900)
     finally:
         os.unlink(constraints)
 
@@ -348,8 +359,8 @@ def verify(comfyui_dir, node_dir, repair=True):
         added = set()
         while True:
             result = subprocess.run([str(python), "-c", _VERIFY.format(comfy=str(Path(comfyui_dir).resolve()))],
-                                    env=dict(os.environ, PYTHONNOUSERSITE="1"), capture_output=True, text=True,
-                                    timeout=600, cwd=str(comfyui_dir))
+                                    env=UTF8_ENV, capture_output=True, text=True, encoding="utf-8",
+                                    errors="replace", timeout=600, cwd=str(comfyui_dir))
             name = (_missing_requirement((result.stderr or result.stdout), reqs)
                     if result.returncode != 0 else None)
             if name is None or name in added:
@@ -1069,7 +1080,8 @@ def describe_python(comfyui_path: Path) -> bool:
     python = find_comfyui_python(comfyui_path)
     detected = bool(PYTHON_OVERRIDE) or any(c.is_file() for c in python_candidates(comfyui_path))
     try:
-        out = subprocess.run([python, "-c", _PYTHON_REPORT], capture_output=True, text=True, timeout=120)
+        out = subprocess.run([python, "-c", _PYTHON_REPORT], capture_output=True, env=UTF8_ENV, timeout=120,
+                             **UTF8_TEXT)
         version, torch = (out.stdout.split() + ["?", "?"])[:2]
     except (OSError, subprocess.TimeoutExpired):
         version, torch = "?", "?"
@@ -1120,7 +1132,7 @@ def _patch_comfy_env_validator(comfyui_path: Path):
     result = subprocess.run(
         [python_exe, "-c",
          "import importlib.util as u, os; s=u.find_spec('comfy_env'); print(os.path.join(os.path.dirname(s.origin), 'packages', 'toml_generator.py') if s and s.origin else '')"],
-        capture_output=True, text=True,
+        capture_output=True, env=UTF8_ENV, **UTF8_TEXT,
     )
     if result.returncode != 0:
         print("  WARNING: Could not locate comfy_env toml_generator.py, skipping validator patch")
@@ -1203,7 +1215,7 @@ def _patch_comfy_env_platform_tag(comfyui_path: Path):
     result = subprocess.run(
         [python_exe, "-c",
          "import importlib.util as u, os; s=u.find_spec('comfy_env'); print(os.path.join(os.path.dirname(s.origin), 'packages', 'cuda_wheels.py') if s and s.origin else '')"],
-        capture_output=True, text=True,
+        capture_output=True, env=UTF8_ENV, **UTF8_TEXT,
     )
     if result.returncode != 0:
         print("  WARNING: Could not locate comfy_env cuda_wheels.py, "
@@ -1244,7 +1256,7 @@ def _patch_comfy_env_wheel_fallback(comfyui_path: Path):
     result = subprocess.run(
         [python_exe, "-c",
          "import importlib.util as u, os; s=u.find_spec('comfy_env'); print(os.path.join(os.path.dirname(s.origin), 'packages', 'cuda_wheels.py') if s and s.origin else '')"],
-        capture_output=True, text=True,
+        capture_output=True, env=UTF8_ENV, **UTF8_TEXT,
     )
     if result.returncode != 0:
         print("  WARNING: Could not locate comfy_env cuda_wheels.py, "
@@ -1313,7 +1325,7 @@ def _patch_comfy_env_user_site_isolation(comfyui_path: Path):
     result = subprocess.run(
         [python_exe, "-c",
          "import importlib.util as u, os; s=u.find_spec('comfy_env'); print(os.path.join(os.path.dirname(s.origin), 'isolation', 'wrap.py') if s and s.origin else '')"],
-        capture_output=True, text=True,
+        capture_output=True, env=UTF8_ENV, **UTF8_TEXT,
     )
     if result.returncode != 0:
         print("  WARNING: Could not locate comfy_env wrap.py, "
@@ -1356,7 +1368,7 @@ def _patch_comfy_env_distinfo_normalize(comfyui_path: Path):
     result = subprocess.run(
         [python_exe, "-c",
          "import importlib.util as u, os; s=u.find_spec('comfy_env'); print(os.path.join(os.path.dirname(s.origin), 'install.py') if s and s.origin else '')"],
-        capture_output=True, text=True,
+        capture_output=True, env=UTF8_ENV, **UTF8_TEXT,
     )
     if result.returncode != 0:
         print(f"  WARNING: Could not locate comfy_env install.py: {result.stderr}")
@@ -1929,7 +1941,7 @@ def _clean_stale_comfy_envs(repo_path: Path):
 
 
 def _git(args: List[str], cwd: Path) -> subprocess.CompletedProcess:
-    return subprocess.run(["git"] + args, cwd=str(cwd), capture_output=True, text=True)
+    return subprocess.run(["git"] + args, cwd=str(cwd), capture_output=True, **UTF8_TEXT)
 
 
 def clone_git_repo(item_details: Dict[str, Any], comfyui_path: Path, update_nodes: bool = False) -> Tuple[str, str]:
@@ -2217,7 +2229,7 @@ def trellis_python_ok(comfyui_path: Path) -> bool:
     try:
         out = subprocess.run([find_comfyui_python(comfyui_path), "-c",
                               "import sys; print(sys.version_info[0], sys.version_info[1])"],
-                             capture_output=True, text=True, check=True)
+                             capture_output=True, env=UTF8_ENV, check=True, **UTF8_TEXT)
         is_313_plus = tuple(int(x) for x in out.stdout.split()) >= (3, 13)
     except Exception:
         is_313_plus = sys.version_info >= (3, 13)
@@ -2437,7 +2449,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         has_comfy_env = False
         try:
             result = subprocess.run([find_comfyui_python(comfyui_base_path), "-c", "import comfy_env"],
-                                    capture_output=True, text=True)
+                                    capture_output=True, env=UTF8_ENV, **UTF8_TEXT)
             if result.returncode == 0:
                 has_comfy_env = True
                 print("  Detected existing comfy-env installation. Ensuring all patches are applied...")
