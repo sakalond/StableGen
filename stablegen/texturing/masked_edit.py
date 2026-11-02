@@ -1084,6 +1084,8 @@ class SG_OT_MaskedEdit(bpy.types.Operator):
             self.saved_active = context.view_layer.objects.active
             self.saved_selected = list(context.selected_objects)
             self.saved_timestamp = self.scene.output_timestamp
+            # Kept in the scene too: a file saved during the edit restores it on load.
+            self.scene['_sg_mask_run_timestamp'] = self.saved_timestamp
             self.saved_engine = self.scene.render.engine
             self.scene['_sg_mask_original_engine'] = self.saved_engine
             self.scene.output_timestamp = datetime.now().strftime('%Y-%m-%dT%H-%M-%S') + '-masked-' + uuid.uuid4().hex[:6]
@@ -1163,6 +1165,8 @@ class SG_OT_MaskedEdit(bpy.types.Operator):
             self.timer = None
         self.scene.camera = self.saved_camera
         self.scene.output_timestamp = self.saved_timestamp
+        if '_sg_mask_run_timestamp' in self.scene:
+            del self.scene['_sg_mask_run_timestamp']
         if not any(o.sg_mask_original for o in self.scene.objects):
             self.scene.render.engine = self.saved_engine
         for obj in context.view_layer.objects:

@@ -15,11 +15,13 @@ from .architectures import QWEN_ARCHITECTURES
 
 
 @persistent
-def load_handler(dummy, file_loaded=True):
+def load_handler(dummy, _second=None, file_loaded=True):
     """Set default ControlNet/LoRA units and sync checkpoint cache on file load.
 
     Server checks reuse it with file_loaded=False: a generation may be
-    running then, so its status must not be reset.
+    running then, so its status must not be reset. Blender 5.1 calls load_post
+    handlers with two positional arguments (the file path and None), which
+    must not land in *file_loaded*.
     """
     from ..ui.model_units import get_lora_models
     from . import state as _state
@@ -29,6 +31,15 @@ def load_handler(dummy, file_loaded=True):
         return
 
     scene = bpy.context.scene
+
+    # A file saved while a Masked Edit ran kept the edit's own output folder as
+    # the run timestamp; Reproject and Regenerate then looked for the run there.
+    # No edit survives a load, so put the run back.
+    if file_loaded:
+        for each in bpy.data.scenes:
+            if '_sg_mask_run_timestamp' in each:
+                each.output_timestamp = each['_sg_mask_run_timestamp']
+                del each['_sg_mask_run_timestamp']
 
     # Builds saved while Qwen-Image 2.1 shared the Qwen-Image-Edit enum need a
     # one-time architecture migration.  The filename is used only here for
