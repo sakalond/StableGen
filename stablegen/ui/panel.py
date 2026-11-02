@@ -1840,7 +1840,7 @@ class StableGenPanel(bpy.types.Panel):
                         context_box.prop(
                             scene,
                             "qwen_use_confidence_context",
-                            text="Protect reliable context",
+                            text="Confidence-Gated Context",
                             toggle=True,
                             icon="MOD_MASK",
                         )
@@ -2422,7 +2422,7 @@ class StableGenPanel(bpy.types.Panel):
             context_box.prop(
                 scene,
                 "qwen_use_confidence_context",
-                text="Protect reliable context",
+                text="Confidence-Gated Context",
                 toggle=True,
                 icon="MOD_MASK",
             )

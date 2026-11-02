@@ -1273,8 +1273,8 @@ def register_properties(update_model_list, ControlNetUnit, LoRAUnit,
         default=1, min=0, max=64, update=update_parameters
     )
     bpy.types.Scene.qwen_use_confidence_context = bpy.props.BoolProperty(
-        name="Protect reliable context",
-        description="Protect context observed reliably by previous source cameras and mark unreliable regions for regeneration. This confidence decision is separate from the displayed RGB mixture.",
+        name="Confidence-Gated Context",
+        description="Replace the context weighting: each later view keeps only the context whose best earlier source view reaches the minimum trusted view quality, and everything below it is blanked to the missing-context color and generated again. The displayed RGB blend is unchanged.",
         default=TEXTURING_DEFAULTS["qwen_use_confidence_context"], update=update_parameters,
     )
     bpy.types.Scene.qwen_regularize_context_mask = bpy.props.BoolProperty(
@@ -1284,8 +1284,8 @@ def register_properties(update_model_list, ControlNetUnit, LoRAUnit,
     )
     bpy.types.Scene.qwen_trust_threshold = bpy.props.FloatProperty(
         name="Minimum trusted view quality",
-        description="Minimum geometric source-view quality needed to protect existing context. Higher values mark more surface for repair; this is not an artistic image-quality score.",
-        default=0.70, min=0.0, max=1.0, update=update_parameters,
+        description="Minimum geometric source-view quality needed to keep existing context. Higher values blank more surface for regeneration; this is not an artistic image-quality score.",
+        default=0.50, min=0.0, max=1.0, update=update_parameters,
     )
     bpy.types.Scene.qwen_mask_min_island_area = bpy.props.IntProperty(
         name="Minimum trusted island (px²)",

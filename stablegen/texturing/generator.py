@@ -614,7 +614,7 @@ class ComfyUIGenerate(_PBRMixin, bpy.types.Operator):
             camera_id,
             repair_mask=repair_path,
             trusted_mask=trusted_path,
-            trust_threshold=getattr(context.scene, 'qwen_trust_threshold', 0.7),
+            trust_threshold=getattr(context.scene, 'qwen_trust_threshold', 0.5),
         )
 
         # These files are generated immediately before their first upload, but
@@ -1552,7 +1552,7 @@ class ComfyUIGenerate(_PBRMixin, bpy.types.Operator):
 
         reliable = []
         risks = []
-        trust = float(getattr(context.scene, 'qwen_trust_threshold', 0.7))
+        trust = float(getattr(context.scene, 'qwen_trust_threshold', 0.5))
         discard_cosine = math.cos(math.radians(float(context.scene.discard_factor)))
         front_threshold = max(0.0, min(1.0, max(trust, discard_cosine)))
         homogeneous_positions = np.concatenate(

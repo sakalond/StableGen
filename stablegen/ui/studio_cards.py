@@ -269,7 +269,7 @@ LABELS = {
     'sequential_ipadapter_mode': 'Reference source',
     'sequential_desaturate_factor': 'Reference desaturation',
     'sequential_contrast_factor': 'Reference contrast reduction',
-    'qwen_use_confidence_context': 'Protect reliable context',
+    'qwen_use_confidence_context': 'Confidence-gated context',
     'qwen_trust_threshold': 'Minimum trusted view quality',
     'qwen_guidance_fallback_color': 'Missing-context color',
     'qwen_guidance_background_color': 'Image background',

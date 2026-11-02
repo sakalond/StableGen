@@ -1597,7 +1597,7 @@ def _export_visibility_impl(context, to_export, obj=None, camera_visibility=None
             trusted = nodes.new("ShaderNodeMath")
             trusted.operation = 'GREATER_THAN'
             trusted.inputs[1].default_value = float(getattr(
-                context.scene, 'qwen_trust_threshold', 0.7
+                context.scene, 'qwen_trust_threshold', 0.5
             )) - 1e-7
             trusted.label = "SGTrustedContext"
             links.new(source_quality.outputs[0], trusted.inputs[0])
