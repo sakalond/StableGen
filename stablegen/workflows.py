@@ -5,6 +5,7 @@ import uuid
 import websocket
 import socket
 import time
+import urllib.error
 import urllib.request
 import urllib.parse
 import email.utils
@@ -12,6 +13,7 @@ from datetime import datetime, timezone, timedelta
 
 from .timeout_config import get_timeout
 from .util.prompt_archive import archive_prompt
+from .util.comfy_errors import describe_rejection
 from .core.generation_status import set_server_stage, node_stage
 
 from io import BytesIO
@@ -685,6 +687,19 @@ class _WorkflowBase:
             response = json.loads(urllib.request.urlopen(req, timeout=get_timeout('api')).read())
             
             return response['prompt_id']
+        except urllib.error.HTTPError as e:
+            print(f"[StableGen] Failed to queue prompt: {str(e)}")
+            try:
+                body = e.read()
+            except OSError:
+                body = b''
+            if body:
+                print(f"[StableGen] ComfyUI response: {body.decode('utf-8', 'replace')}")
+            # ComfyUI says why it refused the workflow, usually a model or node that is not installed.
+            reason = describe_rejection(body)
+            if reason:
+                raise RuntimeError(reason) from e
+            raise
         except Exception as e:
             print(f"[StableGen] Failed to queue prompt: {str(e)}")
             raise
