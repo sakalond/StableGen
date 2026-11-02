@@ -1,5 +1,6 @@
 """Preset definitions, callbacks, and preset operators."""
 
+from contextlib import contextmanager
 import math
 import bpy  # pylint: disable=import-error
 import mathutils  # pylint: disable=import-error
@@ -762,6 +763,33 @@ def preset_value(context, key):
         return values[key]
     return None if values.get('custom', False) else TEXTURING_DEFAULTS.get(key)
 
+
+def matching_preset(context, name, architecture):
+    """The preset of *architecture* whose panel name (without model and variant words) is *name*'s, preferring one
+    with the same variants (Nunchaku); without such a preset, the architecture's first one."""
+    names = architecture_presets(context, architecture)
+    plain = lambda key: preset_label(key, key.title()).casefold()
+    variants = lambda key: {word for word in PRESET_VARIANTS if strip_word(key.title(), word)[1]}
+    same = [key for key in names if plain(key) == plain(name)]
+    exact = [key for key in same if variants(key) == variants(name)]
+    return (exact or same or names or [None])[0]
+
+
+def carry_preset(context, previous):
+    """After an Architecture switch: when the settings were the stock preset *previous*, apply the new
+    architecture's preset of the same name, else its first preset. Returns whether a preset was applied; custom
+    settings are left as they are."""
+    architecture = context.scene.architecture_mode
+    if (_carry_held or previous not in PRESETS
+            or preset_architecture(PRESETS[previous]) == architecture):
+        return False
+    target = matching_preset(context, previous, architecture)
+    if target is None:
+        return False
+    context.scene.stablegen_preset = target
+    result = apply_preset(context, target, lambda level, message: print(f"[StableGen] {message}"))
+    return 'FINISHED' in result
+
 def normalize_value(key, value):
     if key == "trellis2_remesh" and isinstance(value, bool):
         return "qdc" if value else "none"
@@ -950,121 +978,146 @@ class ApplyPreset(bpy.types.Operator):
         return not sg_modal_active(context)
 
     def execute(self, context):
-        preset = context.scene.stablegen_preset
-        if '(EXPERIMENTAL)' in preset and not experiments_enabled(context):
-            self.report({'ERROR'}, "Enable experimental texturing in add-on preferences first")
+        return apply_preset(context, context.scene.stablegen_preset, self.report)
+
+
+# Architecture changes made while a preset is applied, or while a file migrates its architecture, keep the
+# settings instead of carrying a preset over (carry_preset).
+_carry_held = False
+
+
+@contextmanager
+def preset_carry_held():
+    global _carry_held
+    held, _carry_held = _carry_held, True
+    try:
+        yield
+    finally:
+        _carry_held = held
+
+
+def apply_preset(context, preset, report):
+    """Apply stock preset *preset* to the scene, reporting through *report* (an operator's report signature).
+    Returns the operator result."""
+    with preset_carry_held():
+        return _apply_preset(context, preset, report)
+
+
+def _apply_preset(context, preset, report):
+    if '(EXPERIMENTAL)' in preset and not experiments_enabled(context):
+        report({'ERROR'}, "Enable experimental texturing in add-on preferences first")
+        return {'CANCELLED'}
+    if preset in PRESETS:
+        values = PRESETS[preset]
+        if (preset_uses_deprecated_architecture(values)
+                and not deprecated_architectures_enabled(context)):
+            report({'ERROR'}, "Enable deprecated architectures in add-on preferences first; these architectures no longer receive support")
             return {'CANCELLED'}
-        if preset in PRESETS:
-            values = PRESETS[preset]
-            if (preset_uses_deprecated_architecture(values)
-                    and not deprecated_architectures_enabled(context)):
-                self.report({'ERROR'}, "Enable deprecated architectures in add-on preferences first; these architectures no longer receive support")
-                return {'CANCELLED'}
-            if (preset_uses_experimental_architecture(values)
-                    and not experimental_architectures_enabled(context)):
-                self.report({'ERROR'}, "Enable experimental architectures in add-on preferences first")
-                return {'CANCELLED'}
+        if (preset_uses_experimental_architecture(values)
+                and not experimental_architectures_enabled(context)):
+            report({'ERROR'}, "Enable experimental architectures in add-on preferences first")
+            return {'CANCELLED'}
 
-            if not values.get("custom", False):
-                for key, value in TEXTURING_DEFAULTS.items():
-                    if hasattr(context.scene, key):
-                        setattr(context.scene, key, value)
-            
-            # Apply architecture_mode first so dynamic enums that
-            # depend on it (e.g. sequential_ipadapter_mode) are valid
-            # when their values are set in the main loop.
-            if "architecture_mode" in values and hasattr(context.scene, "architecture_mode"):
-                try:
-                    setattr(context.scene, "architecture_mode", values["architecture_mode"])
-                except (TypeError, AttributeError):
-                    pass
-
-            # Apply regular parameters
-            skipped = []
-            for key, value in values.items():
-                if key not in ["controlnet_units", "lora_units", "description"] and hasattr(context.scene, key):
-                    try:
-                        if key == "trellis2_decimate_method" and value == "planar":
-                            setattr(context.scene, "trellis2_decimate_method", "none")
-                            continue
-                        if key == "trellis2_remesh":
-                            if isinstance(value, bool):
-                                legacy_str = "qdc" if value else "none"
-                            else:
-                                legacy_str = value
-                            setattr(context.scene, "trellis2_remesh", legacy_str)
-                            if legacy_str == "qdc":
-                                setattr(context.scene, "trellis2_decimate_method", "server")
-                                setattr(context.scene, "trellis2_remesh_method", "qdc")
-                            elif legacy_str in ("none", "decimate_planar"):
-                                setattr(context.scene, "trellis2_decimate_method", "none")
-                                setattr(context.scene, "trellis2_remesh_method", "none")
-                            elif legacy_str == "decimate_collapse":
-                                setattr(context.scene, "trellis2_decimate_method", "collapse")
-                                setattr(context.scene, "trellis2_remesh_method", "none")
-                            elif legacy_str == "quadriflow":
-                                setattr(context.scene, "trellis2_decimate_method", "none")
-                                setattr(context.scene, "trellis2_remesh_method", "quadriflow")
-                            elif legacy_str == "instant_meshes":
-                                setattr(context.scene, "trellis2_decimate_method", "none")
-                                setattr(context.scene, "trellis2_remesh_method", "quadriflow")
-                            continue
-                        setattr(context.scene, key, value)
-                    except (TypeError, AttributeError):
-                        # Dynamic enum values (e.g. trellis2_input) may not
-                        # exist when the current architecture differs.
-                        skipped.append(key)
-            
-            # Apply ControlNet units if present in the preset
-            if "controlnet_units" in values:
-                # Clear existing units
-                context.scene.controlnet_units.clear()
-                
-                # Add new units from preset
-                controlnet_units = values["controlnet_units"]
-                for unit_data in controlnet_units:
-                    new_unit = context.scene.controlnet_units.add()
-                    for key, value in unit_data.items():
-                        try:
-                            setattr(new_unit, key, value)
-                        except TypeError:
-                            self.report({'ERROR'}, f"Failed to set {key} for ControlNet unit: {value}. Model might be missing or might not be named correctly.")
-                            return {'CANCELLED'}
-                        
-            if "lora_units" in values:
-                # Clear existing LoRA units
-                context.scene.lora_units.clear()
-                
-                # Add new LoRA units from preset
-                lora_units = values["lora_units"]
-                for lora_data in lora_units:
-                    new_lora = context.scene.lora_units.add()
-                    for key, value in lora_data.items():
-                        try:
-                            setattr(new_lora, key, value)
-                        except TypeError:
-                            self.report({'ERROR'}, f"Failed to set {key} for LoRA unit: {value}. Model might be missing or might not be named correctly.")
-                            context.scene.lora_units.remove(len(context.scene.lora_units) - 1)
-                            return {'CANCELLED'}
-                        
-            # Reverse-sync: if the preset set model_architecture but didn't
-            # include architecture_mode, update the visible dropdown to match.
-            if "architecture_mode" not in values:
-                arch = context.scene.model_architecture
-                if arch in DIFFUSION_ARCHITECTURES:
-                    context.scene.architecture_mode = arch
-
-            if skipped:
-                self.report({'WARNING'}, f"Preset '{preset}' applied (skipped {len(skipped)} incompatible setting(s)).")
-            else:
-                self.report({'INFO'}, f"Preset '{preset}' applied.")
-        else:
-            self.report({'INFO'}, "Custom preset active.")
+        if not values.get("custom", False):
+            for key, value in TEXTURING_DEFAULTS.items():
+                if hasattr(context.scene, key):
+                    setattr(context.scene, key, value)
         
-        # Force update to ensure preset detection is correct after list changes
-        update_parameters(self, context)
+        # Apply architecture_mode first so dynamic enums that
+        # depend on it (e.g. sequential_ipadapter_mode) are valid
+        # when their values are set in the main loop.
+        if "architecture_mode" in values and hasattr(context.scene, "architecture_mode"):
+            try:
+                setattr(context.scene, "architecture_mode", values["architecture_mode"])
+            except (TypeError, AttributeError):
+                pass
 
-        return {'FINISHED'}
+        # Apply regular parameters
+        skipped = []
+        for key, value in values.items():
+            if key not in ["controlnet_units", "lora_units", "description"] and hasattr(context.scene, key):
+                try:
+                    if key == "trellis2_decimate_method" and value == "planar":
+                        setattr(context.scene, "trellis2_decimate_method", "none")
+                        continue
+                    if key == "trellis2_remesh":
+                        if isinstance(value, bool):
+                            legacy_str = "qdc" if value else "none"
+                        else:
+                            legacy_str = value
+                        setattr(context.scene, "trellis2_remesh", legacy_str)
+                        if legacy_str == "qdc":
+                            setattr(context.scene, "trellis2_decimate_method", "server")
+                            setattr(context.scene, "trellis2_remesh_method", "qdc")
+                        elif legacy_str in ("none", "decimate_planar"):
+                            setattr(context.scene, "trellis2_decimate_method", "none")
+                            setattr(context.scene, "trellis2_remesh_method", "none")
+                        elif legacy_str == "decimate_collapse":
+                            setattr(context.scene, "trellis2_decimate_method", "collapse")
+                            setattr(context.scene, "trellis2_remesh_method", "none")
+                        elif legacy_str == "quadriflow":
+                            setattr(context.scene, "trellis2_decimate_method", "none")
+                            setattr(context.scene, "trellis2_remesh_method", "quadriflow")
+                        elif legacy_str == "instant_meshes":
+                            setattr(context.scene, "trellis2_decimate_method", "none")
+                            setattr(context.scene, "trellis2_remesh_method", "quadriflow")
+                        continue
+                    setattr(context.scene, key, value)
+                except (TypeError, AttributeError):
+                    # Dynamic enum values (e.g. trellis2_input) may not
+                    # exist when the current architecture differs.
+                    skipped.append(key)
+        
+        # Apply ControlNet units if present in the preset
+        if "controlnet_units" in values:
+            # Clear existing units
+            context.scene.controlnet_units.clear()
+            
+            # Add new units from preset
+            controlnet_units = values["controlnet_units"]
+            for unit_data in controlnet_units:
+                new_unit = context.scene.controlnet_units.add()
+                for key, value in unit_data.items():
+                    try:
+                        setattr(new_unit, key, value)
+                    except TypeError:
+                        report({'ERROR'}, f"Failed to set {key} for ControlNet unit: {value}. Model might be missing or might not be named correctly.")
+                        return {'CANCELLED'}
+                    
+        if "lora_units" in values:
+            # Clear existing LoRA units
+            context.scene.lora_units.clear()
+            
+            # Add new LoRA units from preset
+            lora_units = values["lora_units"]
+            for lora_data in lora_units:
+                new_lora = context.scene.lora_units.add()
+                for key, value in lora_data.items():
+                    try:
+                        setattr(new_lora, key, value)
+                    except TypeError:
+                        report({'ERROR'}, f"Failed to set {key} for LoRA unit: {value}. Model might be missing or might not be named correctly.")
+                        context.scene.lora_units.remove(len(context.scene.lora_units) - 1)
+                        return {'CANCELLED'}
+                    
+        # Reverse-sync: if the preset set model_architecture but didn't
+        # include architecture_mode, update the visible dropdown to match.
+        if "architecture_mode" not in values:
+            arch = context.scene.model_architecture
+            if arch in DIFFUSION_ARCHITECTURES:
+                context.scene.architecture_mode = arch
+
+        if skipped:
+            report({'WARNING'}, f"Preset '{preset}' applied (skipped {len(skipped)} incompatible setting(s)).")
+        else:
+            report({'INFO'}, f"Preset '{preset}' applied.")
+    else:
+        report({'INFO'}, "Custom preset active.")
+    
+    # Force update to ensure preset detection is correct after list changes
+    update_parameters(None, context)
+
+    return {'FINISHED'}
 
 class SwitchToMeshGeneration(bpy.types.Operator):
     """Switch to mesh generation mode using TRELLIS.2"""

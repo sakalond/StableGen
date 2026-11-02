@@ -69,7 +69,9 @@ def load_handler(dummy, _second=None, file_loaded=True):
                       else 'qwen_image_21')
             scene.model_architecture = target
             if getattr(scene, "architecture_mode", "") == 'qwen_image_edit':
-                scene.architecture_mode = target
+                from ..ui.presets import preset_carry_held
+                with preset_carry_held():           # the file keeps its own settings
+                    scene.architecture_mode = target
             elif getattr(scene, "architecture_mode", "") == 'trellis2':
                 if getattr(scene, "trellis2_texture_mode", "") == 'qwen_image_edit':
                     scene.trellis2_texture_mode = target

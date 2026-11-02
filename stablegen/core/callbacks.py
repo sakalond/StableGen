@@ -8,7 +8,7 @@ and the server address preference.  Extracted from the original
 import bpy  # pylint: disable=import-error
 from urllib.parse import urlparse
 
-from ..ui.presets import update_parameters
+from ..ui.presets import carry_preset, update_parameters
 from . import ADDON_PKG
 from .state import (
     _cached_checkpoint_list,
@@ -155,6 +155,8 @@ def update_architecture_mode(self, context):
     """Called when the user changes the architecture_mode dropdown."""
     scene = context.scene
     mode = scene.architecture_mode
+    # Nothing has rechecked the preset yet, so this is the one the previous architecture's settings matched.
+    previous_preset = scene.stablegen_preset
 
     if mode != 'trellis2':
         if scene.model_architecture != mode:
@@ -162,7 +164,8 @@ def update_architecture_mode(self, context):
     else:
         _sync_trellis2_backbone(scene)
 
-    update_parameters(self, context)
+    if not carry_preset(context, previous_preset):
+        update_parameters(self, context)
 
 
 def _sync_trellis2_backbone(scene):
