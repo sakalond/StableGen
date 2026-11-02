@@ -306,14 +306,16 @@ class CheckServerStatus(bpy.types.Operator):
         server_addr = prefs.server_address
 
         print(f"[StableGen] Checking server status at {server_addr}...")
+        # Read the preferences here; the worker thread must not touch bpy.
+        ping_timeout, api_timeout = get_timeout('ping'), get_timeout('api')
 
         def _bg_work():
             result = {}
-            result['online'] = check_server_availability(server_addr, timeout=get_timeout('ping'))
+            result['online'] = check_server_availability(server_addr, timeout=ping_timeout)
             if result['online']:
-                result['trellis2'] = check_trellis2_available(server_addr, timeout=get_timeout('api'))
-                result['pbr'] = check_pbr_available(server_addr, timeout=get_timeout('api'))
-                result['skintokens'] = check_skintokens_autorig_available(server_addr, timeout=get_timeout('api'))
+                result['trellis2'] = check_trellis2_available(server_addr, timeout=api_timeout)
+                result['pbr'] = check_pbr_available(server_addr, timeout=api_timeout)
+                result['skintokens'] = check_skintokens_autorig_available(server_addr, timeout=api_timeout)
             else:
                 result['trellis2'] = False
                 result['pbr'] = False

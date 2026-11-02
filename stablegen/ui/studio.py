@@ -4,6 +4,7 @@ GPU drawing lives only in this tab's UI region. A lightweight input operator
 passes viewport and native-tab events through. Every workflow command invokes
 its existing Blender operator; every setting writes its original RNA property.
 """
+import contextlib
 import json
 import logging
 from pathlib import Path
@@ -153,13 +154,33 @@ _font_path = ''
 _log = logging.getLogger(__name__)
 
 
+def _in_area(session):
+    return bpy.context.window == session.window and bpy.context.area == session.area
+
+
+def _override(session, region):
+    # Input events already run in the session's area, so override only when the context differs. temp_override
+    # installs a Python context dict that operators read while bpy.ops has released the GIL. Python 3.11 (Blender
+    # 4.x, 5.0) then skips taking the GIL whenever a worker thread holds it, and Blender crashes (#126).
+    if _in_area(session) and bpy.context.region == region:
+        return contextlib.nullcontext()
+    return bpy.context.temp_override(window=session.window, area=session.area, region=region)
+
+
 def _context(session):
-    return bpy.context.temp_override(window=session.window, area=session.area, region=session.region)
+    return _override(session, session.region)
 
 
 def _viewport(session):
-    region = next(r for r in session.area.regions if r.type == 'WINDOW')
-    return bpy.context.temp_override(window=session.window, area=session.area, region=region)
+    return _override(session, next(r for r in session.area.regions if r.type == 'WINDOW'))
+
+
+def _viewport_mode(session, mode):
+    """Context and execution mode that run an operator in the session's 3D viewport region. From its own area
+    Blender picks that region itself (the *_REGION_WIN modes), so no Python context dict is installed."""
+    if _in_area(session):
+        return contextlib.nullcontext(), mode.replace('_DEFAULT', '_REGION_WIN')
+    return _viewport(session), mode
 
 
 def _undo(message):
@@ -400,9 +421,10 @@ class StudioSession:
         self.commit()
         self.clear_hover(leave=True)
         try:
-            with _viewport(self):
+            scope, mode = _viewport_mode(self, mode)
+            with scope:
                 op = model.operator(name)
-                if not op.poll():
+                if not op.poll(mode):
                     self.tell('This command is unavailable for the current scene or operation.')
                     return
                 if diagnostics.active(bpy.context.scene) and name not in {
@@ -461,9 +483,9 @@ class StudioSession:
 
     def write_binding(self, binding, value, undo=True):
         if binding.path == 'sg_studio_diagnostics':
-            with _viewport(self):
-                bpy.ops.stablegen.studio_diagnostic('EXEC_DEFAULT', setting=binding.property,
-                                                   value=json.dumps(value))
+            scope, mode = _viewport_mode(self, 'EXEC_DEFAULT')
+            with scope:
+                bpy.ops.stablegen.studio_diagnostic(mode, setting=binding.property, value=json.dumps(value))
                 _undo('Change diagnostic display')
         else:
             binding.set(bpy.context, value)

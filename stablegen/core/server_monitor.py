@@ -75,9 +75,9 @@ def _tick():
         if (_in_flight or wrapper is None or not wrapper.preferences.server_address
                 or not bpy.app.online_access or not _sidebar_open(context) or _busy(context)):
             return INTERVAL
-        address = wrapper.preferences.server_address
+        address, timeout = wrapper.preferences.server_address, get_timeout('ping')
         _in_flight = True
-        _run_async(lambda: check_server_availability(address, timeout=get_timeout('ping')),
+        _run_async(lambda: check_server_availability(address, timeout=timeout),
                    lambda online: _apply(address, online))
     except Exception:
         _in_flight = False
