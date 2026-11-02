@@ -256,6 +256,24 @@ def declared_packages(config_path):
     return names
 
 
+def _pip_install(python, installed, wanted):
+    """pip install *wanted* ({name: requirement}) into an env with every other package held at its version."""
+    # Hold every other package at its current version so pip can't swap the
+    # env's CUDA torch build or anything else while resolving.
+    with tempfile.NamedTemporaryFile("w", suffix=".txt", delete=False, encoding="utf-8") as fh:
+        fh.write("\n".join(f"{n}=={v}" for n, v in installed.items() if n not in wanted))
+        constraints = fh.name
+    try:
+        # Packages pixi took from conda (e.g. av) may have no build for this
+        # Python that satisfies ComfyUI; pip replaces them with the PyPI wheel.
+        return subprocess.run(
+            [str(python), "-m", "pip", "install", "--disable-pip-version-check", "--no-input",
+             "-c", constraints, *wanted.values()],
+            env=dict(os.environ, PYTHONNOUSERSITE="1"), capture_output=True, text=True, timeout=900)
+    finally:
+        os.unlink(constraints)
+
+
 def sync(comfyui_dir, node_dir, check_only=False):
     """Make the node's envs satisfy ComfyUI core's requirements. Returns a list of problems left over.
 
@@ -282,20 +300,7 @@ def sync(comfyui_dir, node_dir, check_only=False):
             problems.append(f"{env_dir.parent.parent.parent.name}: {summary}")
             continue
         _log(f"{env_dir.parent.parent.parent.name}: {summary}")
-        # Hold every other package at its current version so pip can't swap the
-        # env's CUDA torch build or anything else while resolving.
-        with tempfile.NamedTemporaryFile("w", suffix=".txt", delete=False, encoding="utf-8") as fh:
-            fh.write("\n".join(f"{n}=={v}" for n, v in installed.items() if n not in wanted))
-            constraints = fh.name
-        try:
-            # Packages pixi took from conda (e.g. av) may have no build for this
-            # Python that satisfies ComfyUI; pip replaces them with the PyPI wheel.
-            result = subprocess.run(
-                [str(python), "-m", "pip", "install", "--disable-pip-version-check", "--no-input",
-                 "-c", constraints, *wanted.values()],
-                env=dict(os.environ, PYTHONNOUSERSITE="1"), capture_output=True, text=True, timeout=900)
-        finally:
-            os.unlink(constraints)
+        result = _pip_install(python, installed, wanted)
         after = installed_versions(env_dir)
         left = [t for n, t in wanted.items() if not (n in after and _satisfies(after[n], reqs[n]))]
         if result.returncode != 0 or left:
@@ -309,23 +314,50 @@ def sync(comfyui_dir, node_dir, check_only=False):
     return problems
 
 
+# comfy.model_base pulls in the model code (comfy.ldm, its attention module) that workers import too:
+# TRELLIS.2's node scan imports comfy.lora, which imports it.
 _VERIFY = (
     "import sys; sys.argv = ['main.py']; sys.path[:0] = [{comfy!r}]\n"
-    "import comfy.model_management, comfy.utils, comfy_api.latest\n"
+    "import comfy.model_management, comfy.utils, comfy.model_base, comfy_api.latest\n"
     "print('ok')\n"
 )
 
 
-def verify(comfyui_dir, node_dir):
-    """Import ComfyUI core with each env's own Python, the way the node's worker does."""
+def _missing_requirement(output, reqs):
+    """The ComfyUI core requirement an import error names ("No module named 'comfy_kitchen'"), if any."""
+    m = re.search(r"No module named '([A-Za-z0-9_]+)", output)
+    name = _norm(m.group(1)) if m else None
+    return name if name in reqs else None
+
+
+def verify(comfyui_dir, node_dir, repair=True):
+    """Import ComfyUI core with each env's own Python, the way the node's worker does.
+
+    sync() only updates packages an env has or declares, so a requirement ComfyUI
+    core newly imports (ComfyUI 0.42 imports comfy-kitchen in its attention module)
+    is missing from an env built before it, and the worker then registers no nodes.
+    With *repair*, such a requirement is installed at core's version and the import
+    retried.
+    """
+    reqs = core_requirements(comfyui_dir) if repair else {}
     problems = []
     for _, env_dir in env_dirs(node_dir):
         python = _env_python(env_dir)
         if not python:
             continue
-        result = subprocess.run([str(python), "-c", _VERIFY.format(comfy=str(Path(comfyui_dir).resolve()))],
-                                env=dict(os.environ, PYTHONNOUSERSITE="1"), capture_output=True, text=True,
-                                timeout=600, cwd=str(comfyui_dir))
+        added = set()
+        while True:
+            result = subprocess.run([str(python), "-c", _VERIFY.format(comfy=str(Path(comfyui_dir).resolve()))],
+                                    env=dict(os.environ, PYTHONNOUSERSITE="1"), capture_output=True, text=True,
+                                    timeout=600, cwd=str(comfyui_dir))
+            name = (_missing_requirement((result.stderr or result.stdout), reqs)
+                    if result.returncode != 0 else None)
+            if name is None or name in added:
+                break
+            added.add(name)
+            target = _target(name, reqs[name])
+            _log(f"{env_dir.parent.parent.parent.name}: ComfyUI core imports {name}, missing here -> {target}")
+            _pip_install(python, installed_versions(env_dir), {name: target})
         if result.returncode != 0:
             output = (result.stderr or result.stdout).strip()
             last = output.splitlines()[-1:] or ["unknown error"]
@@ -348,7 +380,7 @@ if __name__ == "__main__":
         sys.exit(__doc__)
     left = sync(args[0], args[1], check_only="--check" in sys.argv)
     if not left:
-        left = verify(args[0], args[1])
+        left = verify(args[0], args[1], repair="--check" not in sys.argv)
     sys.exit(1 if left else 0)
 '''
 
@@ -618,7 +650,10 @@ DEPENDENCIES: Dict[str, Dict[str, Any]] = {
         "commit": "9b878516f2dc2fd873f4f6cceadba403dd12d83e",
         "enforce_pin": True,
         "license": "MIT (Note: textured pipeline uses NVIDIA non-commercial libs)", "packages": ["trellis2"],
-        "pip_packages": [COMFY_ENV, "comfy-sparse-attn", "comfy-3d-viewers"],
+        # The rest of the node's requirements.txt (ComfyUI-Manager would install it). The main process
+        # receives the worker's meshes as trimesh objects: without it every TRELLIS.2 run fails with
+        # "No module named 'trimesh'" on a ComfyUI that nothing else gave trimesh.
+        "pip_packages": [COMFY_ENV, "comfy-sparse-attn", "comfy-3d-viewers", "trimesh[easy]"],
         "clean_envs": True,
         "run_install_script": True,
         "post_clone_patches": [
