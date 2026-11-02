@@ -379,6 +379,62 @@ for _preset_values in PRESETS.values():
         ):
             _preset_values.pop(_prompt_field, None)
 
+# Preset names repeat their model and variant, which the panels show as tags instead: they list only the current
+# architecture's presets, so the model name is redundant there.
+PRESET_MODEL_NAMES = {'qwen_image_edit': 'qwen', 'qwen_image_21': 'qwen 2.1', 'qwen_image_21_turbo': 'qwen 2.1 turbo',
+                      'fibo_edit': 'fibo', 'moss_image': 'moss', 'flux2_klein': 'klein'}
+PRESET_VARIANTS = {'nunchaku': 'Nunchaku', 'experimental': 'Experimental'}
+PRESET_WORKFLOWS = ('New texture', 'Refine', 'Local edit', 'UV inpaint', 'Mesh + texture', 'Mesh only')
+
+
+def preset_workflow(preset):
+    if preset.get('architecture_mode') == 'trellis2':
+        return 'Mesh only' if preset.get('trellis2_texture_mode') == 'none' else 'Mesh + texture'
+    if preset.get('generation_method') == 'uv_inpaint':
+        return 'UV inpaint'
+    if 'local_edit' in (preset.get('generation_method'), preset.get('qwen_generation_method')):
+        return 'Local edit'
+    if preset.get('qwen_generation_method') == 'refine':
+        return 'Refine'
+    return 'New texture'
+
+
+def preset_model(preset):
+    if preset.get('architecture_mode') == 'trellis2':
+        return preset.get('trellis2_texture_mode', 'none')
+    return preset.get('model_architecture', 'sdxl')
+
+
+def preset_architecture(preset):
+    """The Architecture choice a preset belongs to."""
+    return preset.get('architecture_mode') or preset.get('model_architecture', 'sdxl')
+
+
+def strip_word(label, word):
+    lower = label.casefold()
+    if lower.endswith(' (' + word + ')'):
+        return label[:-len(word) - 3], True
+    if lower.startswith(word + ' '):
+        return label[len(word) + 1:], True
+    return label, False
+
+
+def preset_label(identifier, label):
+    preset = PRESETS.get(identifier)
+    if not preset:
+        return label
+    trellis = preset.get('architecture_mode') == 'trellis2'
+    for word in ('mesh + texture', 'mesh only', *PRESET_VARIANTS) if trellis else PRESET_VARIANTS:
+        label = strip_word(label, word)[0]
+    name = PRESET_MODEL_NAMES.get(preset_model(preset))
+    if name:
+        label = strip_word(label, name)[0]
+    if label.startswith('Uv '):         # title() case of UV
+        label = 'UV ' + label[3:]
+    # TRELLIS.2 (MESH ONLY) is the stock mesh preset once its tag says what it does.
+    return 'Default' if trellis and label.casefold() == 'trellis.2' else label
+
+
 # Global list of all generation parameter names to check for a preset.
 GEN_PARAMETERS = [
     'control_after_generate',
@@ -685,6 +741,26 @@ def get_preset_items(self, context):
                   for item in visible_items)
     # Blender's dynamic enums borrow their strings; keep every returned variant.
     return _PRESET_ENUM_CACHE.setdefault(items, items)
+
+
+def architecture_presets(context, architecture):
+    """The presets the panels offer for *architecture*, in their order: by workflow, then as listed."""
+    items = _build_preset_items(context, deprecated_architectures_enabled(context))
+    names = [item[0] for item in items
+             if item[0] in PRESETS and preset_architecture(PRESETS[item[0]]) == architecture]
+    order = {workflow: index for index, workflow in enumerate(PRESET_WORKFLOWS)}
+    return sorted(names, key=lambda name: order.get(preset_workflow(PRESETS[name]), len(order)))
+
+
+def preset_value(context, key):
+    """*key*'s value in the first preset of the scene's architecture, or None when that preset does not set it."""
+    names = architecture_presets(context, context.scene.architecture_mode)
+    if not names:
+        return None
+    values = PRESETS[names[0]]
+    if key in values:
+        return values[key]
+    return None if values.get('custom', False) else TEXTURING_DEFAULTS.get(key)
 
 def normalize_value(key, value):
     if key == "trellis2_remesh" and isinstance(value, bool):

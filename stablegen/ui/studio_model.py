@@ -7,7 +7,7 @@ from pathlib import Path
 import bpy
 
 from .presentation import Layout, Control, capture_panel
-from .presets import get_preset_items
+from .presets import get_preset_items, preset_value
 from .model_units import update_model_list, get_lora_models, get_controlnet_models
 from ..core.architectures import (architecture_items, model_architecture_items,
                                     trellis_texture_items, trellis_initial_image_items)
@@ -45,6 +45,16 @@ def _soft_range(prop):
 def _round(value):
     """C's roundf: halves away from zero."""
     return math.copysign(math.floor(abs(value) + .5), value)
+
+
+def reset_value(binding, context):
+    """What Backspace or an emptied field resets a number to: its value in the first preset of the scene's
+    architecture when that preset sets this scene setting, else the property's default."""
+    if binding.root == 'scene' and not binding.path:
+        value = preset_value(context, binding.property)
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            return value
+    return binding.rna(context).default
 
 
 def number_step(prop):

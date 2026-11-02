@@ -27,7 +27,9 @@ from .presentation import Layout, Control, Section, STRUCTURAL_PROPERTIES, TOOL_
 from .studio_text import TextBuffer, wrap
 from .studio_widgets import (Painter, FONT_SIZE, CONTROL_HEIGHT, CONTROL_GAP,
                              TEXT_LINE_HEIGHT, TEXT_PADDING, font_size)
-from .presets import PRESETS
+from .presets import (PRESETS, PRESET_MODEL_NAMES, PRESET_VARIANTS, PRESET_WORKFLOWS,
+                      preset_label as _preset_label, preset_model as _preset_model,
+                      preset_workflow as _preset_workflow, strip_word as _strip)
 from ..utils import sg_modal_active
 from ..core import ADDON_PKG, legacy_panel_enabled
 from ..core.generation_status import WAITING_STAGES
@@ -51,57 +53,6 @@ def _architecture_tags(prop, identifier):
     tags = ['Asset generation' if identifier in ASSET_ARCHITECTURES else 'Texturing'] if prop == 'architecture_mode' else []
     status = architecture_status(identifier)
     return tags + [status] if status else tags
-
-
-# Preset names repeat their model and variant, which the panel shows as tags instead: it lists only the current
-# architecture's presets, so the model name is redundant there.
-PRESET_MODEL_NAMES = {'qwen_image_edit': 'qwen', 'qwen_image_21': 'qwen 2.1', 'qwen_image_21_turbo': 'qwen 2.1 turbo',
-                      'fibo_edit': 'fibo', 'moss_image': 'moss', 'flux2_klein': 'klein'}
-PRESET_VARIANTS = {'nunchaku': 'Nunchaku', 'experimental': 'Experimental'}
-PRESET_WORKFLOWS = ('New texture', 'Refine', 'Local edit', 'UV inpaint', 'Mesh + texture', 'Mesh only')
-
-
-def _preset_workflow(preset):
-    if preset.get('architecture_mode') == 'trellis2':
-        return 'Mesh only' if preset.get('trellis2_texture_mode') == 'none' else 'Mesh + texture'
-    if preset.get('generation_method') == 'uv_inpaint':
-        return 'UV inpaint'
-    if 'local_edit' in (preset.get('generation_method'), preset.get('qwen_generation_method')):
-        return 'Local edit'
-    if preset.get('qwen_generation_method') == 'refine':
-        return 'Refine'
-    return 'New texture'
-
-
-def _preset_model(preset):
-    if preset.get('architecture_mode') == 'trellis2':
-        return preset.get('trellis2_texture_mode', 'none')
-    return preset.get('model_architecture', 'sdxl')
-
-
-def _strip(label, word):
-    lower = label.casefold()
-    if lower.endswith(' (' + word + ')'):
-        return label[:-len(word) - 3], True
-    if lower.startswith(word + ' '):
-        return label[len(word) + 1:], True
-    return label, False
-
-
-def _preset_label(identifier, label):
-    preset = PRESETS.get(identifier)
-    if not preset:
-        return label
-    trellis = preset.get('architecture_mode') == 'trellis2'
-    for word in ('mesh + texture', 'mesh only', *PRESET_VARIANTS) if trellis else PRESET_VARIANTS:
-        label = _strip(label, word)[0]
-    name = PRESET_MODEL_NAMES.get(_preset_model(preset))
-    if name:
-        label = _strip(label, name)[0]
-    if label.startswith('Uv '):         # title() case of UV
-        label = 'UV ' + label[3:]
-    # TRELLIS.2 (MESH ONLY) is the stock mesh preset once its tag says what it does.
-    return 'Default' if trellis and label.casefold() == 'trellis.2' else label
 
 
 def _preset_tags(identifier):
@@ -482,7 +433,7 @@ class StudioSession:
                 binding, text = edit['binding'], edit['buffer'].text
                 prop = binding.rna(bpy.context)
                 if prop.type in {'INT', 'FLOAT'} and not text.strip():
-                    value = prop.default  # an emptied number resets to its default
+                    value = model.reset_value(binding, bpy.context)  # an emptied number resets
                 else:
                     value = float(text) if prop.type == 'FLOAT' else int(text) if prop.type == 'INT' else text
                 if binding.value(bpy.context) != value:
@@ -727,7 +678,7 @@ class StudioSession:
 
     def number_key(self, event):
         """Blender's keys over a hovered number button: Ctrl+Wheel steps, Enter types, Ctrl+C/Ctrl+V copy and
-        paste, Backspace resets to the default and Minus negates."""
+        paste, Backspace resets (studio_model.reset_value) and Minus negates."""
         target = self.hit_target()
         if (event.value != 'PRESS' or not target or not target.enabled or not isinstance(target.action, tuple)
                 or target.action[0] != 'number'):
@@ -750,7 +701,7 @@ class StudioSession:
             self.set_value(binding, value)
         elif event.type == 'BACK_SPACE' and not ctrl:
             with _context(self):
-                default = binding.rna(bpy.context).default
+                default = model.reset_value(binding, bpy.context)
             self.set_value(binding, default)
         elif event.type in {'MINUS', 'NUMPAD_MINUS'} and not ctrl:
             with _context(self):
