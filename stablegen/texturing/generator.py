@@ -462,6 +462,7 @@ class ComfyUIGenerate(_PBRMixin, bpy.types.Operator):
     _grid_height = 0
     _material_id = -1
     _to_texture = None
+    _edit_layers = ()
     _original_visibility = None
     _generation_method_on_start = None
     _uploaded_images_cache: dict = {}
@@ -572,6 +573,21 @@ class ComfyUIGenerate(_PBRMixin, bpy.types.Operator):
         bpy.app.timers.register(_callback)
         self._wait_event.wait()
         self._wait_event.clear()
+
+    def _replay_edit_layers(self, context):
+        """Lay the Masked Edits captured at the start of a Reproject or
+        Regenerate Selected over the projection it rebuilt."""
+        if not self._edit_layers:
+            return
+        from .masked_edit import replay_layers
+        self._stage = "Restoring Masked Edits"
+        try:
+            laid = replay_layers(context, self._edit_layers)
+            print(f"[StableGen] Laid {laid} Masked Edit view(s) again over the reprojection")
+        except Exception as e:
+            # The projection itself is complete; a lost edit is reported, not fatal.
+            traceback.print_exc()
+            print(f"[StableGen] Could not lay the Masked Edits again: {e}")
 
     def _get_qwen_context_colors(self, context):
         fallback = (1.0, 0.0, 1.0)
@@ -1302,13 +1318,20 @@ class ComfyUIGenerate(_PBRMixin, bpy.types.Operator):
         elif context.scene.generation_method == 'uv_inpaint':
             self._total_images = len(self._to_texture)
 
-        # Regenerate mode preparation
-        if context.scene.generation_mode == 'regenerate_selected':
-            # After Bake Textures the bake is the active material; the views to
-            # reset, and the context of the first regenerated one, are in the
-            # projection material.
+        # Reproject and Regenerate Selected rebuild the projection material from
+        # the generation's views; the Masked Edit layers on it are laid again
+        # after the run. After Bake Textures the bake is the active material;
+        # the layers, the views to reset and the context of the first
+        # regenerated view are in the projection material.
+        self._edit_layers = []
+        if context.scene.generation_mode in {'project_only', 'regenerate_selected'}:
+            from .masked_edit import capture_layers
             for obj in self._to_texture:
                 activate_projection_material(obj)
+            self._edit_layers = capture_layers(self._to_texture)
+
+        # Regenerate mode preparation
+        if context.scene.generation_mode == 'regenerate_selected':
             if context.scene.generation_method == 'sequential':
                 # Sequential regeneration: reset all cameras from the first
                 # selected onward so the projection sequence replays correctly.
@@ -2307,6 +2330,7 @@ class ComfyUIGenerate(_PBRMixin, bpy.types.Operator):
                     )
                     if getattr(context.scene, 'pbr_auto_lighting', False):
                         _pbr_setup_studio_lights(context, self._to_texture)
+                self._replay_edit_layers(context)
                 return None
             self._stage = "Projecting Image"
             redraw_ui(context)
@@ -2336,7 +2360,7 @@ class ComfyUIGenerate(_PBRMixin, bpy.types.Operator):
                 if getattr(context.scene, 'pbr_auto_lighting', False):
                     _pbr_setup_studio_lights(context, self._to_texture)
 
-
+            self._replay_edit_layers(context)
             return None
 
         if context.scene.view_blend_use_color_match and self._to_texture:

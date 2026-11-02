@@ -1036,6 +1036,130 @@ def project_view(context, objects, camera, image_path, write_path, material_id, 
     return layers
 
 
+def _upstream_selection(socket, depth=12):
+    """The selection snapshot gating a layer's weight: the first frozen-selection texture upstream of *socket*."""
+    pending, seen = [socket], set()
+    while pending and depth:
+        depth -= 1
+        following = []
+        for item in pending:
+            for link in item.links:
+                node = link.from_node
+                if node.as_pointer() in seen:
+                    continue
+                seen.add(node.as_pointer())
+                if node.type == 'TEX_IMAGE' and node.label.startswith(FROZEN):
+                    return node
+                following.extend(node.inputs)
+        pending = following
+    return None
+
+
+def capture_layers(objects):
+    """The Masked Edit layers each object's projection material carries, oldest first.
+
+    Reproject and Regenerate Selected rebuild a projection material from the
+    generation's views, which dropped the edit layers on it; the run lays them
+    again afterwards with replay_layers. A layer is read back from its edit's
+    folder (masked-edit.json: the camera and the selection expansion; the view's
+    generated image and write mask) and the selection snapshot its weight used.
+    """
+    captured = []
+    for obj in objects:
+        material = obj.active_material
+        if material is None or not material.use_nodes:
+            continue
+        nodes = material.node_tree.nodes
+        for texture in nodes:
+            if texture.type != 'TEX_IMAGE' or not texture.get('sg_masked_edit') or texture.image is None:
+                continue
+            try:
+                layer_id = int(texture.label.split('-')[1])
+            except (IndexError, ValueError):
+                continue
+            view_dir = Path(bpy.path.abspath(texture.image.filepath)).parent.parent
+            report_path = view_dir.parent / 'masked-edit.json'
+            try:
+                report = json.loads(report_path.read_text(encoding='utf-8'))
+            except (OSError, ValueError):
+                print(f"[StableGen] Masked Edit layer {layer_id} on {obj.name}: no edit report at {report_path}")
+                continue
+            key = lambda path: Path(path).resolve().as_posix().lower()
+            view = next((v for v in report.get('views', []) if key(v.get('directory', '')) == key(view_dir)), None)
+            if view is None or not view.get('camera'):
+                print(f"[StableGen] Masked Edit layer {layer_id} on {obj.name}: its view is not in {report_path}")
+                continue
+            mix = next((n for n in nodes if n.bl_idname == 'ShaderNodeMixRGB'
+                        and _upstream_texture(n.inputs['Color1']) == texture), None)
+            snapshot = _upstream_selection(mix.inputs['Fac']) if mix else None
+            captured.append({
+                'object': obj.name, 'layer': layer_id, 'camera': view['camera'], 'directory': str(view_dir),
+                'expand': int(report.get('expand_selection_px', 0) or 0),
+                'snapshot': snapshot.image.name if snapshot is not None and snapshot.image else None,
+                'pbr': bool(report.get('pbr_channels')),
+            })
+    return sorted(captured, key=lambda entry: entry['layer'])
+
+
+def replay_layers(context, captured):
+    """Lay the captured Masked Edit layers (capture_layers) over the rebuilt projection, in their order.
+
+    Each edit view is projected again through project_view from its camera, with
+    its generated image, write mask, expansion and selection snapshot. A layer
+    whose camera or files are gone is reported and left out; edited PBR maps are
+    not laid again. Returns the number of edit views laid.
+    """
+    scene = context.scene
+    views = {}
+    for entry in captured:
+        views.setdefault((entry['layer'], entry['camera'], entry['directory']), []).append(entry)
+    laid = 0
+    for (layer_id, camera_name, directory), entries in sorted(views.items(), key=lambda item: item[0][0]):
+        view_dir = Path(directory)
+        camera = bpy.data.objects.get(camera_name)
+        image_path = view_dir / 'generated.png'
+        write_path = view_dir / 'write_mask_opaque.png'
+        if not write_path.is_file():
+            write_path = view_dir / 'write-mask.png'
+        targets = [(bpy.data.objects.get(e['object']), e) for e in entries]
+        targets = [(obj, e) for obj, e in targets if obj is not None and obj.active_material]
+        if (camera is None or camera.type != 'CAMERA' or not targets
+                or not image_path.is_file() or not write_path.is_file()):
+            print(f"[StableGen] Masked Edit layer {layer_id} ({camera_name}) not laid again: "
+                  "its camera or files are gone")
+            continue
+        if any(e['pbr'] for _obj, e in targets):
+            print(f"[StableGen] Masked Edit layer {layer_id}: its edited PBR maps are not laid again")
+        for obj, entry in targets:
+            # As begin_layers prepares a material, without copying it or the mesh
+            material = obj.active_material
+            for node in material.node_tree.nodes:
+                if node.label == FROZEN:
+                    node.label = FROZEN + ' Previous'
+                if node.name == COVERAGE:
+                    node.name = COVERAGE + ' Previous'
+            snapshot = bpy.data.images.get(entry['snapshot']) if entry['snapshot'] else None
+            if snapshot is not None:
+                mask_socket(material, snapshot)
+            source = color_socket(material)
+            before = output_node(material).inputs['Surface'].links[0].from_node
+            material['_sg_mask_shader'] = before.name if before.type in {'BSDF_PRINCIPLED', 'EMISSION'} else ''
+            if before.type in {'BSDF_PRINCIPLED', 'EMISSION'}:
+                material.node_tree.links.new(source, color_input(before))
+        previous = scene.get('_sg_masked_output')
+        scene['_sg_masked_output'] = str(view_dir)
+        try:
+            project_view(context, [obj for obj, _e in targets], camera, str(image_path), str(write_path),
+                         layer_id, targets[0][1]['expand'])
+            laid += 1
+        finally:
+            if previous is None:
+                del scene['_sg_masked_output']
+            else:
+                scene['_sg_masked_output'] = previous
+    return laid
+
+
 class SG_OT_MaskedEdit(bpy.types.Operator):
     bl_idname = 'stablegen.masked_edit'
     bl_label = 'Generate Masked Edit'
