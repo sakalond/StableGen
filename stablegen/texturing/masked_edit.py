@@ -19,7 +19,7 @@ import numpy as np
 from ..core import ADDON_PKG, legacy_panel_enabled
 from ..utils import sg_modal_active, get_file_path
 from .pbr_emission import emission_from_hsv, emission_from_residual
-from .rendering import _RenderStateTransaction
+from .rendering import _RenderStateTransaction, EDIT_NORMAL_LAYER as NORMAL_LAYER
 from ..core.architectures import MASKED_EDIT_ARCHITECTURES, QWEN_ARCHITECTURES, SDXL_GRAPH_ARCHITECTURES
 
 MASK_UV = 'SG Edit Mask UV'
@@ -706,9 +706,6 @@ def resolve_layers(scene, apply):
         if not apply:
             scene.render.engine = scene['_sg_mask_original_engine']
         del scene['_sg_mask_original_engine']
-
-
-NORMAL_LAYER = 'Masked Edit normal'
 
 
 def pbr_targets(material):

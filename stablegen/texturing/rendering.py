@@ -2915,6 +2915,10 @@ def _remove_stale_pbr_maps(output_dir, object_name, channels):
     return removed
 
 
+# The label of a Masked Edit's decoded normal layers (masked_edit.world_normal_layer).
+EDIT_NORMAL_LAYER = 'Masked Edit normal'
+
+
 def _find_pbr_bake_sources(mat):
     """Inspect a Principled BSDF material and return bakeable PBR channel sources.
 
@@ -2975,6 +2979,10 @@ def _find_pbr_bake_sources(mat):
             ci = n_node.inputs.get("Color")
             if ci and ci.links:
                 sources['normal'] = ci.links[0].from_socket
+        elif n_node.label == EDIT_NORMAL_LAYER:
+            # A Masked Edit's normals decoded over the map: the normal bake
+            # takes the shading normal, so the layered result is the source.
+            sources['normal'] = ni.links[0].from_socket
 
     # ── Emission ─────────────────────────────────────────────────────
     ei = principled.inputs.get("Emission Color") or principled.inputs.get("Emission")
