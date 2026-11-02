@@ -1894,6 +1894,28 @@ def is_baked_material(material):
     return bool(material.get('sg_baked')) or re.search(r'_baked(\.\d+)?( Masked Edit)*$', material.name) is not None
 
 
+def activate_projection_material(obj):
+    """Make the object's projection material active again when a bake's material is.
+
+    A bake's material holds its final texture and is the active one after Bake
+    Textures; projecting into it, or reading a run's views from it, replaced or
+    missed the projection. Faces move to the projection material (a new one if
+    the object has none); the bake stays for the user to switch back to.
+    """
+    if obj.active_material is None or not is_baked_material(obj.active_material):
+        return obj.active_material
+    baked = obj.active_material
+    index = next((k for k, m in enumerate(obj.data.materials)
+                  if m and m is not baked and not is_baked_material(m)), -1)
+    if index < 0:
+        obj.data.materials.append(bpy.data.materials.new(name="ProjectionMaterial"))
+        index = len(obj.data.materials) - 1
+    obj.active_material_index = index
+    obj.data.polygons.foreach_set("material_index", [index] * len(obj.data.polygons))
+    obj.data.update()
+    return obj.active_material
+
+
 def _get_voronoi_placeholder(color=(1.0, 0.0, 1.0)):
     """Get or create a 1x1 solid-colour image used as placeholder for
     non-generated cameras in Voronoi projection mode.  The colour is
@@ -2872,26 +2894,13 @@ def project_image(
         context.view_layer.objects.active = obj
         obj.select_set(True)
 
-        # A bake's material holds its final texture. Projecting into it (it is
-        # the active material after Bake Textures) replaced the bake with a new
-        # projection graph; project into the object's projection material
-        # again, or a new one, and leave the bake for the user to switch back to.
         # Local edits (Masked Edit, local refine) edit the active material on
         # purpose, a bake included, and keep doing so.
         local_edit = (context.scene.generation_method == 'local_edit'
                       or (context.scene.model_architecture in QWEN_ARCHITECTURES
                           and context.scene.qwen_generation_method == 'local_edit'))
-        if (not local_edit and obj.active_material is not None
-                and is_baked_material(obj.active_material)):
-            baked = obj.active_material
-            index = next((k for k, m in enumerate(obj.data.materials)
-                          if m and m is not baked and not is_baked_material(m)), -1)
-            if index < 0:
-                obj.data.materials.append(bpy.data.materials.new(name="ProjectionMaterial"))
-                index = len(obj.data.materials) - 1
-            obj.active_material_index = index
-            obj.data.polygons.foreach_set("material_index", [index] * len(obj.data.polygons))
-            obj.data.update()
+        if not local_edit:
+            activate_projection_material(obj)
 
         # Create the material
         to_switch = False

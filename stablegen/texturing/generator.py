@@ -29,7 +29,7 @@ from ..util.workflow_templates import prompt_text, prompt_text_img2img, prompt_t
 from .rendering import export_emit_image, export_visibility, export_canny, bake_texture, prepare_baking, unwrap, export_render, export_viewport, render_edge_feather_mask, apply_uv_inpaint_texture, flatten_projection_material_for_refine, _RenderStateTransaction, _legacy_render_dither, _prepare_compositor_render, _finish_compositor_render
 from ..cameras.geometry import _SGCameraResolution, _get_camera_resolution, _get_resolution_align
 from ..cameras.overlays import _sg_restore_square_display, _sg_remove_crop_overlay, _sg_ensure_crop_overlay, _sg_hide_label_overlay, _sg_restore_label_overlay
-from .projection import project_image, reinstate_compare_nodes, _bake_visibility_weights, reset_projection_material_nodes, _is_projection_mesh, pop_svm_stack_warning, pop_eevee_attribute_warning
+from .projection import project_image, reinstate_compare_nodes, activate_projection_material, _bake_visibility_weights, reset_projection_material_nodes, _is_projection_mesh, pop_svm_stack_warning, pop_eevee_attribute_warning
 from .jobs import operation, RenderRequest, MainThreadOperation, run_sync
 from ..utils import get_last_material_index, get_generation_dirs, get_file_path, get_dir_path, remove_empty_dirs, get_compositor_node_tree, new_compositor_math, configure_output_node_paths, get_eevee_engine_id, sg_modal_active
 from ..util.mirror_color import MirrorReproject, _get_viewport_ref_np, _apply_color_match_to_file, restore_unmatched_image
@@ -194,9 +194,10 @@ class Regenerate(bpy.types.Operator):
                 return {'CANCELLED'}
         else: # all
             self._to_texture = [obj for obj in bpy.context.view_layer.objects if obj.type == 'MESH' and not obj.hide_get()]
-        # Revert discard angle
+        # Revert discard angle (in the projection material, not a bake's)
         new_discard_angle = context.scene.discard_factor
         for obj in self._to_texture:
+            activate_projection_material(obj)
             if not obj.active_material or not obj.active_material.use_nodes:
                 continue
 
@@ -1150,8 +1151,9 @@ class ComfyUIGenerate(_PBRMixin, bpy.types.Operator):
             self._to_texture = [obj for obj in bpy.context.view_layer.objects if obj.type == 'MESH' and not obj.hide_get()]
 
         # Find all mesh objects, check their material ids and store the highest one
-        # (a reprojection reads generated views, which Masked Edit layers do not have)
-        reproject = context.scene.generation_mode == 'project_only'
+        # (a reprojection or regeneration reads and replaces generated views,
+        # which Masked Edit layers do not have)
+        reproject = context.scene.generation_mode in {'project_only', 'regenerate_selected'}
         for obj in self._to_texture:
             for slot in obj.material_slots:
                 material_id = get_last_material_index(obj, include_edits=not reproject)
@@ -1302,6 +1304,11 @@ class ComfyUIGenerate(_PBRMixin, bpy.types.Operator):
 
         # Regenerate mode preparation
         if context.scene.generation_mode == 'regenerate_selected':
+            # After Bake Textures the bake is the active material; the views to
+            # reset, and the context of the first regenerated one, are in the
+            # projection material.
+            for obj in self._to_texture:
+                activate_projection_material(obj)
             if context.scene.generation_method == 'sequential':
                 # Sequential regeneration: reset all cameras from the first
                 # selected onward so the projection sequence replays correctly.
@@ -1964,6 +1971,28 @@ class ComfyUIGenerate(_PBRMixin, bpy.types.Operator):
                             else:
                                 image = self.workflow_manager.generate(context, controlnet_info=controlnet_info, ipadapter_ref_info=ipadapter_ref_info)
                         else:
+                            if (context.scene.generation_mode == 'regenerate_selected'
+                                    and self._current_image == min(self._selected_camera_ids)):
+                                # Regeneration starts mid-sequence: project the
+                                # views before it, as the run did, so its context
+                                # holds those and not the views being regenerated.
+                                self._stage = "Projecting Image"
+                                def earlier_project_callback():
+                                    try:
+                                        yield from project_image(
+                                            context, self._to_texture, self._material_id,
+                                            stop_index=self._current_image - 1,
+                                            cameras=self._cameras,
+                                            view_plan=self._view_plan,
+                                            _steps=True,
+                                        )
+                                    except Exception as e:
+                                        self._error = str(e)
+                                        traceback.print_exc()
+                                    return None
+                                self._run_on_main_thread(earlier_project_callback, finish_on_cancel=True)
+                                if self._error:
+                                    return
                             self._stage = "Preparing Next Camera"
                             self._progress = 0
                             def context_callback():
