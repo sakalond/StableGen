@@ -219,6 +219,10 @@ class StudioSession:
         self.last_refresh = 0
         self.edit = None
         self.drag = None
+        # Part of the hovered number button under the pointer, and the page scrollbar's (top, height, grip
+        # height, grip top) from the last draw.
+        self.hover_zone = None
+        self.scrollbar = None
         self.camera_drag = None
         self.camera_rows = []
         self.camera_clip = None
@@ -322,7 +326,7 @@ class StudioSession:
         if self.camera_drag or self.drag or self.edit and self.edit['selecting']:
             self.clear_hover()
             if cursor:
-                self.set_cursor('MOVE_Y' if self.camera_drag else 'MOVE_X' if self.drag else 'TEXT')
+                self.set_cursor('MOVE_Y' if self.camera_drag else self.drag_cursor() if self.drag else 'TEXT')
             return None
         if not inside:
             self.clear_hover()
@@ -339,9 +343,19 @@ class StudioSession:
             self.hover_signature = signature
             if target:
                 self.area.tag_redraw()
+        zone = (target.number_zone(self.pointer[0])
+                if target and isinstance(target.action, tuple) and target.action[0] == 'number' else None)
+        if zone != self.hover_zone:
+            self.hover_zone = zone
+            self.area.tag_redraw()
         if cursor:
-            self.set_cursor('MOVE_X' if self.drag else target.cursor if target else 'DEFAULT')
+            self.set_cursor(target.cursor if target else 'DEFAULT')
         return target
+
+    def drag_cursor(self):
+        # Blender hides the pointer while a number is dragged (it wraps at the window edge, see scrub).
+        kind = self.drag.get('kind', 'slider')
+        return 'MOVE_X' if kind == 'slider' else 'NONE' if kind == 'number' and self.drag['moved'] else 'DEFAULT'
 
     def tooltip_target(self, targets=None):
         if (not bpy.context.preferences.view.show_tooltips or self.camera_drag or self.drag or self.popup
@@ -497,7 +511,8 @@ class StudioSession:
         binding = target.action[1]
         with _context(self):
             value = self.query if binding is None else binding.value(bpy.context)
-        buffer = TextBuffer(str(value))
+        # Floats open for typing as Blender shows them: six decimals at most, trailing zeros dropped.
+        buffer = TextBuffer(f'{value:.6f}'.rstrip('0').rstrip('.') if isinstance(value, float) else str(value))
         if select:
             buffer.anchor = 0
         self.edit = {'key': target.key, 'binding': binding, 'buffer': buffer,
@@ -585,6 +600,26 @@ class StudioSession:
             self.drag = {'binding': action[1], 'min': action[2], 'max': action[3],
                          'rect': target.rect, 'before': before}
             self.slide(self.pointer[0])
+        elif action[0] == 'number':
+            # Like Blender, a press waits: a drag past the threshold scrubs, a click steps from an arrow or
+            # starts typing in the middle (see scrub and finish_drag).
+            self.commit()
+            with _context(self):
+                before = action[1].value(bpy.context)
+            self.drag = {'kind': 'number', 'key': target.key, 'target': target, 'binding': action[1],
+                         'before': before, 'zone': target.number_zone(self.pointer[0]), 'press': self.mouse,
+                         'start': self.mouse[0], 'wrap': 0, 'moved': False}
+        elif action[0] == 'scrollbar' and self.scrollbar:
+            self.commit()
+            top, height, grip, grip_top = self.scrollbar
+            y = self.pointer[1]
+            before = self.scroll.get(self.page, 0)
+            if not grip_top <= y <= grip_top + grip:
+                # A press beside the grip jumps it there, then keeps dragging, as in Blender's scrollbars.
+                travel = max(1, height - grip)
+                self.scroll[self.page] = max(0, min(self.max_scroll, (y - grip / 2 - top) / travel * self.max_scroll))
+                grip_top = y - grip / 2
+            self.drag = {'kind': 'scroll', 'offset': y - grip_top, 'before': before}
         elif action[0] == 'camera-drag':
             self.commit()
             self.camera_drag = {'name': action[1], 'names': tuple(c.name for c in self.ordered_cameras())}
@@ -616,6 +651,112 @@ class StudioSession:
         left, _, width, _ = drag['rect']
         value = drag['min'] + max(0, min(1, (x - left) / width)) * (drag['max'] - drag['min'])
         self.set_value(drag['binding'], value, undo=False)
+
+    def drag_move(self, event):
+        kind = self.drag.get('kind', 'slider')
+        if kind == 'scroll':
+            top, height, grip, _ = self.scrollbar or (0, 1, 1, 0)
+            travel = max(1, height - grip)
+            position = (self.pointer[1] - self.drag['offset'] - top) / travel * self.max_scroll
+            self.scroll[self.page] = max(0, min(self.max_scroll, position))
+            self.area.tag_redraw()
+        elif kind == 'number':
+            self.scrub(event)
+        else:
+            self.slide(self.pointer[0])
+        self.clear_hover()
+        self.set_cursor(self.drag_cursor())
+
+    def scrub(self, event):
+        """Blender's number drag: a threshold, then a linear change per pixel with the pointer hidden and
+        wrapped at the window edge, Shift for precision and Ctrl (Ctrl+Shift) for snapping."""
+        drag = self.drag
+        mouse_x = event.mouse_x
+        x = mouse_x + drag['wrap']
+        if drag['moved']:
+            width = self.window.width
+            if mouse_x <= 1 or mouse_x >= width - 2:
+                wrapped = width - 3 if mouse_x <= 1 else 2
+                drag['wrap'] += mouse_x - wrapped
+                self.window.cursor_warp(wrapped, event.mouse_y)
+        if not drag['moved']:
+            if abs(x - drag['start']) <= 3 * self.scale:
+                return
+            drag['moved'], drag['start'] = True, x
+        ctrl = event.ctrl or event.oskey
+        with _context(self):
+            prop = drag['binding'].rna(bpy.context)
+            value, shift = model.number_drag(prop, drag['before'], x - drag['start'], precise=event.shift,
+                                             snap=('SMALL' if event.shift else 'ON') if ctrl else None)
+        drag['start'] += shift
+        self.set_value(drag['binding'], value, undo=False)
+
+    def step_number(self, binding, direction):
+        with _context(self):
+            value = model.stepped_number(binding.rna(bpy.context), binding.value(bpy.context), direction)
+        self.set_value(binding, value)
+
+    def finish_drag(self, cancel=False):
+        drag, self.drag = self.drag, None
+        kind = drag.get('kind', 'slider')
+        if kind == 'scroll':
+            if cancel:
+                self.scroll[self.page] = drag['before']
+        elif kind == 'number' and not drag['moved']:
+            if not cancel and drag['zone'] == 'middle':
+                self.begin_edit(drag['target'], select=True)
+            elif not cancel:
+                self.step_number(drag['binding'], -1 if drag['zone'] == 'left' else 1)
+        else:
+            if kind == 'number':
+                # The hidden pointer comes back where the drag began.
+                self.window.cursor_warp(*drag['press'])
+                self.mouse = drag['press']
+                _window_mouse[self.key[0]] = self.mouse
+            if cancel:
+                self.set_value(drag['binding'], drag['before'], undo=False)
+            else:
+                with _context(self):
+                    if drag['binding'].value(bpy.context) != drag['before']:
+                        _undo('Adjust ' + drag['binding'].rna(bpy.context).name)
+        self.area.tag_redraw()
+        self.update_hover()
+
+    def number_key(self, event):
+        """Blender's keys over a hovered number button: Ctrl+Wheel steps, Enter types, Ctrl+C/Ctrl+V copy and
+        paste, Backspace resets to the default and Minus negates."""
+        target = self.hit_target()
+        if (event.value != 'PRESS' or not target or not target.enabled or not isinstance(target.action, tuple)
+                or target.action[0] != 'number'):
+            return False
+        binding, ctrl = target.action[1], event.ctrl or event.oskey
+        if event.type in {'WHEELUPMOUSE', 'WHEELDOWNMOUSE'} and event.ctrl:
+            self.step_number(binding, 1 if event.type == 'WHEELUPMOUSE' else -1)
+        elif event.type in {'RET', 'NUMPAD_ENTER'} and not ctrl:
+            self.begin_edit(target, select=True)
+        elif ctrl and event.type == 'C':
+            with _context(self):
+                value = binding.value(bpy.context)
+            self.window_manager.clipboard = (f'{value:.6f}'.rstrip('0').rstrip('.') if isinstance(value, float)
+                                             else str(value))
+        elif ctrl and event.type == 'V':
+            try:
+                value = float(self.window_manager.clipboard.strip())
+            except ValueError:
+                return True
+            self.set_value(binding, value)
+        elif event.type == 'BACK_SPACE' and not ctrl:
+            with _context(self):
+                default = binding.rna(bpy.context).default
+            self.set_value(binding, default)
+        elif event.type in {'MINUS', 'NUMPAD_MINUS'} and not ctrl:
+            with _context(self):
+                value = binding.value(bpy.context)
+            self.set_value(binding, -value)
+        else:
+            return False
+        self.area.tag_redraw()
+        return True
 
     def ordered_cameras(self):
         from ..texturing.view_plan import order_cameras
@@ -715,11 +856,15 @@ class StudioSession:
         elif key in {'BACK_SPACE', 'DEL'}:
             buffer.delete(backward=key == 'BACK_SPACE', word=ctrl)
         elif key == 'TAB':
-            candidates = [t for t in self.targets if t.enabled and isinstance(t.action, tuple) and t.action[0] in {'edit', 'enum', 'toggle'}]
+            candidates = [t for t in self.targets if t.enabled and isinstance(t.action, tuple) and t.action[0] in {'edit', 'number', 'enum', 'toggle'}]
             index = next((i for i, target in enumerate(candidates) if target.key == edit['key']), -1)
             self.commit()
             if candidates:
-                self.activate(candidates[(index + (-1 if event.shift else 1)) % len(candidates)])
+                target = candidates[(index + (-1 if event.shift else 1)) % len(candidates)]
+                if target.action[0] == 'number':
+                    self.begin_edit(target, select=True)
+                else:
+                    self.activate(target)
         elif getattr(event, 'unicode', '') and not ctrl and not event.alt:
             buffer.replace(event.unicode)
         else:
@@ -771,10 +916,8 @@ class StudioSession:
                 return {'RUNNING_MODAL'}
             # Keep shortcuts and other commands from changing the scene mid-drag.
             return {'RUNNING_MODAL'}
-        if event.value == 'PRESS' and event.type == 'ESC' and self.drag:
-            drag, self.drag = self.drag, None
-            self.set_value(drag['binding'], drag['before'], undo=False)
-            self.update_hover()
+        if event.value == 'PRESS' and event.type in {'ESC', 'RIGHTMOUSE'} and self.drag:
+            self.finish_drag(cancel=True)
             return {'RUNNING_MODAL'}
         if self.edit and event.value == 'PRESS' and (event.ctrl or event.oskey) and event.type == 'S':
             self.commit()
@@ -782,9 +925,7 @@ class StudioSession:
             return {'PASS_THROUGH'}
         if event.type in {'MOUSEMOVE', 'INBETWEEN_MOUSEMOVE'}:
             if self.drag:
-                self.slide(x)
-                self.clear_hover()
-                self.set_cursor('MOVE_X')
+                self.drag_move(event)
                 return {'RUNNING_MODAL'}
             if self.edit and self.edit['selecting']:
                 self.select_caret(x, y, extend=True)
@@ -801,11 +942,7 @@ class StudioSession:
             self.clear_hover()
         if event.type == 'LEFTMOUSE' and event.value == 'RELEASE':
             if self.drag:
-                drag, self.drag = self.drag, None
-                with _context(self):
-                    if drag['binding'].value(bpy.context) != drag['before']:
-                        _undo('Adjust ' + drag['binding'].rna(bpy.context).name)
-                self.update_hover()
+                self.finish_drag()
                 return {'RUNNING_MODAL'}
             if self.edit:
                 self.edit['selecting'] = False
@@ -849,6 +986,8 @@ class StudioSession:
                     self.menu['index'] = self.menu['scroll'] = 0
                 self.area.tag_redraw()
                 return {'RUNNING_MODAL'}
+        if not self.edit and not self.menu and self.number_key(event):
+            return {'RUNNING_MODAL'}
         if event.type in {'WHEELUPMOUSE', 'WHEELDOWNMOUSE', 'TRACKPADPAN'}:
             self.clear_hover()
             change = -45 if event.type == 'WHEELUPMOUSE' else 45
@@ -909,6 +1048,10 @@ class StudioSession:
 
     def hovered(self, key):
         return key == self.hover_key
+
+    def number_state(self, key):
+        drag = self.drag if self.drag and self.drag.get('key') == key else None
+        return {'zone': self.hover_zone if self.hovered(key) else None, 'dragging': bool(drag and drag['moved'])}
 
     def draw_binding(self, painter, binding, label, x, y, width, *, enabled=True, multiline=False, height=112, corners='ALL'):
         ctx = bpy.context
@@ -977,10 +1120,14 @@ class StudioSession:
             filepath = prop.type == 'STRING' and prop.subtype in {'FILE_PATH', 'DIR_PATH'}
             field_width = 90 if inline else width - 27 if filepath else width
             field_x = x + width - field_width if inline else x
-            lines, scroll = painter.text_field(key, (field_x, y, field_width, CONTROL_HEIGHT), display,
-                                              ('edit', binding, False), enabled=enabled, hint=hint,
-                                              editing=editing['buffer'] if editing else None,
-                                              kind='number' if prop.type in {'INT','FLOAT'} else 'field')
+            if prop.type in {'INT', 'FLOAT'} and not editing:
+                painter.number_field(key, (field_x, y, field_width, CONTROL_HEIGHT), display,
+                                     ('number', binding, False), enabled=enabled, hint=hint, **self.number_state(key))
+            else:
+                lines, scroll = painter.text_field(key, (field_x, y, field_width, CONTROL_HEIGHT), display,
+                                                  ('edit', binding, False), enabled=enabled, hint=hint,
+                                                  editing=editing['buffer'] if editing else None,
+                                                  kind='number' if prop.type in {'INT','FLOAT'} else 'field')
             if editing:
                 editing.update(rect=(field_x, y, field_width, CONTROL_HEIGHT), lines=lines, scroll=scroll)
             if filepath:
@@ -1021,16 +1168,19 @@ class StudioSession:
         precision = binding.rna(bpy.context).precision
         number = f'{value:.{precision}f}'
         display = editing['buffer'].text if editing else (number.rstrip('0').rstrip('.') if precision else number) + unit
-        lines, scroll = p.text_field(key, (ex, ey, edit_width, CONTROL_HEIGHT), display, ('edit', binding, False),
-                                    enabled=enabled, hint=binding.rna(bpy.context).description,
-                                    editing=editing['buffer'] if editing else None, kind='number')
         if editing:
+            lines, scroll = p.text_field(key, (ex, ey, edit_width, CONTROL_HEIGHT), display, ('edit', binding, False),
+                                        enabled=enabled, hint=binding.rna(bpy.context).description,
+                                        editing=editing['buffer'], kind='number')
             editing.update(rect=(ex, ey, edit_width, CONTROL_HEIGHT), lines=lines, scroll=scroll)
+        else:
+            p.number_field(key, (ex, ey, edit_width, CONTROL_HEIGHT), display, ('number', binding, False),
+                           enabled=enabled, hint=binding.rna(bpy.context).description, **self.number_state(key))
         track_y = y + (46 if narrow else 27)
         p.rect(x, track_y, width, 3, 'line', 1)
         fill = max(0, min(1, (value - minimum) / (maximum - minimum)))
         p.rect(x, track_y, width * fill, 3, 'blue', 1)
-        radius = 5 if enabled and (self.hovered(key + ':slider') or self.drag and self.drag['binding'] == binding) else 4
+        radius = 5 if enabled and (self.hovered(key + ':slider') or self.drag and self.drag.get('binding') == binding) else 4
         p.rect(x + width * fill - radius, track_y + 1 - radius, radius * 2, radius * 2,
                'accent' if enabled else 'disabled', radius)
         p.target(key + ':slider', (x, track_y - 7, width, 17), ('slider', binding, minimum, maximum),
@@ -2179,10 +2329,20 @@ class StudioSession:
             if offset > self.max_scroll:
                 self.scroll[self.page] = self.max_scroll
                 self.area.tag_redraw()
+            self.scrollbar = None
             if self.max_scroll:
                 available = bottom - top
                 thumb = max(24, available * available / (available + self.max_scroll))
-                p.rect(p.width - 5, top + offset / self.max_scroll * max(0, available - thumb), 2, thumb, 'muted', 1)
+                thumb_y = top + min(offset, self.max_scroll) / self.max_scroll * max(0, available - thumb)
+                self.scrollbar = (top, available, thumb, thumb_y)
+                dragging = bool(self.drag and self.drag.get('kind') == 'scroll')
+                if dragging or self.hovered('scrollbar'):
+                    # At rest the bar stays a hairline; under the pointer it widens like Blender's.
+                    p.rect(p.width - 10, top + 2, 8, available - 4, 'scroll_track', 4)
+                    p.rect(p.width - 9, thumb_y + 1, 6, thumb - 2, 'text' if dragging else 'secondary', 3)
+                else:
+                    p.rect(p.width - 5, thumb_y, 2, thumb, 'muted', 1)
+                p.target('scrollbar', (p.width - 12, top, 12, available), ('scrollbar',))
             p.clip(None)
             if not tips.dismissed(tips.WIDEN_CALLOUT):
                 if self.callout_width is not None and width > self.callout_width + 20:

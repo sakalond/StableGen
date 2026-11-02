@@ -47,6 +47,7 @@ ICON_PATHS = {
     'down': [[(5, 8), (10, 13), (15, 8)]],
     'up': [[(5, 13), (10, 8), (15, 13)]],
     'right': [[(7, 5), (12, 10), (7, 15)]],
+    'left': [[(13, 5), (8, 10), (13, 15)]],
     'reset': [arc for arc, _ in _SYNC],
     'search': [[(14, 14), (19, 19)]],
     'settings': [[(2, 5), (19, 5)], [(2, 10), (19, 10)], [(2, 15), (19, 15)], [(7, 3), (7, 7)], [(14, 8), (14, 12)], [(9, 13), (9, 17)]],
@@ -184,7 +185,8 @@ def color(value):
 
 COLORS = {key: color(value) for key, value in {
     'panel': '3d3d3d', 'field': '1d1d1d', 'field_text': 'e6e6e6',
-    'number': '545454', 'number_text': 'e6e6e6', 'menu': '282828', 'menu_text': 'e6e6e6',
+    'number': '545454', 'number_text': 'e6e6e6', 'number_hover': '646464', 'number_hot': '797979',
+    'menu': '282828', 'menu_text': 'e6e6e6', 'scroll_track': '2f2f2f',
     'raised': '545454', 'line': '494949', 'divider': '464646', 'text': 'e6e6e6',
     'secondary': 'c4c4c4', 'muted': '999999', 'accent': '8fa6ca',
     'blue': '4772b3', 'on_accent': 'ffffff', 'hover': '545454', 'disabled': '787878',
@@ -212,6 +214,11 @@ def _over(foreground, background):
     return _mix(background, foreground, foreground[3])
 
 
+def _shade(color, amount):
+    """Lighten like Blender's widget hover shading, which adds to each channel."""
+    return tuple(max(0, min(1, c + amount)) for c in color[:3]) + (1,)
+
+
 def theme_colors(context):
     """Read the active native palette each draw, including unsaved theme edits."""
     theme = context.preferences.themes[0]
@@ -232,6 +239,10 @@ def theme_colors(context):
     return {
         'panel': panel, 'field': field_back, 'field_text': _rgba(field.text),
         'number': _over(number.inner, panel), 'number_text': _rgba(number.text),
+        # A hovered number field lightens, and the part under the pointer more (measured on Blender's own).
+        'number_hover': _shade(_over(number.inner, panel), 16 / 255),
+        'number_hot': _shade(_over(number.inner, panel), 37 / 255),
+        'scroll_track': _mix(panel, (0, 0, 0, 1), .22),
         'menu': _over(menu.inner, panel), 'menu_text': _rgba(menu.text),
         'field_border': _over(field.outline, panel), 'number_border': _over(number.outline, panel),
         'menu_border': _over(menu.outline, panel), 'tool_border': _over(tool.outline, panel),
@@ -277,6 +288,12 @@ class Target:
             return 'DEFAULT'
         kind = self.action[0] if isinstance(self.action, tuple) else ''
         return 'TEXT' if kind in {'edit', 'menu-lora-search'} else 'MOVE_X' if kind == 'slider' else 'MOVE_Y' if kind == 'camera-drag' else 'DEFAULT'
+
+    def number_zone(self, x):
+        """Blender's arrow zones: min(a third of the width, 0.7 x the height) at each end."""
+        rx, _, width, height = self.rect
+        handle = min(width / 3, height * .7)
+        return 'left' if x < rx + handle else 'right' if x > rx + width - handle else 'middle'
 
     def contains(self, x, y):
         rx, ry, width, height = self.rect
@@ -608,6 +625,27 @@ class Painter:
                   else 'switch_off_hover' if hover else 'switch_off', 7)
         self.rect(sx + (16 if checked else 2), sy + 2, 10, 10, 'switch_knob' if enabled else 'muted', 5)
         self.target(key, rect, action, enabled, hint)
+
+    def number_field(self, key, rect, display, action, *, enabled=True, hint='', zone=None, dragging=False):
+        """A number button drawn like Blender's: the value centered, arrows at both ends while hovered and the
+        part under the pointer (*zone*: left, middle or right) lit."""
+        x, y, w, h = rect
+        target = self.target(key, rect, action, enabled, hint)
+        hovered = enabled and (dragging or key == self.hover_key)
+        self.outline(x, y, w, h, 'number_selected' if dragging else 'number_hover' if hovered else 'number',
+                     'hover_border' if hovered else 'number_border')
+        handle = min(w / 3, h * .7)
+        if hovered and not dragging and zone:
+            zx, zw, corners = {'left': (x + 1, handle - 1, 'LEFT'), 'middle': (x + handle, w - 2 * handle, 'NONE'),
+                               'right': (x + w - handle, handle - 1, 'RIGHT')}[zone]
+            self.rect(zx, y + 1, zw, h - 2, 'number_hot', 3, corners=corners)
+        if hovered:
+            for name, zx in (('left', x), ('right', x + w - handle)):
+                self.icon(name, zx + (handle - 12) / 2, y + (h - 12) / 2, 12, 'number_text')
+        text = self.fit(display, max(0, w - 2 * handle - 2))
+        self.text(text, x + (w - self.measure(text)) / 2, y + (h - font_size()) / 2 - 1, FONT_SIZE,
+                  'number_text' if enabled else 'disabled')
+        return target
 
     def text_field(self, key, rect, value, action, *, enabled=True, hint='', editing=None, scroll=0, multiline=False, follow_caret=True, kind='field'):
         x, y, w, h = rect

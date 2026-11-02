@@ -1,6 +1,7 @@
 """Live RNA bindings for the custom Studio sidebar; no generation logic."""
 from dataclasses import dataclass
 import json
+import math
 from pathlib import Path
 
 import bpy
@@ -33,6 +34,63 @@ def controls(node, enabled=True, alert=False):
 def operator(name):
     namespace, identifier = name.split('.', 1)
     return getattr(getattr(bpy.ops, namespace), identifier)
+
+
+# Number buttons follow Blender's own (interface_handlers.cc: ui_do_but_NUM, ui_numedit_but_NUM and its
+# snapping helpers) so the panel's fields respond exactly like native ones.
+def _soft_range(prop):
+    return max(prop.soft_min, prop.hard_min), min(prop.soft_max, prop.hard_max)
+
+
+def _round(value):
+    """C's roundf: halves away from zero."""
+    return math.copysign(math.floor(abs(value) + .5), value)
+
+
+def number_step(prop):
+    """The arrow and Ctrl+Wheel increment: an int's step, or a float's step in hundredths."""
+    return prop.step * .01 if prop.type == 'FLOAT' else max(1, int(prop.step))
+
+
+def stepped_number(prop, value, direction):
+    """The value after one arrow step, kept inside the soft range."""
+    soft_min, soft_max = _soft_range(prop)
+    value += direction * number_step(prop)
+    return max(soft_min, value) if direction < 0 else min(soft_max, value)
+
+
+def snap_number(prop, value, snap):
+    """Ctrl ('ON') and Ctrl+Shift ('SMALL') snapping of a dragged value."""
+    soft_min, soft_max = _soft_range(prop)
+    if not snap or value in (soft_min, soft_max):
+        return value
+    if prop.type == 'INT':
+        unit = 100 if snap == 'SMALL' else 10
+        return unit * int(value / unit)
+    fac = .1 if snap == 'SMALL' else 1.0
+    # Wider ranges snap like a range of 20.
+    if soft_max - soft_min < 2.1:
+        return _round(value * 10 / fac) * .1 * fac
+    return _round(value / fac) * fac
+
+
+def number_drag(prop, start, pixels, *, precise=False, snap=None):
+    """The value after dragging *pixels* from *start*: a float moves one click step per pixel (a tenth with
+    *precise*), an int one per pixel, per 2 or per 16 pixels by the size of its soft range. Also returns how
+    far the drag origin moves when the soft range clamps, so turning back responds at once."""
+    soft_min, soft_max = _soft_range(prop)
+    if prop.type == 'FLOAT':
+        fac = .01 * prop.step * (.1 if precise else 1)
+        value = snap_number(prop, start + pixels * fac, snap)
+    else:
+        span = soft_max - soft_min
+        fac = 1 if span > 256 else .5 if span > 32 else 1 / 16
+        value = snap_number(prop, int(start + pixels * fac), snap)
+    if value < soft_min:
+        return soft_min, -(soft_min - value) / fac
+    if value > soft_max:
+        return soft_max, (value - soft_max) / fac
+    return value, 0
 
 
 @dataclass(frozen=True)
