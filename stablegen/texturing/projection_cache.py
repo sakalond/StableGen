@@ -78,6 +78,7 @@ def eligible(scene):
             and scene.generation_mode == 'standard'
             and (not qwen or scene.qwen_generation_method == 'generate')
             and not scene.bake_visibility_weights
+            and not getattr(scene, 'sg_object_relative_projection', False)
             and not confidence and not surface and not voronoi)
 
 

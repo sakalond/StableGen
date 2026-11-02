@@ -690,6 +690,15 @@ def register_properties(update_model_list, ControlNetUnit, LoRAUnit,
                     "with >500 faces",
         default=False, update=update_parameters
     )
+    bpy.types.Scene.sg_object_relative_projection = bpy.props.BoolProperty(
+        name="Object-Relative Projection",
+        description="Remember each camera relative to the textured object, so the texture stays put when the "
+                    "object is moved, rotated or scaled, when cameras are moved or removed, and when objects are "
+                    "added later. Self-occlusion is still ray traced per pixel, against the object alone; what "
+                    "other objects covered comes from per-camera ownership maps taken when the views were "
+                    "projected. Native Raycast path (Blender 5.1+); not combined with Bake Visibility Weights",
+        default=False, update=update_parameters
+    )
     bpy.types.Scene.discard_factor = bpy.props.FloatProperty(
         name="Discard Factor",
         description="If the texture is facing the camera at an angle greater than this value, it will be discarded. This is useful for preventing artifacts from the very edge of the generated texture appearing when keeping high discard factor (use ~65 for best results when generating textures around an object)",
@@ -2120,6 +2129,7 @@ def unregister_properties(load_handler, _sg_queue_load_handler):
         'generation_progress',
         'overwrite_material',
         'bake_visibility_weights',
+        'sg_object_relative_projection',
         'discard_factor',
         'discard_factor_generation_only',
         'discard_factor_after_generation',

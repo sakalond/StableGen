@@ -2,6 +2,7 @@ from ..core.feature_flags import experimental_enabled
 import bpy
 import os
 import re
+from functools import partial
 from math import atan, tan, pi
 
 from ..utils import get_last_material_index, get_file_path, get_dir_path
@@ -567,6 +568,256 @@ def _projection_uv_output(node):
     return node.outputs["Vector"] if "Vector" in node.outputs else node.outputs["UV"]
 
 
+# ── Object-relative projection ────────────────────────────────────────────
+# The native visibility test compares the shading point with each camera in
+# world space, so moving a textured object, moving a camera or adding an
+# occluder later changes which camera colours it.  With
+# ``sg_object_relative_projection`` the test runs in the frame the object had
+# when the views were projected: the point and normal are mapped back into
+# that frame, the self-occlusion ray starts from the camera carried along with
+# the object (Raycast "Only Local"), and occlusion by other objects comes from
+# per-camera ownership maps rendered at projection time.
+
+def _frame_prop(mat_id, kind, row):
+    """Object property with one row of the object's world matrix when ``mat_id``'s views were projected:
+    ``kind`` '' the matrix, 'Inv' its inverse, 'N' the normal matrix (inverse transpose of its 3x3)."""
+    return f"_SG_Frame{kind}_{mat_id}_{row}"
+
+
+def _owner_prop(mat_id):
+    """Object property with the object's flat colour in ``mat_id``'s ownership maps."""
+    return f"_SG_Owner_{mat_id}"
+
+
+def _store_projection_frame(obj, mat_id, replace):
+    """Remember where ``obj`` was when ``mat_id``'s views were projected. ``replace`` is set when this projection
+    recomputed the projection UVs; otherwise the frame those UVs were made in stays, and a duplicate, which
+    copies its source's UVs and properties, keeps its source's texture."""
+    if not replace and _frame_prop(mat_id, '', 0) in obj:
+        return
+    matrix = obj.matrix_world.copy()
+    inverse = matrix.inverted_safe()
+    normal = matrix.to_3x3().inverted_safe().transposed()
+    for row in range(3):
+        obj[_frame_prop(mat_id, '', row)] = tuple(matrix[row])
+        obj[_frame_prop(mat_id, 'Inv', row)] = tuple(inverse[row])
+        obj[_frame_prop(mat_id, 'N', row)] = tuple(normal[row])
+
+
+def _projection_anchor_nodes(nodes, links, mat_id):
+    """Build one material's object-relative inputs: ``position`` and ``normal`` (the shading point and normal in
+    the frame the object had when ``mat_id``'s views were projected), ``current_position`` (the shading point in
+    today's world) and ``current(point)``, which carries a projection-time point such as a camera along with the
+    object to where it is now. The frame rows are per-object properties read with Attribute (Object) nodes, so a
+    material shared by several objects stays right for each."""
+    def node(kind, label, **settings):
+        new = nodes.new(kind)
+        new.label = f"{label}-{mat_id}"
+        new['sg_layout_stage'] = 'Object-relative frame'
+        for name, value in settings.items():
+            setattr(new, name, value)
+        return new
+
+    def rows(kind):
+        return [node("ShaderNodeAttribute", f"Frame{kind}Row{r}", attribute_type='OBJECT',
+                     attribute_name=_frame_prop(mat_id, kind, r)) for r in range(3)]
+
+    def apply(row_nodes, vector, affine, label):
+        combine = node("ShaderNodeCombineXYZ", label)
+        for r, row in enumerate(row_nodes):
+            dot = node("ShaderNodeVectorMath", f"{label}Row{r}", operation='DOT_PRODUCT')
+            links.new(row.outputs["Vector"], dot.inputs[0])
+            if isinstance(vector, Vector):
+                dot.inputs[1].default_value = vector
+            else:
+                links.new(vector, dot.inputs[1])
+            value = dot.outputs["Value"]
+            if affine:
+                offset = node("ShaderNodeMath", f"{label}Offset{r}", operation='ADD')
+                links.new(value, offset.inputs[0])
+                links.new(row.outputs["Alpha"], offset.inputs[1])
+                value = offset.outputs[0]
+            links.new(value, combine.inputs[r])
+        return combine.outputs["Vector"]
+
+    coordinates = node("ShaderNodeTexCoord", "ObjectPoint")
+    position = apply(rows(''), coordinates.outputs["Object"], True, "ProjectionFramePoint")
+    geometry = node("ShaderNodeNewGeometry", "CurrentSurface")
+    to_object = node("ShaderNodeVectorTransform", "NormalToObject", vector_type='NORMAL',
+                     convert_from='WORLD', convert_to='OBJECT')
+    links.new(geometry.outputs["Normal"], to_object.inputs[0])
+    normal = node("ShaderNodeVectorMath", "ProjectionFrameNormal", operation='NORMALIZE')
+    links.new(apply(rows('N'), to_object.outputs[0], False, "ProjectionFrameNormalRaw"), normal.inputs[0])
+    inverse_rows = rows('Inv')
+
+    def current(point, after=None):
+        # ``after`` (the previous camera's raycast result) delays the carried point, and with it the whole
+        # ray, until that raycast: one camera's ray inputs wait on the SVM stack at a time, not every camera's.
+        value = Vector(point)
+        if after is not None:
+            bound = node("ShaderNodeMath", "CarriedPointAfterRaycastBound", operation='MAXIMUM')
+            bound.inputs[1].default_value = 1e30
+            links.new(after, bound.inputs[0])
+            bounds = node("ShaderNodeCombineXYZ", "CarriedPointAfterRaycastBounds")
+            for axis in range(3):
+                links.new(bound.outputs[0], bounds.inputs[axis])
+            late = node("ShaderNodeVectorMath", "CarriedPointAfterRaycast", operation='MINIMUM')
+            late.inputs[0].default_value = value
+            links.new(bounds.outputs[0], late.inputs[1])
+            value = late.outputs["Vector"]
+        to_world = node("ShaderNodeVectorTransform", "CarriedToWorld", vector_type='POINT',
+                        convert_from='OBJECT', convert_to='WORLD')
+        links.new(apply(inverse_rows, value, True, "CarriedPoint"), to_world.inputs[0])
+        return to_world.outputs[0]
+
+    return {'position': position, 'normal': normal.outputs["Vector"],
+            'current_position': geometry.outputs["Position"], 'current': current}
+
+
+def _render_ownership_maps(context, cameras, mat_id, replace):
+    """Per-camera ownership maps for object-relative projection: which object each pixel of each camera showed
+    when ``mat_id``'s views were projected, as a flat colour per object (32-bit EXR at the camera's projection
+    resolution, the generated images' pixel grid). ``replace`` renders them all again, for a projection that
+    recomputed the projection UVs; otherwise only missing maps are rendered and the rest are reused, as later
+    sequential steps and previews project the same views. Returns the paths in camera order."""
+    scene = context.scene
+    directory = get_dir_path(context, 'inpaint')['visibility']
+    os.makedirs(directory, exist_ok=True)
+    paths = [os.path.join(directory, f"projection_ownership{i}-{mat_id}.exr") for i in range(len(cameras))]
+    missing = [i for i, path in enumerate(paths) if replace or not os.path.isfile(path)]
+    if not missing:
+        return paths
+    key = _owner_prop(mat_id)
+    meshes = [obj for obj in scene.objects if obj.type == 'MESH']
+    # A partial render keeps the colours the remaining maps already use.
+    keep = len(missing) < len(paths)
+    taken = {tuple(round(c * 255) for c in obj[key]) for obj in meshes if keep and key in obj}
+    index = 0
+    for obj in meshes:
+        if keep and key in obj:
+            continue
+        index += 1
+        while ((index >> 16) & 255, (index >> 8) & 255, index & 255) in taken:
+            index += 1
+        obj[key] = tuple(c / 255.0 for c in ((index >> 16) & 255, (index >> 8) & 255, index & 255))
+
+    material = bpy.data.materials.new("SG Ownership")
+    material.use_nodes = True
+    tree = material.node_tree
+    tree.nodes.clear()
+    attribute = tree.nodes.new("ShaderNodeAttribute")
+    attribute.attribute_type = 'OBJECT'
+    attribute.attribute_name = key
+    emission = tree.nodes.new("ShaderNodeEmission")
+    output = tree.nodes.new("ShaderNodeOutputMaterial")
+    tree.links.new(attribute.outputs["Color"], emission.inputs["Color"])
+    tree.links.new(emission.outputs[0], output.inputs["Surface"])
+    world = bpy.data.worlds.new("SG Ownership World")
+    world.use_nodes = True
+    world.node_tree.nodes["Background"].inputs["Color"].default_value = (0, 0, 0, 1)
+
+    render, cycles, view = scene.render, scene.cycles, scene.view_settings
+    settings = render.image_settings
+    # One sample at each pixel centre, the flat colours written unchanged. Restored in this order, so the
+    # file format is back before its colour depth.
+    overrides = [
+        (render, 'engine', 'CYCLES'), (cycles, 'samples', 1), (cycles, 'use_denoising', False),
+        (cycles, 'filter_width', 0.01), (cycles, 'film_exposure', 1.0), (cycles, 'sample_clamp_direct', 0.0),
+        (cycles, 'sample_clamp_indirect', 0.0), (render, 'film_transparent', False),
+        (render, 'use_motion_blur', False), (render, 'use_border', False), (render, 'use_multiview', False),
+        (render, 'use_compositing', False), (render, 'use_sequencer', False),
+        (render, 'use_single_layer', True), (render, 'resolution_percentage', 100), (scene, 'world', world),
+        (context.view_layer, 'material_override', material),
+        (view, 'view_transform', 'Standard'), (view, 'look', 'None'), (view, 'exposure', 0.0),
+        (view, 'gamma', 1.0), (settings, 'file_format', 'OPEN_EXR'), (settings, 'color_depth', '32'),
+        (settings, 'color_mode', 'RGB'),
+    ]
+    restore = [(owner, name, getattr(owner, name)) for owner, name, _value in overrides]
+    restore += [(scene, 'camera', scene.camera), (render, 'resolution_x', render.resolution_x),
+                (render, 'resolution_y', render.resolution_y), (render, 'filepath', render.filepath)]
+    try:
+        for owner, name, value in overrides:
+            setattr(owner, name, value)
+        for i in missing:
+            scene.camera = cameras[i]
+            render.resolution_x, render.resolution_y = _get_camera_resolution(cameras[i], scene)
+            render.filepath = paths[i]
+            bpy.ops.render.render(write_still=True)
+    finally:
+        for owner, name, value in restore:
+            setattr(owner, name, value)
+        bpy.data.materials.remove(material)
+        bpy.data.worlds.remove(world)
+    for i in missing:
+        get_or_load_image(paths[i], force_reload=True)    # a map loaded before must show the new render
+    return paths
+
+
+def _ownership_test(nodes, links, path, uv_node, mat_id, i, owner_cache, after):
+    """1 where camera ``i``'s ownership map shows this object at the shading point's projection UV, else 0: an
+    equality test on the generated image's own pixel grid, so another object that stood in front when the views
+    were projected keeps its pixels, and objects added or moved since then change nothing. ``owner_cache`` holds
+    the material's one owner-colour node. The map is read through ``after`` (the camera's raycast result), like
+    the generated image, so Cycles does not keep every camera's sample on the stack until the raycasts."""
+    image = get_or_load_image(path)
+    if image is None:
+        return None
+    image.colorspace_settings.name = 'Non-Color'
+    texture = nodes.new("ShaderNodeTexImage")
+    texture.image = image
+    texture.interpolation = 'Closest'
+    texture.extension = 'CLIP'
+    texture.label = f"Ownership-{i}-{mat_id}"
+    texture['sg_layout_stage'] = 'Raycast visibility'
+    bound = nodes.new("ShaderNodeMath")
+    bound.operation = 'MAXIMUM'
+    bound.inputs[1].default_value = 1e30
+    links.new(after, bound.inputs[0])
+    bounds = nodes.new("ShaderNodeCombineXYZ")
+    for axis in range(3):
+        links.new(bound.outputs[0], bounds.inputs[axis])
+    late_uv = nodes.new("ShaderNodeVectorMath")
+    late_uv.operation = 'MINIMUM'
+    late_uv.label = f"OwnershipUVAfterRaycast-{i}-{mat_id}"
+    links.new(_projection_uv_output(uv_node), late_uv.inputs[0])
+    links.new(bounds.outputs[0], late_uv.inputs[1])
+    links.new(late_uv.outputs["Vector"], texture.inputs["Vector"])
+    for helper in (bound, bounds, late_uv):
+        helper.hide = True
+        helper['sg_layout_stage'] = 'Raycast visibility'
+    if 'owner' not in owner_cache:
+        owner = nodes.new("ShaderNodeAttribute")
+        owner.attribute_type = 'OBJECT'
+        owner.attribute_name = _owner_prop(mat_id)
+        owner.label = f"OwnerColour-{mat_id}"
+        owner['sg_layout_stage'] = 'Object-relative frame'
+        # An object without a colour (added to the material later) must not own the black background.
+        present = nodes.new("ShaderNodeVectorMath")
+        present.operation = 'LENGTH'
+        links.new(owner.outputs["Vector"], present.inputs[0])
+        has_owner = nodes.new("ShaderNodeMath")
+        has_owner.operation = 'GREATER_THAN'
+        has_owner.inputs[1].default_value = 0.5 / 255.0
+        links.new(present.outputs["Value"], has_owner.inputs[0])
+        owner_cache['owner'], owner_cache['present'] = owner, has_owner
+    distance = nodes.new("ShaderNodeVectorMath")
+    distance.operation = 'DISTANCE'
+    links.new(texture.outputs["Color"], distance.inputs[0])
+    links.new(owner_cache['owner'].outputs["Vector"], distance.inputs[1])
+    match = nodes.new("ShaderNodeMath")
+    match.operation = 'LESS_THAN'
+    match.inputs[1].default_value = 0.25 / 255.0
+    links.new(distance.outputs["Value"], match.inputs[0])
+    owned = nodes.new("ShaderNodeMath")
+    owned.operation = 'MINIMUM'
+    owned.label = f"OwnedPixel-{i}-{mat_id}"
+    links.new(match.outputs[0], owned.inputs[0])
+    links.new(owner_cache['present'].outputs[0], owned.inputs[1])
+    for helper in (distance, match, owned):
+        helper['sg_layout_stage'] = 'Raycast visibility'
+    return owned.outputs[0]
+
+
 def _bake_visibility_weights(
     context,
     objects,
@@ -945,7 +1196,7 @@ def _bake_visibility_weights(
 
 
 def create_native_raycast_visibility(nodes, links, camera, geometry, context, i, mat_id, stop_index,
-                                     pre_factors=None, extra=None):
+                                     pre_factors=None, extra=None, anchor=None, owned=None):
     """
     Creates a visibility weight node group using the native Raycast shader node (Blender 5.1+).
     Replicates the OSL raycast.osl shader logic:
@@ -953,6 +1204,13 @@ def create_native_raycast_visibility(nodes, links, camera, geometry, context, i,
       2. Occlusion check (Raycast from camera, compare Hit Distance with expected distance)
       3. Angle check (surface normal vs ray direction)
       4. Weight = pow(orthogonality, Power)
+
+    ``anchor`` (``_projection_anchor_nodes``) makes it object-relative: the
+    frustum, angle and distance terms use the point and normal in the frame
+    the object had at projection time, the occlusion ray starts from the
+    camera carried along with the object and tests only the object itself
+    ("Only Local"), and ``owned`` (``_ownership_test``) rejects what another
+    object covered at projection time.
 
     Cycles compiles the raycast one sweep after the camera math (its direction
     is converted to a normal), so the raycast-free terms are multiplied first
@@ -985,7 +1243,9 @@ def create_native_raycast_visibility(nodes, links, camera, geometry, context, i,
     normalize_node.operation = 'NORMALIZE'
     normalize_node.location = (x_base, -500 + y_base)
 
-    links.new(geometry.outputs["Position"], subtract.inputs[0])
+    surface_position = anchor['position'] if anchor else geometry.outputs["Position"]
+    surface_normal = anchor['normal'] if anchor else geometry.outputs["Normal"]
+    links.new(surface_position, subtract.inputs[0])
     links.new(subtract.outputs["Vector"], normalize_node.inputs[0])
 
     # --- Length (camera-to-surface distance) ---
@@ -1180,14 +1440,37 @@ def create_native_raycast_visibility(nodes, links, camera, geometry, context, i,
     # ========================================
     raycast = nodes.new("ShaderNodeRaycast")
     raycast.location = (x_base + 200, y_base)
-    links.new(add_camera_loc.outputs["Vector"], raycast.inputs["Position"])
-    links.new(normalize_node.outputs["Vector"], raycast.inputs["Direction"])
+    ray_length = length_node.outputs["Value"]
+    if anchor:
+        # The camera as it stood to the object at projection time, wherever
+        # the object is now; only the object itself can occlude this ray.
+        carried_camera = anchor['current'](camera_location, anchor.get('after'))
+        carried_ray = nodes.new("ShaderNodeVectorMath")
+        carried_ray.operation = 'SUBTRACT'
+        carried_ray.label = f"CarriedCameraToSurface-{i}-{mat_id}"
+        links.new(anchor['current_position'], carried_ray.inputs[0])
+        links.new(carried_camera, carried_ray.inputs[1])
+        carried_direction = nodes.new("ShaderNodeVectorMath")
+        carried_direction.operation = 'NORMALIZE'
+        links.new(carried_ray.outputs["Vector"], carried_direction.inputs[0])
+        carried_length = nodes.new("ShaderNodeVectorMath")
+        carried_length.operation = 'LENGTH'
+        links.new(carried_ray.outputs["Vector"], carried_length.inputs[0])
+        for helper in (carried_ray, carried_direction, carried_length):
+            helper['sg_layout_stage'] = 'Raycast visibility'
+        raycast.only_local = True
+        links.new(carried_camera, raycast.inputs["Position"])
+        links.new(carried_direction.outputs["Vector"], raycast.inputs["Direction"])
+        ray_length = carried_length.outputs["Value"]
+    else:
+        links.new(add_camera_loc.outputs["Vector"], raycast.inputs["Position"])
+        links.new(normalize_node.outputs["Vector"], raycast.inputs["Direction"])
     threshold_plus = nodes.new("ShaderNodeMath")
     threshold_plus.operation = 'ADD'
     threshold_plus.location = (x_base + 100, y_base + 100)
     ray_epsilon = _scene_ray_epsilon(context)
     threshold_plus.inputs[1].default_value = ray_epsilon * 10.0
-    links.new(length_node.outputs["Value"], threshold_plus.inputs[0])
+    links.new(ray_length, threshold_plus.inputs[0])
     links.new(threshold_plus.outputs[0], raycast.inputs["Length"])
 
     hit_dist_plus = nodes.new("ShaderNodeMath")
@@ -1199,7 +1482,7 @@ def create_native_raycast_visibility(nodes, links, camera, geometry, context, i,
     dist_check = nodes.new("ShaderNodeMath")
     dist_check.operation = 'LESS_THAN'
     dist_check.location = (x_base + 500, y_base + 50)
-    links.new(length_node.outputs["Value"], dist_check.inputs[0])
+    links.new(ray_length, dist_check.inputs[0])
     links.new(hit_dist_plus.outputs[0], dist_check.inputs[1])
 
     occlusion_ok = nodes.new("ShaderNodeMath")
@@ -1207,8 +1490,20 @@ def create_native_raycast_visibility(nodes, links, camera, geometry, context, i,
     occlusion_ok.location = (x_base + 600, y_base + 50)
     links.new(raycast.outputs["Is Hit"], occlusion_ok.inputs[0])
     links.new(dist_check.outputs[0], occlusion_ok.inputs[1])
+    occlusion_socket = occlusion_ok.outputs[0]
+    owned_socket = owned(occlusion_socket) if owned is not None else None
+    if owned_socket is not None:
+        owned_ok = nodes.new("ShaderNodeMath")
+        owned_ok.operation = 'MINIMUM'
+        owned_ok.label = f"OwnedAndUnoccluded-{i}-{mat_id}"
+        owned_ok['sg_layout_stage'] = 'Raycast visibility'
+        links.new(occlusion_socket, owned_ok.inputs[0])
+        links.new(owned_socket, owned_ok.inputs[1])
+        occlusion_socket = owned_ok.outputs[0]
     visible, raycast_sinks = _absorb_unused_raycast_outputs(
-        nodes, links, raycast, occlusion_ok.outputs[0])
+        nodes, links, raycast, occlusion_socket)
+    if anchor:
+        anchor['after'] = visible.outputs[0]    # the next camera's carried ray waits for this raycast
 
     # ========================================
     # ANGLE CHECK + WEIGHT
@@ -1217,7 +1512,7 @@ def create_native_raycast_visibility(nodes, links, camera, geometry, context, i,
     dot_d_normal.operation = 'DOT_PRODUCT'
     dot_d_normal.location = (x_base + 300, y_base - 150)
     links.new(normalize_node.outputs["Vector"], dot_d_normal.inputs[0])
-    links.new(geometry.outputs["Normal"], dot_d_normal.inputs[1])
+    links.new(surface_normal, dot_d_normal.inputs[1])
 
     clamp_dot = nodes.new("ShaderNodeMath")
     clamp_dot.operation = 'MAXIMUM'
@@ -2064,6 +2359,17 @@ def project_image(
         if level == 0 and len(shaders) > 1:
             # ── Step 1: Neutralize per-camera Power (set to 1.0) ──────
             user_exponent = None
+            # The upstream walks below read each input's source from one index: NodeSocket.links scans every link
+            # of the tree per call, which made them quadratic in the camera count (and worse once object-relative
+            # rays chain each camera to the previous camera's raycast).
+            feeding = {link.to_socket.as_pointer(): link.from_node for link in links}
+
+            def upstream_nodes(node):
+                for socket in node.inputs:
+                    source = feeding.get(socket.as_pointer())
+                    if source is not None:
+                        yield source
+
             for idx in range(len(weight_nodes)):
                 w = weight_nodes[idx]
                 node = w[0] if isinstance(w, tuple) else w
@@ -2110,8 +2416,7 @@ def project_image(
                                 user_exponent = upstream.inputs["Power"].default_value
                             upstream.inputs["Power"].default_value = 1.0
                             break
-                        for socket in upstream.inputs:
-                            pending.extend(link.from_node for link in socket.links)
+                        pending.extend(upstream_nodes(upstream))
 
                 # OSL path: ShaderNodeScript with "Power" input
                 elif node.type == 'SCRIPT' and "Power" in node.inputs:
@@ -2142,8 +2447,7 @@ def project_image(
                             user_exponent = upstream.inputs["Power"].default_value
                         upstream.inputs["Power"].default_value = 1.0
                         break
-                    for socket in upstream.inputs:
-                        pending.extend(link.from_node for link in socket.links)
+                    pending.extend(upstream_nodes(upstream))
 
             if user_exponent is None:
                 user_exponent = 1.0
@@ -2531,6 +2835,19 @@ def project_image(
             _warn_coarse_projection_faces(
                 to_project, cameras, mat_id, "Baked visibility weighting")
             _bake_visibility_weights(context, to_project, cameras, mat_id)
+
+    # ── Optional: object-relative projection (native Raycast path) ───────
+    use_anchor = (getattr(context.scene, 'sg_object_relative_projection', False)
+                  and bpy.app.version >= (5, 1, 0) and not use_baked_weights)
+    ownership_paths = None
+    if use_anchor:
+        # The frame and the maps belong to the projection UVs: a call that recomputed them takes the scene
+        # as it is now, later sequential steps and previews keep what the UVs were made with.
+        fresh = (not reuse_projection_uv
+                 and (context.scene.generation_method != 'sequential' or stop_index == 0))
+        for obj in to_project:
+            _store_projection_frame(obj, mat_id, replace=fresh)
+        ownership_paths = _render_ownership_maps(context, cameras, mat_id, replace=fresh)
 
     # Switch to Cycles (needed for Raycast shader node on all versions)
     if context.scene.render.engine != 'CYCLES':
@@ -2951,6 +3268,11 @@ def project_image(
         )
 
         geometry_nodes = []
+        # Object-relative projection: one set of frame nodes per material, an
+        # ownership test per camera (native Raycast path only).
+        anchor = (_projection_anchor_nodes(nodes, links, mat_id)
+                  if use_anchor and use_native_raycast else None)
+        owner_cache = {}
         for i, camera in enumerate(cameras):
             camera_node_start = {node.as_pointer() for node in nodes}
             native_extra = {}
@@ -3067,9 +3389,12 @@ def project_image(
                         if not acquisition:
                             return weight
                         return _acquisition_quality(weight, parts['length'], camera, i).outputs[0]
+                owned = (partial(_ownership_test, nodes, links, ownership_paths[i], uv_map_node, mat_id, i,
+                                 owner_cache) if anchor is not None else None)
                 result = create_native_raycast_visibility(
                     nodes, links, camera, geometry, context, i, mat_id, stop_index,
                     pre_factors=native_pre_factors, extra=native_extra,
+                    anchor=anchor, owned=owned,
                 )
                 angle_weight = result[0]
                 # Destructure result for create_native_feather

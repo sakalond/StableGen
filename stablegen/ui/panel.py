@@ -1462,6 +1462,12 @@ class StableGenPanel(bpy.types.Panel):
                 row = content_box.row()
                 row.prop(scene, "bake_visibility_weights", text="Bake Visibility (Transform-Stable)", toggle=True, icon="MESH_DATA")
 
+                row = content_box.row()
+                # Native Raycast path only: not used with baked weights or before Blender 5.1.
+                row.enabled = not scene.bake_visibility_weights and bpy.app.version >= (5, 1, 0)
+                row.prop(scene, "sg_object_relative_projection", text="Object-Relative Projection", toggle=True,
+                         icon="ORIENTATION_LOCAL")
+
                 row = (content_box.split(factor=0.5, align=False) if width_mode == 'wide'
                        else content_box.row(align=True))
                 row.prop(scene, "sg_allow_backface_projection", text="Allow Backface Projection", toggle=True)

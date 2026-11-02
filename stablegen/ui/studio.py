@@ -132,7 +132,8 @@ def _draw_tags(p, tags, right, y, enabled=True):
 
 
 PROJECTION_KEYS = {'discard_factor', 'weight_exponent', 'early_priority', 'early_priority_strength',
-                   'bake_visibility_weights', 'sg_texturing_frame', 'sg_allow_backface_projection',
+                   'bake_visibility_weights', 'sg_object_relative_projection', 'sg_texturing_frame',
+                   'sg_allow_backface_projection',
                    'sg_rework_acquisition_quality', 'sg_rework_projection_guard', 'sg_guard_directional',
                    'sg_silhouette_margin', 'sg_guard_foreground_margin', 'sg_silhouette_depth',
                    'sg_guard_coverage_rescue', 'sg_silhouette_feather', 'sg_projection_guard_scale',
