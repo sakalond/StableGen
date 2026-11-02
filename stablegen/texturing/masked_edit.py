@@ -1012,6 +1012,8 @@ def project_view(context, objects, camera, image_path, write_path, material_id, 
         if texture is not None:
             # Keeps camera image displays on the generated views, not this edit layer.
             texture['sg_masked_edit'] = True
+            # Where the view was taken from, for laying the layer again (replay_layers)
+            texture['sg_edit_camera_matrix'] = [v for row in camera.matrix_world for v in row]
             layers[obj.name] = {'mix': mix.name, 'texture': texture.name}
         selected = selection_socket(material, obj.sg_edit_mask)
         # With expansion enabled, the camera-space write mask defines the
@@ -1092,11 +1094,13 @@ def capture_layers(objects):
             mix = next((n for n in nodes if n.bl_idname == 'ShaderNodeMixRGB'
                         and _upstream_texture(n.inputs['Color1']) == texture), None)
             snapshot = _upstream_selection(mix.inputs['Fac']) if mix else None
+            matrix = texture.get('sg_edit_camera_matrix')
             captured.append({
                 'object': obj.name, 'layer': layer_id, 'camera': view['camera'], 'directory': str(view_dir),
                 'expand': int(report.get('expand_selection_px', 0) or 0),
                 'snapshot': snapshot.image.name if snapshot is not None and snapshot.image else None,
                 'pbr': bool(report.get('pbr_channels')),
+                'matrix': list(matrix) if matrix is not None and len(matrix) == 16 else None,
             })
     return sorted(captured, key=lambda entry: entry['layer'])
 
@@ -1104,10 +1108,11 @@ def capture_layers(objects):
 def replay_layers(context, captured):
     """Lay the captured Masked Edit layers (capture_layers) over the rebuilt projection, in their order.
 
-    Each edit view is projected again through project_view from its camera, with
-    its generated image, write mask, expansion and selection snapshot. A layer
-    whose camera or files are gone is reported and left out; edited PBR maps are
-    not laid again. Returns the number of edit views laid.
+    Each edit view is projected again through project_view from where its camera
+    stood for the edit (a temporary copy when it has moved since), with its
+    generated image, write mask, expansion and selection snapshot. A layer whose
+    camera or files are gone is reported and left out; edited PBR maps are not
+    laid again. Returns the number of edit views laid.
     """
     scene = context.scene
     views = {}
@@ -1146,10 +1151,21 @@ def replay_layers(context, captured):
             material['_sg_mask_shader'] = before.name if before.type in {'BSDF_PRINCIPLED', 'EMISSION'} else ''
             if before.type in {'BSDF_PRINCIPLED', 'EMISSION'}:
                 material.node_tree.links.new(source, color_input(before))
+        # A camera moved since the edit projects from where the view was taken
+        matrix = targets[0][1].get('matrix')
+        view_camera = camera
+        if matrix is not None:
+            from mathutils import Matrix
+            taken = Matrix([matrix[i:i + 4] for i in range(0, 16, 4)])
+            if any(abs(a - b) > 1e-5 for row_a, row_b in zip(taken, camera.matrix_world)
+                   for a, b in zip(row_a, row_b)):
+                view_camera = camera.copy()
+                view_camera.matrix_world = taken
+                scene.collection.objects.link(view_camera)
         previous = scene.get('_sg_masked_output')
         scene['_sg_masked_output'] = str(view_dir)
         try:
-            project_view(context, [obj for obj, _e in targets], camera, str(image_path), str(write_path),
+            project_view(context, [obj for obj, _e in targets], view_camera, str(image_path), str(write_path),
                          layer_id, targets[0][1]['expand'])
             laid += 1
         finally:
@@ -1157,6 +1173,8 @@ def replay_layers(context, captured):
                 del scene['_sg_masked_output']
             else:
                 scene['_sg_masked_output'] = previous
+            if view_camera is not camera:
+                bpy.data.objects.remove(view_camera)
     return laid
 
 
