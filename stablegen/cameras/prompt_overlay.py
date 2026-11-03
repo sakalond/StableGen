@@ -123,7 +123,8 @@ class SG_GGT_CameraPrompts(bpy.types.GizmoGroup):
 
     def draw_prepare(self, context):
         view = _views.get(view_key(context))
-        targets = {t['camera'].as_pointer(): t for t in view.targets if t['kind'] == 'toggle'} if view else {}
+        # The labels rebuild the targets after this runs, so a camera deleted since then is still listed (#129).
+        targets = {t['key']: t for t in view.targets if t['kind'] == 'toggle'} if view else {}
         for key in set(self.widgets) - targets.keys():
             self.gizmos.remove(self.widgets.pop(key))
         for key, target in targets.items():
@@ -162,7 +163,7 @@ def draw_icon(painter, view, camera, rect, has_prompt, border='section_border'):
     else:
         painter.line([(px + a*u, py + b*u) for a, b in [*points, points[0]]], tint, 1.2)
         painter.line([(px + a*u, py + b*u) for a, b in fold], tint, 1.2)
-    view.targets.append(dict(kind='toggle', camera=camera, rect=rect))
+    view.targets.append(dict(kind='toggle', camera=camera, key=camera.as_pointer(), rect=rect))
 
 
 def draw_field(painter, view, camera, prompt, rect):
@@ -175,7 +176,7 @@ def draw_field(painter, view, camera, prompt, rect):
         follow_caret=edit is not None and edit['follow_caret'])
     view.scrolls[key] = scroll
     view.fields[key] = dict(rect=rect, lines=lines, scroll=scroll)
-    view.targets.append(dict(kind='edit', camera=camera, rect=rect))
+    view.targets.append(dict(kind='edit', camera=camera, key=key, rect=rect))
     if not value and not edit:
         painter.text('View prompt', rect[0] + 8, rect[1] + 8, 11, 'muted')
 
@@ -264,7 +265,7 @@ class SG_OT_CameraPromptInput(bpy.types.Operator):
 
     def update_hover(self, point=None):
         target = hit(self.view, point) if point is not None else None
-        hovered = target['camera'].as_pointer() if target and target['kind'] == 'toggle' else None
+        hovered = target['key'] if target and target['kind'] == 'toggle' else None
         if self.view.hover != hovered:
             self.view.hover = hovered
             try:

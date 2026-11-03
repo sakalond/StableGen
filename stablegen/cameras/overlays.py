@@ -39,7 +39,18 @@ def _snapshot(context):
     if key not in _snapshots:
         _snapshots[key] = dict(scene=scene, layer=context.view_layer, cameras=(), images={},
                                dirty=True, manifests={})
-    return _snapshots[key]
+    snapshot = _snapshots[key]
+    # The timer refreshes the cameras; drop any deleted since then before a draw handler reads them (#129).
+    snapshot['cameras'] = tuple(c for c in snapshot['cameras'] if _alive(c))
+    return snapshot
+
+
+def _alive(obj):
+    try:
+        obj.as_pointer()
+    except ReferenceError:
+        return False
+    return True
 
 
 def _source_materials(context):
