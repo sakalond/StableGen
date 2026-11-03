@@ -9,7 +9,7 @@ from bpy_extras.view3d_utils import location_3d_to_region_2d
 from gpu_extras.batch import batch_for_shader
 
 from ..texturing.view_plan import generation_cameras, order_cameras
-from .geometry import _get_camera_resolution
+from .geometry import _get_camera_resolution, _set_display_square
 from . import prompt_overlay
 
 _ADDON_PKG = __package__.rsplit('.', 1)[0]
@@ -567,8 +567,7 @@ def _sg_restore_square_display(scene):
         for c in cameras
     )
     if max_side > 0:
-        scene.render.resolution_x = max_side
-        scene.render.resolution_y = max_side
+        _set_display_square(scene, max_side)
     # Refresh viewports
     for area in bpy.context.screen.areas if bpy.context.screen else []:
         if area.type == 'VIEW_3D':

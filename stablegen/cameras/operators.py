@@ -14,7 +14,8 @@ from .geometry import (
     _gather_target_meshes, _get_mesh_verts_world,
     _compute_per_camera_aspect, _resolution_from_aspect,
     _get_fov, _compute_silhouette_distance, _perspective_aspect,
-    _camera_basis, _rotation_from_basis, _get_resolution_align
+    _camera_basis, _rotation_from_basis, _get_resolution_align,
+    _pixel_budget, _set_display_square,
 )
 import numpy as np
 
@@ -53,8 +54,7 @@ class ApplyAutoAspect(bpy.types.Operator):
         center_np = center_for_aspect
         center_vec = mathutils.Vector(center_np.tolist())
         
-        render = context.scene.render
-        total_px = render.resolution_x * render.resolution_y
+        total_px = _pixel_budget(context.scene)
         align = _get_resolution_align(context)
         
         updated_count = 0
@@ -111,9 +111,8 @@ class ApplyAutoAspect(bpy.types.Operator):
                 for c in all_sg_cams
             )
             if max_side > 0:
-                context.scene.render.resolution_x = max_side
-                context.scene.render.resolution_y = max_side
-                
+                _set_display_square(context.scene, max_side)
+
         self.report({'INFO'}, f"Applied Auto Aspect to {updated_count} camera(s)")
         return {'FINISHED'}
 

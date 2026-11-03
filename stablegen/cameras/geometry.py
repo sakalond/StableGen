@@ -805,6 +805,28 @@ def _get_resolution_align(context):
     return 8
 
 
+def _pixel_budget(scene):
+    """Pixel count the user's own resolution asks for.  Per-camera aspect
+    replaces the scene resolution with a display square, so while that square
+    is still in place, return the budget it stood in for (#129)."""
+    render = scene.render
+    square = scene.get('sg_display_square')
+    if (square and 'sg_pixel_budget' in scene
+            and render.resolution_x == render.resolution_y == int(square)):
+        return int(scene['sg_pixel_budget'])
+    return render.resolution_x * render.resolution_y
+
+
+def _set_display_square(scene, side):
+    """Set the scene to a *side* square so every camera's crop fits the
+    viewport, remembering the pixel budget it replaces."""
+    budget = _pixel_budget(scene)
+    scene.render.resolution_x = side
+    scene.render.resolution_y = side
+    scene['sg_pixel_budget'] = budget
+    scene['sg_display_square'] = side
+
+
 def _apply_auto_aspect(directions_np, context, verts_world):
     """Adjust scene render resolution to match the mesh's average apparent
     aspect ratio across the given camera *directions_np*.  This is the
@@ -817,7 +839,7 @@ def _apply_auto_aspect(directions_np, context, verts_world):
     avg_aspect = float(np.mean(aspects))
 
     render = context.scene.render
-    total_px = render.resolution_x * render.resolution_y
+    total_px = _pixel_budget(context.scene)
     align = _get_resolution_align(context)
     new_x, new_y = _resolution_from_aspect(avg_aspect, total_px, align=align)
     render.resolution_x = new_x
