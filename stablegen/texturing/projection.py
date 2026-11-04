@@ -3000,7 +3000,20 @@ def project_image(
         else:
             context.scene.cycles.use_osl = True
 
+    loaded_images = {}
+
+    def load_image(path):
+        """``get_or_load_image`` once per file and call: every material reads the same views and masks, and
+        Overwrite Material's reload only has to bring each file up to date once."""
+        if path not in loaded_images:
+            loaded_images[path] = get_or_load_image(path, force_reload=context.scene.overwrite_material)
+        return loaded_images[path]
+
     processed_materials = set()
+    # The material this call rebuilt from scratch. Every other object whose projection material would be rebuilt
+    # the same way gets it instead: the graph reads per-object attributes only, so one material serves them all,
+    # is built once and compiles once.
+    shared_material = None
     svm_estimates = {}
     cache_key = (_cache_configuration(context.scene, cameras, mat_id, assets, to_project)
                  if stable_sequential else None)
@@ -3033,7 +3046,7 @@ def project_image(
             # Use active material
             mat = obj.active_material
         else:
-            mat = bpy.data.materials.new(name="ProjectionMaterial")
+            mat = shared_material or bpy.data.materials.new(name="ProjectionMaterial")
             obj.data.materials.append(mat)
             # Mark as active material
             obj.active_material_index = obj.material_slots.find(mat.name)
@@ -3052,9 +3065,20 @@ def project_image(
 
         # UV and baked-visibility attributes were prepared on every mesh above.
         # The shader reads those named attributes at the shading point, so its
-        # topology is independent of the representative object. Local edits
-        # retain their existing append/copy behavior.
-        if not is_local_edit and mat.name in processed_materials:
+        # topology is independent of the representative object. A local edit
+        # appends its pass once to a material several objects share; a copied
+        # material is new and always gets its own.
+        if mat.name in processed_materials:
+            continue
+        # Masked Edit layers belong to their object (its selection gates them) and are laid again on its own
+        # material after the run, so a material that carried them is neither shared nor replaced, also at the
+        # later sequential steps that find it rebuilt without them.
+        own_material = mat.get('sg_object_material') or (
+            mat.use_nodes and any(node.get('sg_masked_edit') for node in mat.node_tree.nodes))
+        if own_material:
+            mat['sg_object_material'] = True
+        if not is_local_edit and shared_material is not None and not own_material:
+            obj.active_material = shared_material
             continue
 
         # Enable use of nodes
@@ -3085,26 +3109,28 @@ def project_image(
                 and cache_entry['assets'] == _asset_state(cache_entry['asset_paths'])
                 and cache_entry['state'] == _graph_state(mat)):
             image_path = get_file_path(context, 'generated', camera_id=stop_index, material_id=mat_id)
-            image = get_or_load_image(image_path, force_reload=context.scene.overwrite_material)
+            image = load_image(image_path)
             if image:
                 nodes[cache_entry['images'][stop_index]].image = image
-                write = cache_entry['writes'].get(stop_index)
-                if write:
-                    texture_name, bypass_name, mask_path = write
-                    mask = (get_or_load_image(mask_path, force_reload=context.scene.overwrite_material)
+                writes = cache_entry['writes'].get(stop_index, ())
+                for texture_name, bypass_name, mask_path, present, missing in writes:
+                    mask = (load_image(mask_path)
                             if os.path.isfile(mask_path) else None)
                     if mask:
                         mask.colorspace_settings.name = 'Non-Color'
+                    elif not missing:
+                        print("[StableGen] WARNING: confidence write mask "
+                              f"missing for camera {stop_index}; refusing to upgrade "
+                              "source confidence for that view.")
                     nodes[texture_name].image = mask
-                    nodes[bypass_name].inputs[1].default_value = 0.0 if mask else 1.0
+                    nodes[bypass_name].inputs[1].default_value = present if mask else missing
                 nodes[cache_entry['gates'][stop_index]].inputs[1].default_value = 1.0
                 for frame in nodes:
                     if frame.type == 'FRAME' and frame.label.startswith(f'View {stop_index + 1:02d} |'):
                         frame.label = frame.label.removesuffix(' | pending')
                 cache_entry['stop'] = stop_index
                 cache_entry['asset_paths'].append(image_path)
-                if write:
-                    cache_entry['asset_paths'].append(mask_path)
+                cache_entry['asset_paths'] += [write[2] for write in writes]
                 cache_entry['assets'] = _asset_state(cache_entry['asset_paths'])
                 cache_entry['state'] = _graph_state(mat)
                 processed_materials.add(mat.name)
@@ -3176,16 +3202,15 @@ def project_image(
                             and stop_index == 0
                             and context.scene.sequential_ipadapter_mode == 'first'):
                         image_path = image_path.replace(".png", "_ipadapter.png")
-                    image = get_or_load_image(
-                        image_path,
-                        force_reload=context.scene.overwrite_material,
-                    )
+                    image = load_image(image_path)
                     if image:
                         node.image = image
                     break
             processed_materials.add(mat.name)
             continue
         elif not is_local_edit:
+            if not own_material:
+                shared_material = mat
             # Rebuild mode is required for per-view assets that only exist
             # after generation (write masks, guards, and confidence inputs).
             # Clear existing nodes
@@ -3238,7 +3263,7 @@ def project_image(
             if not os.path.exists(ef_path):
                 print(f"[StableGen] Edge-feather mask not found: {ef_path}")
                 return None
-            ef_image = get_or_load_image(ef_path, force_reload=context.scene.overwrite_material)
+            ef_image = load_image(ef_path)
             if ef_image is None:
                 return None
 
@@ -3267,8 +3292,15 @@ def project_image(
             mat_id_inner,
             binary=False,
             label_prefix="SequentialWrite",
+            missing=1.0,
         ):
-            """Sample the authoritative per-view sequential write mask."""
+            """Sample the authoritative per-view sequential write mask.
+
+            ``missing`` is the weight a stable sequential graph uses while the
+            mask file is absent: 1 (neutral) for a write mask, 0 for a
+            confidence write mask, which a rebuild then replaces by a 0
+            constant and refuses to upgrade.
+            """
             mask_path = get_file_path(
                 context,
                 "inpaint",
@@ -3277,10 +3309,7 @@ def project_image(
             )
             if not os.path.exists(mask_path) and not stable_sequential:
                 return None
-            mask_image = get_or_load_image(
-                mask_path,
-                force_reload=context.scene.overwrite_material,
-            ) if os.path.isfile(mask_path) and cam_index <= stop_index else None
+            mask_image = load_image(mask_path) if os.path.isfile(mask_path) and cam_index <= stop_index else None
             if mask_image is None and not stable_sequential:
                 return None
             if mask_image:
@@ -3303,14 +3332,16 @@ def project_image(
             to_float.label = f"{label_prefix}Weight-{cam_index}-{mat_id_inner}"
             links.new(_mask_value(nodes, links, mask_tex).outputs[0], to_float.inputs[0])
             if stable_sequential:
-                # A missing mask is a neutral multiplier, matching a rebuild.
-                # Bind its resource before opening the camera's active gate.
+                # A missing mask gives the ``missing`` weight, matching a
+                # rebuild. Bind its resource before opening the camera's gate.
+                present = 0.0 if missing else 1.0
                 bypass = nodes.new('ShaderNodeMath')
-                bypass.operation = 'MAXIMUM'
+                bypass.operation = 'MAXIMUM' if missing else 'MULTIPLY'
                 bypass.label = f'{label_prefix}Available-{cam_index}-{mat_id_inner}'
-                bypass.inputs[1].default_value = 0.0 if mask_image else 1.0
+                bypass.inputs[1].default_value = present if mask_image else missing
                 links.new(to_float.outputs[0], bypass.inputs[0])
-                sequential_writes[cam_index] = (mask_tex.name, bypass.name, mask_path)
+                sequential_writes.setdefault(cam_index, []).append(
+                    (mask_tex.name, bypass.name, mask_path, present, missing))
                 return bypass
             return to_float
 
@@ -3324,9 +3355,7 @@ def project_image(
             )
             if not os.path.exists(guard_path):
                 return None
-            guard_image = get_or_load_image(
-                guard_path, force_reload=context.scene.overwrite_material
-            )
+            guard_image = load_image(guard_path)
             if guard_image is None:
                 return None
             guard_image.colorspace_settings.name = 'Non-Color'
@@ -3415,7 +3444,7 @@ def project_image(
                 and not context.scene.use_ipadapter and i == 0 and context.scene.sequential_ipadapter_mode == 'first':
                     image_path = get_file_path(context, "generated", camera_id=i, material_id=mat_id).replace(".png", "_ipadapter.png")
 
-                image = get_or_load_image(image_path, force_reload=context.scene.overwrite_material)
+                image = load_image(image_path)
                 if image:
                     tex_image.image = image
             elif voronoi_active:
@@ -3851,8 +3880,7 @@ def project_image(
                             f"projection_guard_feather{i}.png",
                         )
                         if os.path.isfile(feather_path):
-                            feather_image = get_or_load_image(
-                                feather_path, force_reload=context.scene.overwrite_material)
+                            feather_image = load_image(feather_path)
                             if feather_image is not None:
                                 feather_image.colorspace_settings.name = 'Non-Color'
                                 feather_tex = nodes.new("ShaderNodeTexImage")
@@ -3881,8 +3909,7 @@ def project_image(
                                     import json
                                     with open(calibration_path) as stream:
                                         distance_scale = float(json.load(stream)['distance_scale'])
-                                    occlusion_image = get_or_load_image(
-                                        occlusion_path, force_reload=context.scene.overwrite_material)
+                                    occlusion_image = load_image(occlusion_path)
                                     occlusion_image.colorspace_settings.name = 'Non-Color'
                                     occlusion_tex = nodes.new("ShaderNodeTexImage")
                                     occlusion_tex.label = f"ProjectionOcclusionFeather-{i}-{mat_id}"
@@ -3936,8 +3963,7 @@ def project_image(
                                     influence_path = os.path.join(os.path.dirname(feather_path),
                                                                   f"projection_guard_influence{i}.png")
                                     if os.path.isfile(influence_path):
-                                        influence_image = get_or_load_image(
-                                            influence_path, force_reload=context.scene.overwrite_material)
+                                        influence_image = load_image(influence_path)
                                         influence_image.colorspace_settings.name = 'Non-Color'
                                         influence_tex = nodes.new("ShaderNodeTexImage")
                                         influence_tex.name = f"SGFeatherInfluenceMask-{i}-{mat_id}"
@@ -3959,11 +3985,13 @@ def project_image(
             if (confidence_context_active and script_nodes_outputs
                     and not isinstance(script_nodes_outputs[-1], tuple)):
                 confidence_quality = script_nodes_outputs[-1]
-                if i > stop_index:
+                if i > stop_index and not stable_sequential:
                     # Voronoi generation intentionally leaves future camera
                     # placeholders active for colour segmentation. They are
                     # not acquired observations and must never contribute to
-                    # source confidence.
+                    # source confidence. (A stable sequential graph keeps the
+                    # chain: its pending cameras are exactly zero through their
+                    # active gate until their view lands.)
                     confidence_quality = nodes.new("ShaderNodeValue")
                     confidence_quality.outputs[0].default_value = 0.0
                     confidence_quality.label = f"ConfidenceFuture-{i}-{mat_id}"
@@ -3973,6 +4001,7 @@ def project_image(
                         mat_id,
                         binary=True,
                         label_prefix="ConfidenceWrite",
+                        missing=0.0,
                     )
                     if confidence_write is None:
                         print(
@@ -4031,16 +4060,9 @@ def project_image(
             best_quality.label = "SGBestSourceQuality"
 
         # Build mix shader tree
-        if mat.name in processed_materials and is_local_edit:
-            # If we already processed this material, we don't need to rebuild the mix tree
-            # But we still need to connect the nodes for the current object (done in the loop below)
-            # We need to find the existing mix node to position the output node
-            # The mix node is connected to the output node
-            mix_node = output.inputs["Surface"].links[0].from_node
-        else:
-            mix_node, _ = yield from build_mix_tree(tex_image_nodes, script_nodes_outputs, nodes, links, previous_node, stop_index=stop_index, _steps=True)
-            links.new(mix_node.outputs[0], output.inputs["Surface"])
-            processed_materials.add(mat.name)
+        mix_node, _ = yield from build_mix_tree(tex_image_nodes, script_nodes_outputs, nodes, links, previous_node, stop_index=stop_index, _steps=True)
+        links.new(mix_node.outputs[0], output.inputs["Surface"])
+        processed_materials.add(mat.name)
 
         # Move output node right to the mix_node
         output.location = (mix_node.location[0] + 400, mix_node.location[1])
@@ -4121,7 +4143,8 @@ def project_image(
         if stable_sequential:
             active_assets = [n.image.filepath for i, n in enumerate(tex_image_nodes)
                              if i <= stop_index and n.image]
-            active_assets += [v[2] for i, v in sequential_writes.items() if i <= stop_index]
+            active_assets += [write[2] for i, writes in sequential_writes.items() if i <= stop_index
+                              for write in writes]
             incremental_cache[mat.as_pointer()] = dict(
                 key=cache_key, stop=stop_index, state=_graph_state(mat),
                 writes=sequential_writes, asset_paths=active_assets, assets=_asset_state(active_assets),
@@ -4274,13 +4297,15 @@ def reinstate_compare_nodes(context, to_project, stop_id_mat_id_pairs):
     This will esentially revert given views to not-generated state for viewpoint regeneration.
     """
 
+    reinstated = set()
     for obj in to_project:
         if not obj.active_material:
             continue
 
         mat = obj.active_material
-        if not mat.use_nodes:
+        if not mat.use_nodes or mat.as_pointer() in reinstated:
             continue
+        reinstated.add(mat.as_pointer())
 
         nodes = mat.node_tree.nodes
         links = mat.node_tree.links

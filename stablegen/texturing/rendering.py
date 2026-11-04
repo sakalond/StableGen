@@ -643,6 +643,16 @@ def render_edge_feather_mask(context, to_export, camera, camera_index, feather_w
         )
 
 
+def _own_material(obj, mat):
+    """``mat``, or a copy of it in its place on ``obj`` when other objects use it too: one projection material
+    serves every object of a run, and what follows writes this object's own bake into it."""
+    if mat.users - mat.use_fake_user <= 1:
+        return mat
+    own = mat.copy()
+    obj.active_material = own
+    return own
+
+
 def apply_uv_inpaint_texture(context, obj, baked_image_path):
     """
     Apply a UV inpainted/baked texture to the active material.
@@ -662,6 +672,7 @@ def apply_uv_inpaint_texture(context, obj, baked_image_path):
     if not mat or not mat.use_nodes or not mat.node_tree:
         print("[StableGen] No active material or no node tree.")
         return
+    mat = _own_material(obj, mat)
 
     nodes = mat.node_tree.nodes
     links = mat.node_tree.links
@@ -810,10 +821,11 @@ def flatten_projection_material_for_refine(context, obj, baked_image_path):
     # 1) Find or create a suitable material
     # -------------------------------------------------------------------------
     target_mat = None
-    for slot in obj.material_slots:
+    for index, slot in enumerate(obj.material_slots):
         mat = slot.material
         if mat and mat.name.startswith("ProjectionMaterial"):
             target_mat = mat
+            obj.active_material_index = index
             break
 
     if target_mat is None:
@@ -823,6 +835,7 @@ def flatten_projection_material_for_refine(context, obj, baked_image_path):
         target_mat = bpy.data.materials.new(name="ProjectionMaterial")
         obj.data.materials.append(target_mat)
 
+    target_mat = _own_material(obj, target_mat)
     obj.active_material = target_mat
     if obj.active_material_index < 0:
         if target_mat not in obj.data.materials:
