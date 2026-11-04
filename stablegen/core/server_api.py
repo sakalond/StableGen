@@ -75,7 +75,7 @@ def offline_message(server_address):
 
 
 def check_trellis2_available(server_address, timeout=1.0):
-    """Checks if TRELLIS.2 custom nodes are installed in ComfyUI.
+    """Checks if ComfyUI has its native TRELLIS.2 nodes (ComfyUI 0.42 or newer).
 
     Args:
         server_address (str): The address:port of the ComfyUI server.
@@ -84,27 +84,12 @@ def check_trellis2_available(server_address, timeout=1.0):
     Returns:
         bool: True if TRELLIS.2 nodes are detected, False otherwise.
     """
+    from ..mesh_gen.trellis2_graph import PROBE_NODE
     if not server_address:
         return False
-    try:
-        url = f"http://{server_address}/object_info/Trellis2ImageToShape"
-        response = requests.get(url, timeout=timeout)
-        if response.status_code == 200:
-            data = response.json()
-            if 'Trellis2ImageToShape' in data:
-                print("[TRELLIS2] Auto-detect: TRELLIS.2 nodes found in ComfyUI.")
-                return True
-        print("[TRELLIS2] Auto-detect: TRELLIS.2 nodes NOT found in ComfyUI.")
-        return False
-    except Exception as e:
-        print(f"[TRELLIS2] Auto-detect failed: {e}")
-        return False
-    except requests.exceptions.RequestException as e:
-        print(f"[StableGen]   Initial server check failed: Request Error ({e}).")
-        return False
-    except Exception as e:
-        print(f"[StableGen]   Initial server check failed: Unexpected Error ({e}).")
-        return False
+    found = fetch_node_info(server_address, PROBE_NODE, timeout=timeout) is not None
+    print(f"[TRELLIS2] Auto-detect: ComfyUI's TRELLIS.2 nodes {'found' if found else 'NOT found'}.")
+    return found
 
 
 def check_pbr_available(server_address, timeout=1.0):

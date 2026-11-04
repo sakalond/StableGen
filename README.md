@@ -92,7 +92,7 @@ Texturing works by projection. Each camera gets a generated view that follows th
 ### Built on
 
 - [ComfyUI](https://github.com/comfyanonymous/ComfyUI) runs every model, locally or on another machine.
-- [TRELLIS.2](https://github.com/microsoft/TRELLIS.2) generates meshes, through [ComfyUI-TRELLIS2](https://github.com/PozzettiAndrea/ComfyUI-TRELLIS2).
+- [TRELLIS.2](https://github.com/microsoft/TRELLIS.2) generates meshes, through ComfyUI's own TRELLIS.2 nodes.
 - [SDXL](https://huggingface.co/stabilityai/stable-diffusion-xl-base-1.0) with ControlNet and IPAdapter, and [Qwen Image](https://github.com/QwenLM/Qwen-Image), generate the texture views. [MOSS-Image](https://huggingface.co/OpenMOSS-Team/MOSS-Image-SFT) and [Bria FIBO 2.0](https://huggingface.co/briaai/Fibo-2.0-edit-turbo) are available as experimental architectures.
 - [SkinTokens](https://github.com/VAST-AI-Research/SkinTokens) rigs characters.
 - [Marigold](https://github.com/prs-eth/Marigold) and [StableDelight](https://github.com/Stable-X/StableDelight) estimate the PBR maps.
@@ -173,13 +173,13 @@ StableGen is released under the [GNU General Public License v3.0](LICENSE). The 
 
 - Qwen Image 2.1 and Qwen Image 2.1 Turbo are released under the [Qwen Research License](https://huggingface.co/Qwen/Qwen-Image-2.1/blob/main/LICENSE). Qwen Image Edit and SDXL are not affected.
 - Bria FIBO 2.0 is released under [CC BY-NC 4.0](https://huggingface.co/briaai/Fibo-2.0-edit-turbo); commercial use needs an agreement with Bria.
-- The TRELLIS.2 **Native** texture mode uses NVIDIA's nvdiffrast and nvdiffrec. The other modes do not use them. See [TRELLIS.2 third-party licenses](https://github.com/sakalond/StableGen/wiki/TRELLIS.2-mesh-generation#third-party-licenses).
+- TRELLIS.2's image encoder, Meta's DINOv3, has its own license. See [TRELLIS.2 third-party licenses](https://github.com/sakalond/StableGen/wiki/TRELLIS.2-mesh-generation#third-party-licenses).
 
 ## Acknowledgements
 
 StableGen began as a bachelor's thesis by Ondřej Sakala at the Faculty of Information Technology, Czech Technical University in Prague, supervised by Ing. Radek Richtr, Ph.D. ([full text](https://dspace.cvut.cz/handle/10467/123567)). Part of its development took place during a study stay at Kanazawa University in summer 2026; travel costs were supported by a grant from Nadace „Nadání Josefa, Marie a Zdeňky Hlávkových“.
 
-It builds on [ComfyUI](https://github.com/comfyanonymous/ComfyUI), [ComfyUI-TRELLIS2](https://github.com/PozzettiAndrea/ComfyUI-TRELLIS2) and [Blender](https://www.blender.org/), and was inspired by the [Dream Textures](https://github.com/carson-katri/dream-textures) and [Diffused Texture](https://github.com/FrederikHasecke/diffused-texture-addon) add-ons.
+It builds on [ComfyUI](https://github.com/comfyanonymous/ComfyUI) and [Blender](https://www.blender.org/), ran TRELLIS.2 through [ComfyUI-TRELLIS2](https://github.com/PozzettiAndrea/ComfyUI-TRELLIS2) before ComfyUI had its own nodes, and was inspired by the [Dream Textures](https://github.com/carson-katri/dream-textures) and [Diffused Texture](https://github.com/FrederikHasecke/diffused-texture-addon) add-ons.
 
 <details>
 <summary>Research StableGen draws on</summary>

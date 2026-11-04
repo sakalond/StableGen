@@ -1184,7 +1184,7 @@ def _stabilize_autorig_garment_weights(imported_objects, mode='STABILIZE'):
 class Trellis2Generate(bpy.types.Operator):
     """Generate a 3D mesh from a reference image using TRELLIS.2 via ComfyUI.
 
-    Requires the PozzettiAndrea/ComfyUI-TRELLIS2 custom node pack installed on the ComfyUI server.
+    Runs on ComfyUI's native TRELLIS.2 nodes (ComfyUI 0.42 or newer, models from installer package 8).
     Uploads the input image, runs the full TRELLIS.2 pipeline (background removal, conditioning,
     shape generation, texture generation, GLB export), downloads the resulting GLB file, and
     imports it into the Blender scene."""
@@ -1255,6 +1255,30 @@ class Trellis2Generate(bpy.types.Operator):
         self._overall_progress = max(0.0, min(self._overall_progress, 100.0))
         # Keep legacy _progress in sync for any code that reads it
         self._progress = self._overall_progress
+
+    # The auto-rig step runs the standalone SkinTokens flow, which reports upload, rigging and download as its
+    # own phases 1-3; here they share the Auto-Rigging phase in these proportions
+    _AUTORIG_SUBPHASES = {1: (0.0, 10.0), 2: (10.0, 85.0), 3: (95.0, 5.0)}
+
+    def _set_pipeline_phase(self, phase, label, percent, detail=None):
+        """Progress callback of the standalone SkinTokens flow (see _AUTORIG_SUBPHASES)."""
+        if self._autorig_phase and self._current_phase != self._autorig_phase:
+            self._phase_progress = 100
+            self._update_overall()
+            self._current_phase = self._autorig_phase
+            self._overall_stage = f"Phase {self._autorig_phase}/{self._total_phases}: Auto-Rigging"
+        percent = max(0.0, min(float(percent), 100.0))
+        start, span = self._AUTORIG_SUBPHASES.get(int(phase), (0.0, 100.0))
+        starts, weights = self._phase_spec()
+        within = (start + span * percent / 100.0) / 100.0
+        self._overall_progress = max(self._overall_progress, starts.get(self._current_phase, 0)
+                                     + weights.get(self._current_phase, 0) * within)
+        self._progress = self._overall_progress
+        # the flow reads _phase_progress back as its own sub-phase's percent, so it stays that
+        self._phase_progress = percent
+        self._phase_stage = f"Auto-Rigging: {label}"
+        self._detail_stage = detail or label
+        self._detail_progress = percent
 
     @staticmethod
     def _clear_imported_custom_normals(mesh_objects):

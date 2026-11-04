@@ -128,7 +128,7 @@ SCHEMAS = {
         Spec('shape', 'Shape generation', 'layers', ('trellis2_ss_guidance', 'trellis2_ss_steps',
              'trellis2_shape_guidance', 'trellis2_shape_steps', 'trellis2_max_tokens')),
         feature('trellis2_post_processing_enabled', 'Mesh post-processing', 'modifier'),
-        Spec('model', 'Mesh model', 'settings', ('trellis2_resolution', 'trellis2_precision', 'trellis2_attn_backend')),
+        Spec('model', 'Mesh model', 'settings', ('trellis2_resolution',)),
         Spec('conditioning', 'Image conditioning', 'eye', ('trellis2_background_color', 'trellis2_bg_removal', 'trellis2_shade_mode')),
     ),
     'show_trellis2_autorig_settings': (

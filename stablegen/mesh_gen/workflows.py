@@ -12,14 +12,16 @@ from datetime import datetime, timedelta, timezone
 
 from ..timeout_config import get_timeout
 from ..utils import get_generation_dirs
-from ..util.workflow_templates import prompt_text_trellis2, prompt_text_trellis2_shape_only
 
 from io import BytesIO
 import numpy as np
-from PIL import Image
 
 _ADDON_PKG = __package__.rsplit('.', 1)[0]
 _SKINTOKENS_PROGRESS_EVENT = "stablegen_skintokens_progress"
+_MESHTOOLS_PROGRESS_EVENT = "lato2_progress"          # ComfyUI-LATO2's stage progress
+# What a mesh tool graph is doing while ComfyUI runs one of its nodes (core nodes send no progress of their own)
+_MESHTOOLS_STAGES = {'Load3DAdvanced': "Loading the mesh", 'Get3DComponents': "Loading the mesh",
+                     'RemeshMesh': "Remeshing (QDC)", 'DecimateMesh': "Decimating", 'SaveGLB': "Writing the GLB"}
 
 
 def _progress_percent(data):
@@ -43,102 +45,6 @@ def _message_node_matches(data, expected_node):
 
 class _Trellis2WorkflowMixin:
     """TRELLIS.2 workflow methods for WorkflowManager."""
-
-    @staticmethod
-    def _cleanup_trellis2_temp_files():
-        """Remove stale TRELLIS2 IPC temp directories and voxelgrid cache.
-
-        The ComfyUI-TRELLIS2 custom node creates one temp directory
-        (``trellis2_<random>``) per worker subprocess via a module-level
-        global and reuses it for the entire ComfyUI session.  Deleting
-        that directory while the worker is alive causes "Parent directory
-        does not exist" errors on the next generation.
-
-        Since only the most recently created directory can belong to the
-        current (running) worker, we delete all *older* ``trellis2_*``
-        directories entirely and only clean up the stale ``.pt`` tensor
-        files inside the newest one, leaving the directory itself intact.
-        """
-        import tempfile
-        import glob
-        import shutil
-
-        tmp_root = tempfile.gettempdir()
-
-        dirs = sorted(
-            (d for d in glob.glob(os.path.join(tmp_root, 'trellis2_*'))
-             if os.path.isdir(d)),
-            key=os.path.getctime,
-        )
-
-        if not dirs:
-            return
-
-        # Everything except the newest is from a dead worker — remove entirely.
-        for d in dirs[:-1]:
-            try:
-                shutil.rmtree(d)
-            except OSError:
-                pass
-
-        # Newest directory may be in use — only purge .pt files inside it.
-        newest = dirs[-1]
-        for f in os.listdir(newest):
-            if f.endswith('.pt'):
-                try:
-                    os.remove(os.path.join(newest, f))
-                except OSError:
-                    pass
-
-        # Voxelgrid cache (Windows: C:\tmp\trellis2_cache)
-        for cache_dir in ('/tmp/trellis2_cache', r'C:\tmp\trellis2_cache'):
-            if os.path.isdir(cache_dir):
-                try:
-                    shutil.rmtree(cache_dir)
-                except OSError:
-                    pass
-
-    @staticmethod
-    def _rasterize_alpha(image_path, background_color='black'):
-        """Flatten a PNG's alpha channel onto a solid background colour.
-
-        When BG removal is set to *Skip*, the user's image may still
-        contain arbitrary RGB data behind transparent pixels.  Vision
-        encoders read raw RGB — not premultiplied data — so those
-        hidden pixels leak into the conditioning and corrupt the
-        generated shape.
-
-        This method composites the foreground onto *background_color*,
-        writes a new temp PNG (preserving the alpha channel for ComfyUI's
-        LoadImage mask output), and returns the path to that temp file.
-
-        If the image has no alpha channel, the original path is returned
-        unchanged.
-        """
-        import tempfile
-
-        img = Image.open(image_path)
-        if img.mode != 'RGBA':
-            return image_path  # nothing to rasterize
-
-        bg_map = {'black': (0, 0, 0), 'gray': (128, 128, 128), 'white': (255, 255, 255)}
-        bg_rgb = bg_map.get(background_color, (0, 0, 0))
-
-        # Composite: result_rgb = fg_rgb * alpha + bg_rgb * (1 - alpha)
-        r, g, b, a = img.split()
-        bg = Image.new('RGB', img.size, bg_rgb)
-        bg.paste(img, mask=a)
-
-        # Re-attach the original alpha so ComfyUI's LoadImage still
-        # provides the correct mask output via its second slot.
-        result = bg.convert('RGBA')
-        result.putalpha(a)
-
-        fd, tmp_path = tempfile.mkstemp(suffix='.png', prefix='sg_rasterized_')
-        os.close(fd)
-        result.save(tmp_path, 'PNG')
-        print(f"[TRELLIS2] Rasterized alpha onto {background_color} background: {tmp_path}")
-        return tmp_path
 
     @staticmethod
     def _is_local_server(server_address):
@@ -871,10 +777,65 @@ class _Trellis2WorkflowMixin:
             client_id = str(uuid.uuid4())
             result = self._generate_trellis2_inner(
                 context, input_image_path, server_address, client_id)
+            if isinstance(result, (bytes, bytearray)):
+                result = self._apply_lato2_remesh(context, result)
+            if isinstance(result, (bytes, bytearray)) and getattr(context.scene, 'trellis2_autorig_enabled', False):
+                result = self._autorig_trellis2_mesh(context, result)
             return result
         finally:
             self._flush_comfyui_vram(server_address, label="Post-generation")
-            self._cleanup_trellis2_temp_files()
+
+    def _autorig_trellis2_mesh(self, context, glb_data):
+        """Rig a freshly generated mesh with SkinTokens: the native SaveGLB node has no output a rig node could
+        take, so the GLB goes back up through the standalone auto-rig flow. Returns the rigged GLB or an error."""
+        import tempfile
+        fd, glb_path = tempfile.mkstemp(suffix='.glb', prefix='sg_trellis2_')
+        try:
+            with os.fdopen(fd, 'wb') as f:
+                f.write(glb_data)
+            return self.generate_skintokens_autorig_file(context, glb_path)
+        finally:
+            try:
+                os.remove(glb_path)
+            except OSError:
+                pass
+
+    def _apply_lato2_remesh(self, context, glb_bytes):
+        """With Remesh Method 'LATO.2', rebuild the generated mesh as a low-poly one on the server. The node removes
+        TRELLIS.2's inner shells first. Any problem keeps the TRELLIS.2 mesh and says why in the console."""
+        scene = context.scene
+        if not (getattr(scene, 'trellis2_post_processing_enabled', True)
+                and getattr(scene, 'trellis2_remesh_method', 'qdc') == 'lato2'):
+            return glb_bytes
+        if not scene.trellis2_skip_texture:
+            print("[TRELLIS2] LATO.2 remesh skipped: it rebuilds the topology, which would drop TRELLIS.2's native "
+                  "textures. Use a diffusion texture mode or none.")
+            return glb_bytes
+        if not getattr(scene, 'meshtools_lato2_available', False):
+            print("[TRELLIS2] LATO.2 remesh skipped: the LATO2Remesh node (ComfyUI-LATO2) was not found in ComfyUI.")
+            return glb_bytes
+        import tempfile
+        handle, path = tempfile.mkstemp(prefix="stablegen_lato2_", suffix=".glb")
+        try:
+            with os.fdopen(handle, 'wb') as out:
+                out.write(glb_bytes)
+            if hasattr(self.operator, '_phase_stage'):
+                self.operator._phase_stage = "LATO.2 low-poly remesh"
+            result = self.generate_meshtools_file(
+                context, "LATO2Remesh",
+                {"vertex_count": int(scene.meshtools_lato2_vertices), "seed": int(scene.meshtools_lato2_seed),
+                 "filename_prefix": "trellis2_lato2"},
+                uploads={"input_path": path}, label="LATO.2 Remesh")
+        finally:
+            try:
+                os.remove(path)
+            except OSError:
+                pass
+        if isinstance(result, dict):
+            print(f"[TRELLIS2] LATO.2 remesh failed, keeping the TRELLIS.2 mesh: {result.get('error')}")
+            return glb_bytes
+        print(f"[TRELLIS2] LATO.2 remesh: {len(glb_bytes)} -> {len(result)} bytes")
+        return result
 
     def generate_skintokens_autorig_file(self, context, input_glb_path):
         """Run the StableGen SkinTokens node on a GLB path accessible to ComfyUI."""
@@ -1189,108 +1150,194 @@ class _Trellis2WorkflowMixin:
             )
         }
 
-    def _generate_trellis2_inner(self, context, input_image_path, server_address, client_id):
-        """Inner implementation of generate_trellis2, called within a try/finally VRAM flush."""
-        import urllib.parse
+    def generate_meshtools_file(self, context, class_type, inputs, uploads=None, label="Mesh Tool", graph=None):
+        """Run one mesh tool node (ComfyUI-LATO2's LATO2Remesh) and return the GLB it wrote as bytes, or
+        {"error": ...}.
 
-        # Upload the input image to ComfyUI
-        from .._generator_utils import upload_image_to_comfyui
+        `uploads` maps node inputs to local files: each is uploaded to ComfyUI's input folder and passed as the
+        server-side path, so a remote ComfyUI works like a local one. Phases: 1 upload, 2 server, 3 download.
+        `graph(uploaded)` instead builds a whole graph: given {input: {"path": server path, "annotated": the path
+        relative to ComfyUI's input folder}} it returns (prompt, the id of the node that writes the GLB)."""
+        server_address = context.preferences.addons[_ADDON_PKG].preferences.server_address
+        operator = self.operator
 
-        # When BG removal is skipped, rasterize the image client-side:
-        # flatten the alpha channel onto the configured background colour so
-        # that invisible pixels behind the alpha don't leak into the
-        # conditioning encoder (which reads raw RGB, not premultiplied data).
-        skip_bg = getattr(context.scene, 'trellis2_bg_removal', 'auto') == 'skip'
-        rasterized_tmp = None
-        if skip_bg:
-            maybe_tmp = self._rasterize_alpha(
-                input_image_path,
-                getattr(context.scene, 'trellis2_background_color', 'black'),
+        def _set_phase(phase, phase_label, percent, detail=None):
+            if hasattr(operator, '_set_pipeline_phase'):
+                operator._set_pipeline_phase(phase, phase_label, percent, detail)
+
+        def _cancelled():
+            return getattr(operator, '_cancelled', False)
+
+        if not self._check_server_alive(server_address):
+            return {"error": "ComfyUI server is not responding. Please restart it and try again."}
+
+        from .._generator_utils import (
+            _TransferCancelled,
+            download_file_with_resume,
+            upload_file_to_comfyui,
+        )
+
+        node_inputs = dict(inputs)
+        uploads = dict(uploads or {})
+        uploaded = {}
+        upload_limit = self._comfyui_remote_upload_limit(server_address)
+        for index, (name, path) in enumerate(uploads.items()):
+            size = os.path.getsize(path)
+            if upload_limit and size > upload_limit:
+                required_mb = ((int(size / (1024 * 1024)) // 64) + 1) * 64
+                return {"error": (
+                    f"{os.path.basename(path)} is {size / (1024 * 1024):.1f} MB, over the ComfyUI upload limit "
+                    f"of {upload_limit / (1024 * 1024):.0f} MB. Restart ComfyUI with --max-upload-size "
+                    f"{required_mb} or higher.")}
+
+            def _upload_progress(completed, total, attempt, _index=index):
+                share = 100.0 / max(1, len(uploads))
+                percent = share * _index + (share * completed / total if total else 0.0)
+                _set_phase(1, "Upload", percent, f"Uploading {os.path.basename(path)}")
+
+            info = upload_file_to_comfyui(
+                server_address, path, file_type="input", subfolder="stablegen_meshtools",
+                progress_cb=_upload_progress, cancel_cb=_cancelled, max_retries=4,
             )
-            if maybe_tmp != input_image_path:
-                rasterized_tmp = maybe_tmp
-                input_image_path = rasterized_tmp
+            if not info:
+                return {"error": "cancelled"} if _cancelled() else {
+                    "error": f"Could not upload {os.path.basename(path)} to ComfyUI."}
+            remote = self._comfyui_uploaded_file_path(server_address, info)
+            if not remote:
+                return {"error": "Uploaded, but StableGen could not find ComfyUI's input folder (/system_stats)."}
+            node_inputs[name] = remote
+            uploaded[name] = {"path": remote, "annotated": "/".join(
+                part for part in (info.get("subfolder", ""), info.get("name", "")) if part)}
+        _set_phase(1, "Upload", 100, "Upload complete")
 
-        image_info = upload_image_to_comfyui(server_address, input_image_path, operator=self.operator)
+        # The tools run in their own processes and need the VRAM ComfyUI keeps for its models.
+        self._flush_comfyui_vram(server_address, label=f"Pre-{label}")
 
-        # Clean up the temp rasterized file after upload
-        if rasterized_tmp:
+        if graph is not None:
+            prompt, out_node = graph(uploaded)
+        else:
+            prompt, out_node = {"1": {"class_type": class_type, "inputs": node_inputs}}, "1"
+        client_id = str(uuid.uuid4())
+        ws = self._connect_to_websocket(server_address, client_id)
+        if ws is None:
+            return {"error": getattr(self, '_error', 'Could not connect to ComfyUI WebSocket.')}
+        ws.settimeout(get_timeout('mesh_gen'))
+        if hasattr(operator, '_active_ws'):
+            operator._active_ws = ws
+            type(operator)._active_ws = ws
+
+        prompt_id = None
+        output_refs = []
+        try:
+            prompt_id = self._queue_prompt(prompt, client_id, server_address)
+            _set_phase(2, label, 0, "Queued on ComfyUI")
+            while True:
+                if _cancelled():
+                    return {"error": "cancelled"}
+                try:
+                    out = ws.recv()
+                except websocket.WebSocketTimeoutException:
+                    print(f"[StableGen] {label}: WebSocket recv timed out; still waiting...")
+                    continue
+                except Exception as ws_err:
+                    if _cancelled():
+                        return {"error": "cancelled"}
+                    return {"error": f"ComfyUI connection failed during {label}: {ws_err}"}
+                if not isinstance(out, str):
+                    continue
+                message = json.loads(out)
+                kind = message.get('type')
+                data = message.get('data', {})
+                if kind == 'executing':
+                    if data.get('prompt_id') != prompt_id:
+                        continue
+                    if data.get('node') is None:
+                        _set_phase(2, label, 100, "Done on the server")
+                        break
+                    stage = _MESHTOOLS_STAGES.get(prompt.get(str(data.get('node')), {}).get('class_type'))
+                    if stage:
+                        _set_phase(2, label, getattr(operator, '_phase_progress', 0.0), stage)
+                elif kind == 'executed':
+                    if data.get('node') == out_node:
+                        output_refs.extend(self._extract_trellis2_file_refs(data.get('output', {})))
+                elif kind == _MESHTOOLS_PROGRESS_EVENT:
+                    if not _message_node_matches(data, out_node):
+                        continue
+                    percent = _progress_percent(data)
+                    if percent is not None:
+                        _set_phase(2, label, max(getattr(operator, '_phase_progress', 0.0), percent),
+                                   str(data.get('stage') or label))
+                elif kind == 'execution_error':
+                    if data.get('prompt_id') not in (None, prompt_id):
+                        continue
+                    return {"error": f"{label} failed: {data.get('exception_message', 'unknown error')}"}
+        finally:
+            if hasattr(operator, '_active_ws'):
+                operator._active_ws = None
+                type(operator)._active_ws = None
             try:
-                os.remove(rasterized_tmp)
-            except OSError:
+                ws.close()
+            except Exception:
                 pass
 
+        if not output_refs and prompt_id and not _cancelled():
+            try:
+                history = json.loads(urllib.request.urlopen(
+                    f"http://{server_address}/history/{prompt_id}", timeout=get_timeout('api')).read())
+                output_refs = self._extract_trellis2_file_refs(
+                    history.get(prompt_id, {}).get("outputs", {}).get(out_node, {}))
+            except Exception as hist_err:
+                print(f"[StableGen] {label}: history lookup failed: {hist_err}")
+
+        for ref in output_refs:
+            if _cancelled():
+                return {"error": "cancelled"}
+            path = ref.get('path') or ''
+            if path and os.path.isfile(path):
+                with open(path, 'rb') as handle:
+                    data = handle.read()
+                if data:
+                    _set_phase(3, "Download", 100, "Result ready")
+                    return data
+            view_url = self._comfyui_view_url_for_file_ref(server_address, ref)
+            if not view_url:
+                continue
+            try:
+                def _download_progress(completed, total, attempt):
+                    _set_phase(3, "Download", completed * 100.0 / total if total else 0.0, "Downloading result")
+
+                data = download_file_with_resume(
+                    view_url, progress_cb=_download_progress, cancel_cb=_cancelled, max_retries=6)
+                if data:
+                    _set_phase(3, "Download", 100, "Download complete")
+                    return data
+            except _TransferCancelled:
+                return {"error": "cancelled"}
+            except Exception as view_err:
+                print(f"[StableGen] {label}: download failed: {view_err}")
+
+        if _cancelled():
+            return {"error": "cancelled"}
+        return {"error": f"{label} finished, but StableGen could not retrieve its GLB."}
+
+    def _generate_trellis2_inner(self, context, input_image_path, server_address, client_id):
+        """Inner implementation of generate_trellis2, called within a try/finally VRAM flush.
+
+        Runs TRELLIS.2 on ComfyUI's native nodes (mesh_gen/trellis2_graph.py) and returns the GLB."""
+        from .._generator_utils import upload_image_to_comfyui
+        from ..core.server_api import fetch_node_info
+        from . import trellis2_graph
+
+        # The image goes up as it is: ImageCropToMask puts the subject on the background colour, and with
+        # background removal skipped the image's own alpha is the mask
+        image_info = upload_image_to_comfyui(server_address, input_image_path, operator=self.operator)
         if image_info is None:
             self.operator._error = f"Failed to upload input image: {input_image_path}"
             return {"error": self.operator._error}
 
         scene = context.scene
         skip_texture = scene.trellis2_skip_texture
-
-        # Load the appropriate workflow template
-        if skip_texture:
-            prompt = json.loads(prompt_text_trellis2_shape_only)
-            NODES = {
-                'input_image': '1',
-                'load_models': '2',
-                'remove_bg': '3',
-                'get_conditioning': '4',
-                'image_to_shape': '5',
-                'simplify': '6',
-                'export_trimesh': '7',
-            }
-            export_node_key = 'export_trimesh'
-        else:
-            prompt = json.loads(prompt_text_trellis2)
-            NODES = {
-                'input_image': '1',
-                'load_models': '2',
-                'remove_bg': '3',
-                'get_conditioning': '4',
-                'image_to_shape': '5',
-                'shape_to_textured_mesh': '6',
-                'process_mesh': '8',
-                'rasterize_pbr': '9',
-                'export_glb': '7',
-            }
-            export_node_key = 'export_glb'
-
-        # Set input image
-        prompt[NODES['input_image']]["inputs"]["image"] = image_info['name']
-
-        # Configure model settings from scene properties
-        prompt[NODES['load_models']]["inputs"]["resolution"] = scene.trellis2_resolution
-        prompt[NODES['load_models']]["inputs"]["precision"] = scene.trellis2_precision
-        prompt[NODES['load_models']]["inputs"]["attn_backend"] = scene.trellis2_attn_backend
-
-        # Configure background removal (or bypass it)
         skip_bg = getattr(scene, 'trellis2_bg_removal', 'auto') == 'skip'
-        if skip_bg:
-            # Remove the RemoveBackground node from the workflow.
-            # Wire GetConditioning to use LoadImage outputs directly:
-            #   LoadImage[0] → image,  LoadImage[1] → mask (alpha channel).
-            # If the input has no alpha, ComfyUI's LoadImage provides an
-            # all-white mask (= entire image is foreground).
-            remove_bg_node_id = NODES.pop('remove_bg')
-            del prompt[remove_bg_node_id]
-            prompt[NODES['get_conditioning']]["inputs"]["image"] = [NODES['input_image'], 0]
-            prompt[NODES['get_conditioning']]["inputs"]["mask"] = [NODES['input_image'], 1]
-        else:
-            prompt[NODES['remove_bg']]["inputs"]["low_vram"] = True
-
-        # Configure conditioning
-        prompt[NODES['get_conditioning']]["inputs"]["background_color"] = scene.trellis2_background_color
-
-        # Configure shape generation
-        seed = scene.trellis2_seed
-        prompt[NODES['image_to_shape']]["inputs"]["seed"] = seed
-        prompt[NODES['image_to_shape']]["inputs"]["ss_guidance_strength"] = scene.trellis2_ss_guidance
-        prompt[NODES['image_to_shape']]["inputs"]["ss_sampling_steps"] = scene.trellis2_ss_steps
-        prompt[NODES['image_to_shape']]["inputs"]["shape_guidance_strength"] = scene.trellis2_shape_guidance
-        prompt[NODES['image_to_shape']]["inputs"]["shape_sampling_steps"] = scene.trellis2_shape_steps
-        prompt[NODES['image_to_shape']]["inputs"]["max_tokens"] = scene.trellis2_max_tokens
-
-        # Configure export with unique prefix for identification
         unique_prefix = f"trellis2_{uuid.uuid4().hex[:8]}"
         autorig_enabled = bool(getattr(scene, 'trellis2_autorig_enabled', False))
         if autorig_enabled and not getattr(scene, 'skintokens_autorig_available', False):
@@ -1301,8 +1348,8 @@ class _Trellis2WorkflowMixin:
                 )
             }
 
-        # When post-processing is disabled, maximize the decimation target
-        # and disable remeshing so the user gets the rawest possible mesh.
+        # QDC remeshing and server decimation run in ComfyUI, the local methods after import. With
+        # post-processing off the user gets the rawest mesh.
         use_pp = getattr(scene, 'trellis2_post_processing_enabled', True)
         decimate_method = getattr(scene, 'trellis2_decimate_method', 'server')
         remesh_method = getattr(scene, 'trellis2_remesh_method', 'qdc')
@@ -1312,99 +1359,40 @@ class _Trellis2WorkflowMixin:
                 "using server-side decimation instead of local collapse decimation"
             )
             decimate_method = 'server'
+        server_remesh = use_pp and remesh_method == 'qdc'
+        server_decimate = use_pp and (server_remesh or decimate_method == 'server')
 
-        if skip_texture:
-            bypass_server_simplify = (not use_pp) or (remesh_method != 'qdc' and decimate_method != 'server')
-            if bypass_server_simplify:
-                # Bypass simplify node entirely: connect export directly to shape generation
-                prompt[NODES['export_trimesh']]["inputs"]["trimesh"] = [NODES['image_to_shape'], 0]
-                # Remove the simplify node from the prompt
-                simplify_id = NODES.get('simplify')
-                if simplify_id and simplify_id in prompt:
-                    del prompt[simplify_id]
-            else:
-                # Post-processing is enabled and uses server-side QDC or decimation
-                if remesh_method == 'qdc':
-                    # Server QDC handles both decimation and remeshing
-                    prompt[NODES['simplify']]["inputs"]["target_face_count"] = scene.trellis2_decimation
-                    prompt[NODES['simplify']]["inputs"]["remesh"] = True
-                elif decimate_method == 'server':
-                    # Server decimation only (no server remesh)
-                    prompt[NODES['simplify']]["inputs"]["target_face_count"] = scene.trellis2_decimation
-                    prompt[NODES['simplify']]["inputs"]["remesh"] = False
-                prompt[NODES['simplify']]["inputs"]["fill_holes"] = False
-            prompt[NODES['export_trimesh']]["inputs"]["filename_prefix"] = unique_prefix
-        else:
-            # Configure texture generation
-            prompt[NODES['shape_to_textured_mesh']]["inputs"]["seed"] = seed
-            prompt[NODES['shape_to_textured_mesh']]["inputs"]["tex_guidance_strength"] = scene.trellis2_tex_guidance
-            prompt[NODES['shape_to_textured_mesh']]["inputs"]["tex_sampling_steps"] = scene.trellis2_tex_steps
- 
-            # Configure GLB export via process/rasterize/export pipeline
-            bypass_server_process = (not use_pp) or (remesh_method != 'qdc' and decimate_method != 'server')
-            if bypass_server_process:
-                # Local decimation and/or local remeshing, or post-processing disabled: bypass server process_mesh entirely
-                prompt[NODES['rasterize_pbr']]["inputs"]["trimesh"] = [NODES['image_to_shape'], 0]
-                process_id = NODES.get('process_mesh')
-                if process_id and process_id in prompt:
-                    del prompt[process_id]
-            else:
-                if remesh_method == 'qdc':
-                    prompt[NODES['process_mesh']]["inputs"]["target_face_count"] = scene.trellis2_decimation
-                    prompt[NODES['process_mesh']]["inputs"]["remesh"] = "on"
-                elif decimate_method == 'server':
-                    prompt[NODES['process_mesh']]["inputs"]["target_face_count"] = scene.trellis2_decimation
-                    prompt[NODES['process_mesh']]["inputs"]["remesh"] = "off"
-            
-            prompt[NODES['rasterize_pbr']]["inputs"]["texture_size"] = scene.trellis2_texture_size
-            prompt[NODES['export_glb']]["inputs"]["filename_prefix"] = unique_prefix
+        budget = None
+        if scene.trellis2_resolution in trellis2_graph.CASCADE_TARGETS:
+            budget = trellis2_graph.budget_mode(
+                fetch_node_info(server_address, "Trellis2UpsampleStage", timeout=get_timeout('api')),
+                fetch_node_info(server_address, trellis2_graph.BUDGET_NODE, timeout=get_timeout('api')))
+            if budget is None:
+                print("[TRELLIS2] This ComfyUI has no voxel budget (installer package 8 adds it): "
+                      "the cascade runs at its full resolution")
 
-        if autorig_enabled:
-            rig_node_id = str(
-                max(int(node_id) for node_id in prompt.keys() if str(node_id).isdigit()) + 1
-            )
-            prompt[rig_node_id] = {
-                "class_type": "StableGenSkinTokensAutoRig",
-                "inputs": {
-                    "input_glb": [NODES[export_node_key], 0],
-                    "input_path": "",
-                    "output_prefix": f"{unique_prefix}_skintokens",
-                    "install_policy": "auto",
-                    "use_transfer": bool(getattr(scene, 'trellis2_autorig_use_transfer', True)),
-                    "use_skeleton": bool(getattr(scene, 'trellis2_autorig_use_skeleton', False)),
-                    "use_postprocess": bool(getattr(scene, 'trellis2_autorig_use_postprocess', False)),
-                    "top_k": int(getattr(scene, 'trellis2_autorig_top_k', 5)),
-                    "top_p": float(getattr(scene, 'trellis2_autorig_top_p', 0.95)),
-                    "temperature": float(getattr(scene, 'trellis2_autorig_temperature', 1.0)),
-                    "repetition_penalty": float(getattr(scene, 'trellis2_autorig_repetition_penalty', 2.0)),
-                    "num_beams": int(getattr(scene, 'trellis2_autorig_num_beams', 10)),
-                    "model_ckpt": getattr(scene, 'trellis2_autorig_model_ckpt', ''),
-                    "hf_path": getattr(scene, 'trellis2_autorig_hf_path', ''),
-                },
-            }
-            NODES['autorig'] = rig_node_id
-            export_node_key = 'autorig'
-            print(f"[TRELLIS2] SkinTokens auto-rigging enabled via node {rig_node_id}")
+        prompt, NODES = trellis2_graph.build_trellis2_prompt(
+            image_info['name'], resolution=scene.trellis2_resolution, seed=scene.trellis2_seed,
+            ss_steps=scene.trellis2_ss_steps, ss_guidance=scene.trellis2_ss_guidance,
+            shape_steps=scene.trellis2_shape_steps, shape_guidance=scene.trellis2_shape_guidance,
+            texture=not skip_texture, tex_steps=scene.trellis2_tex_steps, tex_guidance=scene.trellis2_tex_guidance,
+            texture_size=scene.trellis2_texture_size, remove_background=not skip_bg,
+            background=getattr(scene, 'trellis2_background_color', 'black'), remesh=server_remesh,
+            target_faces=scene.trellis2_decimation if server_decimate else None,
+            max_tokens=scene.trellis2_max_tokens, budget=budget, prefix=unique_prefix)
+        export_node_id = NODES['export']
 
         # Save prompt for debugging
         revision_dir = get_generation_dirs(context).get("revision", "")
         if revision_dir:
             self._save_prompt_to_file(prompt, revision_dir, workflow="trellis2")
 
-        # --- Two-phase VRAM management for textured path ---
-        # NOTE: Two-phase execution (shape first, flush, then texture) was
-        # removed because ComfyUI requires at least one OUTPUT_NODE per prompt
-        # and the shape-only subset has none.  The TRELLIS pipeline stages
-        # handle VRAM management internally (unload_shape_pipeline before
-        # loading texture models), so a single full-prompt submission works.
-
         # Connect WebSocket
         ws = self._connect_to_websocket(server_address, client_id)
         if ws is None:
             return {"error": "conn_failed"}
 
-        # TRELLIS.2 simplification / post-processing can take several
-        # minutes without sending any WS messages.  Use the user-
+        # Remeshing and UV unwrapping can take minutes without sending any WS messages.  Use the user-
         # configurable mesh generation timeout.
         ws.settimeout(get_timeout('mesh_gen'))
 
@@ -1418,81 +1406,38 @@ class _Trellis2WorkflowMixin:
             # Queue prompt
             prompt_id = self._queue_prompt(prompt, client_id, server_address)
 
-            # Node-level progress (isolated subprocess doesn't emit within-node progress)
-            # Weights approximate actual time spent per node
-            if skip_texture:
-                NODE_PROGRESS = {
-                    NODES['input_image']:        1,
-                    NODES['load_models']:        2,
-                    NODES['get_conditioning']:   8,
-                    NODES['image_to_shape']:     10,
-                    NODES['simplify']:           85,
-                    NODES['export_trimesh']:     95,
-                }
-                if not skip_bg:
-                    NODE_PROGRESS[NODES['remove_bg']] = 5
-            else:
-                # Full textured pipeline (single submission)
-                NODE_PROGRESS = {
-                    NODES['input_image']:              1,
-                    NODES['load_models']:              2,
-                    NODES['get_conditioning']:         8,
-                    NODES['image_to_shape']:           10,
-                    NODES['shape_to_textured_mesh']:   50,
-                    NODES['process_mesh']:             85,
-                    NODES['rasterize_pbr']:            92,
-                    NODES['export_glb']:               98,
-                }
-                if not skip_bg:
-                    NODE_PROGRESS[NODES['remove_bg']] = 5
-            if autorig_enabled:
-                NODE_PROGRESS[NODES['autorig']] = 5
-
-            # Wait for execution to complete via WebSocket
-            # Also capture 'executed' events which may contain the output path
-            export_node_id = NODES[export_node_key]
+            # Phase progress at the start of each node; every sampler reports its own steps
+            NODE_PROGRESS = trellis2_graph.progress_weights(NODES)
+            roles = {node_id: role for role, node_id in NODES.items()}
             glb_output_refs = []
+            current = None
 
-            # Friendly node labels for the progress bars
-            NODE_LABELS = {
-                'input_image':              'Loading Image',
-                'load_models':              'Loading Models',
-                'remove_bg':                'Removing Background',
-                'get_conditioning':         'Conditioning',
-                'image_to_shape':           'Generating Shape',
-                'shape_to_textured_mesh':   'Generating Texture',
-                'process_mesh':             'Processing Mesh',
-                'rasterize_pbr':            'Rasterizing PBR',
-                'simplify':                 'Simplifying Mesh',
-                'export_trimesh':           'Exporting Mesh',
-                'export_glb':               'Exporting GLB',
-                'autorig':                  'Auto-Rigging',
-            }
+            def _label(node_id):
+                return trellis2_graph.LABELS.get(roles.get(node_id), roles.get(node_id, str(node_id)))
 
-            # Build a lookup of known step counts so we can identify
-            # which sampling sub-phase a within-node progress event
-            # belongs to (the TRELLIS nodes may emit separate runs of
-            # progress events for SS, shape, and texture sampling).
-            _ss_steps    = scene.trellis2_ss_steps
-            _shape_steps = scene.trellis2_shape_steps
-            _tex_steps   = getattr(scene, 'trellis2_tex_steps', 0)
-            _resolution  = getattr(scene, 'trellis2_resolution', '1024_cascade')
-            _is_cascade  = _resolution in ('1024_cascade', '1536_cascade')
-            _current_exec_node = None  # node-key of the currently executing node
-            _current_exec_node_id = None  # node-id of the currently executing node
+            def _start(node_id):
+                nonlocal current
+                current = node_id
+                label = _label(node_id)
+                print(f"[TRELLIS2] Executing: {label}")
+                self.operator._phase_stage = f"TRELLIS.2: {label}"
+                if node_id in NODE_PROGRESS:
+                    self.operator._phase_progress = max(self.operator._phase_progress, NODE_PROGRESS[node_id])
+                    if hasattr(self.operator, '_update_overall'):
+                        self.operator._update_overall()
+                self.operator._detail_stage = label
+                self.operator._detail_progress = 0
 
-            # Track accumulated sub-phases within a node so we can
-            # compute a node-internal overall progress.
-            _sub_phase_idx = 0     # resets when the executing node changes
-            _sub_phase_count = 1   # how many sub-phases this node has
-            _prev_p_value = 0      # track previous step value to detect restarts
+            def _next_weight(node_id):
+                later = [w for w in NODE_PROGRESS.values() if w > NODE_PROGRESS[node_id]]
+                return min(later) if later else 100
 
             while True:
                 try:
                     out = ws.recv()
                 except websocket.WebSocketTimeoutException:
                     # Timeout on recv — server is still alive but a heavy
-                    # step (e.g. simplification) took longer than expected.
+                    # step (e.g. remeshing) took longer than expected.
                     # Keep waiting instead of treating it as a crash.
                     print("[TRELLIS2] WebSocket recv timed out — "
                           "server may still be processing. Retrying...")
@@ -1506,241 +1451,65 @@ class _Trellis2WorkflowMixin:
                     return {"error": (
                         "ComfyUI server crashed during TRELLIS.2 generation "
                         "(likely VRAM exhaustion). Please restart ComfyUI, "
-                        "reduce max_tokens or resolution, and try again."
+                        "lower the resolution or the sparse voxel budget, and try again."
                     )}
-                if isinstance(out, str):
-                    message = json.loads(out)
+                if not isinstance(out, str):
+                    continue
+                message = json.loads(out)
+                data = message.get('data', {})
 
-                    if message['type'] == 'executing':
-                        data = message['data']
-                        if data.get('prompt_id') == prompt_id:
-                            if data['node'] is None:
-                                self.operator._phase_progress = 100
-                                self.operator._detail_progress = 100
-                                if hasattr(self.operator, '_update_overall'):
-                                    self.operator._update_overall()
-                                break  # Execution complete
-                            else:
-                                node_id = data['node']
-                                node_names = {v: k for k, v in NODES.items()}
-                                node_key = node_names.get(node_id, node_id)
-                                node_label = NODE_LABELS.get(node_key, node_key)
-                                print(f"[TRELLIS2] Executing: {node_label}")
-                                if autorig_enabled and node_key == 'autorig':
-                                    autorig_phase = getattr(self.operator, '_autorig_phase', 0)
-                                    if autorig_phase:
-                                        if getattr(self.operator, '_current_phase', 0) != autorig_phase:
-                                            self.operator._phase_progress = 100
-                                            if hasattr(self.operator, '_update_overall'):
-                                                self.operator._update_overall()
-                                            self.operator._current_phase = autorig_phase
-                                            self.operator._phase_progress = 0
-                                        total_phases = getattr(self.operator, '_total_phases', autorig_phase)
-                                        self.operator._overall_stage = (
-                                            f"Phase {autorig_phase}/{total_phases}: Auto-Rigging"
-                                        )
-                                    self.operator._phase_stage = "Auto-Rigging"
-                                else:
-                                    self.operator._phase_stage = f"TRELLIS.2: {node_label}"
-                                # Update progress based on node weight
-                                if node_id in NODE_PROGRESS:
-                                    self.operator._phase_progress = max(self.operator._phase_progress, NODE_PROGRESS[node_id])
-                                    if hasattr(self.operator, '_update_overall'):
-                                        self.operator._update_overall()
-                                self.operator._detail_stage = node_label
-                                self.operator._detail_progress = 0
+                if message['type'] == 'executing':
+                    if data.get('prompt_id') == prompt_id:
+                        if data['node'] is None:
+                            self.operator._phase_progress = 100
+                            self.operator._detail_progress = 100
+                            if hasattr(self.operator, '_update_overall'):
+                                self.operator._update_overall()
+                            break  # Execution complete
+                        if data['node'] != current:
+                            _start(data['node'])
 
-                                # Reset sub-phase tracking for the new node if not already transitioned
-                                if node_id != _current_exec_node_id:
-                                    _current_exec_node = node_key
-                                    _current_exec_node_id = node_id
-                                    _sub_phase_idx = 0
-                                    _prev_p_value = 0
-                                    if node_key == 'image_to_shape':
-                                        # SS sampling + SLat base (+ SLat cascade if cascade resolution)
-                                        _sub_phase_count = 3 if _is_cascade else 2
-                                    elif node_key == 'shape_to_textured_mesh':
-                                        _sub_phase_count = 1
-                                    else:
-                                        _sub_phase_count = 1
+                elif message['type'] == 'executed':
+                    # Capture output from export node (newer ComfyUI versions)
+                    if data.get('node') == export_node_id:
+                        ws_output = data.get('output', {})
+                        if ws_output:
+                            refs = self._extract_trellis2_file_refs(ws_output)
+                            if refs:
+                                glb_output_refs.extend(refs)
+                                print(
+                                    "[TRELLIS2] Got file reference from WS "
+                                    f"executed event: {self._describe_trellis2_file_ref(refs[0])}"
+                                )
 
-                    elif message['type'] == 'executed':
-                        # Capture output from export node (newer ComfyUI versions)
-                        data = message.get('data', {})
-                        if data.get('node') == export_node_id:
-                            ws_output = data.get('output', {})
-                            if ws_output:
-                                refs = self._extract_trellis2_file_refs(ws_output)
-                                if refs:
-                                    glb_output_refs.extend(refs)
-                                    print(
-                                        "[TRELLIS2] Got file reference from WS "
-                                        f"executed event: {self._describe_trellis2_file_ref(refs[0])}"
-                                    )
-
-                    elif message['type'] == _SKINTOKENS_PROGRESS_EVENT:
-                        if not autorig_enabled:
+                elif message['type'] == 'progress':
+                    # Within-node progress (sampler steps, remeshing, unwrapping)
+                    if data.get('prompt_id') not in (None, prompt_id):
+                        continue
+                    node_id = data.get('node')
+                    if node_id and node_id != current:
+                        if node_id not in NODE_PROGRESS:
                             continue
-                        p_data = message.get('data', {})
-                        autorig_node_id = NODES.get('autorig')
-                        if not _message_node_matches(p_data, autorig_node_id):
-                            continue
-                        expected_run_id = f"{unique_prefix}_skintokens"
-                        if str(p_data.get('run_id') or '') != expected_run_id:
-                            continue
-
-                        autorig_phase = getattr(self.operator, '_autorig_phase', 0)
-                        if autorig_phase:
-                            if getattr(self.operator, '_current_phase', 0) != autorig_phase:
-                                self.operator._current_phase = autorig_phase
-                                self.operator._phase_progress = 0
-                            total_phases = getattr(
-                                self.operator, '_total_phases', autorig_phase)
-                            self.operator._overall_stage = (
-                                f"Phase {autorig_phase}/{total_phases}: Auto-Rigging"
-                            )
-
-                        percent = _progress_percent(p_data)
-                        if percent is not None:
-                            self.operator._phase_progress = max(
-                                self.operator._phase_progress, percent)
-                            self.operator._detail_progress = percent
-                        stage = str(p_data.get('stage') or 'Auto-Rigging').strip()
-                        detail = str(p_data.get('detail') or '').strip()
-                        self.operator._phase_stage = stage
-                        self.operator._detail_stage = detail or stage
+                        _start(node_id)  # the 'executing' event may arrive late
+                    value, maximum = data.get('value', 0), data.get('max', 0)
+                    if not maximum:
+                        continue
+                    step_progress = value * 100.0 / maximum
+                    self.operator._detail_progress = step_progress
+                    self.operator._detail_stage = f"{_label(current)}: Step {value}/{maximum}"
+                    if current in NODE_PROGRESS:
+                        base = NODE_PROGRESS[current]
+                        self.operator._phase_progress = max(
+                            self.operator._phase_progress,
+                            base + (_next_weight(current) - base) * step_progress / 100.0)
                         if hasattr(self.operator, '_update_overall'):
                             self.operator._update_overall()
 
-                    elif message['type'] == 'progress':
-                        # Within-node progress (sampler steps).
-                        # TRELLIS.2 nodes may emit separate runs of progress
-                        # events for each internal sampling phase.  We detect
-                        # the sub-phase transition by checking if the progress
-                        # value decreased (restarted), which works even when the
-                        # step counts (max) of different sub-phases are identical.
-                        p_data = message['data']
-                        # Only process progress for the currently executing node to prevent
-                        # stray progress events from corrupting our stateful sub-phase tracking.
-                        p_node = p_data.get('node')
-                        # If the progress event is for a new node, transition to it immediately.
-                        # This prevents timing races where the 'executing' event is delayed.
-                        if p_node and p_node != _current_exec_node_id and p_node in NODE_PROGRESS:
-                            _current_exec_node_id = p_node
-                            node_names = {v: k for k, v in NODES.items()}
-                            _current_exec_node = node_names.get(p_node, p_node)
-                            node_label = NODE_LABELS.get(_current_exec_node, _current_exec_node)
-                            print(f"[TRELLIS2] Early transition to node {_current_exec_node} via progress event")
-                            if autorig_enabled and _current_exec_node == 'autorig':
-                                autorig_phase = getattr(self.operator, '_autorig_phase', 0)
-                                if autorig_phase:
-                                    if getattr(self.operator, '_current_phase', 0) != autorig_phase:
-                                        self.operator._phase_progress = 0
-                                    self.operator._current_phase = autorig_phase
-                                    total_phases = getattr(self.operator, '_total_phases', autorig_phase)
-                                    self.operator._overall_stage = (
-                                        f"Phase {autorig_phase}/{total_phases}: Auto-Rigging"
-                                    )
-                                self.operator._phase_stage = "Auto-Rigging"
-                            else:
-                                self.operator._phase_stage = f"TRELLIS.2: {node_label}"
-                            self.operator._detail_stage = node_label
-                            self.operator._detail_progress = 0
-
-                            # Reset sub-phase tracking
-                            _sub_phase_idx = 0
-                            _prev_p_value = 0
-                            if _current_exec_node == 'image_to_shape':
-                                _sub_phase_count = 3 if _is_cascade else 2
-                            else:
-                                _sub_phase_count = 1
-
-                        if p_node and p_node != _current_exec_node_id:
-                            continue
-
-                        p_value = p_data['value']
-                        p_max   = p_data['max']
-
-                        # Filter out any progress updates that do not match the expected sampler steps.
-                        # This eliminates high-level node progress (p_max=3) and stray tiled convolution tqdm progress (e.g. p_max=5 or p_max=37).
-                        if _current_exec_node == 'image_to_shape':
-                            if p_max not in (_ss_steps, _shape_steps):
-                                continue
-                        elif _current_exec_node == 'shape_to_textured_mesh':
-                            if p_max != _tex_steps:
-                                continue
-
-                        step_progress = (p_value / p_max) * 100 if p_max else 0
-
-                        if _current_exec_node == 'autorig':
-                            self.operator._phase_progress = max(
-                                self.operator._phase_progress, step_progress)
-                            self.operator._detail_progress = step_progress
-                            if not self.operator._detail_stage:
-                                self.operator._detail_stage = "Auto-Rigging"
-                            if hasattr(self.operator, '_update_overall'):
-                                self.operator._update_overall()
-                            continue
-
-                        # Detect sub-phase transition
-                        if p_value < _prev_p_value:
-                            _sub_phase_idx = min(_sub_phase_idx + 1, _sub_phase_count - 1)
-                            print(f"[TRELLIS2] Sub-phase restart detected. Transitioning to sub-phase index {_sub_phase_idx}")
-                        _prev_p_value = p_value
-
-                        # ── Sub-phase identification ──
-                        sub_label = ""
-                        if _current_exec_node == 'image_to_shape':
-                            if _sub_phase_idx == 0:
-                                sub_label = "Sampling SS"
-                            elif _sub_phase_idx == 1:
-                                sub_label = "Sampling Shape SLat LR" if _is_cascade else "Sampling Shape SLat"
-                            else:
-                                sub_label = "Sampling Shape SLat HR"
-                        elif _current_exec_node == 'shape_to_textured_mesh':
-                            sub_label = "Sampling Texture"
-                        else:
-                            sub_label = "Processing"
-
-                        # Compute node-internal overall progress accounting for weighted sub-phases.
-                        # SS sampling is very fast, SLat Base is medium, SLat Cascade is slow.
-                        if _current_exec_node == 'image_to_shape':
-                            sub_weights = [10, 40, 50] if _is_cascade else [15, 85]
-                        else:
-                            sub_weights = [100]
-
-                        idx = min(_sub_phase_idx, len(sub_weights) - 1)
-                        completed_progress = sum(sub_weights[:idx])
-                        current_weight = sub_weights[idx]
-                        node_overall = completed_progress + (step_progress / 100.0) * current_weight
-
-                        if step_progress != 0:
-                            self.operator._detail_progress = step_progress
-                            self.operator._detail_stage = (
-                                f"{sub_label}: Step {p_value}/{p_max}"
-                            )
-                            # Interpolate the overall phase progress dynamically based on node_overall
-                            if _current_exec_node_id in NODE_PROGRESS:
-                                base_pct = NODE_PROGRESS[_current_exec_node_id]
-                                sorted_pcts = sorted(list(NODE_PROGRESS.values()))
-                                try:
-                                    idx = sorted_pcts.index(base_pct)
-                                    next_pct = sorted_pcts[idx + 1] if idx + 1 < len(sorted_pcts) else 100
-                                except (ValueError, IndexError):
-                                    next_pct = base_pct + 10  # fallback
-                                span = next_pct - base_pct
-                                new_phase_pct = base_pct + (node_overall / 100.0) * span
-                                self.operator._phase_progress = max(self.operator._phase_progress, new_phase_pct)
-                                if hasattr(self.operator, '_update_overall'):
-                                    self.operator._update_overall()
-                            print(f"[TRELLIS2] {sub_label}: Step {p_value}/{p_max} ({step_progress:.0f}%)")
-
-                    elif message['type'] == 'execution_error':
-                        error_data = message.get('data', {})
-                        error_msg = error_data.get('exception_message', 'Unknown error')
-                        self.operator._error = f"TRELLIS.2 execution error: {error_msg}"
-                        print(f"[TRELLIS2] Error: {self.operator._error}")
-                        return {"error": self.operator._error}
+                elif message['type'] == 'execution_error':
+                    error_msg = data.get('exception_message', 'Unknown error')
+                    self.operator._error = f"TRELLIS.2 execution error: {error_msg}"
+                    print(f"[TRELLIS2] Error: {self.operator._error}")
+                    return {"error": self.operator._error}
         finally:
             if hasattr(self.operator, '_active_ws'):
                 self.operator._active_ws = None

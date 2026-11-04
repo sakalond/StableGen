@@ -486,7 +486,7 @@ class StableGenPanel(bpy.types.Panel):
             elif not getattr(scene, 'trellis2_available', False):
                 split = action_row.split(factor=0.8)
                 err_sub = split.row()
-                err_sub.operator("object.trellis2_generate", text="TRELLIS.2 nodes not found", icon="ERROR")
+                err_sub.operator("object.trellis2_generate", text="TRELLIS.2 needs ComfyUI 0.42+", icon="ERROR")
                 err_sub.enabled = False
                 split.operator("stablegen.check_server_status", text="", icon="FILE_REFRESH")
             else:
@@ -824,12 +824,12 @@ class StableGenPanel(bpy.types.Panel):
 
             if is_trellis2:
                 # --- TRELLIS.2 specific layout ---
-                # Warning if TRELLIS.2 nodes not detected
+                # Warning if ComfyUI has no native TRELLIS.2 nodes
                 if not getattr(scene, 'trellis2_available', False):
                     warn_row = params_container.row()
                     warn_row.alert = True
                     warn_split = warn_row.split(factor=0.9)
-                    warn_split.label(text="TRELLIS.2 nodes not detected on server", icon="ERROR")
+                    warn_split.label(text="TRELLIS.2 needs ComfyUI 0.42 or newer", icon="ERROR")
                     warn_split.operator("stablegen.check_server_status", text="", icon="FILE_REFRESH")
 
                 # Generate From toggle (Image / Prompt)
@@ -1024,14 +1024,6 @@ class StableGenPanel(bpy.types.Panel):
                     split = content_box.split(factor=0.5)
                     split.label(text="Resolution:")
                     split.prop(scene, "trellis2_resolution", text="")
-
-                    split = content_box.split(factor=0.5)
-                    split.label(text="Precision:")
-                    split.prop(scene, "trellis2_precision", text="")
-
-                    split = content_box.split(factor=0.5)
-                    split.label(text="Attention:")
-                    split.prop(scene, "trellis2_attn_backend", text="")
 
                     content_box.separator()
 
