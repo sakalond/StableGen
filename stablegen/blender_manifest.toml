@@ -47,5 +47,5 @@ wheels = [
 ]
 
 [permissions]
-network = "Connects to ComfyUI for AI generation, and downloads ComfyUI, Python packages and models when you install them"
-files = "Saves generated textures, 3D meshes, PBR maps and exported GIFs, and installs ComfyUI and models into the folders you choose"
+network = "Connects to ComfyUI and downloads ComfyUI, packages and models"
+files = "Saves generated assets and installs ComfyUI and its models"
