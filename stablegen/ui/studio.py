@@ -2413,8 +2413,9 @@ class StudioSession:
         p.text(note, x + width - p.measure(note, 10) - 2, y + 1, 10, 'muted')
         y += 17
         target = self.object_prompt if self.object_prompt in dict(seen) else None
-        # The selected object's rename button ends the first row; the tags leave room for it
-        tags_width = width - 30 if target else width
+        # The selected object's rename button ends the first row. That row always leaves room for it, so selecting a
+        # tag moves no tag; the rows below use the whole width
+        row_end = x + width - 28
         tx, ty = x, y
         for name, share in sorted(seen, key=lambda item: (item[0] not in described, -item[1])):
             label = f'{share:.1%}' if share < .01 else f'{share:.0%}'
@@ -2424,11 +2425,11 @@ class StudioSession:
             if renaming:
                 # While renamed, the tag is its object's name field, growing with the name
                 tag_width = max(tag_width, p.measure(renaming['buffer'].text) + 2 * TEXT_PADDING + 8)
-            if tx > x and tx + tag_width > x + tags_width:
-                tx, ty = x, ty + 22
+            if tx > x and tx + tag_width > row_end:
+                tx, ty, row_end = x, ty + 22, x + width
             key = 'object-prompt:' + name
             if renaming:
-                rect = (tx, ty - 2, min(tag_width, x + tags_width - tx), 22)
+                rect = (tx, ty - 2, min(tag_width, row_end - tx), 22)
                 lines, scroll = p.text_field(rename_key, rect, renaming['buffer'].text, ('edit', renaming['binding'], False),
                                              editing=renaming['buffer'], hint='Enter renames · Esc cancels')
                 renaming.update(rect=rect, lines=lines, scroll=scroll)
