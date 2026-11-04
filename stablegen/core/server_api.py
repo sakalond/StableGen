@@ -140,6 +140,33 @@ def check_skintokens_autorig_available(server_address, timeout=1.0):
         return False
 
 
+MESHTOOLS_NODES = {
+    'lato2': 'LATO2Remesh',         # ComfyUI-LATO2
+}
+
+
+def check_meshtools_available(server_address, timeout=1.0):
+    """Which mesh tool nodes ComfyUI has: {'lato2': bool}."""
+    found = {tool: False for tool in MESHTOOLS_NODES}
+    if not server_address:
+        return found
+    for tool, node_class in MESHTOOLS_NODES.items():
+        try:
+            response = requests.get(f"http://{server_address}/object_info/{node_class}", timeout=timeout)
+            found[tool] = response.status_code == 200 and node_class in response.json()
+        except Exception as e:
+            print(f"[MeshTools] Auto-detect of {node_class} failed: {e}")
+            break
+    print(f"[MeshTools] Auto-detect: {', '.join(t for t, ok in found.items() if ok) or 'no nodes'} found.")
+    return found
+
+
+def apply_meshtools_available(scene, found):
+    """Store a check_meshtools_available() result on the scene."""
+    found = found or {}
+    scene.meshtools_lato2_available = bool(found.get('lato2', False))
+
+
 def fetch_node_info(server_address, node_class, timeout=1.0):
     """Return a node's ``/object_info`` entry, or ``None`` if it is not installed."""
     if not server_address:

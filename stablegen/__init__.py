@@ -132,6 +132,7 @@ classes = [
     StableGenApplyBoneDisplay,
     StableGenAutoRigSelectedMesh,
     StableGenLocalPostProcess,
+    StableGenLato2Remesh,
     TRELLIS2_OT_BatchSelectFolder,
     TRELLIS2_OT_BatchGenerate,
     TRELLIS2_OT_BatchCancel,

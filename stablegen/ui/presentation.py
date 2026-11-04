@@ -27,6 +27,7 @@ SECTION_INFO = {
     'show_texturing_experiments': ('Experimental Texturing', 'DEBUG', 'EXPERIMENTAL'),
     'show_trellis2_mesh_settings': ('Mesh & Post-Processing', 'MESH', 'MESH_DATA'),
     'show_trellis2_autorig_settings': ('Rigging & Animation', 'MESH', 'ARMATURE_DATA'),
+    'show_meshtools': ('Low-poly remesh (LATO.2)', 'TOOLS', 'MOD_REMESH'),     # any mesh: with the tools
     'show_trellis2_texture_settings': ('Native Textures', 'MESH', 'TEXTURE'),
     'show_trellis2_camera_settings': ('Camera Placement', 'CAMERAS', 'CAMERA_DATA'),
 }

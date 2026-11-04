@@ -1939,9 +1939,12 @@ class StudioSession:
     def draw_tools(self, p, x, y, width):
         y = self.draw_actions(p, 'Scene setup', [
             ('object.add_hdri', 'Add HDRI lighting', 'light')], x, y, width)
+        lato2 = next((s for s in self.document.sections if s.key == 'show_meshtools'), None)
         for section in self.document.sections:
             if section.key in TOOL_SECTIONS:
                 y = self.draw_section(p, section, x, y, width)
+                if section.key == 'mesh_tools' and lato2 is not None:     # LATO.2 remeshes any mesh
+                    y = self.draw_section(p, lato2, x, y, width)
         y = self.draw_actions(p, 'Import & batch', [
             ('stablegen.import_dae', 'Import DAE', 'download'),
             ('stablegen.batch_import_dae', 'Batch import DAE', 'folder'),

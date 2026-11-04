@@ -1011,10 +1011,24 @@ class StableGenPanel(bpy.types.Panel):
                         if rem_method == 'quadriflow':
                             row = content_box.row()
                             row.label(text="Note: Quadriflow is experimental and might produce artifacts.", icon="WARNING")
+                        elif rem_method == 'lato2':
+                            row = content_box.row(align=True)
+                            row.prop(scene, "meshtools_lato2_vertices", text="LATO.2 Vertices")
+                            if not getattr(scene, 'meshtools_lato2_available', False):
+                                from ..mesh_gen.meshtools import lato2_missing
+                                content_box.label(text=lato2_missing()[0], icon="ERROR")
+                            elif scene.trellis2_texture_mode == 'native':
+                                content_box.label(text="LATO.2 drops native TRELLIS.2 textures; it is skipped in this mode.", icon="INFO")
 
                         row = content_box.row()
                         row.prop(scene, "trellis2_solidify", text="Solidify Mesh")
-
+                        if scene.trellis2_solidify:
+                            row = content_box.row()
+                            row.prop(scene, "trellis2_solidify_seal_bottom")
+                        # the same settings on a mesh that already exists (the box keeps its progress with it)
+                        _draw_meshtool_button(context, content_box.box(), 'OBJECT_OT_stablegen_local_postprocess',
+                                              "object.stablegen_local_postprocess", "Post-Process Active Mesh",
+                                              "MODIFIER", "Cancel Post-Processing")
 
 
                     content_box.separator()
@@ -1178,6 +1192,11 @@ class StableGenPanel(bpy.types.Panel):
                         row.prop(scene, "trellis2_autorig_model_ckpt", text="Rig checkpoint path")
                         row = content_box.row()
                         row.prop(scene, "trellis2_autorig_hf_path", text="Hugging Face model path")
+
+            # --- LATO.2 low-poly remesh (ComfyUI-LATO2): any mesh, so every architecture; the Tools tab in the panel ---
+            content_box = draw_collapsible_section(advanced_params_box, "show_meshtools", "Low-Poly Remesh (LATO.2)", icon="MOD_REMESH")
+            if content_box:
+                draw_meshtools_section(context, content_box)
 
             # --- TRELLIS.2: Native Texture Settings ---
             if is_trellis2 and trellis2_tex_mode == 'native':

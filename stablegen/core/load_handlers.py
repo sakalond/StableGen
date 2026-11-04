@@ -233,6 +233,8 @@ def load_handler(dummy, _second=None, file_loaded=True):
         if server_address:
             from .server_api import (
                 check_pbr_available,
+                check_meshtools_available,
+                apply_meshtools_available,
                 check_skintokens_autorig_available,
                 check_trellis2_available,
             )
@@ -245,6 +247,7 @@ def load_handler(dummy, _second=None, file_loaded=True):
                 result['trellis2'] = check_trellis2_available(server_address, timeout=_timeout)
                 result['pbr'] = check_pbr_available(server_address, timeout=_timeout)
                 result['skintokens'] = check_skintokens_autorig_available(server_address, timeout=_timeout)
+                result['meshtools'] = check_meshtools_available(server_address, timeout=_timeout)
                 return result
 
             def _apply_node_result(result):
@@ -254,5 +257,6 @@ def load_handler(dummy, _second=None, file_loaded=True):
                     bpy.context.scene.trellis2_available = result.get('trellis2', False)
                     bpy.context.scene.pbr_nodes_available = result.get('pbr', False)
                     bpy.context.scene.skintokens_autorig_available = result.get('skintokens', False)
+                    apply_meshtools_available(bpy.context.scene, result.get('meshtools'))
 
             _state._run_async(_check_nodes, _apply_node_result)

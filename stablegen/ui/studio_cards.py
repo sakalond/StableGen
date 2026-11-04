@@ -147,6 +147,15 @@ SCHEMAS = {
              'trellis2_autorig_temperature', 'trellis2_autorig_repetition_penalty', 'trellis2_autorig_num_beams')),
         Spec('checkpoint', 'Rig model', 'settings', ('trellis2_autorig_model_ckpt', 'trellis2_autorig_hf_path')),
     ),
+    'show_meshtools': (
+        Spec('lato2', 'Remesh the selected mesh', 'modifier', ('meshtools_lato2_vertices', 'meshtools_lato2_seed',
+             'meshtools_hide_source', 'op:object.stablegen_lato2_remesh'),
+             rows=(('meshtools_lato2_vertices', 'meshtools_lato2_seed'),),
+             description='Generated low-poly topology, 200 to 5000 vertices, imported next to the source.'),
+        # while the server has no LATO.2: what would bring it (a restart, the setup, the server's installer)
+        Spec('lato2_missing', 'LATO.2 on the server', 'server', ('op:stablegen.comfy_restart', 'op:stablegen.open_setup',
+             'op:stablegen.comfy_copy_install_command', 'op:stablegen.check_server_status')),
+    ),
     'show_trellis2_texture_settings': (
         Spec('texture', 'Native texture generation', 'layers', ('trellis2_tex_guidance',
              'trellis2_tex_steps', 'trellis2_texture_size', 'trellis2_auto_lighting')),

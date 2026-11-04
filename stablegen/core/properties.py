@@ -1491,6 +1491,28 @@ def register_properties(update_model_list, ControlNetUnit, LoRAUnit,
         description="Whether the StableGen SkinTokens auto-rig node is available on the ComfyUI server (auto-detected)",
         default=False
     )
+    # ── Mesh tools (ComfyUI-LATO2) ──────────────────────────────────────
+    bpy.types.Scene.meshtools_lato2_available = bpy.props.BoolProperty(
+        name="LATO.2 Available",
+        description="Whether ComfyUI-LATO2's LATO2Remesh node is available on the ComfyUI server (auto-detected)",
+        default=False
+    )
+    bpy.types.Scene.show_meshtools = bpy.props.BoolProperty(
+        name="Show Mesh Tools", description="Toggle the mesh tools section", default=False
+    )
+    bpy.types.Scene.meshtools_hide_source = bpy.props.BoolProperty(
+        name="Hide Source",
+        description="Hide the source object after a remeshed or edited copy is imported",
+        default=True
+    )
+    bpy.types.Scene.meshtools_lato2_vertices = bpy.props.IntProperty(
+        name="Vertices",
+        description="Target vertex count of the low-poly mesh (LATO.2 generates 200 to 5000 vertices)",
+        default=2000, min=200, max=5000, step=100
+    )
+    bpy.types.Scene.meshtools_lato2_seed = bpy.props.IntProperty(
+        name="Seed", description="Random seed for LATO.2", default=42, min=0
+    )
     bpy.types.Scene.show_trellis2_params = bpy.props.BoolProperty(
         name="Show TRELLIS.2 Section", description="Toggle TRELLIS.2 Image-to-3D section", default=False
     )
@@ -1720,6 +1742,7 @@ def register_properties(update_model_list, ControlNetUnit, LoRAUnit,
             ('none', "None (Trimesh)", "Keep triangles (raw or decimated) - no retopology solver"),
             ('qdc', "QDC (Server)", "Quad Dual Contouring - uniform server-side quad remeshing (handles both decimation and remeshing natively)"),
             ('quadriflow', "Quadriflow (Local) [Experimental]", "Curvature-adaptive local quad retopology in Blender (Zero-dependency). Note: Experimental, might produce artifacts"),
+            ('lato2', "LATO.2 Low-Poly (Server)", "Rebuild the mesh with generated low-poly topology (200 to 5000 vertices) on the ComfyUI server; needs the LATO.2 package (ComfyUI-LATO2). Shape-only and diffusion texturing, not native TRELLIS.2 textures"),
         ],
         default='qdc',
         update=update_parameters
@@ -1733,6 +1756,14 @@ def register_properties(update_model_list, ControlNetUnit, LoRAUnit,
         name="Solidify Mesh",
         description="Apply watertight capping and hollowing to delete internal geometry, saving UV and texture space",
         default=False, update=update_parameters
+    )
+    bpy.types.Scene.trellis2_solidify_seal_bottom = bpy.props.BoolProperty(
+        name="Close Bottom Openings",
+        description=(
+            "Treat the object's underside as closed while finding interior geometry, so a hollow mesh open at "
+            "the bottom (outer and inner shell joined at the rim) becomes solid with a capped bottom"
+        ),
+        default=True, update=update_parameters
     )
     bpy.types.Scene.trellis2_autorig_enabled = bpy.props.BoolProperty(
         name="Auto-Rig",
@@ -2344,7 +2375,7 @@ def unregister_properties(load_handler, _sg_queue_load_handler):
         'trellis2_texture_size', 'trellis2_decimation', 'trellis2_remesh',
         'trellis2_decimate_method', 'trellis2_remesh_method',
         'trellis2_post_processing_enabled',
-        'trellis2_solidify',
+        'trellis2_solidify', 'trellis2_solidify_seal_bottom',
         'trellis2_autorig_enabled', 'trellis2_autorig_use_transfer',
         'trellis2_autorig_use_skeleton', 'trellis2_autorig_use_postprocess',
         'trellis2_autorig_cleanup_cross_limb_weights',
@@ -2356,6 +2387,8 @@ def unregister_properties(load_handler, _sg_queue_load_handler):
         'trellis2_autorig_hf_path',
         'trellis2_auto_lighting',
         'trellis2_skip_texture', 'trellis2_bg_removal', 'trellis2_background_color',
+        'meshtools_lato2_available', 'show_meshtools', 'meshtools_hide_source', 'meshtools_lato2_vertices',
+        'meshtools_lato2_seed',
     ]
     for prop in trellis2_props:
         if hasattr(bpy.types.Scene, prop):

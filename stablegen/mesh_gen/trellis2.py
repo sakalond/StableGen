@@ -1773,7 +1773,9 @@ class Trellis2Generate(bpy.types.Operator):
                 for obj in imported_meshes:
                     try:
                         print(f"[TRELLIS2] Solidifying mesh: {obj.name} before decimation/retopology...")
-                        solid_mesh = _make_solid_mesh_object(obj)
+                        solid_mesh = _make_solid_mesh_object(
+                            obj, require_printable=False,
+                            seal_bottom=getattr(context.scene, "trellis2_solidify_seal_bottom", True))
                         old_mesh = obj.data
                         obj.data = solid_mesh
                         bpy.data.meshes.remove(old_mesh)

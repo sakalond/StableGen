@@ -19,6 +19,8 @@ from .server_api import (
     _fetch_api_list,
     check_pbr_available,
     check_server_availability,
+    check_meshtools_available,
+    apply_meshtools_available,
     check_skintokens_autorig_available,
     check_trellis2_available,
 )
@@ -407,10 +409,12 @@ class CheckServerStatus(bpy.types.Operator):
                 result['trellis2'] = check_trellis2_available(server_addr, timeout=api_timeout)
                 result['pbr'] = check_pbr_available(server_addr, timeout=api_timeout)
                 result['skintokens'] = check_skintokens_autorig_available(server_addr, timeout=api_timeout)
+                result['meshtools'] = check_meshtools_available(server_addr, timeout=api_timeout)
             else:
                 result['trellis2'] = False
                 result['pbr'] = False
                 result['skintokens'] = False
+                result['meshtools'] = {}
             return result
 
         def _on_done(result):
@@ -425,6 +429,7 @@ class CheckServerStatus(bpy.types.Operator):
                 bpy.context.scene.trellis2_available = result.get('trellis2', False)
                 bpy.context.scene.pbr_nodes_available = result.get('pbr', False)
                 bpy.context.scene.skintokens_autorig_available = result.get('skintokens', False)
+                apply_meshtools_available(bpy.context.scene, result.get('meshtools'))
 
             if result.get('online', False):
                 print(f"[StableGen] ComfyUI server is online at {server_addr}.")
