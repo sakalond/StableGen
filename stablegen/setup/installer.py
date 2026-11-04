@@ -658,13 +658,6 @@ MENU_PACKAGES: Dict[str, Dict[str, Any]] = {
         "description_suffix": "*Downloads MOSS-Image int8 (~5.2GB), its Qwen3.5 9B text encoder (~9.3GB), VAE (~0.2GB) and*\n"
                               "    *color/depth control adapter (~0.3GB). Needs ComfyUI 0.42.3 or newer. Apache 2.0.*",
     },
-    '18': {"name": "[LATO.2] Low-Poly Remesh (ComfyUI-LATO2 node)",
-        "tags": ["lato2"],
-        "size_gb": 12.2,
-        "description_suffix": "*Clones ComfyUI-LATO2 and runs its setup: LATO.2 in its own Python environment (PyTorch*\n"
-                              "    *2.8, CUDA 12.8, ~8 GB, built with uv), its weights (3.4 GB) and DINOv2 (1.1 GB). Needs an*\n"
-                              "    *NVIDIA GPU. ComfyUI's Python only gets uv. LATO.2 and its weights are MIT.*",
-    },
     '17': {"name": "[EXPERIMENTAL] FIBO 2.0 Edit",
         "tags": ["fibo_edit"],
         "size_gb": 13.0,
@@ -672,6 +665,13 @@ MENU_PACKAGES: Dict[str, Dict[str, Any]] = {
         "description_suffix": "*Downloads Bria FIBO 2.0 Edit Turbo int8 (~8.0GB), its Qwen3-VL 4B text encoder (~4.6GB) and*\n"
                               "    *the FLUX.2 VAE (~0.3GB). Needs a ComfyUI build with core FIBO 2.0 support (master, October 2026).*\n"
                               "    *LICENSE NOTICE: CC BY-NC 4.0, non-commercial use only.*",
+    },
+    '18': {"name": "[LATO.2] Low-Poly Remesh (ComfyUI-LATO2 node)",
+        "tags": ["lato2"],
+        "size_gb": 12.2,
+        "description_suffix": "*Clones ComfyUI-LATO2 and runs its setup: LATO.2 in its own Python environment (PyTorch*\n"
+                              "    *2.8, CUDA 12.8, ~8 GB, built with uv), its weights (3.4 GB) and DINOv2 (1.1 GB). Needs an*\n"
+                              "    *NVIDIA GPU. ComfyUI's Python only gets uv. LATO.2 and its weights are MIT.*",
     },
 }
 
