@@ -1687,7 +1687,7 @@ def _export_visibility_impl(context, to_export, obj=None, camera_visibility=None
             if not color_mix.inputs[0].links:
                 break
             color_ramp = color_mix.inputs[0].links[0].from_node
-            if not color_ramp.inputs[0].links:
+            if not color_ramp.inputs or not color_ramp.inputs[0].links:
                 # Color ramp Fac is unlinked (constant value) — remove it and
                 # fall through so the rest of the chain is wired correctly.
                 nodes.remove(color_ramp)
@@ -1702,7 +1702,8 @@ def _export_visibility_impl(context, to_export, obj=None, camera_visibility=None
             links.new(subtract.outputs[0], color_mix.inputs["Fac"])
             nodes.remove(color_ramp)
             # Disconnect color1
-            links.remove(color_mix.inputs[1].links[0])
+            if color_mix.inputs[1].links:
+                links.remove(color_mix.inputs[1].links[0])
             color_mix.inputs["Color1"].default_value = (0, 0, 0, 1)
             if not (color_mix.inputs["Color2"].links and (color_mix.inputs[2].links[0].from_node.type == 'MIX_RGB')):
                 color_mix.inputs["Color2"].default_value = (1, 1, 1, 1)
