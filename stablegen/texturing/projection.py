@@ -604,7 +604,7 @@ def _projection_uv_output(node):
 
 def _frame_prop(mat_id, kind, row):
     """Object property with one row of the object's world matrix when ``mat_id``'s views were projected:
-    ``kind`` '' the matrix, 'Inv' its inverse, 'N' the normal matrix (inverse transpose of its 3x3)."""
+    ``kind`` '' the matrix, 'Inv' its inverse."""
     return f"_SG_Frame{kind}_{mat_id}_{row}"
 
 
@@ -621,11 +621,12 @@ def _store_projection_frame(obj, mat_id, replace):
         return
     matrix = obj.matrix_world.copy()
     inverse = matrix.inverted_safe()
-    normal = matrix.to_3x3().inverted_safe().transposed()
     for row in range(3):
         obj[_frame_prop(mat_id, '', row)] = tuple(matrix[row])
         obj[_frame_prop(mat_id, 'Inv', row)] = tuple(inverse[row])
-        obj[_frame_prop(mat_id, 'N', row)] = tuple(normal[row])
+    # Writing custom properties does not tell the depsgraph: the viewport's engines kept reading the frame as
+    # missing and drew the object black until something else updated it.
+    obj.update_tag()
 
 
 def _projection_anchor_nodes(nodes, links, mat_id):
@@ -670,9 +671,26 @@ def _projection_anchor_nodes(nodes, links, mat_id):
     to_object = node("ShaderNodeVectorTransform", "NormalToObject", vector_type='NORMAL',
                      convert_from='WORLD', convert_to='OBJECT')
     links.new(geometry.outputs["Normal"], to_object.inputs[0])
-    normal = node("ShaderNodeVectorMath", "ProjectionFrameNormal", operation='NORMALIZE')
-    links.new(apply(rows('N'), to_object.outputs[0], False, "ProjectionFrameNormalRaw"), normal.inputs[0])
     inverse_rows = rows('Inv')
+    # The frame's normal matrix is its inverse transposed, so the normal is the inverse's rows weighted by the
+    # normal's components. Rows of its own made ten object attributes with the owner colour, and EEVEE reads only
+    # eight per material (GPU_MAX_UNIFORM_ATTR): the rest read as zero and Material Preview drew the object black.
+    axes = node("ShaderNodeSeparateXYZ", "NormalToObjectAxes")
+    links.new(to_object.outputs[0], axes.inputs[0])
+    raw = None
+    for r, row in enumerate(inverse_rows):
+        term = node("ShaderNodeVectorMath", f"ProjectionFrameNormalRow{r}", operation='SCALE')
+        links.new(row.outputs["Vector"], term.inputs[0])
+        links.new(axes.outputs[r], term.inputs["Scale"])
+        if raw is None:
+            raw = term.outputs["Vector"]
+            continue
+        total = node("ShaderNodeVectorMath", f"ProjectionFrameNormalSum{r}", operation='ADD')
+        links.new(raw, total.inputs[0])
+        links.new(term.outputs["Vector"], total.inputs[1])
+        raw = total.outputs["Vector"]
+    normal = node("ShaderNodeVectorMath", "ProjectionFrameNormal", operation='NORMALIZE')
+    links.new(raw, normal.inputs[0])
 
     def current(point, after=None):
         # ``after`` (the previous camera's raycast result) delays the carried point, and with it the whole
@@ -703,14 +721,14 @@ def _render_ownership_maps(context, cameras, mat_id, replace):
     when ``mat_id``'s views were projected, as a flat colour per object (32-bit EXR at the camera's projection
     resolution, the generated images' pixel grid). ``replace`` renders them all again, for a projection that
     recomputed the projection UVs; otherwise only missing maps are rendered and the rest are reused, as later
-    sequential steps and previews project the same views. Returns the paths in camera order."""
+    sequential steps and previews project the same views. Returns the maps' atlas (see _ownership_atlas)."""
     scene = context.scene
     directory = get_dir_path(context, 'inpaint')['visibility']
     os.makedirs(directory, exist_ok=True)
     paths = [os.path.join(directory, f"projection_ownership{i}-{mat_id}.exr") for i in range(len(cameras))]
     missing = [i for i, path in enumerate(paths) if replace or not os.path.isfile(path)]
     if not missing:
-        return paths
+        return _ownership_atlas(paths, mat_id, rebuild=False)
     key = _owner_prop(mat_id)
     meshes = [obj for obj in scene.objects if obj.type == 'MESH']
     # A partial render keeps the colours the remaining maps already use.
@@ -724,6 +742,7 @@ def _render_ownership_maps(context, cameras, mat_id, replace):
         while ((index >> 16) & 255, (index >> 8) & 255, index & 255) in taken:
             index += 1
         obj[key] = tuple(c / 255.0 for c in ((index >> 16) & 255, (index >> 8) & 255, index & 255))
+        obj.update_tag()        # the viewport reads the colour through the depsgraph (see _store_projection_frame)
 
     material = bpy.data.materials.new("SG Ownership")
     material.use_nodes = True
@@ -772,17 +791,61 @@ def _render_ownership_maps(context, cameras, mat_id, replace):
             setattr(owner, name, value)
         bpy.data.materials.remove(material)
         bpy.data.worlds.remove(world)
-    for i in missing:
-        get_or_load_image(paths[i], force_reload=True)    # a map loaded before must show the new render
-    return paths
+    return _ownership_atlas(paths, mat_id, rebuild=True)
 
 
-def _ownership_test(nodes, links, path, uv_node, mat_id, i, owner_cache, after):
+def _ownership_atlas(paths, mat_id, rebuild):
+    """Pack the cameras' ownership maps into one image. EEVEE fits only so many image textures in a material: with
+    the raycasts, six generated images and six maps already drew Material Preview black. 8-bit holds the flat
+    owner colours exactly. ``rebuild`` packs the maps again (some were rendered anew). Returns the atlas path, each
+    camera's (x, y, width, height) in it, bottom-left origin like image pixels, and the atlas size."""
+    import numpy as np
+
+    path = os.path.join(os.path.dirname(paths[0]), f"projection_ownership_atlas-{mat_id}.png")
+    maps = [bpy.data.images.load(map_path, check_existing=False) for map_path in paths]
+    try:
+        sizes = [tuple(image.size) for image in maps]
+        # Rows well inside the GPU's 16384 pixel texture limit
+        limit = max(8192, max(width for width, _height in sizes))
+        rects, x, y, row = [], 0, 0, 0
+        for width, height in sizes:
+            if x and x + width > limit:
+                x, y, row = 0, y + row, 0
+            rects.append((x, y, width, height))
+            x, row = x + width, max(row, height)
+        size = (max(rx + rw for rx, _ry, rw, _rh in rects), y + row)
+        if rebuild or not os.path.isfile(path):
+            atlas = np.zeros((size[1], size[0], 4), dtype=np.float32)
+            atlas[..., 3] = 1.0
+            for image, (x, y, width, height) in zip(maps, rects):
+                pixels = np.empty(width * height * 4, dtype=np.float32)
+                image.pixels.foreach_get(pixels)
+                atlas[y:y + height, x:x + width] = pixels.reshape(height, width, 4)
+            packed = bpy.data.images.new("SG Ownership Atlas", size[0], size[1])
+            try:
+                packed.colorspace_settings.name = 'Non-Color'
+                packed.pixels.foreach_set(atlas.ravel())
+                packed.filepath_raw = path
+                packed.file_format = 'PNG'
+                packed.save()
+            finally:
+                bpy.data.images.remove(packed)
+            get_or_load_image(path, force_reload=True)    # an atlas loaded before must show the new maps
+    finally:
+        for image in maps:
+            bpy.data.images.remove(image)
+    return path, rects, size
+
+
+def _ownership_test(nodes, links, atlas, uv_node, mat_id, i, owner_cache, after):
     """1 where camera ``i``'s ownership map shows this object at the shading point's projection UV, else 0: an
     equality test on the generated image's own pixel grid, so another object that stood in front when the views
-    were projected keeps its pixels, and objects added or moved since then change nothing. ``owner_cache`` holds
-    the material's one owner-colour node. The map is read through ``after`` (the camera's raycast result), like
-    the generated image, so Cycles does not keep every camera's sample on the stack until the raycasts."""
+    were projected keeps its pixels, and objects added or moved since then change nothing. ``atlas`` is
+    _ownership_atlas's result, ``owner_cache`` holds the material's one owner-colour node. The map is read through
+    ``after`` (the camera's raycast result), like the generated image, so Cycles does not keep every camera's
+    sample on the stack until the raycasts."""
+    path, rects, (atlas_width, atlas_height) = atlas
+    x, y, width, height = rects[i]
     image = get_or_load_image(path)
     if image is None:
         return None
@@ -790,7 +853,7 @@ def _ownership_test(nodes, links, path, uv_node, mat_id, i, owner_cache, after):
     texture = nodes.new("ShaderNodeTexImage")
     texture.image = image
     texture.interpolation = 'Closest'
-    texture.extension = 'CLIP'
+    texture.extension = 'EXTEND'
     texture.label = f"Ownership-{i}-{mat_id}"
     texture['sg_layout_stage'] = 'Raycast visibility'
     bound = nodes.new("ShaderNodeMath")
@@ -805,8 +868,24 @@ def _ownership_test(nodes, links, path, uv_node, mat_id, i, owner_cache, after):
     late_uv.label = f"OwnershipUVAfterRaycast-{i}-{mat_id}"
     links.new(_projection_uv_output(uv_node), late_uv.inputs[0])
     links.new(bounds.outputs[0], late_uv.inputs[1])
-    links.new(late_uv.outputs["Vector"], texture.inputs["Vector"])
-    for helper in (bound, bounds, late_uv):
+    # The camera's tile, held half a pixel inside it: outside its view (where the camera has no weight) a point
+    # reads the tile's edge rather than a neighbouring camera's map.
+    low = nodes.new("ShaderNodeVectorMath")
+    low.operation = 'MAXIMUM'
+    low.inputs[1].default_value = (0.5 / width, 0.5 / height, 0.0)
+    links.new(late_uv.outputs["Vector"], low.inputs[0])
+    high = nodes.new("ShaderNodeVectorMath")
+    high.operation = 'MINIMUM'
+    high.inputs[1].default_value = (1.0 - 0.5 / width, 1.0 - 0.5 / height, 0.0)
+    links.new(low.outputs["Vector"], high.inputs[0])
+    tile = nodes.new("ShaderNodeVectorMath")
+    tile.operation = 'MULTIPLY_ADD'
+    tile.label = f"OwnershipTile-{i}-{mat_id}"
+    tile.inputs[1].default_value = (width / atlas_width, height / atlas_height, 0.0)
+    tile.inputs[2].default_value = (x / atlas_width, y / atlas_height, 0.0)
+    links.new(high.outputs["Vector"], tile.inputs[0])
+    links.new(tile.outputs["Vector"], texture.inputs["Vector"])
+    for helper in (bound, bounds, late_uv, low, high, tile):
         helper.hide = True
         helper['sg_layout_stage'] = 'Raycast visibility'
     if 'owner' not in owner_cache:
@@ -832,12 +911,26 @@ def _ownership_test(nodes, links, path, uv_node, mat_id, i, owner_cache, after):
     match.operation = 'LESS_THAN'
     match.inputs[1].default_value = 0.25 / 255.0
     links.new(distance.outputs["Value"], match.inputs[0])
+    # Only another object's colour means something covered this point. The background shows where the pixel's
+    # centre fell just off this object's own outline; rejecting it left the outline's texels to no camera at all
+    # where every view sees that edge from the side (black specks along a wall's top edge).
+    shown = nodes.new("ShaderNodeVectorMath")
+    shown.operation = 'LENGTH'
+    links.new(texture.outputs["Color"], shown.inputs[0])
+    background = nodes.new("ShaderNodeMath")
+    background.operation = 'LESS_THAN'
+    background.inputs[1].default_value = 0.5 / 255.0
+    links.new(shown.outputs["Value"], background.inputs[0])
+    uncovered = nodes.new("ShaderNodeMath")
+    uncovered.operation = 'MAXIMUM'
+    links.new(match.outputs[0], uncovered.inputs[0])
+    links.new(background.outputs[0], uncovered.inputs[1])
     owned = nodes.new("ShaderNodeMath")
     owned.operation = 'MINIMUM'
     owned.label = f"OwnedPixel-{i}-{mat_id}"
-    links.new(match.outputs[0], owned.inputs[0])
+    links.new(uncovered.outputs[0], owned.inputs[0])
     links.new(owner_cache['present'].outputs[0], owned.inputs[1])
-    for helper in (distance, match, owned):
+    for helper in (distance, match, shown, background, uncovered, owned):
         helper['sg_layout_stage'] = 'Raycast visibility'
     return owned.outputs[0]
 
@@ -2886,7 +2979,7 @@ def project_image(
     # ── Optional: object-relative projection (native Raycast path) ───────
     use_anchor = (getattr(context.scene, 'sg_object_relative_projection', False)
                   and bpy.app.version >= (5, 1, 0) and not use_baked_weights)
-    ownership_paths = None
+    ownership = None
     if use_anchor:
         # The frame and the maps belong to the projection UVs: a call that recomputed them takes the scene
         # as it is now, later sequential steps and previews keep what the UVs were made with.
@@ -2894,7 +2987,7 @@ def project_image(
                  and (context.scene.generation_method != 'sequential' or stop_index == 0))
         for obj in to_project:
             _store_projection_frame(obj, mat_id, replace=fresh)
-        ownership_paths = _render_ownership_maps(context, cameras, mat_id, replace=fresh)
+        ownership = _render_ownership_maps(context, cameras, mat_id, replace=fresh)
 
     # Switch to Cycles (needed for Raycast shader node on all versions)
     if context.scene.render.engine != 'CYCLES':
@@ -3423,7 +3516,7 @@ def project_image(
                         if not acquisition:
                             return weight
                         return _acquisition_quality(weight, parts['length'], camera, i).outputs[0]
-                owned = (partial(_ownership_test, nodes, links, ownership_paths[i], uv_map_node, mat_id, i,
+                owned = (partial(_ownership_test, nodes, links, ownership, uv_map_node, mat_id, i,
                                  owner_cache) if anchor is not None else None)
                 result = create_native_raycast_visibility(
                     nodes, links, camera, geometry, context, i, mat_id, stop_index,
