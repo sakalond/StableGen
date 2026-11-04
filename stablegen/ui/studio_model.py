@@ -207,6 +207,10 @@ def action(document, *names):
 
 
 def projected_images(context):
-    """Read existing projection textures using their saved camera identities."""
-    from ..cameras.images import projected_images as resolve
-    return resolve(context)
+    """Each camera's generated view: the image its projection material shows (by its saved camera identity), else
+    the image file in the scene's own run folder, as for a baked scene (a file path; the cards draw either)."""
+    from ..cameras.images import generated_files, projected_images as resolve
+    images = resolve(context)
+    for name, path in generated_files(context).items():
+        images.setdefault(name, path)
+    return images

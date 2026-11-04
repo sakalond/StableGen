@@ -28,7 +28,7 @@ from . import studio_setup as setup_page
 from .presentation import Layout, Control, Section, STRUCTURAL_PROPERTIES, TOOL_SECTIONS
 from .studio_text import TextBuffer, wrap
 from .studio_widgets import (Painter, FONT_SIZE, CONTROL_HEIGHT, CONTROL_GAP,
-                             TEXT_LINE_HEIGHT, TEXT_PADDING, color, font_size)
+                             TEXT_LINE_HEIGHT, TEXT_PADDING, color, font_size, image_size)
 from .presets import (PRESETS, PRESET_MODEL_NAMES, PRESET_VARIANTS, PRESET_WORKFLOWS,
                       preset_label as _preset_label, preset_model as _preset_model,
                       preset_workflow as _preset_workflow, strip_word as _strip)
@@ -151,9 +151,10 @@ def _undo(message):
 
 
 def _view_aspect(scene, camera, image):
-    """A camera's view shape: its generated image's, else its resolution's."""
-    if image is not None and image.size[0] > 0 and image.size[1] > 0:
-        return image.size[0] / image.size[1]
+    """A camera's view shape: its generated image's (a Blender image or a file), else its resolution's."""
+    width, height = image_size(image) if image is not None else (0, 0)
+    if width > 0 and height > 0:
+        return width / height
     from ..cameras.geometry import _get_camera_resolution
     width, height = _get_camera_resolution(camera, scene)
     return width / max(1, height)
@@ -2565,7 +2566,8 @@ class StudioSession:
             index = next((i for i, c in enumerate(cameras) if c.name == camera.name), 0)
             margin = 24
             p.text(f'{index + 1:02} · {camera.name}', left + margin, top + 14, 13, 'text', right - left - 2 * margin)
-            note = f'{image.size[0]} × {image.size[1]} · click or Esc to close'
+            image_width, image_height = image_size(image)
+            note = f'{image_width} × {image_height} · click or Esc to close'
             p.text(note, right - margin - p.measure(note, 10), top + 17, 10, 'muted')
             p.image(image, (left + margin, top + 40, right - left - 2 * margin, bottom - top - 40 - margin), 12)
         finally:

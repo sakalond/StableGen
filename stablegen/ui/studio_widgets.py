@@ -218,6 +218,34 @@ def _file_key(path):
     return os.path.normcase(os.path.abspath(path)), stat.st_mtime_ns, stat.st_size
 
 
+_file_sizes = {}    # file path -> (its _file_key, (width, height))
+
+
+def image_size(image):
+    """(width, height) of a Blender image or an image file: a PNG's header, else the decoded file."""
+    if not isinstance(image, str):
+        return tuple(image.size)
+    key = _file_key(image)
+    if key is None:
+        return 0, 0
+    cached = _file_sizes.get(key[0])
+    if cached is None or cached[0] != key:
+        size = (0, 0)
+        try:
+            with open(image, 'rb') as handle:
+                head = handle.read(24)
+            if head[:8] == b'\x89PNG\r\n\x1a\n':
+                size = int.from_bytes(head[16:20], 'big'), int.from_bytes(head[20:24], 'big')
+        except OSError:
+            pass
+        if size == (0, 0):
+            source = _file_source(image)
+            if source is not None:
+                size = source.shape[1], source.shape[0]
+        cached = _file_sizes[key[0]] = (key, size)
+    return cached[1]
+
+
 def _file_source(path, cap=THUMBNAIL_SOURCE):
     """An image file as _thumbnail_source gives a Blender image (premultiplied RGBA, bottom row first), read
     straight from the file: drawing may not load image datablocks. None when it can't be read."""
