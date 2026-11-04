@@ -13,6 +13,7 @@ import time
 
 import bpy
 import blf
+import numpy as np
 from bpy.app.handlers import persistent
 
 from . import studio_model as model
@@ -102,6 +103,7 @@ _cursor_owners = {}
 _window_mouse = {}
 _pending = set()
 _handler = None
+_preview_handler = None
 _registered = False
 _font_id = None
 _font_path = ''
@@ -145,8 +147,70 @@ def _undo(message):
         _log.debug('Undo push unavailable', exc_info=True)
 
 
+def _view_aspect(scene, camera, image):
+    """A camera's view shape: its generated image's, else its resolution's."""
+    if image is not None and image.size[0] > 0 and image.size[1] > 0:
+        return image.size[0] / image.size[1]
+    from ..cameras.geometry import _get_camera_resolution
+    width, height = _get_camera_resolution(camera, scene)
+    return width / max(1, height)
+
+
+def _open_view_layout(x, y, width, aspect, fields_height=200):
+    """Where an open camera card shows its view and its fields: a portrait or square view beside the fields, as tall
+    as they are (200 to 420 px, at most 240 px wide); a landscape view (or any view when the fields would get
+    narrower than 220 px) across the card above them, at most 260 px tall. Returns (view rect, (fields x, fields y,
+    fields width))."""
+    if aspect <= 1.25:
+        view_width = min(240, max(200, min(420, fields_height)) * aspect)
+        if width - 24 - view_width - 16 >= 220:
+            return ((x + 12, y + 43, view_width, view_width / aspect),
+                    (x + 12 + view_width + 16, y + 43, width - 24 - view_width - 16))
+    height = min(260, (width - 24) / aspect)
+    view_width = height * aspect
+    return ((x + 12 + (width - 24 - view_width) / 2, y + 43, view_width, height),
+            (x + 12, y + 43 + height + 12, width - 24))
+
+
+def _object_tag(p, x, y, name, hue, *, share='', height=15, size=9, selected=False, hover=False):
+    """The panel's tag, led by the object's colour when it is described; undescribed objects are dimmed."""
+    width = p.measure(name, size) + 10 + (9 if hue else 0) + (p.measure(share, size) + 4 if share else 0)
+    p.outline(x, y, width, height, 'selected' if selected else 'hover_soft',
+              'accent' if selected else 'hover_border' if hover else 'line', 3)
+    tx = x + 5
+    if hue:
+        p.rect(tx, y + (height - 5) / 2, 5, 5, hue, 1)
+        tx += 9
+    p.text(name, tx, y + (height - size) / 2 - .5, size, 'secondary' if hue else 'disabled')
+    if share:
+        p.text(share, tx + p.measure(name, size) + 4, y + (height - size) / 2 - .5, size, 'muted')
+    return width
+
+
 def _binding_key(binding):
     return f'{binding.root}:{binding.name}:{binding.path}:{binding.property}'
+
+
+def prompt_wording(scene, prop):
+    """(label, placeholder) for a prompt field, by what the prompt does now: a new texture, a restyle of the
+    current one, an edit of part of it, an image for TRELLIS.2. The placeholder shows, greyed, while it is empty.
+    ('', '') for other text fields."""
+    if prop == 'comfyui_negative_prompt':
+        return 'Negative prompt', 'What to keep out, e.g. blurry, text, watermark'
+    if prop == 'sg_masked_prompt':
+        return 'Edit instructions', 'What to change inside the painted area, e.g. make the jacket red leather'
+    if prop == 'texture_prompt':
+        return 'Texture prompt', 'The surface for the mesh, e.g. weathered bronze with green patina'
+    if prop != 'comfyui_prompt':
+        return '', ''
+    if scene.architecture_mode == 'trellis2':
+        return 'Mesh image prompt', 'The object to generate, e.g. a wooden treasure chest with iron bands'
+    method = scene.qwen_generation_method if scene.model_architecture in QWEN_ARCHITECTURES else scene.generation_method
+    return {
+        'refine': ('Refine prompt', 'How the whole texture should change, e.g. hand-painted style, warmer colors'),
+        'local_edit': ('Edit prompt', 'What to change where the detail cameras look, e.g. add gold lettering to the sign'),
+        'uv_inpaint': ('Texture prompt', 'What the untextured areas should show, e.g. the same dark wood grain'),
+    }.get(method, ('Texture prompt', 'The texture to generate, e.g. a weathered bronze statue with green patina'))
 
 
 class StudioSession:
@@ -195,6 +259,15 @@ class StudioSession:
         self.busy = False
         self.ctrl = False
         self.camera_images = {}
+        # The display chosen in Diagnostics, and the settings of the one shown (Update view applies a difference)
+        self.diagnostic_pick = None
+        self.diagnostic_shown = None
+        # The object whose prompt an open camera card is editing, and the outline drawn over that card's view
+        self.object_prompt = None
+        self.object_outline = None
+        self.open_fields_height = {}       # camera -> height of its open card's fields, for the view beside them
+        # The camera whose view fills the 3D viewport after a click on its image; any click closes it
+        self.preview = None
         self.card_bounds = {}
         # Narrowest width while the widen callout was shown in this session.
         self.callout_width = None
@@ -440,7 +513,12 @@ class StudioSession:
                 else:
                     value = float(text) if prop.type == 'FLOAT' else int(text) if prop.type == 'INT' else text
                 if binding.value(bpy.context) != value:
+                    # A renamed object keeps its open section (Blender may adjust the name: .001)
+                    renamed = (binding.data(bpy.context) if binding.root == 'object' and binding.property == 'name'
+                               and binding.name == self.object_prompt else None)
                     self.write_binding(binding, value)
+                    if renamed is not None:
+                        self.object_prompt = renamed.name
             self.refresh()
         except (ValueError, TypeError, ReferenceError, RuntimeError) as exc:
             self.tell('Could not apply this value: ' + str(exc).split('\n')[0])
@@ -855,7 +933,14 @@ class StudioSession:
             if not self.active():
                 self.commit()
                 self.menu = None
+                self.preview = None
             return {'PASS_THROUGH'}
+        if self.preview:
+            closing = (event.value == 'PRESS' and event.type in {'LEFTMOUSE', 'RIGHTMOUSE', 'ESC'})
+            if closing or event.type == 'LEFTMOUSE' and event.value in {'RELEASE', 'DOUBLE_CLICK'}:
+                if closing:
+                    self.close_preview()
+                return {'RUNNING_MODAL'} if self.in_area() else {'PASS_THROUGH'}
         if self.camera_drag:
             if event.type in {'ESC', 'RIGHTMOUSE'} and event.value == 'PRESS':
                 self.finish_camera_drag(cancel=True)
@@ -2132,8 +2217,16 @@ class StudioSession:
         y += 29
         def setup(cx, cy, cw):
             cy += self.draw_binding(p, self.binding('use_camera_prompts'), 'Use view prompts', cx, cy, cw)
+            cy += self.draw_binding(p, self.binding('use_object_prompts'), 'Use object prompts', cx, cy, cw)
             return cy + self.draw_binding(p, self.binding('sg_use_custom_camera_order'), 'Custom generation order', cx, cy, cw)
         y = cards.group(p, 'View setup', x, y, width, setup, 'camera')
+        object_prompts = getattr(scene, 'use_object_prompts', False)
+        grids = visibility.request(scene, cameras) if object_prompts and not self.busy else {}
+        hues = {name: color(hue.lstrip('#')) for name, hue in visibility.colors(grids.values()).items()}
+        images = {camera.name: self.camera_images.get(camera.name) for camera in cameras}
+        aspects = {camera.name: _view_aspect(scene, camera, images[camera.name]) for camera in cameras}
+        # One frame width for every row: as wide as the widest view needs at the rows' 60 px height
+        column = round(min(104, max(40, max((60 * aspect for aspect in aspects.values()), default=60))))
         if cameras:
             # The displayed camera cards are the order editor. Avoid a second,
             # disconnected native list and its up/down-button cluster.
@@ -2151,38 +2244,66 @@ class StudioSession:
             p.begin_group()
             selected = camera.select_get()
             hovered = self.hovered('camera:' + camera.name) and not self.busy
-            tx = x + 32 if selected else x + 103
+            tx = x + 32 if selected else x + 30 + column + 13
             p.text(f'{i + 1:02} · {camera.name}', tx, y + 16, FONT_SIZE, 'text', x + width - tx - 44)
-            image = self.camera_images.get(camera.name)
+            image = images[camera.name]
             prompt = scene.camera_prompts.get(camera.name)
+            grid = grids.get(camera.name)
             if not selected:
                 title = prompt.prompt if prompt and prompt.prompt else 'Generated' if image else 'No generated image'
-                p.text(title, tx, y + 36, 10, 'secondary', width - 146)
+                p.text(title, tx, y + 36, 10, 'secondary', x + width - tx - 44)
+                if grid is not None:
+                    self.draw_object_tags(p, grid, hues, tx, y + 53, x + width - tx - 44)
             p.target('camera:' + camera.name, (x + 25, y + 1, width - 67, 38 if selected else 82),
                      lambda name=camera.name: self.call('stablegen.studio_select_camera', {'camera_name': name, 'extend': self.ctrl}),
                      not self.busy, camera.name + ' · Ctrl click to add to selection')
+            # Without a custom order the list shows the alphabetical order generation uses, so it cannot be dragged
             grip = (x + 4, y + 5, 23, 28)
-            p.icon('grip', grip[0] + 4, grip[1] + 7, 14, 'disabled' if self.busy else 'accent' if self.hovered('camera-drag:' + camera.name) else 'secondary')
-            p.target('camera-drag:' + camera.name, grip, ('camera-drag', camera.name), not self.busy,
-                              'Drag to change generation order. Dropping enables custom order; Esc cancels.')
+            draggable = scene.sg_use_custom_camera_order and not self.busy
+            p.icon('grip', grip[0] + 4, grip[1] + 7, 14, 'accent' if draggable and self.hovered('camera-drag:' + camera.name)
+                   else 'secondary' if draggable else 'disabled')
+            p.target('camera-drag:' + camera.name, grip, ('camera-drag', camera.name), draggable,
+                     'Drag to change the generation order; Esc cancels' if scene.sg_use_custom_camera_order
+                     else 'Turn on Custom generation order (View setup) to drag views into the order they generate in')
             p.button('look:' + camera.name, (x + width - 37, y + (10 if selected else 28), 25, CONTROL_HEIGHT), '',
                      ('operator', 'stablegen.studio_look_camera', {'camera_name': camera.name}), icon='eye', enabled=not self.busy,
                      hint='Look through ' + camera.name)
-            image_rect = (x + 12, y + 43, 70, 160) if selected else (x + 30, y + 12, 60, 60)
-            p.outline(*image_rect, 'menu', 'menu_border', 2)
-            if image:
-                p.image(image, image_rect)
+            if selected:
+                # A view beside the fields matches their height, measured on the previous draw
+                fields_height, settled = self.open_fields_height.get(camera.name, (200, 0))
+                view_rect, (fx, fy, fw) = _open_view_layout(x, y, width, aspects[camera.name], fields_height)
+                fields_top = fy
+                vx, vy, vw, vh = view_rect
+                frame = (vx - 1, vy - 1, vw + 2, vh + 2)
             else:
-                ix, iy, iw, ih = image_rect
+                # Every row's frame is as wide as the widest view; a narrower one sits centred in it.
+                frame = (x + 30, y + 12, column, 60)
+                view_rect = (x + 31, y + 13, column - 2, 58)
+            # The whole frame opens the preview, so a narrow view is as easy to click as a wide one
+            preview_key = 'camera-preview:' + camera.name
+            hover = image is not None and self.hovered(preview_key)
+            p.outline(*frame, 'menu', 'hover_border' if hover else 'menu_border', 2)
+            shown = p.image(image, view_rect, 8 if selected else 4) if image else None
+            if shown:
+                p.target(preview_key, frame, lambda name=camera.name: self.open_preview(name), not self.busy,
+                         'View full size · click again or Esc to close')
+            if not shown:
+                ix, iy, iw, ih = view_rect
                 p.icon('camera', ix + (iw - 25) / 2, iy + (ih - 25) / 2, 25)
             if selected:
-                y += 43
-                y += self.draw_binding(p, model.Binding.from_data(camera, 'name'), 'Camera name', x + 98, y, width - 110)
+                fy += self.draw_binding(p, model.Binding.from_data(camera, 'name'), 'Camera name', fx, fy, fw)
                 if prompt and scene.use_camera_prompts:
-                    y += self.draw_binding(p, model.Binding.from_data(prompt, 'prompt'), 'View prompt', x + 98, y, width - 110,
-                                           multiline=True, height=93)
-                y = max(y, image_rect[1] + image_rect[3]) + 12
+                    fy += self.draw_binding(p, model.Binding.from_data(prompt, 'prompt'), 'View prompt', fx, fy, fw,
+                                            multiline=True, height=56 if object_prompts else 93)
+                if object_prompts:
+                    fy = self.draw_view_objects(p, camera, grid, grids, hues, fx, fy, fw, shown)
+                # Wrapping text can trade height for width: settle within a few redraws
+                if abs((fy - fields_top) - fields_height) > 1 and settled < 4:
+                    self.open_fields_height[camera.name] = (fy - fields_top, settled + 1)
+                    self.area.tag_redraw()
+                y = max(fy, view_rect[1] + view_rect[3]) + 12
             else:
+                self.open_fields_height.pop(camera.name, None)
                 y += 84
             self.camera_rows.append((camera.name, (x, start, width, y - start)))
             p.end_group((x, start, width, y - start), 'subbox', 'accent' if selected else 'hover_border' if hovered else 'section_border', 3)
@@ -2196,8 +2317,205 @@ class StudioSession:
                 p.line([(sx, sy), (sx + sw, sy), (sx + sw, sy + sh), (sx, sy + sh), (sx, sy)], 'accent')
         for section in self.document.sections:
             if section.page == 'CAMERAS' and section.key not in {'camera_tools', 'show_camera_options'}:
-                y = self.draw_section(p, section, x, y + 8, width, omit={'use_camera_prompts','sg_use_custom_camera_order'})
+                y = self.draw_section(p, section, x, y + 8, width, omit={'use_camera_prompts', 'use_object_prompts',
+                                                                          'sg_object_prompt', 'sg_use_custom_camera_order'})
         return y
+
+    def draw_object_tags(self, p, grid, hues, x, y, width):
+        """A closed camera card's described objects, largest first, on one line."""
+        right = x + width
+        for name, _share, _prompt in visibility.described(grid):
+            tag_width = p.measure(name, 9) + 19
+            if x + tag_width > right:
+                break
+            _object_tag(p, x, y, name, hues.get(name), height=15, size=9)
+            x += tag_width + 4
+
+    def draw_view_objects(self, p, camera, grid, grids, hues, x, y, width, shown):
+        """An open camera card's objects: every object the view sees with its share (described ones in their
+        colour), the prompt of the one being edited, and the prompt this view adds to the texture prompt."""
+        p.text('Objects in view', x, y, FONT_SIZE)
+        if grid is None:
+            p.text('Finding what this view sees…', x, y + 17, 10, 'muted', width)
+            return y + 17 + 22
+        seen = [(name, share) for name, share in grid.shares if share >= visibility.MIN_SHARE]
+        described = [name for name, _share in seen if visibility.object_prompt(name)]
+        note = f'{len(described)} described · {len(seen) - len(described)} more'
+        p.text(note, x + width - p.measure(note, 10) - 2, y + 1, 10, 'muted')
+        y += 17
+        target = self.object_prompt if self.object_prompt in dict(seen) else None
+        # The selected object's rename button ends the first row; the tags leave room for it
+        tags_width = width - 30 if target else width
+        tx, ty = x, y
+        for name, share in sorted(seen, key=lambda item: (item[0] not in described, -item[1])):
+            label = f'{share:.1%}' if share < .01 else f'{share:.0%}'
+            tag_width = p.measure(name, 10) + p.measure(label, 10) + 14 + (9 if name in described else 0)
+            rename_key = 'object-name:' + name
+            renaming = self.edit if self.edit and self.edit['key'] == rename_key else None
+            if renaming:
+                # While renamed, the tag is its object's name field, growing with the name
+                tag_width = max(tag_width, p.measure(renaming['buffer'].text) + 2 * TEXT_PADDING + 8)
+            if tx > x and tx + tag_width > x + tags_width:
+                tx, ty = x, ty + 22
+            key = 'object-prompt:' + name
+            if renaming:
+                rect = (tx, ty - 2, min(tag_width, x + tags_width - tx), 22)
+                lines, scroll = p.text_field(rename_key, rect, renaming['buffer'].text, ('edit', renaming['binding'], False),
+                                             editing=renaming['buffer'], hint='Enter renames · Esc cancels')
+                renaming.update(rect=rect, lines=lines, scroll=scroll)
+            else:
+                _object_tag(p, tx, ty, name, hues.get(name), share=label, height=18, size=10, selected=name == target,
+                            hover=self.hovered(key))
+                p.target(key, (tx, ty, tag_width, 18), lambda name=name: self.edit_object_prompt(name), not self.busy,
+                         f'Describe {name}; every view that sees it uses the description')
+            tx += tag_width + 4
+        if target:
+            button_key = 'object-rename:' + target
+            p.button(button_key, (x + width - 24, y - 2, 24, CONTROL_HEIGHT), '', lambda: self.rename_object(target),
+                     icon='rename', enabled=not self.busy, hover=self.hovered(button_key), hint=f'Rename {target}')
+        y = ty + 18 + 9
+        if target:
+            obj = bpy.data.objects.get(target)
+            count = sum(1 for g in grids.values() if dict(g.shares).get(target, 0) >= visibility.MIN_SHARE)
+            note = f'in {count} of {len(grids)} views'
+            p.text(note, x + width - p.measure(note, 10) - 2, y + 1, 10, 'muted')
+            y += self.draw_binding(p, model.Binding.from_data(obj, 'sg_object_prompt'), f'Object prompt · {target}',
+                                   x, y, width)
+            p.text('Every view that sees it uses this text', x, y - 2, 10, 'muted', width)
+            y += 16
+            if shown:
+                self.draw_object_outline(p, camera, target, hues.get(target), shown)
+        return self.draw_view_prompt(p, camera, grid, hues, x, y, width)
+
+    def draw_object_outline(self, p, camera, name, hue, rect):
+        """Outline the object being described in the open view, from a finer ray sample of that one view."""
+        scene = bpy.context.scene
+        detail = visibility.request(scene, [camera], visibility.DETAIL_RAYS).get(camera.name)
+        if detail is None:
+            return
+        key = (camera.name, name, id(detail), hue)
+        if not self.object_outline or self.object_outline[0] != key:
+            mask = detail.mask(name)
+            inner = mask.copy()
+            for _ in range(2):          # a two-sample edge reads at the panel's scale
+                eroded = inner.copy()
+                eroded[1:, :] &= inner[:-1, :]
+                eroded[:-1, :] &= inner[1:, :]
+                eroded[:, 1:] &= inner[:, :-1]
+                eroded[:, :-1] &= inner[:, 1:]
+                inner = eroded
+            rgba = np.zeros(mask.shape + (4,), np.float32)
+            rgba[..., :3] = (hue or p.colors['accent'])[:3]
+            rgba[..., 3] = np.where(mask & ~inner, 1.0, np.where(mask, .22, 0.0))
+            self.object_outline = (key, rgba)
+        p.overlay(self.object_outline[1], rect)
+
+    def draw_view_prompt(self, p, camera, grid, hues, x, y, width):
+        """What this view sends: its view prompt, its described objects' prompts (underlined in their colours) and
+        the texture prompt, as the generation's view plan composes them."""
+        from ..texturing.workflows import _texturing_prompt
+        scene = bpy.context.scene
+        parts = []
+        item = scene.camera_prompts.get(camera.name)
+        if scene.use_camera_prompts and item and item.prompt.strip():
+            parts.append((item.prompt.strip(), None))
+        parts += [(prompt, hues.get(name)) for name, _share, prompt in visibility.described(grid)]
+        parts.append((_texturing_prompt(scene).strip(), 'texture'))
+        text, spans = '', []
+        for part, hue in parts:
+            if not part:
+                continue
+            if text:
+                text += ', '
+            spans.append((len(text), len(text) + len(part), hue))
+            text += part
+        p.text('Prompt for this view', x, y, FONT_SIZE)
+        y += 17
+        lines = wrap(text, width - 16, p.measure)
+        shown_lines = min(len(lines), 6)
+        height = shown_lines * TEXT_LINE_HEIGHT + 2 * TEXT_PADDING - 2
+        p.outline(x, y, width, height, 'menu', 'menu_border')
+        for row, (start, end, line) in enumerate(lines[:shown_lines]):
+            ly = y + TEXT_PADDING - 1 + row * TEXT_LINE_HEIGHT
+            cuts = sorted({0, len(line)} | {min(max(s - start, 0), len(line)) for s, e, _ in spans}
+                          | {min(max(e - start, 0), len(line)) for s, e, _ in spans})
+            for a, b in zip(cuts, cuts[1:]):
+                span = next((hue for s, e, hue in spans if s <= start + a < e), None)
+                piece = line[a:b]
+                px = x + TEXT_PADDING + p.measure(line[:a])
+                p.text(piece, px, ly, FONT_SIZE, 'secondary' if span in (None, 'texture') else 'text')
+                if span not in (None, 'texture') and piece.strip():
+                    p.rect(px, ly + 14, p.measure(piece.rstrip()), 2, span)
+        words = len(text.split())
+        p.text('View prompt + objects in view + texture prompt', x, y + height + 5, 10, 'muted', width - 68)
+        p.text(f'{words} words', x + width - 55, y + height + 5, 10, 'muted')
+        return y + height + 24
+
+    def open_preview(self, name):
+        self.preview = name
+        self.clear_hover(leave=True)
+        self.area.tag_redraw()
+
+    def close_preview(self):
+        self.preview = None
+        self.area.tag_redraw()
+
+    def in_area(self):
+        x, y = self.mouse
+        area = self.area
+        return area.x <= x < area.x + area.width and area.y <= y < area.y + area.height
+
+    def draw_preview(self, region):
+        """A camera's view across the 3D viewport, left of the sidebar when it overlaps the viewport."""
+        camera = bpy.data.objects.get(self.preview or '')
+        image = self.camera_images.get(self.preview or '')
+        if camera is None or image is None:
+            self.preview = None
+            return
+        scale = max(.8, bpy.context.preferences.system.ui_scale)
+        p = Painter(region, scale, _font_id or 0)
+        try:
+            width, height = region.width / scale, region.height / scale
+            # With Region Overlap the header, toolbar and sidebar draw over the viewport: keep clear of them.
+            left, top, right, bottom = 0, 0, width, height
+            for other in self.area.regions:
+                if other == region or other.width <= 1 or other.height <= 1:
+                    continue
+                if not (region.x <= other.x < region.x + region.width or region.x < other.x + other.width <= region.x + region.width):
+                    continue
+                if other.type == 'TOOLS' and other.x <= region.x + 1:
+                    left = max(left, (other.x + other.width - region.x) / scale)
+                elif other.type == 'UI' and other.x + other.width >= region.x + region.width - 1:
+                    right = min(right, (other.x - region.x) / scale)
+                elif other.type in {'HEADER', 'TOOL_HEADER'} and other.y >= region.y + region.height / 2:
+                    top = max(top, (region.y + region.height - other.y) / scale)
+                elif other.type in {'HEADER', 'TOOL_HEADER', 'ASSET_SHELF', 'ASSET_SHELF_HEADER'}:
+                    bottom = min(bottom, (other.y + other.height - region.y) / scale)
+            # The viewport blends in linear light: 94 % black reads as a dimmed backdrop (82 % looked half-dark)
+            p.rect(0, 0, width, height, (0, 0, 0, .94))
+            cameras = self.ordered_cameras()
+            index = next((i for i, c in enumerate(cameras) if c.name == camera.name), 0)
+            margin = 24
+            p.text(f'{index + 1:02} · {camera.name}', left + margin, top + 14, 13, 'text', right - left - 2 * margin)
+            note = f'{image.size[0]} × {image.size[1]} · click or Esc to close'
+            p.text(note, right - margin - p.measure(note, 10), top + 17, 10, 'muted')
+            p.image(image, (left + margin, top + 40, right - left - 2 * margin, bottom - top - 40 - margin), 12)
+        finally:
+            p.finish()
+
+    def rename_object(self, name):
+        """Turn the selected object's tag into its name field, the name selected."""
+        obj = bpy.data.objects.get(name)
+        if obj is None:
+            return
+        from .studio_widgets import Target
+        field = Target('object-name:' + name, (0, 0, 0, 0), ('edit', model.Binding.from_data(obj, 'name'), False))
+        self.begin_edit(field, select=True)
+
+    def edit_object_prompt(self, name):
+        self.object_prompt = None if self.object_prompt == name else name
+        self.object_outline = None
+        self.area.tag_redraw()
 
     def menu_items(self):
         if self.menu.get('kind') == 'lora':
@@ -2712,6 +3030,25 @@ def _draw():
             session.error = str(exc)
 
 
+def preview_open(window, area):
+    """Whether the StableGen panel in this viewport shows a camera's view over it."""
+    session = _sessions.get((window.as_pointer(), area.as_pointer())) if window and area else None
+    return bool(session and session.preview)
+
+
+def _draw_preview():
+    context = bpy.context
+    if context.area is None or context.region is None or context.region.type != 'WINDOW':
+        return
+    session = _sessions.get((context.window.as_pointer(), context.area.as_pointer()))
+    if session and session.preview and session.active():
+        try:
+            session.draw_preview(context.region)
+        except Exception:
+            _log.exception('Studio preview drawing error')
+            session.preview = None
+
+
 def _tick():
     if not _registered:
         return None
@@ -2744,7 +3081,7 @@ STUDIO_UI_CLASSES = diagnostics.CLASSES + [lora.SG_OT_StudioLoRA, SG_OT_StudioSe
 
 
 def register_studio_ui():
-    global _registered, _handler, _font_id, _font_path
+    global _registered, _handler, _preview_handler, _font_id, _font_path
     _registered = True
     diagnostics.register()
     _font_id = None
@@ -2759,19 +3096,23 @@ def register_studio_ui():
                 _font_path = str(path)
                 break
         _handler = bpy.types.SpaceView3D.draw_handler_add(_draw, (), 'UI', 'POST_PIXEL')
+        _preview_handler = bpy.types.SpaceView3D.draw_handler_add(_draw_preview, (), 'WINDOW', 'POST_PIXEL')
         bpy.app.timers.register(_tick, first_interval=.05, persistent=True)
     if _load_pre not in bpy.app.handlers.load_pre:
         bpy.app.handlers.load_pre.append(_load_pre)
 
 
 def unregister_studio_ui():
-    global _registered, _handler
+    global _registered, _handler, _preview_handler
     _registered = False
     diagnostics.unregister()
     _load_pre(None)
     if _handler:
         bpy.types.SpaceView3D.draw_handler_remove(_handler, 'UI')
         _handler = None
+    if _preview_handler:
+        bpy.types.SpaceView3D.draw_handler_remove(_preview_handler, 'WINDOW')
+        _preview_handler = None
     if bpy.app.timers.is_registered(_tick):
         bpy.app.timers.unregister(_tick)
     if _load_pre in bpy.app.handlers.load_pre:

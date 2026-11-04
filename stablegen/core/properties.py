@@ -1345,6 +1345,17 @@ def register_properties(update_model_list, ControlNetUnit, LoRAUnit,
         name="Use view prompts", description="Include each camera’s view prompt with the shared generation prompt. Use view prompts for viewing direction or details belonging to that view.",
         default=True, update=update_parameters
     )
+    bpy.types.Scene.use_object_prompts = bpy.props.BoolProperty(
+        name="Use object prompts",
+        description="Add each described object's prompt to the views that see it, largest first. Describe an object "
+                    "from an open camera card's Objects in view",
+        default=False, update=update_parameters
+    )
+    bpy.types.Object.sg_object_prompt = bpy.props.StringProperty(
+        name="Object prompt",
+        description="Describes this object. With Use object prompts, every view that sees it includes this text",
+        default=""
+    )
     bpy.types.Scene.sg_camera_order = bpy.props.CollectionProperty(
         type=CameraOrderItem, name="Camera Generation Order",
         description="Defines the order in which cameras are processed during generation"
@@ -2217,6 +2228,7 @@ def unregister_properties(load_handler, _sg_queue_load_handler):
         'output_timestamp',
         'camera_prompts',
         'use_camera_prompts',
+        'use_object_prompts',
         'sg_camera_order',
         'sg_camera_order_index',
         'sg_use_custom_camera_order',
@@ -2271,6 +2283,8 @@ def unregister_properties(load_handler, _sg_queue_load_handler):
     for prop in _simple_scene_props:
         if hasattr(bpy.types.Scene, prop):
             delattr(bpy.types.Scene, prop)
+    if hasattr(bpy.types.Object, 'sg_object_prompt'):
+        del bpy.types.Object.sg_object_prompt
 
     # --- PBR Decomposition Properties ---
     pbr_props = [

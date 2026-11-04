@@ -1382,6 +1382,11 @@ class StableGenPanel(bpy.types.Panel):
             if content_box:
                 row = content_box.row(align=True)
                 row.prop(scene, "use_camera_prompts", text="Use view prompts", toggle=True, icon="OUTLINER_OB_CAMERA")
+                row = content_box.row(align=True)
+                row.prop(scene, "use_object_prompts", text="Use object prompts", toggle=True, icon="OBJECT_DATA")
+                active = context.active_object
+                if scene.use_object_prompts and active is not None and active.type == 'MESH':
+                    content_box.prop(active, "sg_object_prompt", text=active.name)
 
                 # ── Camera Generation Order ──
                 row = content_box.row(align=True)

@@ -1,6 +1,7 @@
 """GPU widgets for Studio's sidebar. Bounds also define their hit targets."""
 from dataclasses import dataclass
 import math
+import os
 
 import bpy
 import blf
@@ -148,6 +149,150 @@ def _icon_texture(name, size, scale):
         data = gpu.types.Buffer('FLOAT', rgba.size, rgba.ravel().tolist())
         _icon_textures[key] = gpu.types.GPUTexture((extent, extent), format='RGBA16F', data=data), extent
     return _icon_textures[key]
+
+
+_thumbnail_sources = {}     # (image name, size cap) -> (image key, premultiplied RGBA uint16, rows bottom first)
+_thumbnail_textures = {}
+_overlay_textures = {}
+THUMBNAIL_SOURCE = 1024     # longest side kept for an image's thumbnails; a full-size preview keeps up to 4096
+
+
+def _image_key(image):
+    """Changes when the image's pixels may have: another file version, an edit, a resize."""
+    path = bpy.path.abspath(image.filepath, library=image.library) if image.filepath else ''
+    try:
+        stamp = os.path.getmtime(path) if path else 0.0
+    except OSError:
+        stamp = 0.0
+    return image.name, image.as_pointer(), tuple(image.size), image.is_dirty, stamp
+
+
+def _thumbnail_source(image, cap=THUMBNAIL_SOURCE):
+    """The image as premultiplied, display-referred RGBA at most *cap* pixels long. Premultiplied, so
+    resampling never pulls in the colour a generator leaves under transparent pixels (Qwen's purple)."""
+    import cv2
+    key = _image_key(image)
+    cached = _thumbnail_sources.get((image.name, cap))
+    if cached and cached[0] == key:
+        return cached[1]
+    width, height = image.size
+    channels = image.channels
+    if width <= 0 or height <= 0 or channels not in (1, 3, 4):
+        return None
+    pixels = np.empty(width * height * channels, np.float32)
+    image.pixels.foreach_get(pixels)
+    pixels = pixels.reshape(height, width, channels)
+    if channels == 1:
+        pixels = np.repeat(pixels, 3, axis=2)
+    rgb, alpha = pixels[..., :3], (pixels[..., 3:4] if channels == 4 else np.ones((height, width, 1), np.float32))
+    if image.is_float and 'srgb' not in image.colorspace_settings.name.lower():
+        # Float buffers hold scene-linear values; byte buffers are already display-encoded.
+        rgb = np.where(rgb <= 0.0031308, rgb * 12.92, 1.055 * np.power(np.maximum(rgb, 0), 1 / 2.4) - 0.055)
+    rgba = np.concatenate([np.clip(rgb, 0, 1) * alpha, np.clip(alpha, 0, 1)], axis=2)
+    scale = min(1.0, cap / max(width, height))
+    if scale < 1:
+        rgba = cv2.resize(rgba, (max(1, round(width * scale)), max(1, round(height * scale))),
+                          interpolation=cv2.INTER_AREA)
+    source = (rgba * 65535).round().astype(np.uint16)
+    if len(_thumbnail_sources) > 64:
+        _thumbnail_sources.clear()
+    _thumbnail_sources[(image.name, cap)] = (key, source)
+    return source
+
+
+def _file_key(path):
+    try:
+        stat = os.stat(path)
+    except OSError:
+        return None
+    return os.path.normcase(os.path.abspath(path)), stat.st_mtime_ns, stat.st_size
+
+
+def _file_source(path, cap=THUMBNAIL_SOURCE):
+    """An image file as _thumbnail_source gives a Blender image (premultiplied RGBA, bottom row first), read
+    straight from the file: drawing may not load image datablocks. None when it can't be read."""
+    import cv2
+    key = _file_key(path)
+    if key is None:
+        return None
+    cached = _thumbnail_sources.get((key[0], cap))
+    if cached and cached[0] == key:
+        return cached[1]
+    try:
+        pixels = cv2.imdecode(np.fromfile(path, np.uint8), cv2.IMREAD_UNCHANGED)     # works with any path's letters
+    except (OSError, ValueError, cv2.error):
+        pixels = None
+    if pixels is None:
+        return None
+    depth = 65535.0 if pixels.dtype == np.uint16 else 1.0 if pixels.dtype.kind == 'f' else 255.0
+    pixels = pixels.astype(np.float32) / depth
+    if pixels.ndim == 2:
+        pixels = pixels[..., None]
+    if pixels.shape[2] == 1:
+        pixels = np.repeat(pixels, 3, axis=2)
+    if pixels.shape[2] == 3:
+        pixels = np.concatenate([pixels, np.ones(pixels.shape[:2] + (1,), np.float32)], axis=2)
+    rgba = np.clip(pixels[::-1, :, [2, 1, 0, 3]], 0, 1)        # OpenCV's BGRA, top row first
+    rgba = np.concatenate([rgba[..., :3] * rgba[..., 3:4], rgba[..., 3:4]], axis=2)
+    height, width = rgba.shape[:2]
+    scale = min(1.0, cap / max(width, height))
+    if scale < 1:
+        rgba = cv2.resize(rgba, (max(1, round(width * scale)), max(1, round(height * scale))),
+                          interpolation=cv2.INTER_AREA)
+    source = (rgba * 65535).round().astype(np.uint16)
+    if len(_thumbnail_sources) > 64:
+        _thumbnail_sources.clear()
+    _thumbnail_sources[(key[0], cap)] = (key, source)
+    return source
+
+
+def _thumbnail_texture(image, width, height, check):
+    """A width x height device-pixel texture of the image (a Blender image, or an image file's path) over the
+    theme's transparency checkerboard."""
+    import cv2
+    ui = bpy.context.preferences.themes[0].user_interface
+    primary = tuple(ui.transparent_checker_primary)
+    secondary = tuple(ui.transparent_checker_secondary)
+    from_file = isinstance(image, str)
+    key = (_file_key(image) if from_file else _image_key(image), width, height, check, primary, secondary)
+    if key not in _thumbnail_textures:
+        source = (_file_source if from_file else _thumbnail_source)(
+            image, THUMBNAIL_SOURCE if max(width, height) <= THUMBNAIL_SOURCE else 4096)
+        if source is None:
+            return None
+        small = cv2.resize(source, (width, height), interpolation=cv2.INTER_AREA).astype(np.float32) / 65535
+        rows, columns = np.mgrid[0:height, 0:width]
+        board = np.where((((rows // check) + (columns // check)) % 2 == 0)[..., None],
+                         np.float32(primary), np.float32(secondary))
+        rgba = np.ones((height, width, 4), np.float32)
+        rgba[..., :3] = small[..., :3] + board * (1 - small[..., 3:4])
+        if len(_thumbnail_textures) > 128:
+            _thumbnail_textures.clear()
+        data = _float_buffer(rgba)
+        _thumbnail_textures[key] = gpu.types.GPUTexture((width, height), format='RGBA16F', data=data)
+    return _thumbnail_textures[key]
+
+
+def _float_buffer(array):
+    """A GPU float buffer of a numpy array, without the per-element list a full-size preview would stall on."""
+    flat = np.ascontiguousarray(array, np.float32).ravel()
+    try:
+        return gpu.types.Buffer('FLOAT', flat.size, flat)
+    except (TypeError, ValueError):
+        return gpu.types.Buffer('FLOAT', flat.size, flat.tolist())
+
+
+def _array_texture(rgba):
+    """A texture of a small RGBA float array (rows bottom first), cached while the same array is drawn."""
+    key = (id(rgba), rgba.shape)
+    cached = _overlay_textures.get(key)
+    if cached is None or cached[0] is not rgba:
+        if len(_overlay_textures) > 16:
+            _overlay_textures.clear()
+        height, width = rgba.shape[:2]
+        data = _float_buffer(rgba)
+        cached = _overlay_textures[key] = (rgba, gpu.types.GPUTexture((width, height), format='RGBA16F', data=data))
+    return cached[1]
 
 
 def _logo_texture(size, scale):
@@ -483,19 +628,50 @@ class Painter:
         # blf.draw leaves blending off; translucent shapes and icon edges need it.
         gpu.state.blend_set('ALPHA')
 
-    def image(self, image, rect):
-        self.emit(self.draw_image, image, rect)
-
-    def draw_image(self, image, rect):
+    def image(self, image, rect, check=8):
+        """Draw *image* (a Blender image, or an image file's path) fitted inside *rect*, transparent parts over the
+        theme's checkerboard (*check* UI pixels a square); returns the rectangle it fills, None for a file it can't
+        read."""
         x, y, width, height = rect
-        iw, ih = image.size
+        if isinstance(image, str):
+            source = _file_source(image)
+            if source is None:
+                return None
+            ih, iw = source.shape[:2]
+        else:
+            iw, ih = image.size
         if iw <= 0 or ih <= 0:
-            return
+            return None
         ratio = min(width / iw, height / ih)
-        w, h = iw * ratio, ih * ratio
-        x, y = x + (width - w) / 2, y + (height - h) / 2
+        w = max(1, round(iw * ratio * self.scale)) / self.scale
+        h = max(1, round(ih * ratio * self.scale)) / self.scale
+        x = round((x + (width - w) / 2) * self.scale) / self.scale
+        y = round((y + (height - h) / 2) * self.scale) / self.scale
+        self.emit(self.draw_image, image, (x, y, w, h), check)
+        return x, y, w, h
+
+    def draw_image(self, image, rect, check):
+        x, y, w, h = rect
+        texture = _thumbnail_texture(image, round(w * self.scale), round(h * self.scale),
+                                     max(1, round(check * self.scale)))
+        if texture is None:
+            return
         shader = gpu.shader.from_builtin('IMAGE')
-        texture = gpu.texture.from_image(image)
+        shader.bind()
+        shader.uniform_sampler('image', texture)
+        positions = [(px * self.scale, (self.height - py) * self.scale)
+                     for px, py in ((x, y+h), (x+w, y+h), (x+w, y), (x, y))]
+        batch_for_shader(shader, 'TRI_FAN', {'pos': positions,
+                         'texCoord': [(0,0), (1,0), (1,1), (0,1)]}).draw(shader)
+
+    def overlay(self, rgba, rect):
+        """Draw an RGBA float array (rows bottom first, straight alpha) stretched over *rect*."""
+        self.emit(self.draw_overlay, rgba, rect)
+
+    def draw_overlay(self, rgba, rect):
+        x, y, w, h = rect
+        texture = _array_texture(rgba)
+        shader = gpu.shader.from_builtin('IMAGE')
         shader.bind()
         shader.uniform_sampler('image', texture)
         positions = [(px * self.scale, (self.height - py) * self.scale)

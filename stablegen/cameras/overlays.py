@@ -420,6 +420,9 @@ def _sg_draw_view_labels():
     context = _draw_context()
     if context is None or context.region_data.view_perspective == 'CAMERA':
         return
+    from ..ui.studio import preview_open
+    if preview_open(context.window, context.area):     # a camera's full-size view covers this viewport
+        return
     settings = context.scene.sg_camera_display
     if settings.labels == 'NONE':
         return

@@ -249,6 +249,7 @@ LABELS = {
     'generation_method': 'Texture workflow',
     'qwen_generation_method': 'Texture workflow',
     'use_camera_prompts': 'Use view prompts',
+    'use_object_prompts': 'Use object prompts',
     'denoise': 'Edit strength',
     'sg_masked_strength': 'Edit strength',
     'scheduler': 'Noise schedule',

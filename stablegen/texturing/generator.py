@@ -1071,16 +1071,17 @@ class ComfyUIGenerate(_PBRMixin, bpy.types.Operator):
         self._view_plan = None
         if use_camera_plan:
             view_records = []
+            # The plan freezes what each view adds to the texture prompt: its view prompt and the prompts of the
+            # described objects it sees, sampled now with the cameras where they will render from.
+            from ..cameras.visibility import detect, view_prompt as compose_view_prompt
+            grids = (detect(context, self._cameras)
+                     if getattr(context.scene, 'use_object_prompts', False) else {})
             for index, cam in enumerate(self._cameras):
                 if "sg_view_uuid" not in cam:
                     cam["sg_view_uuid"] = uuid.uuid4().hex
                 cam_res_x = int(cam.get("sg_res_x", render.resolution_x))
                 cam_res_y = int(cam.get("sg_res_y", render.resolution_y))
-                prompt_item = next(
-                    (item for item in context.scene.camera_prompts if item.name == cam.name),
-                    None,
-                )
-                view_prompt = prompt_item.prompt if prompt_item and prompt_item.prompt else ""
+                view_prompt = compose_view_prompt(context.scene, cam, grids.get(cam.name))
                 view_id = str(cam["sg_view_uuid"])
                 matrix_world = tuple(
                     tuple(float(value) for value in row) for row in cam.matrix_world

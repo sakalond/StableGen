@@ -52,12 +52,15 @@ _ADDON_PKG = __package__.rsplit('.', 1)[0]
 
 
 def _immutable_view_prompt(operator):
-    """Return the prompt frozen into the canonical generation view plan."""
+    """Return what the view adds to the texture prompt, frozen into the generation's view plan: its view prompt
+    (Use view prompts) and its described objects' prompts (Use object prompts)."""
     index = getattr(operator, '_current_image', -1)
     plan = getattr(operator, '_view_plan', ()) or ()
     if 0 <= index < len(plan):
         return plan[index].prompt or ""
-    # Legacy camera-prompt lookup when the canonical-plan experiment is off.
+    # Without a plan (Masked Edit): the camera's view prompt alone, with Use view prompts.
+    if not bpy.context.scene.use_camera_prompts:
+        return ""
     cameras = getattr(operator, '_cameras', ()) or ()
     if 0 <= index < len(cameras):
         camera_name = cameras[index].name
@@ -1296,11 +1299,10 @@ class _TexturingWorkflowMixin:
         remove_context = False
 
         # --- Camera Prompt Injection ---
-        if context.scene.use_camera_prompts:
-            view_desc = _immutable_view_prompt(self.operator)
-            if view_desc:
-                # Prepend the view description
-                user_prompt = f"{view_desc}, {user_prompt}"
+        view_desc = _immutable_view_prompt(self.operator)
+        if view_desc:
+            # Prepend the view description
+            user_prompt = f"{view_desc}, {user_prompt}"
 
         # --- Handle Context Render (Image 3) ---
         # This is only active in sequential mode after the first image
@@ -1678,10 +1680,9 @@ class _TexturingWorkflowMixin:
         # --- Base user prompt + camera injection ---
         user_prompt = _texturing_prompt(context.scene)
         camera_suffix = ""
-        if context.scene.use_camera_prompts:
-            view_desc = _immutable_view_prompt(self.operator)
-            if view_desc:
-                camera_suffix = f", {view_desc}"
+        view_desc = _immutable_view_prompt(self.operator)
+        if view_desc:
+            camera_suffix = f", {view_desc}"
 
         # ─── Collect reference images ────────────────────────────────
         ref_images = []
@@ -2877,7 +2878,7 @@ class _TexturingWorkflowMixin:
         
         base_prompt_text = _texturing_prompt(context.scene)
         # Camera Prompt Injection
-        if context.scene.use_camera_prompts and context.scene.generation_method in ['separate', 'sequential', 'refine', 'local_edit']:
+        if context.scene.generation_method in ['separate', 'sequential', 'refine', 'local_edit']:
             view_desc = _immutable_view_prompt(self.operator)
             if view_desc:
                 # Prepend the view description
@@ -3322,7 +3323,7 @@ class _TexturingWorkflowMixin:
         
         base_prompt_text = _texturing_prompt(context.scene)
         # Camera Prompt Injection
-        if context.scene.use_camera_prompts and context.scene.generation_method in ['separate', 'sequential', 'refine', 'local_edit']:
+        if context.scene.generation_method in ['separate', 'sequential', 'refine', 'local_edit']:
             view_desc = _immutable_view_prompt(self.operator)
             if view_desc:
                 # Prepend the view description
@@ -3556,7 +3557,7 @@ class _TexturingWorkflowMixin:
         
         base_prompt_text = _texturing_prompt(context.scene)
         # Camera Prompt Injection
-        if context.scene.use_camera_prompts and context.scene.generation_method in ['separate', 'sequential', 'refine', 'local_edit']:
+        if context.scene.generation_method in ['separate', 'sequential', 'refine', 'local_edit']:
             view_desc = _immutable_view_prompt(self.operator)
             if view_desc:
                 # Prepend the view description
@@ -3759,7 +3760,7 @@ class _TexturingWorkflowMixin:
         
         base_prompt_text = _texturing_prompt(context.scene)
         # Camera Prompt Injection
-        if context.scene.use_camera_prompts and context.scene.generation_method in ['separate', 'sequential', 'refine', 'local_edit', 'grid']:
+        if context.scene.generation_method in ['separate', 'sequential', 'refine', 'local_edit', 'grid']:
             view_desc = _immutable_view_prompt(self.operator)
             if view_desc:
                 # Prepend the view description

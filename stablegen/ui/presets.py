@@ -626,6 +626,7 @@ GEN_PARAMETERS = [
     'mask_blocky',
     'architecture_mode',
     'use_camera_prompts',
+    'use_object_prompts',
     'sg_use_custom_camera_order',
     'generation_mode',
     'texture_objects',
