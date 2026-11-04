@@ -125,6 +125,12 @@ class STABLEGEN_OT_comfy_install(bpy.types.Operator):
             self.report({'ERROR'}, "Allow online access in Blender's preferences (System) to download models")
             return {'CANCELLED'}
         runtime.begin_install([t for t in self.tags.split(",") if t])
+        from ..ui import studio
+        if (runtime.review is not None and runtime.review["notices"]
+                and not any(getattr(s, 'alive', True) for s in studio._sessions.values())
+                and (context.area is None or context.area.type != 'PREFERENCES')):
+            # the legacy panel: the license notices wait in the preferences (the StableGen panel shows its Setup page)
+            bpy.ops.preferences.addon_show('INVOKE_DEFAULT', module=runtime.ADDON_PKG)
         return {'FINISHED'}
 
 

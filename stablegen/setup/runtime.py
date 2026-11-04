@@ -301,7 +301,7 @@ def notices_for(tags: List[str]) -> List[str]:
 
 def begin_install(tags: List[str]):
     """Install these package tags, after the user accepts their license notices and, for a ComfyUI of their own,
-    the changes to its Python (both shown in the preferences)."""
+    the changes to its Python (both shown on the Setup page and in the preferences)."""
     global review
     p = prefs()
     folder = comfy_folder(p)
@@ -314,6 +314,8 @@ def begin_install(tags: List[str]):
                    lambda plan: _plan_done(current, plan))
     elif not review["notices"]:
         confirm_install()
+    if review is not None and review["notices"]:
+        show_review()
     redraw()
 
 
@@ -323,7 +325,18 @@ def _plan_done(pending, plan):
     pending["plan"] = plan or {"error": "run", "message": "the check did not finish"}
     if not pending["notices"] and not needs_review(pending["plan"]):
         confirm_install()
+    elif not pending["notices"]:        # with notices the Install button already showed the review
+        show_review()
     redraw()
+
+
+def show_review():
+    """Take the StableGen panel to its Setup page, where an install waiting for the user's OK is drawn, so an Install
+    pressed elsewhere (the line under Architecture) doesn't seem to do nothing."""
+    from ..ui import studio
+    for session in studio._sessions.values():
+        if getattr(session, 'alive', True) and session.page != 'SETUP':
+            session.navigate('SETUP')
 
 
 def needs_review(plan: Optional[dict]) -> bool:
