@@ -244,6 +244,39 @@ PRESETS["REFINE (QWEN 2.1)"] = {
     "lora_units": [],
 }
 
+# TRELLIS.2 meshes textured with Qwen-Image 2.1, which replaced Qwen Image
+# Edit's: each keeps its TRELLIS.2 mesh, camera and texturing setup and takes
+# Qwen 2.1's tested sampling. Voronoi keeps its own blending exponents. They
+# replace the Qwen Image Edit ones in their order, so the numbers saved files
+# store for every preset stay put.
+_TRELLIS_QWEN_21 = {
+    "PRECISE": "Precise detail when camera overlap is good. Relies on context renders plus the prompt.",
+    "SAFE": "Safer fallback when coverage is limited. Uses the TRELLIS.2 input image as sequential style "
+            "reference for global coherence.",
+    "ALT": "Uses ADDITIONAL context renders with TRELLIS.2 style transfer for consistency.",
+    "VORONOI": "Voronoi projection with exponent 1000 for hard camera segmentation during generation, then "
+               "resets to 15 for softer blending.",
+}
+for _name, _purpose in _TRELLIS_QWEN_21.items():
+    _values = PRESETS.pop(f"QWEN {_name} (MESH + TEXTURE)")
+    PRESETS[f"QWEN 2.1 {_name} (MESH + TEXTURE)"] = {
+        **_values,
+        "description": (
+            f"Uses TRELLIS.2 and Qwen-Image 2.1 to generate a textured mesh. {_purpose} Samples 20 steps at CFG 1 "
+            "with DPM++ SDE and SGM Uniform and no Lightning LoRA."
+        ),
+        "model_architecture": "qwen_image_21",
+        "trellis2_texture_mode": "qwen_image_21",
+        "weight_exponent": _values["weight_exponent"] if _name == "VORONOI" else 7.0,
+        "steps": 20,
+        "cfg": 1.0,
+        "sampler": "dpmpp_sde",
+        "scheduler": "sgm_uniform",
+        "qwen_image_21_native_rgba": False,
+        "qwen_guidance_background_color": mathutils.Color((0.5, 0.5, 0.5)),
+        "lora_units": [],
+    }
+
 # Qwen-Image 2.1 Turbo keeps every Qwen 2.1 view, context and projection
 # strategy and changes only the sampling: its trained 8-step schedule at CFG 1
 # with Euler. The scheduler is unused at 8 steps; Simple applies otherwise.
@@ -432,8 +465,8 @@ def preset_label(identifier, label):
         label = strip_word(label, name)[0]
     if label.startswith('Uv '):         # title() case of UV
         label = 'UV ' + label[3:]
-    # TRELLIS.2 (MESH ONLY) is the stock mesh preset once its tag says what it does.
-    return 'Default' if trellis and label.casefold() == 'trellis.2' else label
+    # TRELLIS.2 (MESH ONLY): its name is all model, so it is named for what it does ('Default' is SDXL's)
+    return 'Mesh only' if trellis and label.casefold() == 'trellis.2' else label
 
 
 # Global list of all generation parameter names to check for a preset.

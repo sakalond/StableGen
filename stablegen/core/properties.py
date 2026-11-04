@@ -1050,7 +1050,7 @@ def register_properties(update_model_list, ControlNetUnit, LoRAUnit,
             ('image', 'Image', 'Use an existing image as input'),
             ('prompt', 'Prompt', 'Generate an image from the prompt first, then feed to TRELLIS.2'),
         ],
-        default='image', update=update_trellis2_generate_from
+        default='prompt', update=update_trellis2_generate_from
     )
     bpy.types.Scene.trellis2_texture_mode = bpy.props.EnumProperty(
         name="Texture Mode", description="How to generate textures for the 3D mesh",
@@ -1163,7 +1163,7 @@ def register_properties(update_model_list, ControlNetUnit, LoRAUnit,
     bpy.types.Scene.trellis2_preview_gallery_enabled = bpy.props.BoolProperty(
         name="Preview Gallery",
         description="When in prompt mode, generate multiple images with different seeds and let you pick the best one before proceeding to 3D generation",
-        default=False, update=update_parameters
+        default=True, update=update_parameters
     )
     bpy.types.Scene.trellis2_preview_gallery_count = bpy.props.IntProperty(
         name="Gallery Count", description="Number of images to generate per batch in the preview gallery",
