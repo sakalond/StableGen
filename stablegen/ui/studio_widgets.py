@@ -837,11 +837,17 @@ class Painter:
                   'number_text' if enabled else 'disabled')
         return target
 
-    def text_field(self, key, rect, value, action, *, enabled=True, hint='', editing=None, scroll=0, multiline=False, follow_caret=True, kind='field'):
+    def text_field(self, key, rect, value, action, *, enabled=True, hint='', editing=None, scroll=0, multiline=False, follow_caret=True, kind='field', placeholder=''):
         x, y, w, h = rect
         self.outline(x, y, w, h, fill=kind, border='cursor' if editing else 'hover_border'
                      if enabled and key == self.hover_key else kind + '_border')
         self.target(key, rect, action, enabled, hint)
+        if placeholder and not value:
+            # what belongs here, greyed, until something is typed (the caret still shows while editing)
+            padding_y = TEXT_PADDING if multiline else (h - font_size()) / 2 - 1
+            rows = int((h - TEXT_PADDING * 2) / TEXT_LINE_HEIGHT) if multiline else 1
+            for index, (_, _, line) in enumerate(wrap(placeholder, w - TEXT_PADDING * 2, self.measure)[:max(1, rows)]):
+                self.text(line, x + TEXT_PADDING, y + padding_y + index * TEXT_LINE_HEIGHT, FONT_SIZE, 'disabled')
         if not multiline and editing is None:
             self.text(value, x + TEXT_PADDING, y + (h - font_size()) / 2 - 1, FONT_SIZE,
                       kind + '_text' if enabled else 'disabled', w - TEXT_PADDING * 2)

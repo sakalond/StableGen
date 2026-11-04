@@ -1095,8 +1095,11 @@ class StudioSession:
         drag = self.drag if self.drag and self.drag.get('key') == key else None
         return {'zone': self.hover_zone if self.hovered(key) else None, 'dragging': bool(drag and drag['moved'])}
 
-    def draw_binding(self, painter, binding, label, x, y, width, *, enabled=True, multiline=False, height=112, corners='ALL'):
+    def draw_binding(self, painter, binding, label, x, y, width, *, enabled=True, multiline=False, height=112, corners='ALL',
+                     placeholder=None):
         ctx = bpy.context
+        if placeholder is None and multiline:
+            placeholder = prompt_wording(ctx.scene, binding.property)[1]
         prop, value = binding.rna(ctx), binding.value(ctx)
         hint = help_text.property_hint(binding, ctx)
         label_y = y
@@ -1131,7 +1134,8 @@ class StudioSession:
                                               ('edit', binding, True), enabled=enabled,
                                               hint=hint, editing=editing['buffer'] if editing else None,
                                               scroll=editing['scroll'] if editing else self.text_scroll.get(key, 0), multiline=True,
-                                              follow_caret=editing.get('follow_caret', True) if editing else False)
+                                              follow_caret=editing.get('follow_caret', True) if editing else False,
+                                              placeholder=placeholder or '')
             self.text_scroll[key] = scroll
             self.text_fields[key] = (lines, max(1, int((height - TEXT_PADDING * 2) / TEXT_LINE_HEIGHT)))
             if editing:
@@ -2160,7 +2164,8 @@ class StudioSession:
         masked = (scene.qwen_generation_method if scene.model_architecture in QWEN_ARCHITECTURES else scene.generation_method) == 'masked_edit' and scene.architecture_mode != 'trellis2'
         prompt = 'sg_masked_prompt' if masked else 'comfyui_prompt'
         if hasattr(scene, prompt) and not trellis:
-            y += self.draw_binding(p, self.binding(prompt), 'Edit instructions' if masked else 'Object prompt' if native else 'Texture prompt', x, y + 4, width, multiline=True, height=112) + 6
+            y += self.draw_binding(p, self.binding(prompt), prompt_wording(scene, prompt)[0], x, y + 4, width,
+                                   multiline=True, height=112) + 6
         handled = {'architecture_mode', 'stablegen_preset', 'model_name', 'comfyui_prompt', 'sg_masked_prompt',
                    'generation_method', 'qwen_generation_method', 'texture_objects'}
         if masked:
@@ -2234,11 +2239,12 @@ class StudioSession:
                 y = self.draw_dependent(p, x, y, width, lambda cx, cy, cw:
                     cy + self.draw_binding(p, binding, 'Image count', cx, cy, cw,
                                           enabled=scene.trellis2_preview_gallery_enabled)) + 5
-            else:
-                shared = scene.trellis2_texture_mode not in {'native', 'none'} and not scene.use_separate_texture_prompt
-                y += self.draw_binding(p, self.binding('comfyui_prompt'), 'Shared texture prompt' if shared else 'Mesh image prompt', x, y + 4, width,
-                                       multiline=True, height=112, enabled=shared) + 6
-                p.text('Mesh generation uses the selected input image.', x, y, 10, 'secondary', width)
+            elif scene.trellis2_texture_mode not in {'native', 'none'} and not scene.use_separate_texture_prompt:
+                # From an image the prompt only matters when it textures the mesh
+                y += self.draw_binding(p, self.binding('comfyui_prompt'), 'Texture prompt', x, y + 4, width,
+                                       multiline=True, height=112,
+                                       placeholder=prompt_wording(scene, 'texture_prompt')[1]) + 6
+                p.text('Texturing uses this prompt; the mesh comes from the input image.', x, y, 10, 'secondary', width)
                 y += 25
             omit = {'architecture_mode', 'stablegen_preset', 'comfyui_prompt', 'texture_prompt',
                     'use_separate_texture_prompt', 'trellis2_texture_mode', 'trellis2_generate_from',
@@ -2248,6 +2254,8 @@ class StudioSession:
                 omit.add('model_name')
                 omit.add('op:stablegen.refresh_checkpoint_list')
             y = self.draw_node(p, main.content, x, y, width, 'main', omit=omit)
+            if scene.trellis2_generate_from == 'image':
+                y = self.draw_input_thumbnail(p, scene, x, y, width)
             y += 8
             p.end_group((outer_x, start, outer_width, y - start), 'subbox', 'section_border', 3)
             x, width, y = outer_x, outer_width, y + 12
@@ -2255,6 +2263,17 @@ class StudioSession:
             if self.section_page(section) == 'MESH':
                 y = self.draw_section(p, section, x, y, width)
         return y
+
+    def draw_input_thumbnail(self, p, scene, x, y, width):
+        """The chosen input image under its field, so the mesh's source shows at a glance."""
+        path = bpy.path.abspath(scene.trellis2_input_image) if scene.trellis2_input_image else ''
+        if not path or not Path(path).is_file():
+            return y
+        height = 160
+        p.outline(x, y + 2, width, height, 'field', 'line', 4)
+        if p.image(path, (x + 4, y + 6, width - 8, height - 8)) is None:
+            p.text("Can't read this image", x + 10, y + height / 2 - 4, 10, 'muted', width - 20)
+        return y + height + 8
 
     def draw_cameras(self, p, x, y, width):
         scene = bpy.context.scene
