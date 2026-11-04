@@ -168,6 +168,7 @@ def restore(scene, *, finish=True):
         if obj is None or record.mesh is None or obj.type != 'MESH':
             continue
         obj.data = record.mesh
+        _remove_stale_uv_projectors(obj)
         for slot, saved in zip(obj.material_slots, record.slots):
             slot.link = 'OBJECT'
             slot.material = saved.object_material

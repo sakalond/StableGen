@@ -329,6 +329,30 @@ def _copy_uv_to_attribute(obj, uv_layer_name, attr_name):
     obj.data.update()
 
 
+def _remove_stale_uv_projectors(obj):
+    """Remove UV Project modifiers that target the temporary buffer UV map.
+
+    Only a failed projection leaves one behind. Blender 5 writes such a
+    modifier into the active UV map, so it must not stay on the object.
+    """
+    for modifier in [m for m in obj.modifiers
+                     if m.type == 'UV_PROJECT' and m.uv_layer == _SG_BUFFER_UV_NAME]:
+        obj.modifiers.remove(modifier)
+
+
+def _apply_uv_projector(context, obj, modifier):
+    """Apply *modifier* on *obj* even when the caller's context names another
+    object (Studio diagnostics pin the inspected camera), and fail loudly."""
+    name = modifier.name  # the applied modifier is freed
+    with context.temp_override(object=obj, active_object=obj,
+                               selected_objects=[obj], selected_editable_objects=[obj]):
+        bpy.ops.object.modifier_apply(modifier=name)
+    left = obj.modifiers.get(name)
+    if left is not None:
+        obj.modifiers.remove(left)
+        raise RuntimeError(f"Could not apply the camera projection to {obj.name}.")
+
+
 def _projection_uvw_name(camera_index, mat_id):
     return f"ProjectionUVW_{camera_index}_{mat_id}"
 
@@ -2775,6 +2799,7 @@ def project_image(
                 buffer_uv = obj.data.uv_layers.get(_SG_BUFFER_UV_NAME)
                 if not buffer_uv:
                     buffer_uv = obj.data.uv_layers.new(name=_SG_BUFFER_UV_NAME)
+                _remove_stale_uv_projectors(obj)
 
                 # Add the UV Project Modifier
                 uv_project_mod = obj.modifiers.new(name="UVProject", type='UV_PROJECT')
@@ -2799,7 +2824,7 @@ def project_image(
                 obj.data.uv_layers.active = buffer_uv
 
                 # Apply the modifier
-                bpy.ops.object.modifier_apply(modifier=uv_project_mod.name)
+                _apply_uv_projector(context, obj, uv_project_mod)
 
                 # Copy buffer UV data to a named attribute (no UV slot limit)
                 attr_name = f"ProjectionUV_{i}_{mat_id}"
