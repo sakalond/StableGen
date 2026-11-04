@@ -172,13 +172,20 @@ class InstallerJob:
         elapsed = max(time.monotonic(), self._samples[-1][0]) - start_time
         return (self._samples[-1][1] - start_bytes) / elapsed if elapsed > 0.5 else None
 
+    @staticmethod
+    def bytes_text(done, total) -> str:
+        """'5.1 of 14.3 GB', or in MB below a gigabyte (uv, Git): not '0.0 of 0.0 GB'."""
+        if total >= 1024**3:
+            return f"{done / 1024**3:.1f} of {total / 1024**3:.1f} GB"
+        return f"{done / 1024**2:.0f} of {total / 1024**2:.0f} MB"
+
     def total_mb(self) -> float:
         return sum(i.get("size_mb", 0) for i in self.items.values() if not i.get("present"))
 
     def size_text(self) -> str:
         """'5.1 of 14.3 GB' over the whole run, or 'Preparing…' before its plan arrives."""
         total = self.total_mb()
-        return f"{self.progress() * total / 1024:.1f} of {total / 1024:.1f} GB" if total else "Preparing…"
+        return self.bytes_text(self.progress() * total * 1024**2, total * 1024**2) if total else "Preparing…"
 
     def rate_text(self) -> str:
         """'42 MB/s · 4 min left' while downloading, else ''."""
@@ -205,5 +212,5 @@ class InstallerJob:
         if not item:
             return "Preparing…"
         if item.get("total"):
-            return f"{item['name']}: {item['done'] / 1024**3:.1f} of {item['total'] / 1024**3:.1f} GB"
+            return f"{item['name']}: {self.bytes_text(item['done'], item['total'])}"
         return f"{item['name']}…"

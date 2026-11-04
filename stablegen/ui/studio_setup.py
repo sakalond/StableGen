@@ -11,6 +11,7 @@ from . import studio_tips as tips
 from .studio_text import wrap
 from .studio_widgets import CONTROL_GAP, CONTROL_HEIGHT, FONT_SIZE, font_size
 from ..setup import installer, packages, prefs_ui, runtime
+from ..setup.jobs import InstallerJob
 
 OPENED = 'setup_page_opened'        # the page opens by itself once, on the first run
 MODES = (
@@ -283,7 +284,7 @@ def _own_progress(session, p, job, x, y, width):
         p.text(item["name"], x + 20, y, FONT_SIZE, 'secondary' if done else 'text' if current else 'muted',
                width - 110)
         if current and item.get("total"):
-            size = f"{item['done'] / 1024**3:.1f} of {item['total'] / 1024**3:.1f} GB"
+            size = InstallerJob.bytes_text(item['done'], item['total'])
         else:
             size = packages.size_text(item.get("size_mb", 0)) if item.get("size_mb") else ""
         p.text(size, x + width - p.measure(size, 10), y + 1, 10, 'muted')
