@@ -27,6 +27,9 @@ from .rig_display import (
     selected_armatures_for_display,
 )
 from ..core.architectures import DIFFUSION_ARCHITECTURES
+from ..core import get_addon_prefs
+from .meshtools import _MeshToolOperator, _export_glb
+from .trellis2_graph import build_mesh_postprocess_prompt
 
 _ADDON_PKG = __package__.rsplit('.', 1)[0]
 _GARMENT_STABILIZED_GROUP = "SG_GarmentStabilized"
@@ -3326,147 +3329,309 @@ def perform_local_retopology(context, meshes, remesh_method, progress_cb=None):
         context.workspace.status_text_set(None)
 
 
-class StableGenLocalPostProcess(bpy.types.Operator):
-    """Run local post-processing (decimation and/or retopology) on the active mesh"""
+def _postprocess_steps(scene):
+    """The Mesh post-processing settings as steps, in the order TRELLIS.2 generation runs them: QDC remeshing and
+    server QEM in one ComfyUI graph (QDC always decimates to the target after it), LATO.2 on ComfyUI, then in
+    Blender Solidify, collapse decimation and Quadriflow."""
+    decimate = getattr(scene, 'trellis2_decimate_method', 'server')
+    remesh = getattr(scene, 'trellis2_remesh_method', 'qdc')
+    return {
+        'qdc': remesh == 'qdc',
+        'server_faces': int(scene.trellis2_decimation) if remesh == 'qdc' or decimate == 'server' else 0,
+        'lato2': remesh == 'lato2',
+        'solidify': bool(getattr(scene, 'trellis2_solidify', False)),
+        'collapse': decimate == 'collapse',
+        'quadriflow': remesh == 'quadriflow',
+    }
+
+
+def _needs_server(steps):
+    return bool(steps['qdc'] or steps['server_faces'] or steps['lato2'])
+
+
+def _replace_mesh_from_glb(context, obj, glb_path, matrix=None):
+    """Put the mesh of a GLB, which holds obj's mesh in its local space (after `matrix`, if given), into obj in
+    place: the object, its transform, modifiers and material slots stay. Returns what changed."""
+    import bmesh
+    old = obj.data
+    known_materials, known_images = set(bpy.data.materials), set(bpy.data.images)
+    active, selected = context.view_layer.objects.active, list(context.selected_objects)
+    collection = bpy.data.collections.new("SG_postprocess_result")
+    context.scene.collection.children.link(collection)
+    previous = context.view_layer.active_layer_collection
+    context.view_layer.active_layer_collection = context.view_layer.layer_collection.children[collection.name]
+    try:
+        bpy.ops.import_scene.gltf(filepath=glb_path)
+    finally:
+        context.view_layer.active_layer_collection = previous
+    imported = list(collection.all_objects)
+    try:
+        bm = bmesh.new()
+        for part in imported:
+            if part.type == 'MESH':
+                part.data.transform(part.matrix_world)
+                bm.from_mesh(part.data)
+        if not bm.faces:
+            bm.free()
+            raise RuntimeError("the result holds no mesh")
+        mesh = bpy.data.meshes.new(old.name)
+        bm.to_mesh(mesh)
+        bm.free()
+        if matrix is not None:
+            mesh.transform(matrix)
+    finally:
+        meshes = [part.data for part in imported if part.type == 'MESH']
+        for part in imported:
+            bpy.data.objects.remove(part)
+        for data in meshes:
+            if data.users == 0:
+                bpy.data.meshes.remove(data)
+        bpy.data.collections.remove(collection)
+        for material in set(bpy.data.materials) - known_materials:
+            if material.users == 0:
+                bpy.data.materials.remove(material)
+        for image in set(bpy.data.images) - known_images:
+            if image.users == 0:
+                bpy.data.images.remove(image)
+        # the import selected its own objects: give the selection back
+        for other in selected:
+            other.select_set(True)
+        context.view_layer.objects.active = active
+
+    for material in old.materials:
+        mesh.materials.append(material)
+    if any(polygon.use_smooth for polygon in old.polygons):
+        mesh.shade_smooth()
+    else:
+        mesh.shade_flat()
+    lost = [what for what, present in (
+        ("UVs", len(old.uv_layers)), ("shape keys", old.shape_keys is not None),
+        ("skin weights", obj.vertex_groups and any(vertex.groups for vertex in old.vertices))) if present]
+    before = len(old.polygons)
+    obj.data = mesh
+    if old.users == 0:
+        bpy.data.meshes.remove(old)
+    message = f"{obj.name}: {before} to {len(mesh.polygons)} faces"
+    return message + (f" ({', '.join(lost)} didn't carry over)" if lost else "")
+
+
+def _run_local_postprocess(context, obj, steps):
+    """Solidify, collapse decimation and Quadriflow on obj, as the steps ask. Collapse decimation runs in the
+    background and Quadriflow after it. Returns a short report, or None when there's nothing to do here."""
+    if not (steps['solidify'] or steps['collapse'] or steps['quadriflow']):
+        return None
+    if obj.mode != 'OBJECT':
+        bpy.ops.object.mode_set(mode='OBJECT')
+    target_faces = context.scene.trellis2_decimation
+    print(f"[StableGen] Local post-processing on {obj.name}: {steps}, target={target_faces}")
+
+    if steps['solidify']:
+        from ..texturing.print_export import _make_solid_mesh_object
+        solid_mesh = _make_solid_mesh_object(
+            obj, require_printable=False,
+            seal_bottom=getattr(context.scene, "trellis2_solidify_seal_bottom", True))
+        old_mesh = obj.data
+        obj.data = solid_mesh
+        bpy.data.meshes.remove(old_mesh)
+        print(f"[StableGen] Solidification completed for {obj.name}")
+
+    if not steps['collapse']:
+        if steps['quadriflow']:
+            perform_local_retopology(context, [obj], 'quadriflow')
+        return "Local post-processing done"
+
+    import numpy as np
+    import bmesh
+
+    # Extract mesh data on the main thread, decimate with trimesh in the background
+    mesh = obj.data
+    vertices = np.empty(len(mesh.vertices) * 3, dtype=np.float32)
+    mesh.vertices.foreach_get("co", vertices)
+    vertices = vertices.reshape((-1, 3))
+    bm = bmesh.new()
+    bm.from_mesh(mesh)
+    bmesh.ops.triangulate(bm, faces=bm.faces)
+    faces = np.empty(len(bm.faces) * 3, dtype=np.int32)
+    for i, face in enumerate(bm.faces):
+        faces[i*3 : (i+1)*3] = [v.index for v in face.verts]
+    bm.free()
+    faces = faces.reshape((-1, 3))
+
+    def bg_decimate_work():
+        import trimesh
+        t_mesh = trimesh.Trimesh(vertices=vertices, faces=faces, process=False)
+        if len(t_mesh.faces) > target_faces:
+            decimated = t_mesh.simplify_quadric_decimation(face_count=target_faces)
+            return {"vertices": decimated.vertices.tolist(), "faces": decimated.faces.tolist(), "success": True}
+        return {"success": False}
+
+    def on_decimate_done(result):
+        if not result:
+            print("[StableGen] Async decimation failed or was aborted.")
+            return
+        if not obj or obj.name not in bpy.context.scene.objects:
+            print("[StableGen] Active mesh object no longer exists.")
+            return
+        if result.get("success"):
+            mesh = obj.data
+            mesh.clear_geometry()
+            mesh.from_pydata(result["vertices"], [], result["faces"])
+            mesh.update()
+            print("[StableGen] Async decimation written back successfully.")
+        else:
+            print("[StableGen] Mesh already has fewer faces than target. Bypassed decimation.")
+        try:
+            if steps['quadriflow']:
+                perform_local_retopology(bpy.context, [obj], 'quadriflow')
+            bpy.context.workspace.status_text_set(None)
+            for area in bpy.context.screen.areas:
+                if area.type == 'VIEW_3D':
+                    area.tag_redraw()
+        except Exception as post_err:
+            print(f"[StableGen] Error in post-decimation stage: {post_err}")
+
+    from ..core.state import _run_async
+    context.workspace.status_text_set("StableGen: Decimating mesh in background...")
+    _run_async(bg_decimate_work, on_decimate_done)
+    return "Collapse decimation started in the background"
+
+
+class StableGenLocalPostProcess(_MeshToolOperator):
+    """Run the Mesh post-processing settings on the active mesh, replacing its geometry"""
     bl_idname = "object.stablegen_local_postprocess"
-    bl_label = "Run Local Post-Processing"
+    bl_label = "Post-Process Active Mesh"
+    bl_description = (
+        "Run the Mesh post-processing settings on the active mesh and replace its geometry: QDC, server QEM and "
+        "LATO.2 run on the ComfyUI server, then Solidify, collapse decimation and Quadriflow in Blender. UVs, "
+        "textures and skin weights don't carry over the server steps"
+    )
     bl_options = {'REGISTER', 'UNDO'}
+    _is_running = False
+    _cancelled = False
+    _active_ws = None
+    _node_label = "Mesh post-processing"
+    _class_type = "postprocess"
 
     @classmethod
     def poll(cls, context):
-        return context.active_object and context.active_object.type == 'MESH'
-
-    def execute(self, context):
-        scene = context.scene
-        decimate_method = getattr(scene, 'trellis2_decimate_method', 'server')
-        remesh_method = getattr(scene, 'trellis2_remesh_method', 'qdc')
-        solidify = getattr(scene, 'trellis2_solidify', False)
-        
-        # 1. Check if all post-processing options are disabled/none
-        if decimate_method == 'none' and remesh_method == 'none' and not solidify:
-            self.report({'WARNING'}, "No local post-processing is enabled (Decimation, Retopology, and Solidification are all disabled/set to None).")
-            return {'CANCELLED'}
-            
-        # 2. Error if set to server-side post-processing
-        if decimate_method == 'server' or remesh_method == 'qdc':
-            self.report({'ERROR'}, "Server-side processing cannot be run locally. Please select a local decimation/remesh method.")
-            return {'CANCELLED'}
-            
+        if cls._is_running:
+            return True
         obj = context.active_object
         if not obj or obj.type != 'MESH':
-            self.report({'ERROR'}, "No active mesh object.")
-            return {'CANCELLED'}
-            
-        target_faces = scene.trellis2_decimation
-        do_decimate = (decimate_method == 'collapse')
-        
-        print(f"[StableGen] Running manual local post-processing on {obj.name}: decimate={decimate_method}, remesh={remesh_method}, solidify={solidify}, target={target_faces}")
-        
-        # Switch to object mode
+            cls.poll_message_set("Select an active mesh object")
+            return False
+        if sg_modal_active(context):
+            cls.poll_message_set("Another operation is in progress")
+            return False
+        steps = _postprocess_steps(context.scene)
+        if not any(steps.values()):
+            cls.poll_message_set("Nothing to do: pick a decimation or remesh method, or Solidify Mesh")
+            return False
+        if _needs_server(steps):
+            prefs = get_addon_prefs(context)
+            if prefs is None or not prefs.server_address or not prefs.server_online:
+                cls.poll_message_set("QDC, server QEM and LATO.2 run on the ComfyUI server, which isn't connected")
+                return False
+            if steps['lato2'] and not getattr(context.scene, 'meshtools_lato2_available', False):
+                from .meshtools import lato2_missing
+                cls.poll_message_set(lato2_missing()[0])
+                return False
+        return True
+
+    def execute(self, context):
+        if type(self)._is_running:
+            return super().execute(context)     # cancels the run
+        obj = context.active_object
         if obj.mode != 'OBJECT':
             bpy.ops.object.mode_set(mode='OBJECT')
-            
-        # 3. Run solidification locally on the main thread first if enabled
-        if solidify:
-            from ..texturing.print_export import _make_solid_mesh_object
-            try:
-                print(f"[StableGen] Solidifying active mesh: {obj.name}...")
-                solid_mesh = _make_solid_mesh_object(obj)
-                old_mesh = obj.data
-                obj.data = solid_mesh
-                bpy.data.meshes.remove(old_mesh)
-                print(f"[StableGen] Solidification completed for {obj.name}")
-            except Exception as e:
-                self.report({'ERROR'}, f"Failed to solidify mesh: {e}")
-                return {'CANCELLED'}
-
-            
-        # If we need local decimation, run it asynchronously
-        if do_decimate:
-            import numpy as np
-            import bmesh
-            
-            print(f"[StableGen] Starting async trimesh decimation for {obj.name}...")
-            
-            # Extract mesh data on main thread
-            mesh = obj.data
-            vertices = np.empty(len(mesh.vertices) * 3, dtype=np.float32)
-            mesh.vertices.foreach_get("co", vertices)
-            vertices = vertices.reshape((-1, 3))
-            
-            bm = bmesh.new()
-            bm.from_mesh(mesh)
-            bmesh.ops.triangulate(bm, faces=bm.faces)
-            
-            faces = np.empty(len(bm.faces) * 3, dtype=np.int32)
-            for i, face in enumerate(bm.faces):
-                faces[i*3 : (i+1)*3] = [v.index for v in face.verts]
-            bm.free()
-            
-            faces = faces.reshape((-1, 3))
-            
-            # Define worker and callback
-            def bg_decimate_work():
-                import trimesh
-                t_mesh = trimesh.Trimesh(vertices=vertices, faces=faces, process=False)
-                orig_faces = len(t_mesh.faces)
-                if orig_faces > target_faces:
-                    decimated = t_mesh.simplify_quadric_decimation(face_count=target_faces)
-                    return {
-                        "vertices": decimated.vertices.tolist(),
-                        "faces": decimated.faces.tolist(),
-                        "success": True
-                    }
-                return {"success": False}
-                
-            def on_decimate_done(result):
-                if not result:
-                    print("[StableGen] Async decimation failed or was aborted.")
-                    return
-                
-                # Check if object still exists
-                if not obj or obj.name not in bpy.context.scene.objects:
-                    print("[StableGen] Active mesh object no longer exists.")
-                    return
-                    
-                if result.get("success"):
-                    mesh = obj.data
-                    mesh.clear_geometry()
-                    mesh.from_pydata(result["vertices"], [], result["faces"])
-                    mesh.update()
-                    print(f"[StableGen] Async decimation written back successfully.")
-                else:
-                    print(f"[StableGen] Mesh already has fewer faces than target. Bypassed decimation.")
-                
-                # Post-decimation stage (retopology)
-                try:
-                    if remesh_method == 'quadriflow':
-                        perform_local_retopology(bpy.context, [obj], remesh_method)
-                    bpy.context.workspace.status_text_set(None)
-                    # Trigger viewport redraw
-                    for area in bpy.context.screen.areas:
-                        if area.type == 'VIEW_3D':
-                            area.tag_redraw()
-                except Exception as post_err:
-                    print(f"[StableGen] Error in post-decimation stage: {post_err}")
-            
-            # Run async decimation
-            from ..core.state import _run_async
-            bpy.context.workspace.status_text_set("StableGen: Decimating mesh in background...")
-            _run_async(bg_decimate_work, on_decimate_done)
-            self.report({'INFO'}, "Trimesh decimation started in the background...")
+        self._steps = _postprocess_steps(context.scene)
+        if _needs_server(self._steps):
+            return super().execute(context)
+        try:
+            self.report({'INFO'}, _run_local_postprocess(context, obj, self._steps))
             return {'FINISHED'}
-            
-        else:
-            # No background decimation needed, run retopology synchronously on main thread
-            try:
-                if remesh_method == 'quadriflow':
-                    perform_local_retopology(context, [obj], remesh_method)
-                    
-                self.report({'INFO'}, "Local post-processing completed successfully!")
-                return {'FINISHED'}
-            except Exception as e:
-                self.report({'ERROR'}, f"Failed to run local post-processing: {e}")
-                import traceback
-                traceback.print_exc()
-                return {'CANCELLED'}
+        except Exception as exc:
+            traceback.print_exc()
+            self.report({'ERROR'}, f"Mesh post-processing failed: {exc}")
+            return {'CANCELLED'}
+
+    def _prepare(self, context, work_dir):
+        obj = context.active_object
+        scene = context.scene
+        self._target_name = obj.name
+        self._lato2 = (int(scene.meshtools_lato2_vertices), int(scene.meshtools_lato2_seed))
+        if not obj.data.polygons:
+            raise RuntimeError(f"{obj.name} has no faces")
+        path = os.path.join(work_dir, f"postprocess_source_{datetime.now():%H%M%S}.glb")
+        # the mesh alone, in its local space without modifiers, so the result goes straight back into obj.data
+        data, self._restore = obj.data, None
+        if self._steps['qdc']:
+            # QDC remeshes inside a fixed [-0.5, 0.5] cube (TRELLIS.2's frame): fit the mesh in it, then back
+            import numpy as np
+            co = np.empty(len(data.vertices) * 3, dtype=np.float64)
+            data.vertices.foreach_get("co", co)
+            co = co.reshape(-1, 3)
+            low, high = co.min(axis=0), co.max(axis=0)
+            extent = float((high - low).max())
+            if extent > 0:
+                fit = (mathutils.Matrix.Scale(1.0 / extent, 4)
+                       @ mathutils.Matrix.Translation(-mathutils.Vector(((low + high) / 2).tolist())))
+                self._restore = fit.inverted()
+                data = data.copy()
+                data.transform(fit)
+        holder = bpy.data.objects.new("SG_postprocess_source", data)
+        scene.collection.objects.link(holder)
+        try:
+            _export_glb(context, [holder], path, materials=False, geometry_only=True)
+        finally:
+            bpy.data.objects.remove(holder)
+            if data is not obj.data:
+                bpy.data.meshes.remove(data)
+        return {}, {"source": path}
+
+    def _run(self, context, inputs, uploads):
+        steps, path = self._steps, uploads["source"]
+        manager = self.workflow_manager
+        try:
+            result = None
+            if steps['qdc'] or steps['server_faces']:
+                def graph(uploaded):
+                    prompt, nodes = build_mesh_postprocess_prompt(
+                        uploaded["model_file"]["annotated"], remesh=steps['qdc'],
+                        target_faces=steps['server_faces'], prefix="stablegen_postprocess")
+                    return prompt, nodes['export']
+                result = manager.generate_meshtools_file(
+                    context, "", {}, uploads={"model_file": path},
+                    label="QDC remesh" if steps['qdc'] else "Server QEM", graph=graph)
+                if steps['lato2'] and isinstance(result, bytes):
+                    path = os.path.join(self._work_dir, f"postprocess_decimated_{datetime.now():%H%M%S}.glb")
+                    with open(path, 'wb') as handle:
+                        handle.write(result)
+            if steps['lato2'] and (result is None or isinstance(result, bytes)):
+                vertices, seed = self._lato2
+                result = manager.generate_meshtools_file(
+                    context, "LATO2Remesh",
+                    {"vertex_count": vertices, "seed": seed, "filename_prefix": "stablegen_postprocess_lato2"},
+                    uploads={"input_path": path}, label="LATO.2")
+            if isinstance(result, dict) and "error" in result:
+                self._error = result["error"]
+            else:
+                self._result = result
+        except Exception as exc:
+            self._error = str(exc)
+            traceback.print_exc()
+
+    def _finish(self, context, glb_path):
+        obj = context.scene.objects.get(self._target_name)
+        if obj is None or obj.type != 'MESH':
+            raise RuntimeError(f"{self._target_name} is no longer in the scene")
+        if context.object and context.object.mode != 'OBJECT':
+            bpy.ops.object.mode_set(mode='OBJECT')
+        message = _replace_mesh_from_glb(context, obj, glb_path, self._restore)
+        try:
+            local = _run_local_postprocess(context, obj, self._steps)
+        except Exception as exc:
+            traceback.print_exc()
+            self.report({'WARNING'}, f"The server steps worked, the Blender steps failed: {exc}")
+            return message
+        return f"{message}. {local}" if local else message

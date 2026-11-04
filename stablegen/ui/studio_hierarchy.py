@@ -136,6 +136,14 @@ def build(source, omit=()):
                       if positions[parent] < positions[child]]
         if candidates:
             owners[child] = max(candidates, key=positions.get)
+    # A command listed as 'op:<idname>' belongs to the closest preceding owner field on any data.
+    for c in controls:
+        if c.method == 'operator' and c.args and 'op:' + c.args[0] in PARENTS:
+            names = set(PARENTS['op:' + c.args[0]])
+            candidates = [parent for (_, name), ids in by_property.items() if name in names
+                          for parent in ids if positions[parent] < positions[id(c)]]
+            if candidates:
+                owners[id(c)] = max(candidates, key=positions.get)
 
     def ancestors(cid):
         seen = set()

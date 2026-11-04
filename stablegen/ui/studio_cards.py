@@ -635,7 +635,7 @@ def partition_data(source, specs, data_tokens, omit, title):
 ACTION_DESCRIPTIONS = {
     'object.switch_material': 'Change the material shown on the model.',
     'object.stablegen_mirror_reproject': 'Mirror the last texture projection.',
-    'object.stablegen_local_postprocess': 'Decimate, remesh or solidify the active mesh using local methods.',
+    'object.stablegen_local_postprocess': 'Run the Mesh post-processing settings on the active mesh.',
     'object.add_hdri': 'Add environment lighting to the scene.',
     'object.apply_all_mesh_modifiers': 'Apply modifiers on the scene meshes.',
     'object.curves_to_mesh': 'Convert curves into mesh geometry.',

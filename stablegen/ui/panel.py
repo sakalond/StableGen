@@ -21,6 +21,53 @@ from . import queue as _queue_mod
 
 _ADDON_PKG = __package__.rsplit('.', 1)[0]
 
+
+def _running_operator(context, bl_idname):
+    return next((op for win in context.window_manager.windows for op in win.modal_operators
+                 if op.bl_idname == bl_idname), None)
+
+
+def _draw_meshtool_button(context, layout, bl_idname, operator_id, text, icon, cancel_text):
+    """The tool's button, or its progress bars and a cancel button while it runs."""
+    running = _running_operator(context, bl_idname)
+    if running is None:
+        layout.operator(operator_id, text=text, icon=icon)
+        return
+    layout.operator(operator_id, text=cancel_text, icon="CANCEL")
+    overall = getattr(running, '_overall_progress', 0.0)
+    layout.progress(text=f"{getattr(running, '_overall_stage', '')} ({overall:.0f}%)",
+                    factor=max(0.0, min(overall / 100.0, 1.0)))
+    phase = getattr(running, '_phase_progress', 0.0)
+    stage = getattr(running, '_phase_stage', '')
+    if stage:
+        layout.progress(text=f"{stage} ({phase:.0f}%)", factor=max(0.0, min(phase / 100.0, 1.0)))
+
+
+def draw_meshtools_section(context, layout):
+    """LATO.2 low-poly remesh (the ComfyUI-LATO2 node), or why the server doesn't have it."""
+    scene = context.scene
+    if not getattr(scene, 'meshtools_lato2_available', False):
+        from ..mesh_gen.meshtools import lato2_missing
+        why, operator, label, properties = lato2_missing()
+        layout.label(text=why, icon="INFO")
+        row = layout.row(align=True)
+        op = row.operator(operator, text=label)
+        for name, value in properties.items():
+            setattr(op, name, value)
+        if operator != "stablegen.check_server_status":
+            row.operator("stablegen.check_server_status", text="", icon="FILE_REFRESH")
+        return
+    layout.prop(scene, "meshtools_hide_source")
+
+    box = layout.box()
+    row = box.row(align=True)
+    row.prop(scene, "meshtools_lato2_vertices")
+    row.prop(scene, "meshtools_lato2_seed")
+    _draw_meshtool_button(context, box, 'OBJECT_OT_stablegen_lato2_remesh', "object.stablegen_lato2_remesh",
+                          "Remesh Selected", "MOD_REMESH", "Cancel LATO.2")
+
+
+
 def _is_refreshing():
     """Return True while async model-list refreshes are in-flight.
 
@@ -2525,7 +2572,9 @@ class StableGenPanel(bpy.types.Panel):
         row.operator("object.stablegen_mirror_reproject", text="Mirror Last Projection", icon="MOD_MIRROR")
         if width_mode == 'narrow':
             row = tools_box.row()
-        row.operator("object.stablegen_local_postprocess", text="Run Local Post-Processing", icon="MODIFIER")
+        _draw_meshtool_button(context, row, 'OBJECT_OT_stablegen_local_postprocess',
+                              "object.stablegen_local_postprocess", "Mesh Post-Processing", "MODIFIER",
+                              "Cancel Post-Processing")
 
         row = tools_box.row()
         row.operator("object.stablegen_make_solid", text="Make Solid", icon="MOD_REMESH")

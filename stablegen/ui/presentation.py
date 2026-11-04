@@ -41,7 +41,7 @@ TOOL_SECTIONS = {
     'mesh_tools': ('Mesh & rig utilities', 'TOOLS', 'MESH_DATA', (
         ('object.apply_all_mesh_modifiers', 'Apply all modifiers', 'modifier'),
         ('object.curves_to_mesh', 'Convert curves to mesh', 'curve'),
-        ('object.stablegen_local_postprocess', 'Local post-processing', 'modifier'),
+        ('object.stablegen_local_postprocess', 'Mesh post-processing', 'modifier'),
         ('object.stablegen_make_solid', 'Make solid', 'modifier'),
         ('object.stablegen_autorig_selected_mesh', 'Auto-rig selected character', 'rig'),
     )),
