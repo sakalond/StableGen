@@ -137,7 +137,7 @@ def _preset_architectures(preset):
         texture = preset.get('trellis2_texture_mode', 'native')
         if texture in ('none', 'native'):
             return ({preset.get('trellis2_initial_image_arch')}
-                    if preset.get('trellis2_generate_from', 'image') == 'prompt' else set())
+                    if preset.get('trellis2_generate_from', 'prompt') == 'prompt' else set())
         return {texture}
     return {preset.get('architecture_mode'), preset.get('model_architecture')}
 

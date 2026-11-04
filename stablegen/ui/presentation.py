@@ -27,6 +27,7 @@ SECTION_INFO = {
     'show_texturing_experiments': ('Experimental Texturing', 'DEBUG', 'EXPERIMENTAL'),
     'show_trellis2_mesh_settings': ('Mesh & Post-Processing', 'MESH', 'MESH_DATA'),
     'show_trellis2_autorig_settings': ('Rigging & Animation', 'MESH', 'ARMATURE_DATA'),
+    'show_meshtools': ('Low-poly remesh (LATO.2)', 'TOOLS', 'MOD_REMESH'),     # any mesh: with the tools
     'show_trellis2_texture_settings': ('Native Textures', 'MESH', 'TEXTURE'),
     'show_trellis2_camera_settings': ('Camera Placement', 'CAMERAS', 'CAMERA_DATA'),
 }
@@ -40,7 +41,7 @@ TOOL_SECTIONS = {
     'mesh_tools': ('Mesh & rig utilities', 'TOOLS', 'MESH_DATA', (
         ('object.apply_all_mesh_modifiers', 'Apply all modifiers', 'modifier'),
         ('object.curves_to_mesh', 'Convert curves to mesh', 'curve'),
-        ('object.stablegen_local_postprocess', 'Local post-processing', 'modifier'),
+        ('object.stablegen_local_postprocess', 'Mesh post-processing', 'modifier'),
         ('object.stablegen_make_solid', 'Make solid', 'modifier'),
         ('object.stablegen_autorig_selected_mesh', 'Auto-rig selected character', 'rig'),
     )),

@@ -19,8 +19,8 @@ from .geometry import (
     _occ_fom_generator, _occ_tpr_generator,
     _sort_directions_spatially, _classify_camera_direction,
     _compute_per_camera_aspect, _perspective_aspect, _resolution_from_aspect,
-    _get_resolution_align, _apply_auto_aspect,
-    _store_per_camera_resolution, _get_fov,
+    _get_resolution_align, _apply_auto_aspect, _pixel_budget,
+    _set_display_square, _store_per_camera_resolution, _get_fov,
 )
 from .overlays import (
     _sg_hide_label_overlay, _sg_remove_label_overlay,
@@ -758,7 +758,7 @@ class AddCameras(bpy.types.Operator):
                     f"(merged {n_before - len(directions)} near-duplicates)")
 
         render = context.scene.render
-        total_px = render.resolution_x * render.resolution_y
+        total_px = _pixel_budget(context.scene)
         center_np_for_aspect = verts_world.mean(axis=0)
 
         if self.auto_aspect == 'shared' and directions:
@@ -1102,8 +1102,7 @@ class AddCameras(bpy.types.Operator):
         ) if self._cameras else max(context.scene.render.resolution_x,
                                      context.scene.render.resolution_y)
         if max_side > 0:
-            context.scene.render.resolution_x = max_side
-            context.scene.render.resolution_y = max_side
+            _set_display_square(context.scene, max_side)
 
     @staticmethod
     def _copy_camera_settings(cam_obj, cam_settings):

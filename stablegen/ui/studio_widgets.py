@@ -1,6 +1,7 @@
 """GPU widgets for Studio's sidebar. Bounds also define their hit targets."""
 from dataclasses import dataclass
 import math
+import os
 
 import bpy
 import blf
@@ -47,6 +48,7 @@ ICON_PATHS = {
     'down': [[(5, 8), (10, 13), (15, 8)]],
     'up': [[(5, 13), (10, 8), (15, 13)]],
     'right': [[(7, 5), (12, 10), (7, 15)]],
+    'left': [[(13, 5), (8, 10), (13, 15)]],
     'reset': [arc for arc, _ in _SYNC],
     'search': [[(14, 14), (19, 19)]],
     'settings': [[(2, 5), (19, 5)], [(2, 10), (19, 10)], [(2, 15), (19, 15)], [(7, 3), (7, 7)], [(14, 8), (14, 12)], [(9, 13), (9, 17)]],
@@ -70,8 +72,18 @@ ICON_PATHS = {
     'rig': [[(10, 2), (10, 9), (4, 6)], [(10, 9), (17, 5)], [(10, 9), (6, 19)], [(10, 9), (16, 18)]],
     'graph': [[(2, 2), (2, 18), (19, 18)], [(4, 14), (8, 8), (12, 11), (18, 3)]],
     'shield': [[(10, 2), (18, 5), (17, 13), (10, 19), (3, 13), (2, 5), (10, 2)]],
+    'rename': [[(3, 18), (3, 14), (14, 3), (18, 7), (7, 18), (3, 18)], [(12, 5), (16, 9)]],
+    'server': [[(3, 3), (18, 3), (18, 9), (3, 9), (3, 3)], [(3, 12), (18, 12), (18, 18), (3, 18), (3, 12)],
+               [(11, 6), (15, 6)], [(11, 15), (15, 15)]],
+    'image': [[(2, 3), (19, 3), (19, 18), (2, 18), (2, 3)], [(2, 15), (7, 10), (11, 14), (14, 11), (19, 16)]],
+    'cube': [[(10, 2), (18, 6), (18, 15), (10, 19), (2, 15), (2, 6), (10, 2)], [(2, 6), (10, 10), (18, 6)],
+             [(10, 10), (10, 19)]],
+    'trash': [[(3, 5), (18, 5)], [(8, 5), (8, 2.5), (13, 2.5), (13, 5)], [(5, 5), (6, 19), (15, 19), (16, 5)],
+              [(8.5, 9), (8.5, 15.5)], [(12.5, 9), (12.5, 15.5)]],
+    'warning': [[(10.5, 2), (19.5, 18.5), (1.5, 18.5), (10.5, 2)], [(10.5, 8), (10.5, 12.5)]],
 }
-ICON_CIRCLES = {'camera': (10.5, 11, 4), 'eye': (10, 10, 2.5), 'search': (9, 9, 6)}
+ICON_CIRCLES = {'camera': (10.5, 11, 4), 'eye': (10, 10, 2.5), 'search': (9, 9, 6), 'server': (6.5, 6, 1),
+                'image': (14, 7.5, 1.6), 'warning': (10.5, 15.5, .6)}
 # Filled convex shapes, such as arrowheads that would blur into a thin stroke.
 ICON_FILLS = {'reset': [head for _, head in _SYNC]}
 ICON_PAD = 2
@@ -149,6 +161,178 @@ def _icon_texture(name, size, scale):
     return _icon_textures[key]
 
 
+_thumbnail_sources = {}     # (image name, size cap) -> (image key, premultiplied RGBA uint16, rows bottom first)
+_thumbnail_textures = {}
+_overlay_textures = {}
+THUMBNAIL_SOURCE = 1024     # longest side kept for an image's thumbnails; a full-size preview keeps up to 4096
+
+
+def _image_key(image):
+    """Changes when the image's pixels may have: another file version, an edit, a resize."""
+    path = bpy.path.abspath(image.filepath, library=image.library) if image.filepath else ''
+    try:
+        stamp = os.path.getmtime(path) if path else 0.0
+    except OSError:
+        stamp = 0.0
+    return image.name, image.as_pointer(), tuple(image.size), image.is_dirty, stamp
+
+
+def _thumbnail_source(image, cap=THUMBNAIL_SOURCE):
+    """The image as premultiplied, display-referred RGBA at most *cap* pixels long. Premultiplied, so
+    resampling never pulls in the colour a generator leaves under transparent pixels (Qwen's purple)."""
+    import cv2
+    key = _image_key(image)
+    cached = _thumbnail_sources.get((image.name, cap))
+    if cached and cached[0] == key:
+        return cached[1]
+    width, height = image.size
+    channels = image.channels
+    if width <= 0 or height <= 0 or channels not in (1, 3, 4):
+        return None
+    pixels = np.empty(width * height * channels, np.float32)
+    image.pixels.foreach_get(pixels)
+    pixels = pixels.reshape(height, width, channels)
+    if channels == 1:
+        pixels = np.repeat(pixels, 3, axis=2)
+    rgb, alpha = pixels[..., :3], (pixels[..., 3:4] if channels == 4 else np.ones((height, width, 1), np.float32))
+    if image.is_float and 'srgb' not in image.colorspace_settings.name.lower():
+        # Float buffers hold scene-linear values; byte buffers are already display-encoded.
+        rgb = np.where(rgb <= 0.0031308, rgb * 12.92, 1.055 * np.power(np.maximum(rgb, 0), 1 / 2.4) - 0.055)
+    rgba = np.concatenate([np.clip(rgb, 0, 1) * alpha, np.clip(alpha, 0, 1)], axis=2)
+    scale = min(1.0, cap / max(width, height))
+    if scale < 1:
+        rgba = cv2.resize(rgba, (max(1, round(width * scale)), max(1, round(height * scale))),
+                          interpolation=cv2.INTER_AREA)
+    source = (rgba * 65535).round().astype(np.uint16)
+    if len(_thumbnail_sources) > 64:
+        _thumbnail_sources.clear()
+    _thumbnail_sources[(image.name, cap)] = (key, source)
+    return source
+
+
+def _file_key(path):
+    try:
+        stat = os.stat(path)
+    except OSError:
+        return None
+    return os.path.normcase(os.path.abspath(path)), stat.st_mtime_ns, stat.st_size
+
+
+_file_sizes = {}    # file path -> (its _file_key, (width, height))
+
+
+def image_size(image):
+    """(width, height) of a Blender image or an image file: a PNG's header, else the decoded file."""
+    if not isinstance(image, str):
+        return tuple(image.size)
+    key = _file_key(image)
+    if key is None:
+        return 0, 0
+    cached = _file_sizes.get(key[0])
+    if cached is None or cached[0] != key:
+        size = (0, 0)
+        try:
+            with open(image, 'rb') as handle:
+                head = handle.read(24)
+            if head[:8] == b'\x89PNG\r\n\x1a\n':
+                size = int.from_bytes(head[16:20], 'big'), int.from_bytes(head[20:24], 'big')
+        except OSError:
+            pass
+        if size == (0, 0):
+            source = _file_source(image)
+            if source is not None:
+                size = source.shape[1], source.shape[0]
+        cached = _file_sizes[key[0]] = (key, size)
+    return cached[1]
+
+
+def _file_source(path, cap=THUMBNAIL_SOURCE):
+    """An image file as _thumbnail_source gives a Blender image (premultiplied RGBA, bottom row first), read
+    straight from the file: drawing may not load image datablocks. None when it can't be read."""
+    import cv2
+    key = _file_key(path)
+    if key is None:
+        return None
+    cached = _thumbnail_sources.get((key[0], cap))
+    if cached and cached[0] == key:
+        return cached[1]
+    try:
+        pixels = cv2.imdecode(np.fromfile(path, np.uint8), cv2.IMREAD_UNCHANGED)     # works with any path's letters
+    except (OSError, ValueError, cv2.error):
+        pixels = None
+    if pixels is None:
+        return None
+    depth = 65535.0 if pixels.dtype == np.uint16 else 1.0 if pixels.dtype.kind == 'f' else 255.0
+    pixels = pixels.astype(np.float32) / depth
+    if pixels.ndim == 2:
+        pixels = pixels[..., None]
+    if pixels.shape[2] == 1:
+        pixels = np.repeat(pixels, 3, axis=2)
+    if pixels.shape[2] == 3:
+        pixels = np.concatenate([pixels, np.ones(pixels.shape[:2] + (1,), np.float32)], axis=2)
+    rgba = np.clip(pixels[::-1, :, [2, 1, 0, 3]], 0, 1)        # OpenCV's BGRA, top row first
+    rgba = np.concatenate([rgba[..., :3] * rgba[..., 3:4], rgba[..., 3:4]], axis=2)
+    height, width = rgba.shape[:2]
+    scale = min(1.0, cap / max(width, height))
+    if scale < 1:
+        rgba = cv2.resize(rgba, (max(1, round(width * scale)), max(1, round(height * scale))),
+                          interpolation=cv2.INTER_AREA)
+    source = (rgba * 65535).round().astype(np.uint16)
+    if len(_thumbnail_sources) > 64:
+        _thumbnail_sources.clear()
+    _thumbnail_sources[(key[0], cap)] = (key, source)
+    return source
+
+
+def _thumbnail_texture(image, width, height, check):
+    """A width x height device-pixel texture of the image (a Blender image, or an image file's path) over the
+    theme's transparency checkerboard."""
+    import cv2
+    ui = bpy.context.preferences.themes[0].user_interface
+    primary = tuple(ui.transparent_checker_primary)
+    secondary = tuple(ui.transparent_checker_secondary)
+    from_file = isinstance(image, str)
+    key = (_file_key(image) if from_file else _image_key(image), width, height, check, primary, secondary)
+    if key not in _thumbnail_textures:
+        source = (_file_source if from_file else _thumbnail_source)(
+            image, THUMBNAIL_SOURCE if max(width, height) <= THUMBNAIL_SOURCE else 4096)
+        if source is None:
+            return None
+        small = cv2.resize(source, (width, height), interpolation=cv2.INTER_AREA).astype(np.float32) / 65535
+        rows, columns = np.mgrid[0:height, 0:width]
+        board = np.where((((rows // check) + (columns // check)) % 2 == 0)[..., None],
+                         np.float32(primary), np.float32(secondary))
+        rgba = np.ones((height, width, 4), np.float32)
+        rgba[..., :3] = small[..., :3] + board * (1 - small[..., 3:4])
+        if len(_thumbnail_textures) > 128:
+            _thumbnail_textures.clear()
+        data = _float_buffer(rgba)
+        _thumbnail_textures[key] = gpu.types.GPUTexture((width, height), format='RGBA16F', data=data)
+    return _thumbnail_textures[key]
+
+
+def _float_buffer(array):
+    """A GPU float buffer of a numpy array, without the per-element list a full-size preview would stall on."""
+    flat = np.ascontiguousarray(array, np.float32).ravel()
+    try:
+        return gpu.types.Buffer('FLOAT', flat.size, flat)
+    except (TypeError, ValueError):
+        return gpu.types.Buffer('FLOAT', flat.size, flat.tolist())
+
+
+def _array_texture(rgba):
+    """A texture of a small RGBA float array (rows bottom first), cached while the same array is drawn."""
+    key = (id(rgba), rgba.shape)
+    cached = _overlay_textures.get(key)
+    if cached is None or cached[0] is not rgba:
+        if len(_overlay_textures) > 16:
+            _overlay_textures.clear()
+        height, width = rgba.shape[:2]
+        data = _float_buffer(rgba)
+        cached = _overlay_textures[key] = (rgba, gpu.types.GPUTexture((width, height), format='RGBA16F', data=data))
+    return cached[1]
+
+
 def _logo_texture(size, scale):
     """Return a cached (texture, extent) for the full-colour logo at this device pixel size."""
     extent = round(size * scale)
@@ -184,11 +368,12 @@ def color(value):
 
 COLORS = {key: color(value) for key, value in {
     'panel': '3d3d3d', 'field': '1d1d1d', 'field_text': 'e6e6e6',
-    'number': '545454', 'number_text': 'e6e6e6', 'menu': '282828', 'menu_text': 'e6e6e6',
+    'number': '545454', 'number_text': 'e6e6e6', 'number_hover': '646464', 'number_hot': '797979',
+    'menu': '282828', 'menu_text': 'e6e6e6', 'scroll_track': '2f2f2f',
     'raised': '545454', 'line': '494949', 'divider': '464646', 'text': 'e6e6e6',
     'secondary': 'c4c4c4', 'muted': '999999', 'accent': '8fa6ca',
     'blue': '4772b3', 'on_accent': 'ffffff', 'hover': '545454', 'disabled': '787878',
-    'warning': 'c0a673', 'selected': '404c5e', 'card': '353535',
+    'warning': 'c0a673', 'selected': '404c5e', 'card': '353535', 'ok': '7dba82',
     'text_selected': '4a4a4a', 'number_selected': '6e6e6e',
     'cursor': '71a8ff', 'switch_off': '545454', 'switch_knob': 'ffffff',
     'outer_edge': '494949',
@@ -212,6 +397,11 @@ def _over(foreground, background):
     return _mix(background, foreground, foreground[3])
 
 
+def _shade(color, amount):
+    """Lighten like Blender's widget hover shading, which adds to each channel."""
+    return tuple(max(0, min(1, c + amount)) for c in color[:3]) + (1,)
+
+
 def theme_colors(context):
     """Read the active native palette each draw, including unsaved theme edits."""
     theme = context.preferences.themes[0]
@@ -229,9 +419,14 @@ def theme_colors(context):
     card = _over(getattr(ui, 'panel_sub_back', (0, 0, 0, .12)), panel)
     subbox = _mix(card, field_back, .2)
     section_border = _mix(border, text, .075)
+    warning = _mix(_rgba(getattr(ui.wcol_state, 'warning', COLORS['warning'])), text, .35)
     return {
         'panel': panel, 'field': field_back, 'field_text': _rgba(field.text),
         'number': _over(number.inner, panel), 'number_text': _rgba(number.text),
+        # A hovered number field lightens, and the part under the pointer more (measured on Blender's own).
+        'number_hover': _shade(_over(number.inner, panel), 16 / 255),
+        'number_hot': _shade(_over(number.inner, panel), 37 / 255),
+        'scroll_track': _mix(panel, (0, 0, 0, 1), .22),
         'menu': _over(menu.inner, panel), 'menu_text': _rgba(menu.text),
         'field_border': _over(field.outline, panel), 'number_border': _over(number.outline, panel),
         'menu_border': _over(menu.outline, panel), 'tool_border': _over(tool.outline, panel),
@@ -253,7 +448,10 @@ def theme_colors(context):
         'dependency_rail': _mix(panel, text, .23),
         'text_selected': _over(field.item, field_back),
         'number_selected': _mix(_over(number.inner, panel), _rgba(number.text), .18),
-        'warning': _mix(_rgba(getattr(ui.wcol_state, 'warning', COLORS['warning'])), text, .35),
+        'warning': warning,
+        # a model that isn't installed: the tab switcher's selected tab in amber, and its hovered segment
+        'warning_tab': _mix(card, warning, .17), 'warning_strong': _mix(panel, warning, .3),
+        'ok': _mix(COLORS['ok'], text, .2),     # installed, running: the theme has no success color
         'switch_off': _over(ui.wcol_toggle.inner, panel), 'switch_knob': _rgba(ui.wcol_option.item),
         'switch_off_hover': _mix(_over(ui.wcol_toggle.inner, panel), text, .14),
         'tooltip': _over(ui.wcol_tooltip.inner, panel),
@@ -277,6 +475,12 @@ class Target:
             return 'DEFAULT'
         kind = self.action[0] if isinstance(self.action, tuple) else ''
         return 'TEXT' if kind in {'edit', 'menu-lora-search'} else 'MOVE_X' if kind == 'slider' else 'MOVE_Y' if kind == 'camera-drag' else 'DEFAULT'
+
+    def number_zone(self, x):
+        """Blender's arrow zones: min(a third of the width, 0.7 x the height) at each end."""
+        rx, _, width, height = self.rect
+        handle = min(width / 3, height * .7)
+        return 'left' if x < rx + handle else 'right' if x > rx + width - handle else 'middle'
 
     def contains(self, x, y):
         rx, ry, width, height = self.rect
@@ -466,19 +670,50 @@ class Painter:
         # blf.draw leaves blending off; translucent shapes and icon edges need it.
         gpu.state.blend_set('ALPHA')
 
-    def image(self, image, rect):
-        self.emit(self.draw_image, image, rect)
-
-    def draw_image(self, image, rect):
+    def image(self, image, rect, check=8):
+        """Draw *image* (a Blender image, or an image file's path) fitted inside *rect*, transparent parts over the
+        theme's checkerboard (*check* UI pixels a square); returns the rectangle it fills, None for a file it can't
+        read."""
         x, y, width, height = rect
-        iw, ih = image.size
+        if isinstance(image, str):
+            source = _file_source(image)
+            if source is None:
+                return None
+            ih, iw = source.shape[:2]
+        else:
+            iw, ih = image.size
         if iw <= 0 or ih <= 0:
-            return
+            return None
         ratio = min(width / iw, height / ih)
-        w, h = iw * ratio, ih * ratio
-        x, y = x + (width - w) / 2, y + (height - h) / 2
+        w = max(1, round(iw * ratio * self.scale)) / self.scale
+        h = max(1, round(ih * ratio * self.scale)) / self.scale
+        x = round((x + (width - w) / 2) * self.scale) / self.scale
+        y = round((y + (height - h) / 2) * self.scale) / self.scale
+        self.emit(self.draw_image, image, (x, y, w, h), check)
+        return x, y, w, h
+
+    def draw_image(self, image, rect, check):
+        x, y, w, h = rect
+        texture = _thumbnail_texture(image, round(w * self.scale), round(h * self.scale),
+                                     max(1, round(check * self.scale)))
+        if texture is None:
+            return
         shader = gpu.shader.from_builtin('IMAGE')
-        texture = gpu.texture.from_image(image)
+        shader.bind()
+        shader.uniform_sampler('image', texture)
+        positions = [(px * self.scale, (self.height - py) * self.scale)
+                     for px, py in ((x, y+h), (x+w, y+h), (x+w, y), (x, y))]
+        batch_for_shader(shader, 'TRI_FAN', {'pos': positions,
+                         'texCoord': [(0,0), (1,0), (1,1), (0,1)]}).draw(shader)
+
+    def overlay(self, rgba, rect):
+        """Draw an RGBA float array (rows bottom first, straight alpha) stretched over *rect*."""
+        self.emit(self.draw_overlay, rgba, rect)
+
+    def draw_overlay(self, rgba, rect):
+        x, y, w, h = rect
+        texture = _array_texture(rgba)
+        shader = gpu.shader.from_builtin('IMAGE')
         shader.bind()
         shader.uniform_sampler('image', texture)
         positions = [(px * self.scale, (self.height - py) * self.scale)
@@ -609,11 +844,38 @@ class Painter:
         self.rect(sx + (16 if checked else 2), sy + 2, 10, 10, 'switch_knob' if enabled else 'muted', 5)
         self.target(key, rect, action, enabled, hint)
 
-    def text_field(self, key, rect, value, action, *, enabled=True, hint='', editing=None, scroll=0, multiline=False, follow_caret=True, kind='field'):
+    def number_field(self, key, rect, display, action, *, enabled=True, hint='', zone=None, dragging=False):
+        """A number button drawn like Blender's: the value centered, arrows at both ends while hovered and the
+        part under the pointer (*zone*: left, middle or right) lit."""
+        x, y, w, h = rect
+        target = self.target(key, rect, action, enabled, hint)
+        hovered = enabled and (dragging or key == self.hover_key)
+        self.outline(x, y, w, h, 'number_selected' if dragging else 'number_hover' if hovered else 'number',
+                     'hover_border' if hovered else 'number_border')
+        handle = min(w / 3, h * .7)
+        if hovered and not dragging and zone:
+            zx, zw, corners = {'left': (x + 1, handle - 1, 'LEFT'), 'middle': (x + handle, w - 2 * handle, 'NONE'),
+                               'right': (x + w - handle, handle - 1, 'RIGHT')}[zone]
+            self.rect(zx, y + 1, zw, h - 2, 'number_hot', 3, corners=corners)
+        if hovered:
+            for name, zx in (('left', x), ('right', x + w - handle)):
+                self.icon(name, zx + (handle - 12) / 2, y + (h - 12) / 2, 12, 'number_text')
+        text = self.fit(display, max(0, w - 2 * handle - 2))
+        self.text(text, x + (w - self.measure(text)) / 2, y + (h - font_size()) / 2 - 1, FONT_SIZE,
+                  'number_text' if enabled else 'disabled')
+        return target
+
+    def text_field(self, key, rect, value, action, *, enabled=True, hint='', editing=None, scroll=0, multiline=False, follow_caret=True, kind='field', placeholder=''):
         x, y, w, h = rect
         self.outline(x, y, w, h, fill=kind, border='cursor' if editing else 'hover_border'
                      if enabled and key == self.hover_key else kind + '_border')
         self.target(key, rect, action, enabled, hint)
+        if placeholder and not value:
+            # what belongs here, greyed, until something is typed (the caret still shows while editing)
+            padding_y = TEXT_PADDING if multiline else (h - font_size()) / 2 - 1
+            rows = int((h - TEXT_PADDING * 2) / TEXT_LINE_HEIGHT) if multiline else 1
+            for index, (_, _, line) in enumerate(wrap(placeholder, w - TEXT_PADDING * 2, self.measure)[:max(1, rows)]):
+                self.text(line, x + TEXT_PADDING, y + padding_y + index * TEXT_LINE_HEIGHT, FONT_SIZE, 'disabled')
         if not multiline and editing is None:
             self.text(value, x + TEXT_PADDING, y + (h - font_size()) / 2 - 1, FONT_SIZE,
                       kind + '_text' if enabled else 'disabled', w - TEXT_PADDING * 2)

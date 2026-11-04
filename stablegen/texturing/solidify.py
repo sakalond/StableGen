@@ -10,7 +10,6 @@ from ..utils import sg_modal_active
 from .print_export import (
     _make_solid_mesh_object,
     _mesh_topology_counts,
-    _require_printable_mesh,
 )
 
 
@@ -63,7 +62,8 @@ def _restore_vertex_group_names(obj, names):
 
 def _validate_solid_result(
         obj, source, target, weighted_before, *, fill_gaps):
-    """Reject state loss or a result that remains unsafe for slicing."""
+    """Reject state loss: UVs, projection data, materials, caps, skinning. A few open or non-manifold edges stay
+    allowed: this tool prepares meshes for texturing and rigging; the 3D-print export checks print safety."""
     if len(target.vertices) == 0 or len(target.polygons) == 0:
         raise RuntimeError("solidification produced an empty mesh")
 
@@ -89,7 +89,7 @@ def _validate_solid_result(
     target_materials = list(target.materials)
     if source_materials != target_materials:
         raise RuntimeError("solidification changed the material slot layout")
-    if any(
+    if target_materials and any(        # without material slots every face has index 0, which is fine
         polygon.material_index >= len(target_materials)
         for polygon in target.polygons
     ):
@@ -108,12 +108,6 @@ def _validate_solid_result(
         ]
         if any(polygon.area <= 1.0e-12 for polygon in cap_faces):
             raise RuntimeError("solidification produced a degenerate cap face")
-
-    _require_printable_mesh(
-        target,
-        label=f"Make Solid result for {obj.name}",
-        require_closed=bool(fill_gaps),
-    )
 
     weighted_after = _weighted_membership_count(obj)
     if weighted_before and not weighted_after:
@@ -144,16 +138,46 @@ class StableGenMakeSolid(bpy.types.Operator):
         ),
         default=False,
     )
+    visibility_method: bpy.props.EnumProperty(
+        name="Interior Test",
+        description="How hidden interior surfaces are found",
+        items=(
+            ('FLOOD', "Flood Fill",
+             "Keep the faces that empty space from outside the object reaches "
+             "(finds inner walls and sealed cavities, reaches concave areas)"),
+            ('RAYCAST', "Raycast (Legacy)",
+             "Keep the faces hit by rays from a ring of directions around the object"),
+        ),
+        default='FLOOD',
+    )
+    seal_bottom: bpy.props.BoolProperty(
+        name="Close Bottom Openings",
+        description=(
+            "Treat the underside as closed (Flood Fill), so a hollow mesh open at the bottom becomes solid "
+            "with a capped bottom instead of keeping its inside surface"
+        ),
+        default=True,
+    )
     raycast_count: bpy.props.IntProperty(
         name="Raycast Directions",
         description=(
             "Number of radial directions used to distinguish exterior from "
-            "interior surfaces"
+            "interior surfaces (Raycast only)"
         ),
         default=12,
         min=4,
         max=64,
     )
+
+    def draw(self, context):
+        layout = self.layout
+        layout.prop(self, "fill_gaps")
+        layout.prop(self, "keep_largest_island")
+        layout.prop(self, "visibility_method")
+        if self.visibility_method == 'RAYCAST':
+            layout.prop(self, "raycast_count")
+        else:
+            layout.prop(self, "seal_bottom")
 
     @classmethod
     def poll(cls, context):
@@ -200,6 +224,9 @@ class StableGenMakeSolid(bpy.types.Operator):
                 weld_distance=0.0,
                 robust_fill=True,
                 smooth_caps=True,
+                visibility_method=self.visibility_method,
+                seal_bottom=self.seal_bottom,
+                require_printable=False,
             )
             _restore_mesh_metadata(source, solid)
             obj.data = solid
@@ -230,9 +257,13 @@ class StableGenMakeSolid(bpy.types.Operator):
             if source.users == 0:
                 bpy.data.meshes.remove(source)
             obj.data.update()
+            topology = _mesh_topology_counts(obj.data)
+            left = ", ".join(f"{count} {name}{'s' if count != 1 else ''}" for name, count in (
+                ("open edge", topology["boundary"]), ("non-manifold edge", topology["non_manifold"])) if count)
             self.report(
                 {'INFO'},
-                f"Made {obj.name} solid while preserving rig and materials",
+                f"Made {obj.name} solid while preserving rig and materials"
+                + (f" ({left} left; fine for texturing, not for 3D printing)" if left else ""),
             )
             return {'FINISHED'}
         except Exception as error:

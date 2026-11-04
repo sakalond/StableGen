@@ -35,9 +35,9 @@ FAMILIES = {
     'qwen_prompt_template': ('qwen_custom_prompt_initial', 'qwen_custom_prompt_seq_none',
         'qwen_custom_prompt_seq_replace', 'qwen_custom_prompt_seq_additional'),
     'qwen_context_render_mode': ('qwen_prompt_gray_background', 'qwen_guidance_background_color',
-        'qwen_guidance_fallback_color', 'qwen_use_confidence_context'),
-    'qwen_use_confidence_context': ('qwen_trust_threshold', 'qwen_context_fallback_dilation',
-        'qwen_context_cleanup'),
+        'qwen_guidance_fallback_color', 'qwen_use_confidence_context', 'qwen_regularize_context_mask',
+        'qwen_context_fallback_dilation', 'qwen_context_cleanup'),
+    'qwen_use_confidence_context': ('qwen_trust_threshold',),
     'qwen_context_cleanup': ('qwen_context_cleanup_hue_tolerance', 'qwen_context_cleanup_value_adjust'),
     'qwen_regularize_context_mask': ('qwen_mask_min_island_area', 'qwen_mask_min_hole_area',
         'qwen_mask_min_strip_width', 'qwen_mask_uncertainty_dilation', 'qwen_mask_keep_largest_components'),
@@ -73,7 +73,9 @@ FAMILIES = {
         'pbr_tile_material', 'pbr_tile_normal', 'pbr_tile_height', 'pbr_tile_emission'),
     'pbr_use_native_resolution': ('pbr_processing_resolution',),
     'trellis2_post_processing_enabled': ('trellis2_decimate_method', 'trellis2_decimation',
-        'trellis2_remesh_method', 'trellis2_solidify'),
+        'trellis2_remesh_method', 'trellis2_solidify', 'op:object.stablegen_local_postprocess'),
+    'trellis2_remesh_method': ('meshtools_lato2_vertices',),
+    'trellis2_solidify': ('trellis2_solidify_seal_bottom',),
     'trellis2_exclude_bottom': ('trellis2_exclude_bottom_angle',),
     'trellis2_clamp_elevation': ('trellis2_min_elevation', 'trellis2_max_elevation'),
     'trellis2_preview_gallery_enabled': ('trellis2_preview_gallery_count',),
@@ -134,6 +136,14 @@ def build(source, omit=()):
                       if positions[parent] < positions[child]]
         if candidates:
             owners[child] = max(candidates, key=positions.get)
+    # A command listed as 'op:<idname>' belongs to the closest preceding owner field on any data.
+    for c in controls:
+        if c.method == 'operator' and c.args and 'op:' + c.args[0] in PARENTS:
+            names = set(PARENTS['op:' + c.args[0]])
+            candidates = [parent for (_, name), ids in by_property.items() if name in names
+                          for parent in ids if positions[parent] < positions[id(c)]]
+            if candidates:
+                owners[id(c)] = max(candidates, key=positions.get)
 
     def ancestors(cid):
         seen = set()

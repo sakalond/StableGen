@@ -8,7 +8,7 @@ and the server address preference.  Extracted from the original
 import bpy  # pylint: disable=import-error
 from urllib.parse import urlparse
 
-from ..ui.presets import update_parameters
+from ..ui.presets import carry_preset, update_parameters
 from . import ADDON_PKG
 from .state import (
     _cached_checkpoint_list,
@@ -18,6 +18,8 @@ from .state import (
 from .server_api import (
     check_pbr_available,
     check_server_availability,
+    check_meshtools_available,
+    apply_meshtools_available,
     check_skintokens_autorig_available,
     check_trellis2_available,
 )
@@ -155,6 +157,8 @@ def update_architecture_mode(self, context):
     """Called when the user changes the architecture_mode dropdown."""
     scene = context.scene
     mode = scene.architecture_mode
+    # Nothing has rechecked the preset yet, so this is the one the previous architecture's settings matched.
+    previous_preset = scene.stablegen_preset
 
     if mode != 'trellis2':
         if scene.model_architecture != mode:
@@ -162,7 +166,8 @@ def update_architecture_mode(self, context):
     else:
         _sync_trellis2_backbone(scene)
 
-    update_parameters(self, context)
+    if not carry_preset(context, previous_preset):
+        update_parameters(self, context)
 
 
 def _sync_trellis2_backbone(scene):
@@ -264,17 +269,22 @@ def update_combined(self, context):
 
     print("[StableGen] Server address changed, checking asynchronously...")
 
+    # Read the preferences here; the worker thread must not touch bpy.
+    ping_timeout, api_timeout = get_timeout('ping'), get_timeout('api')
+
     def _bg_work():
         result = {}
-        result['online'] = check_server_availability(server_address, timeout=get_timeout('ping'))
+        result['online'] = check_server_availability(server_address, timeout=ping_timeout)
         if result['online']:
-            result['trellis2'] = check_trellis2_available(server_address, timeout=get_timeout('api'))
-            result['pbr'] = check_pbr_available(server_address, timeout=get_timeout('api'))
-            result['skintokens'] = check_skintokens_autorig_available(server_address, timeout=get_timeout('api'))
+            result['trellis2'] = check_trellis2_available(server_address, timeout=api_timeout)
+            result['pbr'] = check_pbr_available(server_address, timeout=api_timeout)
+            result['skintokens'] = check_skintokens_autorig_available(server_address, timeout=api_timeout)
+            result['meshtools'] = check_meshtools_available(server_address, timeout=api_timeout)
         else:
             result['trellis2'] = False
             result['pbr'] = False
             result['skintokens'] = False
+            result['meshtools'] = {}
         return result
 
     def _on_done(result):
@@ -287,6 +297,7 @@ def update_combined(self, context):
             bpy.context.scene.trellis2_available = result.get('trellis2', False)
             bpy.context.scene.pbr_nodes_available = result.get('pbr', False)
             bpy.context.scene.skintokens_autorig_available = result.get('skintokens', False)
+            apply_meshtools_available(bpy.context.scene, result.get('meshtools'))
 
         if not result.get('online', False):
             print("[StableGen] ComfyUI server is not reachable.")
@@ -295,7 +306,7 @@ def update_combined(self, context):
             return
 
         update_parameters(None, bpy.context)
-        load_handler(None)
+        load_handler(None, file_loaded=False)
 
         def _deferred_refresh():
             try:
@@ -310,7 +321,7 @@ def update_combined(self, context):
     _run_async(_bg_work, _on_done, track_generation=True)
 
     update_parameters(self, context)
-    load_handler(None)
+    load_handler(None, file_loaded=False)
 
     return None
 

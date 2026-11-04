@@ -66,9 +66,10 @@ def eligible(scene):
     # Edit passes, baked fields and joint surface solves change topology. Base
     # sequential projection is shared by all texturing architectures; late
     # write-mask/image resources are bound before activating their view.
+    # Confidence-gated context is eligible: a pending camera's source quality
+    # is zero through its active gate, and its confidence write mask refuses
+    # (weight 0) until the mask is bound, as a rebuild's constants do.
     qwen = scene.model_architecture in QWEN_ARCHITECTURES
-    confidence = (qwen and scene.qwen_use_confidence_context
-                  and scene.qwen_context_render_mode in {'REPLACE_STYLE', 'ADDITIONAL'})
     voronoi = (scene.model_architecture in EDIT_ARCHITECTURES
                and scene.qwen_voronoi_mode)
     surface = (scene.sg_guard_feather_method == 'SURFACE_BLEND'
@@ -78,7 +79,8 @@ def eligible(scene):
             and scene.generation_mode == 'standard'
             and (not qwen or scene.qwen_generation_method == 'generate')
             and not scene.bake_visibility_weights
-            and not confidence and not surface and not voronoi)
+            and not getattr(scene, 'sg_object_relative_projection', False)
+            and not surface and not voronoi)
 
 
 def asset_state(paths):

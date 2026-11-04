@@ -236,19 +236,25 @@ class CurvesToMesh(bpy.types.Operator):
 		self.report({'INFO'}, "All curves converted to meshes.")
 		return {'FINISHED'}
 	
-def get_last_material_index(obj):
-	"""Read projection IDs, never infer them from active shader arithmetic."""
+def get_last_material_index(obj, include_edits=True):
+	"""Read projection IDs, never infer them from active shader arithmetic.
+
+	Without *include_edits*, Masked Edit layers do not count: they hold one edited view, not a
+	generated image per camera, so reprojecting must read the generation underneath them."""
 	highest_index = -1
 	for mat in getattr(obj.data, 'materials', ()):
 		if not mat or not mat.use_nodes:
 			continue
 		indices = []
 		legacy = []
+		edit_ids, image_ids = set(), set()
 		for node in mat.node_tree.nodes:
 			if node.type == 'TEX_IMAGE':
 				# Existing .blend files label projected images camera-material.
 				parts = node.label.split('-')
 				if len(parts) == 2 and all(part.isdigit() for part in parts):
+					if not include_edits:
+						(edit_ids if node.get('sg_masked_edit') else image_ids).add(int(parts[1]))
 					indices.append(int(parts[1]))
 			if node.type == 'MATH' and node.operation == 'SUBTRACT':
 				value = float(node.inputs[0].default_value)
@@ -260,6 +266,10 @@ def get_last_material_index(obj):
 				      and not any(socket.is_linked for socket in node.outputs)):
 					# Old versions stored the ID in an unlabeled, detached node.
 					legacy.append(int(value))
+		if not include_edits:
+			# An edit layer also has its own SGMaterialIndex node; drop the IDs only edits use.
+			edit_only = edit_ids - image_ids
+			indices = [i for i in indices if i not in edit_only]
 		if indices or legacy:
 			highest_index = max(highest_index, max(indices or legacy))
 	return highest_index

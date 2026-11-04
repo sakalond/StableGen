@@ -21,6 +21,53 @@ from . import queue as _queue_mod
 
 _ADDON_PKG = __package__.rsplit('.', 1)[0]
 
+
+def _running_operator(context, bl_idname):
+    return next((op for win in context.window_manager.windows for op in win.modal_operators
+                 if op.bl_idname == bl_idname), None)
+
+
+def _draw_meshtool_button(context, layout, bl_idname, operator_id, text, icon, cancel_text):
+    """The tool's button, or its progress bars and a cancel button while it runs."""
+    running = _running_operator(context, bl_idname)
+    if running is None:
+        layout.operator(operator_id, text=text, icon=icon)
+        return
+    layout.operator(operator_id, text=cancel_text, icon="CANCEL")
+    overall = getattr(running, '_overall_progress', 0.0)
+    layout.progress(text=f"{getattr(running, '_overall_stage', '')} ({overall:.0f}%)",
+                    factor=max(0.0, min(overall / 100.0, 1.0)))
+    phase = getattr(running, '_phase_progress', 0.0)
+    stage = getattr(running, '_phase_stage', '')
+    if stage:
+        layout.progress(text=f"{stage} ({phase:.0f}%)", factor=max(0.0, min(phase / 100.0, 1.0)))
+
+
+def draw_meshtools_section(context, layout):
+    """LATO.2 low-poly remesh (the ComfyUI-LATO2 node), or why the server doesn't have it."""
+    scene = context.scene
+    if not getattr(scene, 'meshtools_lato2_available', False):
+        from ..mesh_gen.meshtools import lato2_missing
+        why, operator, label, properties = lato2_missing()
+        layout.label(text=why, icon="INFO")
+        row = layout.row(align=True)
+        op = row.operator(operator, text=label)
+        for name, value in properties.items():
+            setattr(op, name, value)
+        if operator != "stablegen.check_server_status":
+            row.operator("stablegen.check_server_status", text="", icon="FILE_REFRESH")
+        return
+    layout.prop(scene, "meshtools_hide_source")
+
+    box = layout.box()
+    row = box.row(align=True)
+    row.prop(scene, "meshtools_lato2_vertices")
+    row.prop(scene, "meshtools_lato2_seed")
+    _draw_meshtool_button(context, box, 'OBJECT_OT_stablegen_lato2_remesh', "object.stablegen_lato2_remesh",
+                          "Remesh Selected", "MOD_REMESH", "Cancel LATO.2")
+
+
+
 def _is_refreshing():
     """Return True while async model-list refreshes are in-flight.
 
@@ -212,6 +259,8 @@ class StableGenPanel(bpy.types.Panel):
                         and scene.trellis2_generate_from == 'prompt'):
                     box.prop(scene, "trellis2_initial_image_arch")
             return
+        from ..setup.prefs_ui import draw_panel_notices
+        draw_panel_notices(layout, context)
         config_error_message = None
 
         if not os.path.exists(addon_prefs.output_dir):
@@ -276,7 +325,20 @@ class StableGenPanel(bpy.types.Panel):
             ) if not trellis2_op and not comfy_tex_op else None
 
             if config_error_message:
-                if config_error_message == "ComfyUI offline":
+                from ..setup import runtime as setup_runtime
+                if config_error_message == "ComfyUI offline" and setup_runtime.local_mode(addon_prefs):
+                    # StableGen runs this ComfyUI: say what it is doing and offer Start instead of a refresh
+                    state = setup_runtime.comfy().state
+                    split = action_row.split(factor=0.85, align=True)
+                    split.operator("object.trellis2_generate", text={
+                        'starting': "Starting ComfyUI…", 'running': "Connecting to ComfyUI…",
+                        'exited': "ComfyUI stopped unexpectedly"}.get(state, "Cannot generate: ComfyUI stopped"),
+                        icon="SORTTIME" if state in ('starting', 'running') else "ERROR")
+                    if state not in ('starting', 'running'):
+                        split.operator("stablegen.comfy_start", text="", icon='PLAY')
+                    else:
+                        split.operator("stablegen.check_server_status", text="", icon='FILE_REFRESH')
+                elif config_error_message == "ComfyUI offline":
                     split = action_row.split(factor=0.85, align=True)
                     split.operator("object.trellis2_generate", text="Cannot generate: " + config_error_message, icon="ERROR")
                     split.operator("stablegen.check_server_status", text="", icon='FILE_REFRESH')
@@ -471,7 +533,7 @@ class StableGenPanel(bpy.types.Panel):
             elif not getattr(scene, 'trellis2_available', False):
                 split = action_row.split(factor=0.8)
                 err_sub = split.row()
-                err_sub.operator("object.trellis2_generate", text="TRELLIS.2 nodes not found", icon="ERROR")
+                err_sub.operator("object.trellis2_generate", text="TRELLIS.2 needs ComfyUI 0.42+", icon="ERROR")
                 err_sub.enabled = False
                 split.operator("stablegen.check_server_status", text="", icon="FILE_REFRESH")
             else:
@@ -531,7 +593,20 @@ class StableGenPanel(bpy.types.Panel):
                     status_row.label(text=scene.sg_masked_status)
             elif config_error_message:
                 # Split the row to have the error message/disabled button and the refresh button
-                if config_error_message == "ComfyUI offline":
+                from ..setup import runtime as setup_runtime
+                if config_error_message == "ComfyUI offline" and setup_runtime.local_mode(addon_prefs):
+                    # StableGen runs this ComfyUI: say what it is doing and offer Start instead of a refresh
+                    state = setup_runtime.comfy().state
+                    split = action_row.split(factor=0.85, align=True)
+                    split.operator("object.test_stable", text={
+                        'starting': "Starting ComfyUI…", 'running': "Connecting to ComfyUI…",
+                        'exited': "ComfyUI stopped unexpectedly"}.get(state, "Cannot generate: ComfyUI stopped"),
+                        icon="SORTTIME" if state in ('starting', 'running') else "ERROR")
+                    if state not in ('starting', 'running'):
+                        split.operator("stablegen.comfy_start", text="", icon='PLAY')
+                    else:
+                        split.operator("stablegen.check_server_status", text="", icon='FILE_REFRESH')
+                elif config_error_message == "ComfyUI offline":
                     split = action_row.split(factor=0.85, align=True) # Adjust factor as needed
                     split.operator("object.test_stable", text="Cannot generate: " + config_error_message, icon="ERROR") # Use ERROR icon
                     # Use the operator from __init__.py
@@ -796,12 +871,12 @@ class StableGenPanel(bpy.types.Panel):
 
             if is_trellis2:
                 # --- TRELLIS.2 specific layout ---
-                # Warning if TRELLIS.2 nodes not detected
+                # Warning if ComfyUI has no native TRELLIS.2 nodes
                 if not getattr(scene, 'trellis2_available', False):
                     warn_row = params_container.row()
                     warn_row.alert = True
                     warn_split = warn_row.split(factor=0.9)
-                    warn_split.label(text="TRELLIS.2 nodes not detected on server", icon="ERROR")
+                    warn_split.label(text="TRELLIS.2 needs ComfyUI 0.42 or newer", icon="ERROR")
                     warn_split.operator("stablegen.check_server_status", text="", icon="FILE_REFRESH")
 
                 # Generate From toggle (Image / Prompt)
@@ -983,10 +1058,24 @@ class StableGenPanel(bpy.types.Panel):
                         if rem_method == 'quadriflow':
                             row = content_box.row()
                             row.label(text="Note: Quadriflow is experimental and might produce artifacts.", icon="WARNING")
+                        elif rem_method == 'lato2':
+                            row = content_box.row(align=True)
+                            row.prop(scene, "meshtools_lato2_vertices", text="LATO.2 Vertices")
+                            if not getattr(scene, 'meshtools_lato2_available', False):
+                                from ..mesh_gen.meshtools import lato2_missing
+                                content_box.label(text=lato2_missing()[0], icon="ERROR")
+                            elif scene.trellis2_texture_mode == 'native':
+                                content_box.label(text="LATO.2 drops native TRELLIS.2 textures; it is skipped in this mode.", icon="INFO")
 
                         row = content_box.row()
                         row.prop(scene, "trellis2_solidify", text="Solidify Mesh")
-
+                        if scene.trellis2_solidify:
+                            row = content_box.row()
+                            row.prop(scene, "trellis2_solidify_seal_bottom")
+                        # the same settings on a mesh that already exists (the box keeps its progress with it)
+                        _draw_meshtool_button(context, content_box.box(), 'OBJECT_OT_stablegen_local_postprocess',
+                                              "object.stablegen_local_postprocess", "Post-Process Active Mesh",
+                                              "MODIFIER", "Cancel Post-Processing")
 
 
                     content_box.separator()
@@ -996,14 +1085,6 @@ class StableGenPanel(bpy.types.Panel):
                     split = content_box.split(factor=0.5)
                     split.label(text="Resolution:")
                     split.prop(scene, "trellis2_resolution", text="")
-
-                    split = content_box.split(factor=0.5)
-                    split.label(text="Precision:")
-                    split.prop(scene, "trellis2_precision", text="")
-
-                    split = content_box.split(factor=0.5)
-                    split.label(text="Attention:")
-                    split.prop(scene, "trellis2_attn_backend", text="")
 
                     content_box.separator()
 
@@ -1158,6 +1239,11 @@ class StableGenPanel(bpy.types.Panel):
                         row.prop(scene, "trellis2_autorig_model_ckpt", text="Rig checkpoint path")
                         row = content_box.row()
                         row.prop(scene, "trellis2_autorig_hf_path", text="Hugging Face model path")
+
+            # --- LATO.2 low-poly remesh (ComfyUI-LATO2): any mesh, so every architecture; the Tools tab in the panel ---
+            content_box = draw_collapsible_section(advanced_params_box, "show_meshtools", "Low-Poly Remesh (LATO.2)", icon="MOD_REMESH")
+            if content_box:
+                draw_meshtools_section(context, content_box)
 
             # --- TRELLIS.2: Native Texture Settings ---
             if is_trellis2 and trellis2_tex_mode == 'native':
@@ -1382,6 +1468,11 @@ class StableGenPanel(bpy.types.Panel):
             if content_box:
                 row = content_box.row(align=True)
                 row.prop(scene, "use_camera_prompts", text="Use view prompts", toggle=True, icon="OUTLINER_OB_CAMERA")
+                row = content_box.row(align=True)
+                row.prop(scene, "use_object_prompts", text="Use object prompts", toggle=True, icon="OBJECT_DATA")
+                active = context.active_object
+                if scene.use_object_prompts and active is not None and active.type == 'MESH':
+                    content_box.prop(active, "sg_object_prompt", text=active.name)
 
                 # ── Camera Generation Order ──
                 row = content_box.row(align=True)
@@ -1462,12 +1553,20 @@ class StableGenPanel(bpy.types.Panel):
                 row = content_box.row()
                 row.prop(scene, "bake_visibility_weights", text="Bake Visibility (Transform-Stable)", toggle=True, icon="MESH_DATA")
 
+                row = content_box.row()
+                # Native Raycast path only: not used with baked weights or before Blender 5.1.
+                row.enabled = not scene.bake_visibility_weights and bpy.app.version >= (5, 1, 0)
+                row.prop(scene, "sg_object_relative_projection", text="Object-Relative Projection", toggle=True,
+                         icon="ORIENTATION_LOCAL")
+
                 row = (content_box.split(factor=0.5, align=False) if width_mode == 'wide'
                        else content_box.row(align=True))
                 row.prop(scene, "sg_allow_backface_projection", text="Allow Backface Projection", toggle=True)
                 if width_mode == 'narrow':
                     row = content_box.row(align=True)
                 row.prop(scene, "sg_rework_acquisition_quality", text="Weight by view quality", toggle=True)
+                if scene.sg_rework_acquisition_quality:
+                    content_box.prop(scene, "sg_view_density_exponent")
                 content_box.prop(scene, "sg_rework_projection_guard", text="Depth/Part Projection Guard", toggle=True)
                 if scene.sg_rework_projection_guard:
                     guard_box = content_box.box()
@@ -1521,12 +1620,6 @@ class StableGenPanel(bpy.types.Panel):
                     neutral = context_exp.row()
                     neutral.enabled = scene.qwen_latent_locked_context
                     neutral.prop(scene, "qwen_latent_lock_neutral_fill", toggle=True)
-                    regularize = context_exp.column()
-                    regularize.enabled = scene.qwen_use_confidence_context
-                    regularize.prop(scene, "qwen_regularize_context_mask", toggle=True)
-                    if scene.qwen_regularize_context_mask:
-                        for key in ("qwen_mask_min_island_area", "qwen_mask_min_hole_area", "qwen_mask_min_strip_width", "qwen_mask_uncertainty_dilation", "qwen_mask_keep_largest_components"):
-                            regularize.prop(scene, key)
                     context_exp.prop(scene, "qwen_use_projection_write_masks", text="Restrict Projection to Write Mask", toggle=True)
                     context_exp.prop(scene, "qwen_reject_residual_fallback", toggle=True)
                     if scene.qwen_reject_residual_fallback:
@@ -1758,7 +1851,11 @@ class StableGenPanel(bpy.types.Panel):
                             style_box = content_box.box()
                             row = style_box.row()
                             row.prop(scene, "qwen_external_style_image", text="Style Image")
-                    
+                            if (scene.model_architecture == 'qwen_image_edit' and scene.qwen_refine_use_prev_ref
+                                    and scene.qwen_refine_use_depth):
+                                style_box.label(text="Qwen Image Edit takes three images: the style image replaces the depth map.",
+                                                icon='INFO')
+
                     # Timestep-zero reference method — shared across all Qwen modes
                     row = content_box.row()
                     row.prop(scene, "qwen_timestep_zero_ref", text="Timestep-Zero References (color shift fix)", toggle=True, icon="COLORSET_08_VEC")
@@ -1828,7 +1925,7 @@ class StableGenPanel(bpy.types.Panel):
                         context_box.prop(
                             scene,
                             "qwen_use_confidence_context",
-                            text="Protect reliable context",
+                            text="Confidence-Gated Context",
                             toggle=True,
                             icon="MOD_MASK",
                         )
@@ -1837,16 +1934,19 @@ class StableGenPanel(bpy.types.Panel):
                             threshold_row.prop(
                                 scene, "qwen_trust_threshold", text="Minimum trusted view quality"
                             )
-                        else:
-                            dilation_row = context_box.row()
-                            dilation_row.prop(scene, "qwen_context_fallback_dilation", text="Legacy context expansion (px)")
-                            cleanup_row = context_box.row()
-                            cleanup_row.prop(scene, "qwen_context_cleanup", text="Legacy fallback cleanup", toggle=True, icon="BRUSH_DATA")
-                            if scene.qwen_context_cleanup:
-                                row = context_box.row()
-                                row.prop(scene, "qwen_context_cleanup_hue_tolerance", text="Hue tolerance (°)")
-                                row = context_box.row()
-                                row.prop(scene, "qwen_context_cleanup_value_adjust", text="Brightness adjustment")
+                        context_box.prop(scene, "qwen_regularize_context_mask", text="Regularize Context Boundary", toggle=True)
+                        if scene.qwen_regularize_context_mask:
+                            for key in ("qwen_mask_min_island_area", "qwen_mask_min_hole_area", "qwen_mask_min_strip_width", "qwen_mask_uncertainty_dilation", "qwen_mask_keep_largest_components"):
+                                context_box.prop(scene, key)
+                        dilation_row = context_box.row()
+                        dilation_row.prop(scene, "qwen_context_fallback_dilation", text="Context expansion (px)")
+                        cleanup_row = context_box.row()
+                        cleanup_row.prop(scene, "qwen_context_cleanup", text="Fallback cleanup", toggle=True, icon="BRUSH_DATA")
+                        if scene.qwen_context_cleanup:
+                            row = context_box.row()
+                            row.prop(scene, "qwen_context_cleanup_hue_tolerance", text="Hue tolerance (°)")
+                            row = context_box.row()
+                            row.prop(scene, "qwen_context_cleanup_value_adjust", text="Brightness adjustment")
 
                 elif scene.model_architecture == 'sdxl' or scene.model_architecture == 'flux1':
                     # IPAdapter Parameters
@@ -2410,7 +2510,7 @@ class StableGenPanel(bpy.types.Panel):
             context_box.prop(
                 scene,
                 "qwen_use_confidence_context",
-                text="Protect reliable context",
+                text="Confidence-Gated Context",
                 toggle=True,
                 icon="MOD_MASK",
             )
@@ -2418,33 +2518,43 @@ class StableGenPanel(bpy.types.Panel):
                 context_box.prop(
                     scene, "qwen_trust_threshold", text="Minimum trusted view quality", slider=True
                 )
-            else:
+            context_box.prop(
+                scene,
+                "qwen_regularize_context_mask",
+                text="Regularize Context Boundary",
+                toggle=True,
+            )
+            if scene.qwen_regularize_context_mask:
+                for key in ("qwen_mask_min_island_area", "qwen_mask_min_hole_area",
+                            "qwen_mask_min_strip_width", "qwen_mask_uncertainty_dilation",
+                            "qwen_mask_keep_largest_components"):
+                    context_box.prop(scene, key)
+            context_box.prop(
+                scene,
+                "qwen_context_fallback_dilation",
+                text="Context expansion (px)",
+                slider=True,
+            )
+            context_box.prop(
+                scene,
+                "qwen_context_cleanup",
+                text="Fallback cleanup",
+                toggle=True,
+                icon="BRUSH_DATA",
+            )
+            if scene.qwen_context_cleanup:
                 context_box.prop(
                     scene,
-                    "qwen_context_fallback_dilation",
-                    text="Legacy context expansion (px)",
+                    "qwen_context_cleanup_hue_tolerance",
+                    text="Hue tolerance (°)",
                     slider=True,
                 )
                 context_box.prop(
                     scene,
-                    "qwen_context_cleanup",
-                    text="Legacy fallback cleanup",
-                    toggle=True,
-                    icon="BRUSH_DATA",
+                    "qwen_context_cleanup_value_adjust",
+                    text="Brightness adjustment",
+                    slider=True,
                 )
-                if scene.qwen_context_cleanup:
-                    context_box.prop(
-                        scene,
-                        "qwen_context_cleanup_hue_tolerance",
-                        text="Hue tolerance (°)",
-                        slider=True,
-                    )
-                    context_box.prop(
-                        scene,
-                        "qwen_context_cleanup_value_adjust",
-                        text="Brightness adjustment",
-                        slider=True,
-                    )
 
             actions = preview_box.row(align=True)
             actions.operator(
@@ -2462,7 +2572,9 @@ class StableGenPanel(bpy.types.Panel):
         row.operator("object.stablegen_mirror_reproject", text="Mirror Last Projection", icon="MOD_MIRROR")
         if width_mode == 'narrow':
             row = tools_box.row()
-        row.operator("object.stablegen_local_postprocess", text="Run Local Post-Processing", icon="MODIFIER")
+        _draw_meshtool_button(context, row, 'OBJECT_OT_stablegen_local_postprocess',
+                              "object.stablegen_local_postprocess", "Mesh Post-Processing", "MODIFIER",
+                              "Cancel Post-Processing")
 
         row = tools_box.row()
         row.operator("object.stablegen_make_solid", text="Make Solid", icon="MOD_REMESH")

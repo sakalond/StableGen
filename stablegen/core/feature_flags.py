@@ -2,6 +2,7 @@
 
 GRADUATED_FEATURE_DEFAULTS = {
     "qwen_use_confidence_context": False,
+    "qwen_regularize_context_mask": False,
     "sg_rework_acquisition_quality": False,
     "sg_rework_projection_guard": False,
     "sg_allow_backface_projection": True,
@@ -10,7 +11,7 @@ EXPERIMENTAL_FEATURE_DEFAULTS = dict.fromkeys((
     "sg_rework_aligned_resolution", "sg_rework_full_resolution_scale",
     "sg_rework_final_display", "qwen_global_style_vlm_only",
     "qwen_context_vlm_only", "qwen_latent_locked_context",
-    "qwen_latent_lock_neutral_fill", "qwen_regularize_context_mask",
+    "qwen_latent_lock_neutral_fill",
     "qwen_use_projection_write_masks", "qwen_reject_residual_fallback",
     "sg_auto_view_sequence",
 ), False)

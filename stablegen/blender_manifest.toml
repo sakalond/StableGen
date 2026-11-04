@@ -1,6 +1,6 @@
 schema_version = "1.0.0"
 id = "stablegen"
-version = "0.4.0"
+version = "0.5.0"
 name = "StableGen"
 tagline = "AI-Powered 3D Asset Generation & Texturing"
 maintainer = "Ondrej Sakala <sakalaondrej@gmail.com>"
@@ -47,5 +47,5 @@ wheels = [
 ]
 
 [permissions]
-network = "Connects to a local ComfyUI server for AI generation"
-files = "Saves generated textures, 3D meshes, PBR maps, and exported GIFs"
+network = "Connects to ComfyUI and downloads ComfyUI, packages and models"
+files = "Saves generated assets and installs ComfyUI and its models"

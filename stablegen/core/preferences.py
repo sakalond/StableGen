@@ -19,6 +19,8 @@ from .server_api import (
     _fetch_api_list,
     check_pbr_available,
     check_server_availability,
+    check_meshtools_available,
+    apply_meshtools_available,
     check_skintokens_autorig_available,
     check_trellis2_available,
 )
@@ -61,6 +63,37 @@ def _redraw_sidebars(self, context):
         for area in window.screen.areas:
             if area.type == 'VIEW_3D':
                 area.tag_redraw()
+
+
+def _comfy_setting_changed(self, context):
+    """Blender saves its preferences on quit only when they are marked changed, which a change from Python (the
+    StableGen panel's Setup page, a folder picker) is not; StableGen's setup choices must survive a restart."""
+    context.preferences.is_dirty = True
+
+
+def _comfy_mode_changed(self, context):
+    from ..setup import runtime
+    _comfy_setting_changed(self, context)
+    folder = runtime.comfy_folder(self)
+    if folder is not None and runtime.report(folder) is None:
+        runtime.refresh_status(folder)
+    runtime.follow_folder(self)         # the running ComfyUI is for the folder chosen before
+    runtime.redraw()
+
+
+def _comfy_folder_changed(self, context):
+    from ..setup import runtime
+    _comfy_setting_changed(self, context)
+    folder = runtime.comfy_folder(self)
+    if folder is not None:
+        runtime.refresh_status(folder)
+    runtime.follow_folder(self)
+
+
+def _comfy_keep_running_changed(self, context):
+    from ..setup import runtime
+    _comfy_setting_changed(self, context)
+    runtime.keep_running = self.comfy_keep_running
 
 
 class StableGenAddonPreferences(bpy.types.AddonPreferences):
@@ -151,7 +184,7 @@ class StableGenAddonPreferences(bpy.types.AddonPreferences):
     enable_debug: bpy.props.BoolProperty(
         name="Enable Debug Settings",
         description="Show diagnostic tools in the main panel for visualising projection weights, blending and coverage",
-        default=False
+        default=True
     )  # type: ignore
 
     show_advanced: bpy.props.BoolProperty(
@@ -214,12 +247,72 @@ class StableGenAddonPreferences(bpy.types.AddonPreferences):
         update=update_parameters
     )  # type: ignore
 
+    # ── ComfyUI setup (stablegen/setup) ──
+    comfy_mode: bpy.props.EnumProperty(
+        name="ComfyUI",
+        description="Where StableGen's ComfyUI comes from",
+        items=[
+            ('OWN', "StableGen's own", "StableGen installs, starts and stops its own ComfyUI", 'PACKAGE', 0),
+            ('LOCAL', "My ComfyUI folder", "A ComfyUI on this computer: StableGen installs models into it and "
+                                           "starts and stops it", 'FILE_FOLDER', 1),
+            ('REMOTE', "Remote server", "A ComfyUI running elsewhere (another machine, a cloud GPU), at the server "
+                                        "address", 'WORLD', 2),
+        ],
+        default='REMOTE',
+        update=_comfy_mode_changed,
+    )  # type: ignore
+
+    comfy_root: bpy.props.StringProperty(
+        name="Install folder",
+        description="Where StableGen keeps its own ComfyUI: about 5 GB, plus the models you install",
+        default="",
+        subtype='DIR_PATH',
+        update=_comfy_folder_changed,
+    )  # type: ignore
+
+    comfy_local_path: bpy.props.StringProperty(
+        name="ComfyUI folder",
+        description="Your ComfyUI folder (the one with 'models' and 'custom_nodes'; for a portable build, the folder "
+                    "that contains it works too)",
+        default="",
+        subtype='DIR_PATH',
+        update=_comfy_folder_changed,
+    )  # type: ignore
+
+    comfy_port: bpy.props.IntProperty(
+        name="Port",
+        description="Port StableGen starts ComfyUI on; when another program uses it, the next free one is taken",
+        default=8188, min=1024, max=65500,
+        update=_comfy_setting_changed,
+    )  # type: ignore
+
+    comfy_extra_args: bpy.props.StringProperty(
+        name="Extra arguments",
+        description="Added to ComfyUI's command line, for example --lowvram",
+        default="",
+        update=_comfy_setting_changed,
+    )  # type: ignore
+
+    comfy_auto_start: bpy.props.BoolProperty(
+        name="Start when StableGen needs it",
+        description="Start ComfyUI in the background when the StableGen sidebar opens or a generation needs it",
+        default=True,
+        update=_comfy_setting_changed,
+    )  # type: ignore
+
+    comfy_keep_running: bpy.props.BoolProperty(
+        name="Keep running after Blender closes",
+        description="Leave ComfyUI running when Blender quits; the next Blender uses it again",
+        default=False,
+        update=_comfy_keep_running_changed,
+    )  # type: ignore
+
     def draw(self, context):
+        from ..setup import prefs_ui
         layout = self.layout
+        prefs_ui.draw(self, layout, context)
+        layout.separator()
         layout.prop(self, "output_dir")
-        row = layout.row(align=True)
-        row.prop(self, "server_address")
-        row.operator("stablegen.check_server_status", text="", icon='FILE_REFRESH')
 
         row = layout.row()
         row.prop(self, "use_legacy_panel")
@@ -306,18 +399,22 @@ class CheckServerStatus(bpy.types.Operator):
         server_addr = prefs.server_address
 
         print(f"[StableGen] Checking server status at {server_addr}...")
+        # Read the preferences here; the worker thread must not touch bpy.
+        ping_timeout, api_timeout = get_timeout('ping'), get_timeout('api')
 
         def _bg_work():
             result = {}
-            result['online'] = check_server_availability(server_addr, timeout=get_timeout('ping'))
+            result['online'] = check_server_availability(server_addr, timeout=ping_timeout)
             if result['online']:
-                result['trellis2'] = check_trellis2_available(server_addr, timeout=get_timeout('api'))
-                result['pbr'] = check_pbr_available(server_addr, timeout=get_timeout('api'))
-                result['skintokens'] = check_skintokens_autorig_available(server_addr, timeout=get_timeout('api'))
+                result['trellis2'] = check_trellis2_available(server_addr, timeout=api_timeout)
+                result['pbr'] = check_pbr_available(server_addr, timeout=api_timeout)
+                result['skintokens'] = check_skintokens_autorig_available(server_addr, timeout=api_timeout)
+                result['meshtools'] = check_meshtools_available(server_addr, timeout=api_timeout)
             else:
                 result['trellis2'] = False
                 result['pbr'] = False
                 result['skintokens'] = False
+                result['meshtools'] = {}
             return result
 
         def _on_done(result):
@@ -332,10 +429,11 @@ class CheckServerStatus(bpy.types.Operator):
                 bpy.context.scene.trellis2_available = result.get('trellis2', False)
                 bpy.context.scene.pbr_nodes_available = result.get('pbr', False)
                 bpy.context.scene.skintokens_autorig_available = result.get('skintokens', False)
+                apply_meshtools_available(bpy.context.scene, result.get('meshtools'))
 
             if result.get('online', False):
                 print(f"[StableGen] ComfyUI server is online at {server_addr}.")
-                load_handler(None)
+                load_handler(None, file_loaded=False)
                 def _deferred_refresh():
                     try:
                         bpy.ops.stablegen.refresh_checkpoint_list('INVOKE_DEFAULT')

@@ -5,6 +5,7 @@ import uuid
 import websocket
 import socket
 import time
+import urllib.error
 import urllib.request
 import urllib.parse
 import email.utils
@@ -12,6 +13,7 @@ from datetime import datetime, timezone, timedelta
 
 from .timeout_config import get_timeout
 from .util.prompt_archive import archive_prompt
+from .util.comfy_errors import describe_rejection
 from .core.generation_status import set_server_stage, node_stage
 
 from io import BytesIO
@@ -193,7 +195,12 @@ class _WorkflowBase:
             camera_lookup_index = camera_id
             if camera_lookup_index is None:
                 camera_lookup_index = view_index
-            if isinstance(camera_lookup_index, int) and 0 <= camera_lookup_index < len(cameras):
+            # Masked Edit writes every view as camera 0 of its own folder;
+            # its operator names the view's camera.
+            current_camera = getattr(operator, "current_camera", None)
+            if current_camera is not None:
+                camera_name = getattr(current_camera, "name", None)
+            elif isinstance(camera_lookup_index, int) and 0 <= camera_lookup_index < len(cameras):
                 camera_name = getattr(cameras[camera_lookup_index], "name", None)
 
             _, archive_path = archive_prompt(
@@ -316,6 +323,51 @@ class _WorkflowBase:
 
         detail = f"history: {history_error}; queue: {queue_error}"
         return 'unavailable', detail
+
+    def _follow_prompt_without_websocket(self, server_address, prompt_id, ws,
+                                         interval=5.0):
+        """Follow a prompt over HTTP after its WebSocket dropped.
+
+        A connection to a remote server can drop while the prompt still runs.
+        The HTTP image fallback then ran at once, found no output yet, and
+        failed the view although ComfyUI finished it moments later. Returns
+        when the prompt completes (the caller then downloads its image), fails
+        or stays out of reach for a heartbeat interval, and at once when the
+        drop was a cancel: cancelling closes the socket and clears the
+        operator's reference to it.
+        """
+        owner = type(self.operator)
+        patience = get_timeout('generation_heartbeat')
+        lost_since = None
+        while True:
+            if (getattr(self.operator, '_cancelled', False)
+                    or (hasattr(owner, '_active_ws')
+                        and getattr(owner, '_active_ws', None) is not ws)):
+                return
+            state, detail = self._get_prompt_runtime_state(
+                server_address, prompt_id)
+            if state == 'completed':
+                print("[StableGen] ComfyUI finished the prompt after the "
+                      "WebSocket dropped. Recovering the result via HTTP.")
+                return
+            if state == 'error':
+                self.operator._error = f"ComfyUI execution error: {detail}"
+                print(f"[StableGen] {self.operator._error}")
+                return
+            if state in {'running', 'queued'}:
+                lost_since = None
+            else:
+                lost_since = lost_since or time.monotonic()
+                if time.monotonic() - lost_since > patience:
+                    self.operator._error = (
+                        f"Lost contact with ComfyUI prompt {prompt_id} after "
+                        f"its WebSocket dropped ({detail})."
+                    )
+                    print(f"[StableGen] {self.operator._error}")
+                    return
+            print(f"[StableGen] WebSocket dropped; prompt is {state} "
+                  f"({detail}). Following it over HTTP.")
+            time.sleep(interval)
 
     def _connect_to_websocket(self, server_address, client_id):
         """Establishes WebSocket connection to ComfyUI server."""
@@ -469,6 +521,7 @@ class _WorkflowBase:
                 break
             except (ConnectionError, OSError, Exception) as ws_err:
                 print(f"[StableGen] WebSocket error during generation: {ws_err}")
+                self._follow_prompt_without_websocket(server_address, prompt_id, ws)
                 break
 
             if isinstance(out, str):
@@ -634,6 +687,19 @@ class _WorkflowBase:
             response = json.loads(urllib.request.urlopen(req, timeout=get_timeout('api')).read())
             
             return response['prompt_id']
+        except urllib.error.HTTPError as e:
+            print(f"[StableGen] Failed to queue prompt: {str(e)}")
+            try:
+                body = e.read()
+            except OSError:
+                body = b''
+            if body:
+                print(f"[StableGen] ComfyUI response: {body.decode('utf-8', 'replace')}")
+            # ComfyUI says why it refused the workflow, usually a model or node that is not installed.
+            reason = describe_rejection(body)
+            if reason:
+                raise RuntimeError(reason) from e
+            raise
         except Exception as e:
             print(f"[StableGen] Failed to queue prompt: {str(e)}")
             raise

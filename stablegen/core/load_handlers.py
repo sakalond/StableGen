@@ -15,8 +15,14 @@ from .architectures import QWEN_ARCHITECTURES
 
 
 @persistent
-def load_handler(dummy):
-    """Set default ControlNet/LoRA units and sync checkpoint cache on file load."""
+def load_handler(dummy, _second=None, file_loaded=True):
+    """Set default ControlNet/LoRA units and sync checkpoint cache on file load.
+
+    Server checks reuse it with file_loaded=False: a generation may be
+    running then, so its status must not be reset. Blender 5.1 calls load_post
+    handlers with two positional arguments (the file path and None), which
+    must not land in *file_loaded*.
+    """
     from ..ui.model_units import get_lora_models
     from . import state as _state
     from ..texturing.print_export import prepopulate_palette
@@ -25,6 +31,25 @@ def load_handler(dummy):
         return
 
     scene = bpy.context.scene
+
+    # A file saved while a Masked Edit ran kept the edit's own output folder as
+    # the run timestamp; Reproject and Regenerate then looked for the run there.
+    # No edit survives a load, so put the run back.
+    if file_loaded:
+        for each in bpy.data.scenes:
+            if '_sg_mask_run_timestamp' in each:
+                each.output_timestamp = each['_sg_mask_run_timestamp']
+                del each['_sg_mask_run_timestamp']
+        # Bakes made before their normal maps named a UV map showed a triangle mosaic.
+        from ..texturing.rendering import repair_baked_normal_maps
+        repaired = repair_baked_normal_maps(bpy.data.materials)
+        if repaired:
+            print(f"[StableGen] Baked normal maps now decode with their bake UV map: {repaired}")
+        # Masked Edits on a bake mixed world-space normals into its tangent-space map (black edits).
+        from ..texturing.masked_edit import repair_edit_normal_layers
+        repaired = repair_edit_normal_layers(bpy.data.materials)
+        if repaired:
+            print(f"[StableGen] Masked Edit normal layers now mix decoded normals: {repaired}")
 
     # Builds saved while Qwen-Image 2.1 shared the Qwen-Image-Edit enum need a
     # one-time architecture migration.  The filename is used only here for
@@ -44,7 +69,9 @@ def load_handler(dummy):
                       else 'qwen_image_21')
             scene.model_architecture = target
             if getattr(scene, "architecture_mode", "") == 'qwen_image_edit':
-                scene.architecture_mode = target
+                from ..ui.presets import preset_carry_held
+                with preset_carry_held():           # the file keeps its own settings
+                    scene.architecture_mode = target
             elif getattr(scene, "architecture_mode", "") == 'trellis2':
                 if getattr(scene, "trellis2_texture_mode", "") == 'qwen_image_edit':
                     scene.trellis2_texture_mode = target
@@ -95,7 +122,7 @@ def load_handler(dummy):
     # "running" or "waiting", which leaves the Generate button permanently
     # stuck after reopening. Runtime status is SKIP_SAVE now, but normalize
     # legacy files as well.
-    for loaded_scene in bpy.data.scenes:
+    for loaded_scene in (bpy.data.scenes if file_loaded else ()):
         if getattr(loaded_scene, "generation_status", 'idle') != 'idle':
             loaded_scene.generation_status = 'idle'
         if hasattr(loaded_scene, "generation_progress"):
@@ -206,6 +233,8 @@ def load_handler(dummy):
         if server_address:
             from .server_api import (
                 check_pbr_available,
+                check_meshtools_available,
+                apply_meshtools_available,
                 check_skintokens_autorig_available,
                 check_trellis2_available,
             )
@@ -218,6 +247,7 @@ def load_handler(dummy):
                 result['trellis2'] = check_trellis2_available(server_address, timeout=_timeout)
                 result['pbr'] = check_pbr_available(server_address, timeout=_timeout)
                 result['skintokens'] = check_skintokens_autorig_available(server_address, timeout=_timeout)
+                result['meshtools'] = check_meshtools_available(server_address, timeout=_timeout)
                 return result
 
             def _apply_node_result(result):
@@ -227,5 +257,6 @@ def load_handler(dummy):
                     bpy.context.scene.trellis2_available = result.get('trellis2', False)
                     bpy.context.scene.pbr_nodes_available = result.get('pbr', False)
                     bpy.context.scene.skintokens_autorig_available = result.get('skintokens', False)
+                    apply_meshtools_available(bpy.context.scene, result.get('meshtools'))
 
             _state._run_async(_check_nodes, _apply_node_result)

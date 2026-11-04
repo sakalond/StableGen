@@ -4,6 +4,7 @@ GPU drawing lives only in this tab's UI region. A lightweight input operator
 passes viewport and native-tab events through. Every workflow command invokes
 its existing Blender operator; every setting writes its original RNA property.
 """
+import contextlib
 import json
 import logging
 from pathlib import Path
@@ -12,6 +13,7 @@ import time
 
 import bpy
 import blf
+import numpy as np
 from bpy.app.handlers import persistent
 
 from . import studio_model as model
@@ -22,12 +24,17 @@ from . import studio_help as help_text
 from . import studio_actions as action_style
 from . import studio_lora as lora
 from . import studio_tips as tips
+from . import studio_setup as setup_page
 from .presentation import Layout, Control, Section, STRUCTURAL_PROPERTIES, TOOL_SECTIONS
 from .studio_text import TextBuffer, wrap
 from .studio_widgets import (Painter, FONT_SIZE, CONTROL_HEIGHT, CONTROL_GAP,
-                             TEXT_LINE_HEIGHT, TEXT_PADDING, font_size)
-from .presets import PRESETS
+                             TEXT_LINE_HEIGHT, TEXT_PADDING, color, font_size, image_size)
+from .presets import (PRESETS, PRESET_MODEL_NAMES, PRESET_VARIANTS, PRESET_WORKFLOWS,
+                      preset_label as _preset_label, preset_model as _preset_model,
+                      preset_workflow as _preset_workflow, strip_word as _strip)
 from ..utils import sg_modal_active
+from ..cameras import visibility
+from ..setup import prefs_ui as setup_prefs, runtime as setup_runtime
 from ..core import ADDON_PKG, legacy_panel_enabled
 from ..core.generation_status import WAITING_STAGES
 from ..core.architectures import ARCHITECTURE_ITEMS, QWEN_ARCHITECTURES, architecture_status
@@ -35,9 +42,12 @@ from ..core.architectures import ARCHITECTURE_ITEMS, QWEN_ARCHITECTURES, archite
 TAB = 'StableGen'
 PAGES = [('GENERATE', 'Texture'), ('CAMERAS', 'Cameras'), ('BLEND', 'Blending')]
 MORE = [('TOOLS', 'Tools'), ('QUEUE', 'Scene queue'), ('DEBUG', 'Diagnostics'),
-        ('MESH', 'Mesh & rig'), ('PRINT', '3D printing'), ('EXPERIMENTS', 'Experiments')]
+        ('MESH', 'Mesh & rig'), ('PRINT', '3D printing'), ('EXPERIMENTS', 'Experiments'),
+        ('SETUP', 'ComfyUI setup')]
 # Architectures that generate the asset itself rather than texturing an existing mesh.
 ASSET_ARCHITECTURES = {'trellis2'}
+DIAGNOSTIC_ICONS = {'SOLID': 'material', 'GRID': 'grid', 'COVERAGE': 'layers', 'VISIBILITY': 'eye', 'WEIGHT': 'graph',
+                    'FEATHER': 'widen', 'CONFIDENCE': 'check', 'SEAMS': 'curve', 'DPPG': 'shield'}
 
 
 ARCHITECTURE_PROPERTIES = {'architecture_mode', 'model_architecture', 'trellis2_texture_mode', 'trellis2_initial_image_arch'}
@@ -50,57 +60,6 @@ def _architecture_tags(prop, identifier):
     tags = ['Asset generation' if identifier in ASSET_ARCHITECTURES else 'Texturing'] if prop == 'architecture_mode' else []
     status = architecture_status(identifier)
     return tags + [status] if status else tags
-
-
-# Preset names repeat their model and variant, which the panel shows as tags instead: it lists only the current
-# architecture's presets, so the model name is redundant there.
-PRESET_MODEL_NAMES = {'qwen_image_edit': 'qwen', 'qwen_image_21': 'qwen 2.1', 'qwen_image_21_turbo': 'qwen 2.1 turbo',
-                      'fibo_edit': 'fibo', 'moss_image': 'moss', 'flux2_klein': 'klein'}
-PRESET_VARIANTS = {'nunchaku': 'Nunchaku', 'experimental': 'Experimental'}
-PRESET_WORKFLOWS = ('New texture', 'Refine', 'Local edit', 'UV inpaint', 'Mesh + texture', 'Mesh only')
-
-
-def _preset_workflow(preset):
-    if preset.get('architecture_mode') == 'trellis2':
-        return 'Mesh only' if preset.get('trellis2_texture_mode') == 'none' else 'Mesh + texture'
-    if preset.get('generation_method') == 'uv_inpaint':
-        return 'UV inpaint'
-    if 'local_edit' in (preset.get('generation_method'), preset.get('qwen_generation_method')):
-        return 'Local edit'
-    if preset.get('qwen_generation_method') == 'refine':
-        return 'Refine'
-    return 'New texture'
-
-
-def _preset_model(preset):
-    if preset.get('architecture_mode') == 'trellis2':
-        return preset.get('trellis2_texture_mode', 'none')
-    return preset.get('model_architecture', 'sdxl')
-
-
-def _strip(label, word):
-    lower = label.casefold()
-    if lower.endswith(' (' + word + ')'):
-        return label[:-len(word) - 3], True
-    if lower.startswith(word + ' '):
-        return label[len(word) + 1:], True
-    return label, False
-
-
-def _preset_label(identifier, label):
-    preset = PRESETS.get(identifier)
-    if not preset:
-        return label
-    trellis = preset.get('architecture_mode') == 'trellis2'
-    for word in ('mesh + texture', 'mesh only', *PRESET_VARIANTS) if trellis else PRESET_VARIANTS:
-        label = _strip(label, word)[0]
-    name = PRESET_MODEL_NAMES.get(_preset_model(preset))
-    if name:
-        label = _strip(label, name)[0]
-    if label.startswith('Uv '):         # title() case of UV
-        label = 'UV ' + label[3:]
-    # TRELLIS.2 (MESH ONLY) is the stock mesh preset once its tag says what it does.
-    return 'Default' if trellis and label.casefold() == 'trellis.2' else label
 
 
 def _preset_tags(identifier):
@@ -132,7 +91,8 @@ def _draw_tags(p, tags, right, y, enabled=True):
 
 
 PROJECTION_KEYS = {'discard_factor', 'weight_exponent', 'early_priority', 'early_priority_strength',
-                   'bake_visibility_weights', 'sg_texturing_frame', 'sg_allow_backface_projection',
+                   'bake_visibility_weights', 'sg_object_relative_projection', 'sg_texturing_frame',
+                   'sg_allow_backface_projection',
                    'sg_rework_acquisition_quality', 'sg_rework_projection_guard', 'sg_guard_directional',
                    'sg_silhouette_margin', 'sg_guard_foreground_margin', 'sg_silhouette_depth',
                    'sg_guard_coverage_rescue', 'sg_silhouette_feather', 'sg_projection_guard_scale',
@@ -146,19 +106,40 @@ _cursor_owners = {}
 _window_mouse = {}
 _pending = set()
 _handler = None
+_preview_handler = None
 _registered = False
 _font_id = None
 _font_path = ''
 _log = logging.getLogger(__name__)
 
 
+def _in_area(session):
+    return bpy.context.window == session.window and bpy.context.area == session.area
+
+
+def _override(session, region):
+    # Input events already run in the session's area, so override only when the context differs. temp_override
+    # installs a Python context dict that operators read while bpy.ops has released the GIL. Python 3.11 (Blender
+    # 4.x, 5.0) then skips taking the GIL whenever a worker thread holds it, and Blender crashes (#126).
+    if _in_area(session) and bpy.context.region == region:
+        return contextlib.nullcontext()
+    return bpy.context.temp_override(window=session.window, area=session.area, region=region)
+
+
 def _context(session):
-    return bpy.context.temp_override(window=session.window, area=session.area, region=session.region)
+    return _override(session, session.region)
 
 
 def _viewport(session):
-    region = next(r for r in session.area.regions if r.type == 'WINDOW')
-    return bpy.context.temp_override(window=session.window, area=session.area, region=region)
+    return _override(session, next(r for r in session.area.regions if r.type == 'WINDOW'))
+
+
+def _viewport_mode(session, mode):
+    """Context and execution mode that run an operator in the session's 3D viewport region. From its own area
+    Blender picks that region itself (the *_REGION_WIN modes), so no Python context dict is installed."""
+    if _in_area(session):
+        return contextlib.nullcontext(), mode.replace('_DEFAULT', '_REGION_WIN')
+    return _viewport(session), mode
 
 
 def _undo(message):
@@ -169,8 +150,71 @@ def _undo(message):
         _log.debug('Undo push unavailable', exc_info=True)
 
 
+def _view_aspect(scene, camera, image):
+    """A camera's view shape: its generated image's (a Blender image or a file), else its resolution's."""
+    width, height = image_size(image) if image is not None else (0, 0)
+    if width > 0 and height > 0:
+        return width / height
+    from ..cameras.geometry import _get_camera_resolution
+    width, height = _get_camera_resolution(camera, scene)
+    return width / max(1, height)
+
+
+def _open_view_layout(x, y, width, aspect, fields_height=200):
+    """Where an open camera card shows its view and its fields: a portrait or square view beside the fields, as tall
+    as they are (200 to 420 px, at most 240 px wide); a landscape view (or any view when the fields would get
+    narrower than 220 px) across the card above them, at most 260 px tall. Returns (view rect, (fields x, fields y,
+    fields width))."""
+    if aspect <= 1.25:
+        view_width = min(240, max(200, min(420, fields_height)) * aspect)
+        if width - 24 - view_width - 16 >= 220:
+            return ((x + 12, y + 43, view_width, view_width / aspect),
+                    (x + 12 + view_width + 16, y + 43, width - 24 - view_width - 16))
+    height = min(260, (width - 24) / aspect)
+    view_width = height * aspect
+    return ((x + 12 + (width - 24 - view_width) / 2, y + 43, view_width, height),
+            (x + 12, y + 43 + height + 12, width - 24))
+
+
+def _object_tag(p, x, y, name, hue, *, share='', height=15, size=9, selected=False, hover=False):
+    """The panel's tag, led by the object's colour when it is described; undescribed objects are dimmed."""
+    width = p.measure(name, size) + 10 + (9 if hue else 0) + (p.measure(share, size) + 4 if share else 0)
+    p.outline(x, y, width, height, 'selected' if selected else 'hover_soft',
+              'accent' if selected else 'hover_border' if hover else 'line', 3)
+    tx = x + 5
+    if hue:
+        p.rect(tx, y + (height - 5) / 2, 5, 5, hue, 1)
+        tx += 9
+    p.text(name, tx, y + (height - size) / 2 - .5, size, 'secondary' if hue else 'disabled')
+    if share:
+        p.text(share, tx + p.measure(name, size) + 4, y + (height - size) / 2 - .5, size, 'muted')
+    return width
+
+
 def _binding_key(binding):
     return f'{binding.root}:{binding.name}:{binding.path}:{binding.property}'
+
+
+def prompt_wording(scene, prop):
+    """(label, placeholder) for a prompt field, by what the prompt does now: a new texture, a restyle of the
+    current one, an edit of part of it, an image for TRELLIS.2. The placeholder shows, greyed, while it is empty.
+    ('', '') for other text fields."""
+    if prop == 'comfyui_negative_prompt':
+        return 'Negative prompt', 'What to keep out, e.g. blurry, text, watermark'
+    if prop == 'sg_masked_prompt':
+        return 'Edit instructions', 'What to change inside the painted area, e.g. make the jacket red leather'
+    if prop == 'texture_prompt':
+        return 'Texture prompt', 'The surface for the mesh, e.g. weathered bronze with green patina'
+    if prop != 'comfyui_prompt':
+        return '', ''
+    if scene.architecture_mode == 'trellis2':
+        return 'Mesh image prompt', 'The object to generate, e.g. a wooden treasure chest with iron bands'
+    method = scene.qwen_generation_method if scene.model_architecture in QWEN_ARCHITECTURES else scene.generation_method
+    return {
+        'refine': ('Refine prompt', 'How the whole texture should change, e.g. hand-painted style, warmer colors'),
+        'local_edit': ('Edit prompt', 'What to change where the detail cameras look, e.g. add gold lettering to the sign'),
+        'uv_inpaint': ('Texture prompt', 'What the untextured areas should show, e.g. the same dark wood grain'),
+    }.get(method, ('Texture prompt', 'The texture to generate, e.g. a weathered bronze statue with green patina'))
 
 
 class StudioSession:
@@ -197,6 +241,10 @@ class StudioSession:
         self.last_refresh = 0
         self.edit = None
         self.drag = None
+        # Part of the hovered number button under the pointer, and the page scrollbar's (top, height, grip
+        # height, grip top) from the last draw.
+        self.hover_zone = None
+        self.scrollbar = None
         self.camera_drag = None
         self.camera_rows = []
         self.camera_clip = None
@@ -215,6 +263,15 @@ class StudioSession:
         self.busy = False
         self.ctrl = False
         self.camera_images = {}
+        # The display chosen in Diagnostics, and the settings of the one shown (Update view applies a difference)
+        self.diagnostic_pick = None
+        self.diagnostic_shown = None
+        # The object whose prompt an open camera card is editing, and the outline drawn over that card's view
+        self.object_prompt = None
+        self.object_outline = None
+        self.open_fields_height = {}       # camera -> height of its open card's fields, for the view beside them
+        # The camera whose view fills the 3D viewport after a click on its image; any click closes it
+        self.preview = None
         self.card_bounds = {}
         # Narrowest width while the widen callout was shown in this session.
         self.callout_width = None
@@ -300,7 +357,7 @@ class StudioSession:
         if self.camera_drag or self.drag or self.edit and self.edit['selecting']:
             self.clear_hover()
             if cursor:
-                self.set_cursor('MOVE_Y' if self.camera_drag else 'MOVE_X' if self.drag else 'TEXT')
+                self.set_cursor('MOVE_Y' if self.camera_drag else self.drag_cursor() if self.drag else 'TEXT')
             return None
         if not inside:
             self.clear_hover()
@@ -317,9 +374,19 @@ class StudioSession:
             self.hover_signature = signature
             if target:
                 self.area.tag_redraw()
+        zone = (target.number_zone(self.pointer[0])
+                if target and isinstance(target.action, tuple) and target.action[0] == 'number' else None)
+        if zone != self.hover_zone:
+            self.hover_zone = zone
+            self.area.tag_redraw()
         if cursor:
-            self.set_cursor('MOVE_X' if self.drag else target.cursor if target else 'DEFAULT')
+            self.set_cursor(target.cursor if target else 'DEFAULT')
         return target
+
+    def drag_cursor(self):
+        # Blender hides the pointer while a number is dragged (it wraps at the window edge, see scrub).
+        kind = self.drag.get('kind', 'slider')
+        return 'MOVE_X' if kind == 'slider' else 'NONE' if kind == 'number' and self.drag['moved'] else 'DEFAULT'
 
     def tooltip_target(self, targets=None):
         if (not bpy.context.preferences.view.show_tooltips or self.camera_drag or self.drag or self.popup
@@ -399,9 +466,10 @@ class StudioSession:
         self.commit()
         self.clear_hover(leave=True)
         try:
-            with _viewport(self):
+            scope, mode = _viewport_mode(self, mode)
+            with scope:
                 op = model.operator(name)
-                if not op.poll():
+                if not op.poll(mode):
                     self.tell('This command is unavailable for the current scene or operation.')
                     return
                 if diagnostics.active(bpy.context.scene) and name not in {
@@ -444,9 +512,17 @@ class StudioSession:
                     raise ReferenceError('The adapter list changed while this value was being edited.')
                 binding, text = edit['binding'], edit['buffer'].text
                 prop = binding.rna(bpy.context)
-                value = float(text) if prop.type == 'FLOAT' else int(text) if prop.type == 'INT' else text
+                if prop.type in {'INT', 'FLOAT'} and not text.strip():
+                    value = model.reset_value(binding, bpy.context)  # an emptied number resets
+                else:
+                    value = float(text) if prop.type == 'FLOAT' else int(text) if prop.type == 'INT' else text
                 if binding.value(bpy.context) != value:
+                    # A renamed object keeps its open section (Blender may adjust the name: .001)
+                    renamed = (binding.data(bpy.context) if binding.root == 'object' and binding.property == 'name'
+                               and binding.name == self.object_prompt else None)
                     self.write_binding(binding, value)
+                    if renamed is not None:
+                        self.object_prompt = renamed.name
             self.refresh()
         except (ValueError, TypeError, ReferenceError, RuntimeError) as exc:
             self.tell('Could not apply this value: ' + str(exc).split('\n')[0])
@@ -459,22 +535,20 @@ class StudioSession:
         self.refresh()
 
     def write_binding(self, binding, value, undo=True):
-        if binding.path == 'sg_studio_diagnostics':
-            with _viewport(self):
-                bpy.ops.stablegen.studio_diagnostic('EXEC_DEFAULT', setting=binding.property,
-                                                   value=json.dumps(value))
-                _undo('Change diagnostic display')
-        else:
-            binding.set(bpy.context, value)
-            if undo:
-                _undo('Change ' + binding.rna(bpy.context).name)
+        # Read the label first: after a rename the binding's old name no longer resolves. A diagnostic option
+        # only changes the setting; Update view applies it.
+        label = binding.rna(bpy.context).name
+        binding.set(bpy.context, value)
+        if undo:
+            _undo('Change ' + label)
 
     def begin_edit(self, target, select=False):
         self.commit()
         binding = target.action[1]
         with _context(self):
             value = self.query if binding is None else binding.value(bpy.context)
-        buffer = TextBuffer(str(value))
+        # Floats open for typing as Blender shows them: six decimals at most, trailing zeros dropped.
+        buffer = TextBuffer(f'{value:.6f}'.rstrip('0').rstrip('.') if isinstance(value, float) else str(value))
         if select:
             buffer.anchor = 0
         self.edit = {'key': target.key, 'binding': binding, 'buffer': buffer,
@@ -562,6 +636,26 @@ class StudioSession:
             self.drag = {'binding': action[1], 'min': action[2], 'max': action[3],
                          'rect': target.rect, 'before': before}
             self.slide(self.pointer[0])
+        elif action[0] == 'number':
+            # Like Blender, a press waits: a drag past the threshold scrubs, a click steps from an arrow or
+            # starts typing in the middle (see scrub and finish_drag).
+            self.commit()
+            with _context(self):
+                before = action[1].value(bpy.context)
+            self.drag = {'kind': 'number', 'key': target.key, 'target': target, 'binding': action[1],
+                         'before': before, 'zone': target.number_zone(self.pointer[0]), 'press': self.mouse,
+                         'start': self.mouse[0], 'wrap': 0, 'moved': False}
+        elif action[0] == 'scrollbar' and self.scrollbar:
+            self.commit()
+            top, height, grip, grip_top = self.scrollbar
+            y = self.pointer[1]
+            before = self.scroll.get(self.page, 0)
+            if not grip_top <= y <= grip_top + grip:
+                # A press beside the grip jumps it there, then keeps dragging, as in Blender's scrollbars.
+                travel = max(1, height - grip)
+                self.scroll[self.page] = max(0, min(self.max_scroll, (y - grip / 2 - top) / travel * self.max_scroll))
+                grip_top = y - grip / 2
+            self.drag = {'kind': 'scroll', 'offset': y - grip_top, 'before': before}
         elif action[0] == 'camera-drag':
             self.commit()
             self.camera_drag = {'name': action[1], 'names': tuple(c.name for c in self.ordered_cameras())}
@@ -593,6 +687,112 @@ class StudioSession:
         left, _, width, _ = drag['rect']
         value = drag['min'] + max(0, min(1, (x - left) / width)) * (drag['max'] - drag['min'])
         self.set_value(drag['binding'], value, undo=False)
+
+    def drag_move(self, event):
+        kind = self.drag.get('kind', 'slider')
+        if kind == 'scroll':
+            top, height, grip, _ = self.scrollbar or (0, 1, 1, 0)
+            travel = max(1, height - grip)
+            position = (self.pointer[1] - self.drag['offset'] - top) / travel * self.max_scroll
+            self.scroll[self.page] = max(0, min(self.max_scroll, position))
+            self.area.tag_redraw()
+        elif kind == 'number':
+            self.scrub(event)
+        else:
+            self.slide(self.pointer[0])
+        self.clear_hover()
+        self.set_cursor(self.drag_cursor())
+
+    def scrub(self, event):
+        """Blender's number drag: a threshold, then a linear change per pixel with the pointer hidden and
+        wrapped at the window edge, Shift for precision and Ctrl (Ctrl+Shift) for snapping."""
+        drag = self.drag
+        mouse_x = event.mouse_x
+        x = mouse_x + drag['wrap']
+        if drag['moved']:
+            width = self.window.width
+            if mouse_x <= 1 or mouse_x >= width - 2:
+                wrapped = width - 3 if mouse_x <= 1 else 2
+                drag['wrap'] += mouse_x - wrapped
+                self.window.cursor_warp(wrapped, event.mouse_y)
+        if not drag['moved']:
+            if abs(x - drag['start']) <= 3 * self.scale:
+                return
+            drag['moved'], drag['start'] = True, x
+        ctrl = event.ctrl or event.oskey
+        with _context(self):
+            prop = drag['binding'].rna(bpy.context)
+            value, shift = model.number_drag(prop, drag['before'], x - drag['start'], precise=event.shift,
+                                             snap=('SMALL' if event.shift else 'ON') if ctrl else None)
+        drag['start'] += shift
+        self.set_value(drag['binding'], value, undo=False)
+
+    def step_number(self, binding, direction):
+        with _context(self):
+            value = model.stepped_number(binding.rna(bpy.context), binding.value(bpy.context), direction)
+        self.set_value(binding, value)
+
+    def finish_drag(self, cancel=False):
+        drag, self.drag = self.drag, None
+        kind = drag.get('kind', 'slider')
+        if kind == 'scroll':
+            if cancel:
+                self.scroll[self.page] = drag['before']
+        elif kind == 'number' and not drag['moved']:
+            if not cancel and drag['zone'] == 'middle':
+                self.begin_edit(drag['target'], select=True)
+            elif not cancel:
+                self.step_number(drag['binding'], -1 if drag['zone'] == 'left' else 1)
+        else:
+            if kind == 'number':
+                # The hidden pointer comes back where the drag began.
+                self.window.cursor_warp(*drag['press'])
+                self.mouse = drag['press']
+                _window_mouse[self.key[0]] = self.mouse
+            if cancel:
+                self.set_value(drag['binding'], drag['before'], undo=False)
+            else:
+                with _context(self):
+                    if drag['binding'].value(bpy.context) != drag['before']:
+                        _undo('Adjust ' + drag['binding'].rna(bpy.context).name)
+        self.area.tag_redraw()
+        self.update_hover()
+
+    def number_key(self, event):
+        """Blender's keys over a hovered number button: Ctrl+Wheel steps, Enter types, Ctrl+C/Ctrl+V copy and
+        paste, Backspace resets (studio_model.reset_value) and Minus negates."""
+        target = self.hit_target()
+        if (event.value != 'PRESS' or not target or not target.enabled or not isinstance(target.action, tuple)
+                or target.action[0] != 'number'):
+            return False
+        binding, ctrl = target.action[1], event.ctrl or event.oskey
+        if event.type in {'WHEELUPMOUSE', 'WHEELDOWNMOUSE'} and event.ctrl:
+            self.step_number(binding, 1 if event.type == 'WHEELUPMOUSE' else -1)
+        elif event.type in {'RET', 'NUMPAD_ENTER'} and not ctrl:
+            self.begin_edit(target, select=True)
+        elif ctrl and event.type == 'C':
+            with _context(self):
+                value = binding.value(bpy.context)
+            self.window_manager.clipboard = (f'{value:.6f}'.rstrip('0').rstrip('.') if isinstance(value, float)
+                                             else str(value))
+        elif ctrl and event.type == 'V':
+            try:
+                value = float(self.window_manager.clipboard.strip())
+            except ValueError:
+                return True
+            self.set_value(binding, value)
+        elif event.type == 'BACK_SPACE' and not ctrl:
+            with _context(self):
+                default = model.reset_value(binding, bpy.context)
+            self.set_value(binding, default)
+        elif event.type in {'MINUS', 'NUMPAD_MINUS'} and not ctrl:
+            with _context(self):
+                value = binding.value(bpy.context)
+            self.set_value(binding, -value)
+        else:
+            return False
+        self.area.tag_redraw()
+        return True
 
     def ordered_cameras(self):
         from ..texturing.view_plan import order_cameras
@@ -692,11 +892,15 @@ class StudioSession:
         elif key in {'BACK_SPACE', 'DEL'}:
             buffer.delete(backward=key == 'BACK_SPACE', word=ctrl)
         elif key == 'TAB':
-            candidates = [t for t in self.targets if t.enabled and isinstance(t.action, tuple) and t.action[0] in {'edit', 'enum', 'toggle'}]
+            candidates = [t for t in self.targets if t.enabled and isinstance(t.action, tuple) and t.action[0] in {'edit', 'number', 'enum', 'toggle'}]
             index = next((i for i, target in enumerate(candidates) if target.key == edit['key']), -1)
             self.commit()
             if candidates:
-                self.activate(candidates[(index + (-1 if event.shift else 1)) % len(candidates)])
+                target = candidates[(index + (-1 if event.shift else 1)) % len(candidates)]
+                if target.action[0] == 'number':
+                    self.begin_edit(target, select=True)
+                else:
+                    self.activate(target)
         elif getattr(event, 'unicode', '') and not ctrl and not event.alt:
             buffer.replace(event.unicode)
         else:
@@ -733,7 +937,14 @@ class StudioSession:
             if not self.active():
                 self.commit()
                 self.menu = None
+                self.preview = None
             return {'PASS_THROUGH'}
+        if self.preview:
+            closing = (event.value == 'PRESS' and event.type in {'LEFTMOUSE', 'RIGHTMOUSE', 'ESC'})
+            if closing or event.type == 'LEFTMOUSE' and event.value in {'RELEASE', 'DOUBLE_CLICK'}:
+                if closing:
+                    self.close_preview()
+                return {'RUNNING_MODAL'} if self.in_area() else {'PASS_THROUGH'}
         if self.camera_drag:
             if event.type in {'ESC', 'RIGHTMOUSE'} and event.value == 'PRESS':
                 self.finish_camera_drag(cancel=True)
@@ -748,10 +959,8 @@ class StudioSession:
                 return {'RUNNING_MODAL'}
             # Keep shortcuts and other commands from changing the scene mid-drag.
             return {'RUNNING_MODAL'}
-        if event.value == 'PRESS' and event.type == 'ESC' and self.drag:
-            drag, self.drag = self.drag, None
-            self.set_value(drag['binding'], drag['before'], undo=False)
-            self.update_hover()
+        if event.value == 'PRESS' and event.type in {'ESC', 'RIGHTMOUSE'} and self.drag:
+            self.finish_drag(cancel=True)
             return {'RUNNING_MODAL'}
         if self.edit and event.value == 'PRESS' and (event.ctrl or event.oskey) and event.type == 'S':
             self.commit()
@@ -759,9 +968,7 @@ class StudioSession:
             return {'PASS_THROUGH'}
         if event.type in {'MOUSEMOVE', 'INBETWEEN_MOUSEMOVE'}:
             if self.drag:
-                self.slide(x)
-                self.clear_hover()
-                self.set_cursor('MOVE_X')
+                self.drag_move(event)
                 return {'RUNNING_MODAL'}
             if self.edit and self.edit['selecting']:
                 self.select_caret(x, y, extend=True)
@@ -778,11 +985,7 @@ class StudioSession:
             self.clear_hover()
         if event.type == 'LEFTMOUSE' and event.value == 'RELEASE':
             if self.drag:
-                drag, self.drag = self.drag, None
-                with _context(self):
-                    if drag['binding'].value(bpy.context) != drag['before']:
-                        _undo('Adjust ' + drag['binding'].rna(bpy.context).name)
-                self.update_hover()
+                self.finish_drag()
                 return {'RUNNING_MODAL'}
             if self.edit:
                 self.edit['selecting'] = False
@@ -826,6 +1029,8 @@ class StudioSession:
                     self.menu['index'] = self.menu['scroll'] = 0
                 self.area.tag_redraw()
                 return {'RUNNING_MODAL'}
+        if not self.edit and not self.menu and self.number_key(event):
+            return {'RUNNING_MODAL'}
         if event.type in {'WHEELUPMOUSE', 'WHEELDOWNMOUSE', 'TRACKPADPAN'}:
             self.clear_hover()
             change = -45 if event.type == 'WHEELUPMOUSE' else 45
@@ -887,8 +1092,15 @@ class StudioSession:
     def hovered(self, key):
         return key == self.hover_key
 
-    def draw_binding(self, painter, binding, label, x, y, width, *, enabled=True, multiline=False, height=112, corners='ALL'):
+    def number_state(self, key):
+        drag = self.drag if self.drag and self.drag.get('key') == key else None
+        return {'zone': self.hover_zone if self.hovered(key) else None, 'dragging': bool(drag and drag['moved'])}
+
+    def draw_binding(self, painter, binding, label, x, y, width, *, enabled=True, multiline=False, height=112, corners='ALL',
+                     placeholder=None):
         ctx = bpy.context
+        if placeholder is None and multiline:
+            placeholder = prompt_wording(ctx.scene, binding.property)[1]
         prop, value = binding.rna(ctx), binding.value(ctx)
         hint = help_text.property_hint(binding, ctx)
         label_y = y
@@ -923,7 +1135,8 @@ class StudioSession:
                                               ('edit', binding, True), enabled=enabled,
                                               hint=hint, editing=editing['buffer'] if editing else None,
                                               scroll=editing['scroll'] if editing else self.text_scroll.get(key, 0), multiline=True,
-                                              follow_caret=editing.get('follow_caret', True) if editing else False)
+                                              follow_caret=editing.get('follow_caret', True) if editing else False,
+                                              placeholder=placeholder or '')
             self.text_scroll[key] = scroll
             self.text_fields[key] = (lines, max(1, int((height - TEXT_PADDING * 2) / TEXT_LINE_HEIGHT)))
             if editing:
@@ -954,10 +1167,14 @@ class StudioSession:
             filepath = prop.type == 'STRING' and prop.subtype in {'FILE_PATH', 'DIR_PATH'}
             field_width = 90 if inline else width - 27 if filepath else width
             field_x = x + width - field_width if inline else x
-            lines, scroll = painter.text_field(key, (field_x, y, field_width, CONTROL_HEIGHT), display,
-                                              ('edit', binding, False), enabled=enabled, hint=hint,
-                                              editing=editing['buffer'] if editing else None,
-                                              kind='number' if prop.type in {'INT','FLOAT'} else 'field')
+            if prop.type in {'INT', 'FLOAT'} and not editing:
+                painter.number_field(key, (field_x, y, field_width, CONTROL_HEIGHT), display,
+                                     ('number', binding, False), enabled=enabled, hint=hint, **self.number_state(key))
+            else:
+                lines, scroll = painter.text_field(key, (field_x, y, field_width, CONTROL_HEIGHT), display,
+                                                  ('edit', binding, False), enabled=enabled, hint=hint,
+                                                  editing=editing['buffer'] if editing else None,
+                                                  kind='number' if prop.type in {'INT','FLOAT'} else 'field')
             if editing:
                 editing.update(rect=(field_x, y, field_width, CONTROL_HEIGHT), lines=lines, scroll=scroll)
             if filepath:
@@ -998,16 +1215,19 @@ class StudioSession:
         precision = binding.rna(bpy.context).precision
         number = f'{value:.{precision}f}'
         display = editing['buffer'].text if editing else (number.rstrip('0').rstrip('.') if precision else number) + unit
-        lines, scroll = p.text_field(key, (ex, ey, edit_width, CONTROL_HEIGHT), display, ('edit', binding, False),
-                                    enabled=enabled, hint=binding.rna(bpy.context).description,
-                                    editing=editing['buffer'] if editing else None, kind='number')
         if editing:
+            lines, scroll = p.text_field(key, (ex, ey, edit_width, CONTROL_HEIGHT), display, ('edit', binding, False),
+                                        enabled=enabled, hint=binding.rna(bpy.context).description,
+                                        editing=editing['buffer'], kind='number')
             editing.update(rect=(ex, ey, edit_width, CONTROL_HEIGHT), lines=lines, scroll=scroll)
+        else:
+            p.number_field(key, (ex, ey, edit_width, CONTROL_HEIGHT), display, ('number', binding, False),
+                           enabled=enabled, hint=binding.rna(bpy.context).description, **self.number_state(key))
         track_y = y + (46 if narrow else 27)
         p.rect(x, track_y, width, 3, 'line', 1)
         fill = max(0, min(1, (value - minimum) / (maximum - minimum)))
         p.rect(x, track_y, width * fill, 3, 'blue', 1)
-        radius = 5 if enabled and (self.hovered(key + ':slider') or self.drag and self.drag['binding'] == binding) else 4
+        radius = 5 if enabled and (self.hovered(key + ':slider') or self.drag and self.drag.get('binding') == binding) else 4
         p.rect(x + width * fill - radius, track_y + 1 - radius, radius * 2, radius * 2,
                'accent' if enabled else 'disabled', radius)
         p.target(key + ':slider', (x, track_y - 7, width, 17), ('slider', binding, minimum, maximum),
@@ -1381,7 +1601,7 @@ class StudioSession:
         return PAGES + [('TOOLS', 'Tools')]
 
     def more_menu(self, rect):
-        available = {self.section_page(s) for s in self.document.sections}
+        available = {self.section_page(s) for s in self.document.sections} | {'SETUP'}
         primary = dict(self.pages())
         self.menu = {'anchor': rect, 'items': [(key, name, '') for key, name in MORE if key in available and key not in primary],
                      'query': '', 'binding': None, 'index': 0, 'scroll': 0}
@@ -1450,6 +1670,7 @@ class StudioSession:
                      corners='RIGHT' if i == len(buttons) - 1 else 'NONE')
             button_x += button_width
         y += max(left, right)
+        y = setup_page.draw_model_hint(self, p, x, y, width)
         pages = self.pages() + [('MORE', 'More')]
         p.outline(x, y, width, 28, 'card', 'section_border', 4)
         compact = width < 360
@@ -1530,7 +1751,8 @@ class StudioSession:
         decision = [item for n in self.document.actions for item in model.controls(n)
                     if item.control.method == 'operator' and item.control.args[0] == 'stablegen.resolve_masked_edit']
         utilities = self.page in {'TOOLS', 'DEBUG'} and not decision
-        preview = diagnostics.active(bpy.context.scene)
+        # Diagnostics has its own Restore textures beside the display it shows
+        preview = diagnostics.active(bpy.context.scene) and self.page != 'DEBUG'
         # Keep the last action row twelve pixels clear of the panel's bottom edge.
         bottom_padding = 12
         if progress:
@@ -1580,20 +1802,60 @@ class StudioSession:
         primary = model.action(self.document, 'object.test_stable', 'object.stablegen_regenerate',
                                'object.trellis2_generate', 'object.trellis2_batch_generate', 'stablegen.masked_edit')
         disabled_reason = ''
+        # the server line's dot: green while ComfyUI answers, blue while it starts or is checked
+        dot = 'ok' if prefs.server_online else 'accent' if checking_server else 'warning'
+        comfy = None        # the ComfyUI StableGen runs, while it doesn't answer yet
         if primary:
             text = primary.control.kwargs.get('text', '')
             if any(word in text.lower() for word in ('cannot', 'enable online', 'select an image')):
                 disabled_reason = text.replace('Cannot generate: ', '').replace('Cannot edit: ', '')
             if prefs.server_address and not prefs.server_online and not checking_server:
                 disabled_reason = 'ComfyUI offline · ' + prefs.server_address
+                if setup_runtime.local_mode(prefs):     # StableGen runs this ComfyUI: say what it is doing
+                    comfy = setup_runtime.comfy()
+                    disabled_reason = {
+                        'starting': f'Starting ComfyUI… {int(time.time() - comfy.started_at)} s',
+                        'running': 'Connecting to ComfyUI…', 'exited': 'ComfyUI stopped unexpectedly',
+                        'unresponsive': 'ComfyUI is not answering'}.get(comfy.state, 'ComfyUI stopped')
+                    dot = {'starting': 'accent', 'running': 'accent', 'exited': 'warning',
+                           'unresponsive': 'warning'}.get(comfy.state, 'muted')
         scope = 'TRELLIS.2 · Shape and texture' if native else f'{len(selected)} selected views' if selected else f'{count} views · ' + ('Selected objects' if scene.texture_objects == 'selected' else 'All visible objects')
-        p.text('Checking server…' if checking_server else disabled_reason or ('Reproject changes before baking' if self.dirty_projection else scope), x, y, 10,
-               'warning' if disabled_reason or self.dirty_projection else 'muted', width - 64)
-        if selected and not native:
+        # Start, or Log and Restart, on the line itself while StableGen's ComfyUI isn't up
+        commands = []
+        if comfy is not None and comfy.state in ('exited', 'unresponsive'):
+            commands = [('footer-comfy-log', 'Log', 'document', ('operator', 'stablegen.comfy_open_log', {'which': 'COMFYUI'}),
+                         'Open the ComfyUI log'),
+                        ('footer-comfy-restart', 'Restart', 'reset', ('operator', 'stablegen.comfy_start', {}),
+                         'Start ComfyUI again')]
+        elif comfy is not None and comfy.state not in ('starting', 'running'):
+            commands = [('footer-comfy-start', 'Start', 'play', ('operator', 'stablegen.comfy_start', {}),
+                         'Start ComfyUI in the background')]
+        line_right = x + width
+        for key, label, icon, action, hint in reversed(commands):
+            button_width = p.measure(label, 10) + 30
+            line_right -= button_width
+            with _viewport(self):
+                available = model.operator(action[1]).poll() and not self.busy
+            p.button(key, (line_right, y - 3, button_width, 18), label, action, icon=icon, enabled=available,
+                     hover=self.hovered(key), hint=hint, text_size=10)
+        # a ComfyUI that is stopped or starting is no fault: its line stays muted
+        quiet = comfy is not None and comfy.state in ('stopped', 'starting', 'running')
+        p.rect(x, y + 4, 7, 7, dot, 3.5)
+        p.text('Checking server…' if checking_server else disabled_reason or ('Reproject changes before baking' if self.dirty_projection else scope), x + 13, y, 10,
+               'warning' if (disabled_reason or self.dirty_projection) and not quiet else 'muted',
+               line_right - x - 19 if commands else width - 77)
+        if commands:
+            pass
+        elif selected and not native:
             p.button('all-views', (x + width - 65, y - 3, 65, 18), 'All views', self.clear_camera_selection,
                      enabled=not self.busy, hint='Clear only the selected cameras; retain selected meshes')
         else:
             p.text(f'Seed {scene.trellis2_seed if native else scene.seed}', x + width - 64, y, 10, 'muted', 64)
+        if comfy is not None and comfy.state == 'starting':
+            # ComfyUI doesn't say how far along it is: a bar that slows as it fills
+            elapsed = time.time() - comfy.started_at
+            p.rect(x, y + 15, width, 2, 'line', 1)
+            p.rect(x, y + 15, width * min(.95, 1 - .5 ** (elapsed / 20)), 2, 'accent', 1)
         y += 20
         if decision:
             for i, item in enumerate(decision):
@@ -1605,6 +1867,8 @@ class StudioSession:
             label = 'Generate asset' if native else 'Regenerate selected views' if c.args[0] == 'object.stablegen_regenerate' else 'Edit painted selection' if c.args[0] == 'stablegen.masked_edit' else 'Generate textures'
             with _viewport(self):
                 available = primary.enabled and not disabled_reason and model.operator(c.args[0]).poll()
+            # StableGen's own ComfyUI has its commands on the line above; refresh only once it runs
+            refresh_server = refresh_server and (comfy is None or comfy.state == 'running')
             refresh_width = 34 if refresh_server else 0
             p.button('generate', (x, y, width - refresh_width, 28), label, ('operator', c.args[0], c.properties),
                      icon='play', style='primary', enabled=available and not self.busy and not checking_server,
@@ -1680,9 +1944,12 @@ class StudioSession:
     def draw_tools(self, p, x, y, width):
         y = self.draw_actions(p, 'Scene setup', [
             ('object.add_hdri', 'Add HDRI lighting', 'light')], x, y, width)
+        lato2 = next((s for s in self.document.sections if s.key == 'show_meshtools'), None)
         for section in self.document.sections:
             if section.key in TOOL_SECTIONS:
                 y = self.draw_section(p, section, x, y, width)
+                if section.key == 'mesh_tools' and lato2 is not None:     # LATO.2 remeshes any mesh
+                    y = self.draw_section(p, lato2, x, y, width)
         y = self.draw_actions(p, 'Import & batch', [
             ('stablegen.import_dae', 'Import DAE', 'download'),
             ('stablegen.batch_import_dae', 'Batch import DAE', 'folder'),
@@ -1703,10 +1970,28 @@ class StudioSession:
         state = bpy.context.scene.sg_studio_diagnostics
         items = [(obj.name, obj.name, 'Inspect this camera') for obj in bpy.context.scene.objects if obj.type == 'CAMERA']
         items.sort()
-        self.menu = {'anchor': rect, 'items': items, 'query': '', 'binding': None,
-                     'callback': lambda name: self.call('stablegen.studio_diagnostic',
-                         {'setting': 'camera', 'value': json.dumps(name)}, mode='EXEC_DEFAULT'),
+        def choose(name):
+            state.camera = bpy.data.objects.get(name)
+            _undo('Change diagnostic camera')
+        self.menu = {'anchor': rect, 'items': items, 'query': '', 'binding': None, 'callback': choose,
                      'index': next((i for i, item in enumerate(items) if state.camera and item[0] == state.camera.name), 0), 'scroll': 0}
+
+    def diagnostic_settings(self, mode):
+        """What a shown display depends on: when it differs from what is shown, Update view applies it."""
+        state = bpy.context.scene.sg_studio_diagnostics
+        return (mode, state.grid_size, state.coverage, state.confidence, state.scope, state.stage,
+                state.camera.name if state.camera else '')
+
+    def show_diagnostic(self, mode):
+        self.call('stablegen.studio_diagnostic', {'value': json.dumps(mode)}, mode='EXEC_DEFAULT')
+        scene = bpy.context.scene
+        if mode == 'TEXTURES' or not diagnostics.active(scene):
+            self.diagnostic_shown = None
+            failure = diagnostics.SG_OT_StudioDiagnostic.failure
+            if mode != 'TEXTURES' and failure:
+                self.tell(failure)
+        else:
+            self.diagnostic_shown = self.diagnostic_settings(mode)
 
     def draw_diagnostics(self, p, x, y, width):
         scene, state = bpy.context.scene, bpy.context.scene.sg_studio_diagnostics
@@ -1719,33 +2004,85 @@ class StudioSession:
         p.rect(x + 12, y - 3, width - 24, 1, 'divider')
         with _viewport(self):
             available = model.operator('stablegen.studio_diagnostic').poll()
-        y += self.draw_binding(p, model.Binding.from_data(state, 'mode'), 'Display', x + 8, y + 8, width - 16, enabled=available) + 8
-        description = diagnostics.DISPLAY_SUMMARIES[state.mode]
-        for _, _, line in wrap(description, width - 16, p.measure):
-            p.text(line, x + 8, y, 10, 'secondary')
-            y += 15
-        y += 6
-        if diagnostics.active(scene):
+        active = diagnostics.active(scene)
+        x, width, y = x + 8, width - 16, y + 8
+        if active:
+            # A display replaces the textures right now: say so above everything it could be confused with
+            name = next(label for key, label, _ in diagnostics.MODES if key == state.mode)
             count = sum(record.object is not None for record in state.meshes)
-            p.text(f'Previewing {count} mesh' + ('es' if count != 1 else '') + ' · Originals preserved',
-                   x + 8, y, 10, 'accent', width - 16)
-            y += 22
+            p.rect(x, y, width, 26, 'tab_selected', 4)
+            p.rect(x, y, 3, 26, 'blue', 1)
+            p.rect(x + 12, y + 10, 6, 6, 'accent', 3)
+            p.text('Showing ' + name, x + 26, y + 7, FONT_SIZE, 'text', width - 40)
+            p.text(f'{count} mesh' + ('es' if count != 1 else '') + ' · originals kept',
+                   x + 36 + p.measure('Showing ' + name), y + 8, 10, 'muted')
+            y += 38
+        # Tiles only choose; Show in viewport applies the chosen display with its options.
+        pick = self.diagnostic_pick or (state.mode if active else 'SOLID')
+        modes = [mode for mode in diagnostics.MODES if mode[0] != 'TEXTURES']
+        columns = 3 if width >= 420 else 2
+        tile_width, tile_height, gap = (width - 6 * (columns - 1)) / columns, 30, 6
+        for index, (key, label, description) in enumerate(modes):
+            rect = (x + index % columns * (tile_width + gap), y + index // columns * (tile_height + gap),
+                    tile_width, tile_height)
+            missing = diagnostics.unavailable(bpy.context, key)
+            hover = self.hovered('diagnostic:' + key)
+            chosen = key == pick
+            p.outline(*rect, 'selected' if chosen else 'raised',
+                      'accent' if chosen else 'hover_border' if hover else 'tool_border')
+            tint = 'disabled' if missing else 'text'
+            p.icon(DIAGNOSTIC_ICONS[key], rect[0] + 10, rect[1] + 8, 13, tint)
+            p.text(label, rect[0] + 30, rect[1] + 8, FONT_SIZE, tint, tile_width - 50)
+            if active and key == state.mode:
+                p.rect(rect[0] + tile_width - 13, rect[1] + 12, 6, 6, 'accent', 3)
+            p.target('diagnostic:' + key, rect, lambda key=key: setattr(self, 'diagnostic_pick', key),
+                     available and not self.busy, missing or description)
+        y += (len(modes) + columns - 1) // columns * (tile_height + gap) - gap + 12
+        option = state.confidence if pick == 'CONFIDENCE' else None
+        missing = diagnostics.unavailable(bpy.context, pick, option)
+        if missing:
+            p.icon('shield', x, y, 12, 'warning')
+            for _, _, line in wrap(missing + '.', width - 18, lambda text: p.measure(text, 10)):
+                p.text(line, x + 18, y + 1, 10, 'warning')
+                y += 15
+        else:
+            for _, _, line in wrap(diagnostics.DISPLAY_SUMMARIES[pick], width, lambda text: p.measure(text, 10)):
+                p.text(line, x, y, 10, 'secondary')
+                y += 15
+        y += 8
         options = {'GRID': ['grid_size'], 'COVERAGE': ['coverage'], 'CONFIDENCE': ['confidence'],
-                   'DPPG': ['scope', 'stage']}.get(state.mode, [])
+                   'DPPG': ['scope', 'stage']}.get(pick, [])
         for key in options:
             binding = model.Binding.from_data(state, key)
-            y += self.draw_binding(p, binding, binding.rna(bpy.context).name, x + 8, y, width - 16, enabled=available)
-        if state.mode in {'WEIGHT', 'FEATHER', 'VISIBILITY', 'CONFIDENCE'} or state.mode == 'DPPG' and state.scope == 'ACTIVE':
-            p.text('Camera', x + 8, y, FONT_SIZE, 'text')
+            y += self.draw_binding(p, binding, binding.rna(bpy.context).name, x, y, width, enabled=available)
+        if pick in {'WEIGHT', 'FEATHER', 'VISIBILITY', 'CONFIDENCE'} or pick == 'DPPG' and state.scope == 'ACTIVE':
+            p.text('Camera', x, y, FONT_SIZE, 'text')
             y += 17
-            rect = (x + 8, y, width - 16, CONTROL_HEIGHT)
+            rect = (x, y, width, CONTROL_HEIGHT)
             p.outline(*rect, 'menu', 'hover_border' if self.hovered('diagnostic-camera') else 'menu_border')
-            p.text(state.camera.name if state.camera else 'Choose camera', rect[0] + 8, y + 5, FONT_SIZE, 'menu_text', width - 49)
-            p.icon('down', x + width - 24, y + 6, 10, 'menu_text')
+            p.text(state.camera.name if state.camera else 'Choose camera', rect[0] + 8, y + 5, FONT_SIZE, 'menu_text', width - 33)
+            p.icon('down', x + width - 16, y + 6, 10, 'menu_text')
             p.target('diagnostic-camera', rect, lambda rect=rect: self.diagnostic_camera_menu(rect), available and not self.busy,
                      'Choose the camera whose signal is displayed')
             y += CONTROL_HEIGHT + 8
         y += 2
+        can_show = available and not self.busy and not missing
+        if active:
+            changed = self.diagnostic_settings(pick) != self.diagnostic_shown
+            half = (width - 6) / 2
+            p.button('diagnostic-update', (x, y, half, CONTROL_HEIGHT + 2), 'Update view',
+                     lambda pick=pick: self.show_diagnostic(pick), icon='play', style='primary',
+                     enabled=can_show and changed,
+                     hint='Show the chosen display with these settings' if changed else 'The viewport shows these settings')
+            p.button('diagnostic-restore', (x + half + 6, y, half, CONTROL_HEIGHT + 2), 'Restore textures',
+                     lambda: self.show_diagnostic('TEXTURES'), icon='reset', style='outlined',
+                     enabled=available and not self.busy, hint='Restore the original mesh, materials and render settings')
+        else:
+            p.button('diagnostic-show', (x, y, width, CONTROL_HEIGHT + 2), 'Show in viewport',
+                     lambda pick=pick: self.show_diagnostic(pick), icon='play', style='primary', enabled=can_show,
+                     hint=missing or 'Replace the textures with this display; your originals are kept')
+        y += CONTROL_HEIGHT + 2 + 10
+        x, width = x - 8, width + 16
         p.end_group((x, start, width, y - start), 'subbox', 'section_border', 3)
         y += 12
         y = self.draw_actions(p, 'Projection analysis', [
@@ -1828,7 +2165,8 @@ class StudioSession:
         masked = (scene.qwen_generation_method if scene.model_architecture in QWEN_ARCHITECTURES else scene.generation_method) == 'masked_edit' and scene.architecture_mode != 'trellis2'
         prompt = 'sg_masked_prompt' if masked else 'comfyui_prompt'
         if hasattr(scene, prompt) and not trellis:
-            y += self.draw_binding(p, self.binding(prompt), 'Edit instructions' if masked else 'Object prompt' if native else 'Texture prompt', x, y + 4, width, multiline=True, height=112) + 6
+            y += self.draw_binding(p, self.binding(prompt), prompt_wording(scene, prompt)[0], x, y + 4, width,
+                                   multiline=True, height=112) + 6
         handled = {'architecture_mode', 'stablegen_preset', 'model_name', 'comfyui_prompt', 'sg_masked_prompt',
                    'generation_method', 'qwen_generation_method', 'texture_objects'}
         if masked:
@@ -1902,11 +2240,12 @@ class StudioSession:
                 y = self.draw_dependent(p, x, y, width, lambda cx, cy, cw:
                     cy + self.draw_binding(p, binding, 'Image count', cx, cy, cw,
                                           enabled=scene.trellis2_preview_gallery_enabled)) + 5
-            else:
-                shared = scene.trellis2_texture_mode not in {'native', 'none'} and not scene.use_separate_texture_prompt
-                y += self.draw_binding(p, self.binding('comfyui_prompt'), 'Shared texture prompt' if shared else 'Mesh image prompt', x, y + 4, width,
-                                       multiline=True, height=112, enabled=shared) + 6
-                p.text('Mesh generation uses the selected input image.', x, y, 10, 'secondary', width)
+            elif scene.trellis2_texture_mode not in {'native', 'none'} and not scene.use_separate_texture_prompt:
+                # From an image the prompt only matters when it textures the mesh
+                y += self.draw_binding(p, self.binding('comfyui_prompt'), 'Texture prompt', x, y + 4, width,
+                                       multiline=True, height=112,
+                                       placeholder=prompt_wording(scene, 'texture_prompt')[1]) + 6
+                p.text('Texturing uses this prompt; the mesh comes from the input image.', x, y, 10, 'secondary', width)
                 y += 25
             omit = {'architecture_mode', 'stablegen_preset', 'comfyui_prompt', 'texture_prompt',
                     'use_separate_texture_prompt', 'trellis2_texture_mode', 'trellis2_generate_from',
@@ -1916,6 +2255,8 @@ class StudioSession:
                 omit.add('model_name')
                 omit.add('op:stablegen.refresh_checkpoint_list')
             y = self.draw_node(p, main.content, x, y, width, 'main', omit=omit)
+            if scene.trellis2_generate_from == 'image':
+                y = self.draw_input_thumbnail(p, scene, x, y, width)
             y += 8
             p.end_group((outer_x, start, outer_width, y - start), 'subbox', 'section_border', 3)
             x, width, y = outer_x, outer_width, y + 12
@@ -1923,6 +2264,17 @@ class StudioSession:
             if self.section_page(section) == 'MESH':
                 y = self.draw_section(p, section, x, y, width)
         return y
+
+    def draw_input_thumbnail(self, p, scene, x, y, width):
+        """The chosen input image under its field, so the mesh's source shows at a glance."""
+        path = bpy.path.abspath(scene.trellis2_input_image) if scene.trellis2_input_image else ''
+        if not path or not Path(path).is_file():
+            return y
+        height = 160
+        p.outline(x, y + 2, width, height, 'field', 'line', 4)
+        if p.image(path, (x + 4, y + 6, width - 8, height - 8)) is None:
+            p.text("Can't read this image", x + 10, y + height / 2 - 4, 10, 'muted', width - 20)
+        return y + height + 8
 
     def draw_cameras(self, p, x, y, width):
         scene = bpy.context.scene
@@ -1934,8 +2286,16 @@ class StudioSession:
         y += 29
         def setup(cx, cy, cw):
             cy += self.draw_binding(p, self.binding('use_camera_prompts'), 'Use view prompts', cx, cy, cw)
+            cy += self.draw_binding(p, self.binding('use_object_prompts'), 'Use object prompts', cx, cy, cw)
             return cy + self.draw_binding(p, self.binding('sg_use_custom_camera_order'), 'Custom generation order', cx, cy, cw)
         y = cards.group(p, 'View setup', x, y, width, setup, 'camera')
+        object_prompts = getattr(scene, 'use_object_prompts', False)
+        grids = visibility.request(scene, cameras) if object_prompts and not self.busy else {}
+        hues = {name: color(hue.lstrip('#')) for name, hue in visibility.colors(grids.values()).items()}
+        images = {camera.name: self.camera_images.get(camera.name) for camera in cameras}
+        aspects = {camera.name: _view_aspect(scene, camera, images[camera.name]) for camera in cameras}
+        # One frame width for every row: as wide as the widest view needs at the rows' 60 px height
+        column = round(min(104, max(40, max((60 * aspect for aspect in aspects.values()), default=60))))
         if cameras:
             # The displayed camera cards are the order editor. Avoid a second,
             # disconnected native list and its up/down-button cluster.
@@ -1953,38 +2313,66 @@ class StudioSession:
             p.begin_group()
             selected = camera.select_get()
             hovered = self.hovered('camera:' + camera.name) and not self.busy
-            tx = x + 32 if selected else x + 103
+            tx = x + 32 if selected else x + 30 + column + 13
             p.text(f'{i + 1:02} · {camera.name}', tx, y + 16, FONT_SIZE, 'text', x + width - tx - 44)
-            image = self.camera_images.get(camera.name)
+            image = images[camera.name]
             prompt = scene.camera_prompts.get(camera.name)
+            grid = grids.get(camera.name)
             if not selected:
                 title = prompt.prompt if prompt and prompt.prompt else 'Generated' if image else 'No generated image'
-                p.text(title, tx, y + 36, 10, 'secondary', width - 146)
+                p.text(title, tx, y + 36, 10, 'secondary', x + width - tx - 44)
+                if grid is not None:
+                    self.draw_object_tags(p, grid, hues, tx, y + 53, x + width - tx - 44)
             p.target('camera:' + camera.name, (x + 25, y + 1, width - 67, 38 if selected else 82),
                      lambda name=camera.name: self.call('stablegen.studio_select_camera', {'camera_name': name, 'extend': self.ctrl}),
                      not self.busy, camera.name + ' · Ctrl click to add to selection')
+            # Without a custom order the list shows the alphabetical order generation uses, so it cannot be dragged
             grip = (x + 4, y + 5, 23, 28)
-            p.icon('grip', grip[0] + 4, grip[1] + 7, 14, 'disabled' if self.busy else 'accent' if self.hovered('camera-drag:' + camera.name) else 'secondary')
-            p.target('camera-drag:' + camera.name, grip, ('camera-drag', camera.name), not self.busy,
-                              'Drag to change generation order. Dropping enables custom order; Esc cancels.')
+            draggable = scene.sg_use_custom_camera_order and not self.busy
+            p.icon('grip', grip[0] + 4, grip[1] + 7, 14, 'accent' if draggable and self.hovered('camera-drag:' + camera.name)
+                   else 'secondary' if draggable else 'disabled')
+            p.target('camera-drag:' + camera.name, grip, ('camera-drag', camera.name), draggable,
+                     'Drag to change the generation order; Esc cancels' if scene.sg_use_custom_camera_order
+                     else 'Turn on Custom generation order (View setup) to drag views into the order they generate in')
             p.button('look:' + camera.name, (x + width - 37, y + (10 if selected else 28), 25, CONTROL_HEIGHT), '',
                      ('operator', 'stablegen.studio_look_camera', {'camera_name': camera.name}), icon='eye', enabled=not self.busy,
                      hint='Look through ' + camera.name)
-            image_rect = (x + 12, y + 43, 70, 160) if selected else (x + 30, y + 12, 60, 60)
-            p.outline(*image_rect, 'menu', 'menu_border', 2)
-            if image:
-                p.image(image, image_rect)
+            if selected:
+                # A view beside the fields matches their height, measured on the previous draw
+                fields_height, settled = self.open_fields_height.get(camera.name, (200, 0))
+                view_rect, (fx, fy, fw) = _open_view_layout(x, y, width, aspects[camera.name], fields_height)
+                fields_top = fy
+                vx, vy, vw, vh = view_rect
+                frame = (vx - 1, vy - 1, vw + 2, vh + 2)
             else:
-                ix, iy, iw, ih = image_rect
+                # Every row's frame is as wide as the widest view; a narrower one sits centred in it.
+                frame = (x + 30, y + 12, column, 60)
+                view_rect = (x + 31, y + 13, column - 2, 58)
+            # The whole frame opens the preview, so a narrow view is as easy to click as a wide one
+            preview_key = 'camera-preview:' + camera.name
+            hover = image is not None and self.hovered(preview_key)
+            p.outline(*frame, 'menu', 'hover_border' if hover else 'menu_border', 2)
+            shown = p.image(image, view_rect, 8 if selected else 4) if image else None
+            if shown:
+                p.target(preview_key, frame, lambda name=camera.name: self.open_preview(name), not self.busy,
+                         'View full size · click again or Esc to close')
+            if not shown:
+                ix, iy, iw, ih = view_rect
                 p.icon('camera', ix + (iw - 25) / 2, iy + (ih - 25) / 2, 25)
             if selected:
-                y += 43
-                y += self.draw_binding(p, model.Binding.from_data(camera, 'name'), 'Camera name', x + 98, y, width - 110)
+                fy += self.draw_binding(p, model.Binding.from_data(camera, 'name'), 'Camera name', fx, fy, fw)
                 if prompt and scene.use_camera_prompts:
-                    y += self.draw_binding(p, model.Binding.from_data(prompt, 'prompt'), 'View prompt', x + 98, y, width - 110,
-                                           multiline=True, height=93)
-                y = max(y, image_rect[1] + image_rect[3]) + 12
+                    fy += self.draw_binding(p, model.Binding.from_data(prompt, 'prompt'), 'View prompt', fx, fy, fw,
+                                            multiline=True, height=56 if object_prompts else 93)
+                if object_prompts:
+                    fy = self.draw_view_objects(p, camera, grid, grids, hues, fx, fy, fw, shown)
+                # Wrapping text can trade height for width: settle within a few redraws
+                if abs((fy - fields_top) - fields_height) > 1 and settled < 4:
+                    self.open_fields_height[camera.name] = (fy - fields_top, settled + 1)
+                    self.area.tag_redraw()
+                y = max(fy, view_rect[1] + view_rect[3]) + 12
             else:
+                self.open_fields_height.pop(camera.name, None)
                 y += 84
             self.camera_rows.append((camera.name, (x, start, width, y - start)))
             p.end_group((x, start, width, y - start), 'subbox', 'accent' if selected else 'hover_border' if hovered else 'section_border', 3)
@@ -1998,8 +2386,207 @@ class StudioSession:
                 p.line([(sx, sy), (sx + sw, sy), (sx + sw, sy + sh), (sx, sy + sh), (sx, sy)], 'accent')
         for section in self.document.sections:
             if section.page == 'CAMERAS' and section.key not in {'camera_tools', 'show_camera_options'}:
-                y = self.draw_section(p, section, x, y + 8, width, omit={'use_camera_prompts','sg_use_custom_camera_order'})
+                y = self.draw_section(p, section, x, y + 8, width, omit={'use_camera_prompts', 'use_object_prompts',
+                                                                          'sg_object_prompt', 'sg_use_custom_camera_order'})
         return y
+
+    def draw_object_tags(self, p, grid, hues, x, y, width):
+        """A closed camera card's described objects, largest first, on one line."""
+        right = x + width
+        for name, _share, _prompt in visibility.described(grid):
+            tag_width = p.measure(name, 9) + 19
+            if x + tag_width > right:
+                break
+            _object_tag(p, x, y, name, hues.get(name), height=15, size=9)
+            x += tag_width + 4
+
+    def draw_view_objects(self, p, camera, grid, grids, hues, x, y, width, shown):
+        """An open camera card's objects: every object the view sees with its share (described ones in their
+        colour), the prompt of the one being edited, and the prompt this view adds to the texture prompt."""
+        p.text('Objects in view', x, y, FONT_SIZE)
+        if grid is None:
+            p.text('Finding what this view sees…', x, y + 17, 10, 'muted', width)
+            return y + 17 + 22
+        seen = [(name, share) for name, share in grid.shares if share >= visibility.MIN_SHARE]
+        described = [name for name, _share in seen if visibility.object_prompt(name)]
+        note = f'{len(described)} described · {len(seen) - len(described)} more'
+        p.text(note, x + width - p.measure(note, 10) - 2, y + 1, 10, 'muted')
+        y += 17
+        target = self.object_prompt if self.object_prompt in dict(seen) else None
+        # The selected object's rename button ends the first row. That row always leaves room for it, so selecting a
+        # tag moves no tag; the rows below use the whole width
+        row_end = x + width - 28
+        tx, ty = x, y
+        for name, share in sorted(seen, key=lambda item: (item[0] not in described, -item[1])):
+            label = f'{share:.1%}' if share < .01 else f'{share:.0%}'
+            tag_width = p.measure(name, 10) + p.measure(label, 10) + 14 + (9 if name in described else 0)
+            rename_key = 'object-name:' + name
+            renaming = self.edit if self.edit and self.edit['key'] == rename_key else None
+            if renaming:
+                # While renamed, the tag is its object's name field, growing with the name
+                tag_width = max(tag_width, p.measure(renaming['buffer'].text) + 2 * TEXT_PADDING + 8)
+            if tx > x and tx + tag_width > row_end:
+                tx, ty, row_end = x, ty + 22, x + width
+            key = 'object-prompt:' + name
+            if renaming:
+                rect = (tx, ty - 2, min(tag_width, row_end - tx), 22)
+                lines, scroll = p.text_field(rename_key, rect, renaming['buffer'].text, ('edit', renaming['binding'], False),
+                                             editing=renaming['buffer'], hint='Enter renames · Esc cancels')
+                renaming.update(rect=rect, lines=lines, scroll=scroll)
+            else:
+                _object_tag(p, tx, ty, name, hues.get(name), share=label, height=18, size=10, selected=name == target,
+                            hover=self.hovered(key))
+                p.target(key, (tx, ty, tag_width, 18), lambda name=name: self.edit_object_prompt(name), not self.busy,
+                         f'Describe {name}; every view that sees it uses the description')
+            tx += tag_width + 4
+        if target:
+            button_key = 'object-rename:' + target
+            p.button(button_key, (x + width - 24, y - 2, 24, CONTROL_HEIGHT), '', lambda: self.rename_object(target),
+                     icon='rename', enabled=not self.busy, hover=self.hovered(button_key), hint=f'Rename {target}')
+        y = ty + 18 + 9
+        if target:
+            obj = bpy.data.objects.get(target)
+            count = sum(1 for g in grids.values() if dict(g.shares).get(target, 0) >= visibility.MIN_SHARE)
+            note = f'in {count} of {len(grids)} views'
+            p.text(note, x + width - p.measure(note, 10) - 2, y + 1, 10, 'muted')
+            y += self.draw_binding(p, model.Binding.from_data(obj, 'sg_object_prompt'), f'Object prompt · {target}',
+                                   x, y, width)
+            p.text('Every view that sees it uses this text', x, y - 2, 10, 'muted', width)
+            y += 16
+            if shown:
+                self.draw_object_outline(p, camera, target, hues.get(target), shown)
+        return self.draw_view_prompt(p, camera, grid, hues, x, y, width)
+
+    def draw_object_outline(self, p, camera, name, hue, rect):
+        """Outline the object being described in the open view, from a finer ray sample of that one view."""
+        scene = bpy.context.scene
+        detail = visibility.request(scene, [camera], visibility.DETAIL_RAYS).get(camera.name)
+        if detail is None:
+            return
+        key = (camera.name, name, id(detail), hue)
+        if not self.object_outline or self.object_outline[0] != key:
+            mask = detail.mask(name)
+            inner = mask.copy()
+            for _ in range(2):          # a two-sample edge reads at the panel's scale
+                eroded = inner.copy()
+                eroded[1:, :] &= inner[:-1, :]
+                eroded[:-1, :] &= inner[1:, :]
+                eroded[:, 1:] &= inner[:, :-1]
+                eroded[:, :-1] &= inner[:, 1:]
+                inner = eroded
+            rgba = np.zeros(mask.shape + (4,), np.float32)
+            rgba[..., :3] = (hue or p.colors['accent'])[:3]
+            rgba[..., 3] = np.where(mask & ~inner, 1.0, np.where(mask, .22, 0.0))
+            self.object_outline = (key, rgba)
+        p.overlay(self.object_outline[1], rect)
+
+    def draw_view_prompt(self, p, camera, grid, hues, x, y, width):
+        """What this view sends: its view prompt, its described objects' prompts (underlined in their colours) and
+        the texture prompt, as the generation's view plan composes them."""
+        from ..texturing.workflows import _texturing_prompt
+        scene = bpy.context.scene
+        parts = []
+        item = scene.camera_prompts.get(camera.name)
+        if scene.use_camera_prompts and item and item.prompt.strip():
+            parts.append((item.prompt.strip(), None))
+        parts += [(prompt, hues.get(name)) for name, _share, prompt in visibility.described(grid)]
+        parts.append((_texturing_prompt(scene).strip(), 'texture'))
+        text, spans = '', []
+        for part, hue in parts:
+            if not part:
+                continue
+            if text:
+                text += ', '
+            spans.append((len(text), len(text) + len(part), hue))
+            text += part
+        p.text('Prompt for this view', x, y, FONT_SIZE)
+        y += 17
+        lines = wrap(text, width - 16, p.measure)
+        shown_lines = min(len(lines), 6)
+        height = shown_lines * TEXT_LINE_HEIGHT + 2 * TEXT_PADDING - 2
+        p.outline(x, y, width, height, 'menu', 'menu_border')
+        for row, (start, end, line) in enumerate(lines[:shown_lines]):
+            ly = y + TEXT_PADDING - 1 + row * TEXT_LINE_HEIGHT
+            cuts = sorted({0, len(line)} | {min(max(s - start, 0), len(line)) for s, e, _ in spans}
+                          | {min(max(e - start, 0), len(line)) for s, e, _ in spans})
+            for a, b in zip(cuts, cuts[1:]):
+                span = next((hue for s, e, hue in spans if s <= start + a < e), None)
+                piece = line[a:b]
+                px = x + TEXT_PADDING + p.measure(line[:a])
+                p.text(piece, px, ly, FONT_SIZE, 'secondary' if span in (None, 'texture') else 'text')
+                if span not in (None, 'texture') and piece.strip():
+                    p.rect(px, ly + 14, p.measure(piece.rstrip()), 2, span)
+        words = len(text.split())
+        p.text('View prompt + objects in view + texture prompt', x, y + height + 5, 10, 'muted', width - 68)
+        p.text(f'{words} words', x + width - 55, y + height + 5, 10, 'muted')
+        return y + height + 24
+
+    def open_preview(self, name):
+        self.preview = name
+        self.clear_hover(leave=True)
+        self.area.tag_redraw()
+
+    def close_preview(self):
+        self.preview = None
+        self.area.tag_redraw()
+
+    def in_area(self):
+        x, y = self.mouse
+        area = self.area
+        return area.x <= x < area.x + area.width and area.y <= y < area.y + area.height
+
+    def draw_preview(self, region):
+        """A camera's view across the 3D viewport, left of the sidebar when it overlaps the viewport."""
+        camera = bpy.data.objects.get(self.preview or '')
+        image = self.camera_images.get(self.preview or '')
+        if camera is None or image is None:
+            self.preview = None
+            return
+        scale = max(.8, bpy.context.preferences.system.ui_scale)
+        p = Painter(region, scale, _font_id or 0)
+        try:
+            width, height = region.width / scale, region.height / scale
+            # With Region Overlap the header, toolbar and sidebar draw over the viewport: keep clear of them.
+            left, top, right, bottom = 0, 0, width, height
+            for other in self.area.regions:
+                if other == region or other.width <= 1 or other.height <= 1:
+                    continue
+                if not (region.x <= other.x < region.x + region.width or region.x < other.x + other.width <= region.x + region.width):
+                    continue
+                if other.type == 'TOOLS' and other.x <= region.x + 1:
+                    left = max(left, (other.x + other.width - region.x) / scale)
+                elif other.type == 'UI' and other.x + other.width >= region.x + region.width - 1:
+                    right = min(right, (other.x - region.x) / scale)
+                elif other.type in {'HEADER', 'TOOL_HEADER'} and other.y >= region.y + region.height / 2:
+                    top = max(top, (region.y + region.height - other.y) / scale)
+                elif other.type in {'HEADER', 'TOOL_HEADER', 'ASSET_SHELF', 'ASSET_SHELF_HEADER'}:
+                    bottom = min(bottom, (other.y + other.height - region.y) / scale)
+            # The viewport blends in linear light: 94 % black reads as a dimmed backdrop (82 % looked half-dark)
+            p.rect(0, 0, width, height, (0, 0, 0, .94))
+            cameras = self.ordered_cameras()
+            index = next((i for i, c in enumerate(cameras) if c.name == camera.name), 0)
+            margin = 24
+            p.text(f'{index + 1:02} · {camera.name}', left + margin, top + 14, 13, 'text', right - left - 2 * margin)
+            image_width, image_height = image_size(image)
+            note = f'{image_width} × {image_height} · click or Esc to close'
+            p.text(note, right - margin - p.measure(note, 10), top + 17, 10, 'muted')
+            p.image(image, (left + margin, top + 40, right - left - 2 * margin, bottom - top - 40 - margin), 12)
+        finally:
+            p.finish()
+
+    def rename_object(self, name):
+        """Turn the selected object's tag into its name field, the name selected."""
+        obj = bpy.data.objects.get(name)
+        if obj is None:
+            return
+        from .studio_widgets import Target
+        field = Target('object-name:' + name, (0, 0, 0, 0), ('edit', model.Binding.from_data(obj, 'name'), False))
+        self.begin_edit(field, select=True)
+
+    def edit_object_prompt(self, name):
+        self.object_prompt = None if self.object_prompt == name else name
+        self.object_outline = None
+        self.area.tag_redraw()
 
     def menu_items(self):
         if self.menu.get('kind') == 'lora':
@@ -2123,8 +2710,10 @@ class StudioSession:
             self.card_bounds = {}
             p.panel()
             x, width = 12, p.width - 24
+            setup_page.open_first_run(self)
             top = self.draw_header(p, x, width)
-            bottom = self.draw_footer(p, x, width)
+            # the setup page has nothing to generate: its cards take the whole height
+            bottom = p.height - 6 if self.page == 'SETUP' else self.draw_footer(p, x, width)
             narrow = width < cards.SIDE_BY_SIDE_WIDTH
             if narrow and not tips.dismissed(tips.WIDEN_HINT):
                 bottom = self.draw_widen_hint(p, x, width, bottom)
@@ -2133,8 +2722,14 @@ class StudioSession:
             offset = self.scroll.get(self.page, 0)
             y = top + 12 - offset
             for node in self.document.notices:
+                # the model hint is drawn under Architecture, and the setup page shows what the first-run card says
+                if node.has_operator(*setup_prefs.HINT_OPERATORS) or (
+                        self.page == 'SETUP' and node.has_operator('stablegen.open_setup')):
+                    continue
                 y = self.draw_node(p, node, x, y, width, 'notices')
-            if self.page == 'GENERATE':
+            if self.page == 'SETUP':
+                y = setup_page.draw(self, p, x, y, width)
+            elif self.page == 'GENERATE':
                 y = self.draw_generate(p, x, y, width)
             elif self.page == 'CAMERAS':
                 y = self.draw_cameras(p, x, y, width)
@@ -2156,10 +2751,20 @@ class StudioSession:
             if offset > self.max_scroll:
                 self.scroll[self.page] = self.max_scroll
                 self.area.tag_redraw()
+            self.scrollbar = None
             if self.max_scroll:
                 available = bottom - top
                 thumb = max(24, available * available / (available + self.max_scroll))
-                p.rect(p.width - 5, top + offset / self.max_scroll * max(0, available - thumb), 2, thumb, 'muted', 1)
+                thumb_y = top + min(offset, self.max_scroll) / self.max_scroll * max(0, available - thumb)
+                self.scrollbar = (top, available, thumb, thumb_y)
+                dragging = bool(self.drag and self.drag.get('kind') == 'scroll')
+                if dragging or self.hovered('scrollbar'):
+                    # At rest the bar stays a hairline; under the pointer it widens like Blender's.
+                    p.rect(p.width - 10, top + 2, 8, available - 4, 'scroll_track', 4)
+                    p.rect(p.width - 9, thumb_y + 1, 6, thumb - 2, 'text' if dragging else 'secondary', 3)
+                else:
+                    p.rect(p.width - 5, thumb_y, 2, thumb, 'muted', 1)
+                p.target('scrollbar', (p.width - 12, top, 12, available), ('scrollbar',))
             p.clip(None)
             if not tips.dismissed(tips.WIDEN_CALLOUT):
                 if self.callout_width is not None and width > self.callout_width + 20:
@@ -2504,6 +3109,25 @@ def _draw():
             session.error = str(exc)
 
 
+def preview_open(window, area):
+    """Whether the StableGen panel in this viewport shows a camera's view over it."""
+    session = _sessions.get((window.as_pointer(), area.as_pointer())) if window and area else None
+    return bool(session and session.preview)
+
+
+def _draw_preview():
+    context = bpy.context
+    if context.area is None or context.region is None or context.region.type != 'WINDOW':
+        return
+    session = _sessions.get((context.window.as_pointer(), context.area.as_pointer()))
+    if session and session.preview and session.active():
+        try:
+            session.draw_preview(context.region)
+        except Exception:
+            _log.exception('Studio preview drawing error')
+            session.preview = None
+
+
 def _tick():
     if not _registered:
         return None
@@ -2536,7 +3160,7 @@ STUDIO_UI_CLASSES = diagnostics.CLASSES + [lora.SG_OT_StudioLoRA, SG_OT_StudioSe
 
 
 def register_studio_ui():
-    global _registered, _handler, _font_id, _font_path
+    global _registered, _handler, _preview_handler, _font_id, _font_path
     _registered = True
     diagnostics.register()
     _font_id = None
@@ -2551,19 +3175,23 @@ def register_studio_ui():
                 _font_path = str(path)
                 break
         _handler = bpy.types.SpaceView3D.draw_handler_add(_draw, (), 'UI', 'POST_PIXEL')
+        _preview_handler = bpy.types.SpaceView3D.draw_handler_add(_draw_preview, (), 'WINDOW', 'POST_PIXEL')
         bpy.app.timers.register(_tick, first_interval=.05, persistent=True)
     if _load_pre not in bpy.app.handlers.load_pre:
         bpy.app.handlers.load_pre.append(_load_pre)
 
 
 def unregister_studio_ui():
-    global _registered, _handler
+    global _registered, _handler, _preview_handler
     _registered = False
     diagnostics.unregister()
     _load_pre(None)
     if _handler:
         bpy.types.SpaceView3D.draw_handler_remove(_handler, 'UI')
         _handler = None
+    if _preview_handler:
+        bpy.types.SpaceView3D.draw_handler_remove(_preview_handler, 'WINDOW')
+        _preview_handler = None
     if bpy.app.timers.is_registered(_tick):
         bpy.app.timers.unregister(_tick)
     if _load_pre in bpy.app.handlers.load_pre:

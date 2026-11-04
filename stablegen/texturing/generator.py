@@ -29,7 +29,7 @@ from ..util.workflow_templates import prompt_text, prompt_text_img2img, prompt_t
 from .rendering import export_emit_image, export_visibility, export_canny, bake_texture, prepare_baking, unwrap, export_render, export_viewport, render_edge_feather_mask, apply_uv_inpaint_texture, flatten_projection_material_for_refine, _RenderStateTransaction, _legacy_render_dither, _prepare_compositor_render, _finish_compositor_render
 from ..cameras.geometry import _SGCameraResolution, _get_camera_resolution, _get_resolution_align
 from ..cameras.overlays import _sg_restore_square_display, _sg_remove_crop_overlay, _sg_ensure_crop_overlay, _sg_hide_label_overlay, _sg_restore_label_overlay
-from .projection import project_image, reinstate_compare_nodes, _bake_visibility_weights, reset_projection_material_nodes, _is_projection_mesh, pop_svm_stack_warning, pop_eevee_attribute_warning
+from .projection import project_image, reinstate_compare_nodes, activate_projection_material, _bake_visibility_weights, reset_projection_material_nodes, _is_projection_mesh, pop_svm_stack_warning, pop_eevee_attribute_warning
 from .jobs import operation, RenderRequest, MainThreadOperation, run_sync
 from ..utils import get_last_material_index, get_generation_dirs, get_file_path, get_dir_path, remove_empty_dirs, get_compositor_node_tree, new_compositor_math, configure_output_node_paths, get_eevee_engine_id, sg_modal_active
 from ..util.mirror_color import MirrorReproject, _get_viewport_ref_np, _apply_color_match_to_file, restore_unmatched_image
@@ -66,6 +66,74 @@ from ..core.architectures import CANVAS_EDIT_ARCHITECTURES, EDIT_ARCHITECTURES, 
 import websocket
 
 _ADDON_PKG = __package__.rsplit('.', 1)[0]
+
+
+def _regularized_context(scene):
+    """Regularize Context Boundary cleans each context render's missing-context
+    mask inside object/material parts, so it needs their ID passes."""
+    return (getattr(scene, 'qwen_regularize_context_mask', False)
+            and scene.model_architecture in EDIT_ARCHITECTURES)
+
+
+def _context_boundary_labels(context, camera_id, shape):
+    """Object/material part labels of a view at *shape*, or None without ID maps."""
+    depth_dir = get_dir_path(context, "controlnet")["depth"]
+    frame_suffix = "0001" if bpy.app.version < (5, 0, 0) else ""
+    object_ids = cv2.imread(
+        os.path.join(depth_dir, f"object_id{camera_id}{frame_suffix}.png"),
+        cv2.IMREAD_GRAYSCALE,
+    )
+    material_ids = cv2.imread(
+        os.path.join(depth_dir, f"material_id{camera_id}{frame_suffix}.png"),
+        cv2.IMREAD_GRAYSCALE,
+    )
+    if object_ids is None and material_ids is None:
+        return None
+    if object_ids is None:
+        object_ids = np.ones(shape, dtype=np.uint8)
+    elif object_ids.shape != shape:
+        object_ids = cv2.resize(
+            object_ids, (shape[1], shape[0]), interpolation=cv2.INTER_NEAREST
+        )
+    if material_ids is None:
+        material_ids = np.zeros(shape, dtype=np.uint8)
+    elif material_ids.shape != shape:
+        material_ids = cv2.resize(
+            material_ids, (shape[1], shape[0]), interpolation=cv2.INTER_NEAREST
+        )
+    return object_ids.astype(np.int32) * 256 + material_ids.astype(np.int32)
+
+
+def _regularize_context_mask(context, camera_id, repair_mask):
+    """Binarize a missing-context mask (255 = generate) and, with Regularize
+    Context Boundary, clean it up."""
+    if not _regularized_context(context.scene):
+        return np.where(repair_mask > 127, 255, 0).astype(np.uint8)
+    # Constrain morphology to rendered object/material parts. This avoids
+    # letting a hand/accessory repair seed expand onto a dress/body part.
+    return regularize_repair_mask(
+        repair_mask,
+        threshold=127,
+        dilation=getattr(context.scene, 'qwen_mask_uncertainty_dilation', 1),
+        min_island_area=getattr(context.scene, 'qwen_mask_min_island_area', 16),
+        min_hole_area=getattr(context.scene, 'qwen_mask_min_hole_area', 8),
+        min_strip_width=getattr(context.scene, 'qwen_mask_min_strip_width', 2),
+        boundary_labels=_context_boundary_labels(context, camera_id, repair_mask.shape[:2]),
+        keep_largest_components=getattr(
+            context.scene, 'qwen_mask_keep_largest_components', 0
+        ),
+    )
+
+
+def _expand_context_mask(context, repair_mask):
+    """Context expansion: grow a binary missing-context mask by the set pixels."""
+    dilation = int(max(0, getattr(context.scene, 'qwen_context_fallback_dilation', 0)))
+    if dilation <= 0:
+        return repair_mask
+    kernel = cv2.getStructuringElement(
+        cv2.MORPH_ELLIPSE, (dilation * 2 + 1, dilation * 2 + 1)
+    )
+    return cv2.dilate(repair_mask, kernel, iterations=1)
 
 class Regenerate(bpy.types.Operator):
     """Regenerate textures for selected cameras / viewpoints
@@ -126,9 +194,10 @@ class Regenerate(bpy.types.Operator):
                 return {'CANCELLED'}
         else: # all
             self._to_texture = [obj for obj in bpy.context.view_layer.objects if obj.type == 'MESH' and not obj.hide_get()]
-        # Revert discard angle
+        # Revert discard angle (in the projection material, not a bake's)
         new_discard_angle = context.scene.discard_factor
         for obj in self._to_texture:
+            activate_projection_material(obj)
             if not obj.active_material or not obj.active_material.use_nodes:
                 continue
 
@@ -219,7 +288,7 @@ class Reproject(bpy.types.Operator):
         # Search for largest material id
         max_id = -1
         for obj in to_texture:
-            mat_id = get_last_material_index(obj)
+            mat_id = get_last_material_index(obj, include_edits=False)
             if mat_id > max_id:
                 max_id = mat_id
 
@@ -393,6 +462,7 @@ class ComfyUIGenerate(_PBRMixin, bpy.types.Operator):
     _grid_height = 0
     _material_id = -1
     _to_texture = None
+    _edit_layers = ()
     _original_visibility = None
     _generation_method_on_start = None
     _uploaded_images_cache: dict = {}
@@ -504,6 +574,21 @@ class ComfyUIGenerate(_PBRMixin, bpy.types.Operator):
         self._wait_event.wait()
         self._wait_event.clear()
 
+    def _replay_edit_layers(self, context):
+        """Lay the Masked Edits captured at the start of a Reproject or
+        Regenerate Selected over the projection it rebuilt."""
+        if not self._edit_layers:
+            return
+        from .masked_edit import replay_layers
+        self._stage = "Restoring Masked Edits"
+        try:
+            laid = replay_layers(context, self._edit_layers)
+            print(f"[StableGen] Laid {laid} Masked Edit view(s) again over the reprojection")
+        except Exception as e:
+            # The projection itself is complete; a lost edit is reported, not fatal.
+            traceback.print_exc()
+            print(f"[StableGen] Could not lay the Masked Edits again: {e}")
+
     def _get_qwen_context_colors(self, context):
         fallback = (1.0, 0.0, 1.0)
         background = (1.0, 0.0, 1.0)
@@ -536,52 +621,9 @@ class ComfyUIGenerate(_PBRMixin, bpy.types.Operator):
             print(f"[StableGen] Binary Qwen context skipped; missing context or mask for camera {camera_id}")
             return
 
-        # Constrain morphology to rendered object/material parts. This avoids
-        # letting a hand/accessory repair seed expand onto a dress/body part.
-        depth_dir = get_dir_path(context, "controlnet")["depth"]
-        frame_suffix = "0001" if bpy.app.version < (5, 0, 0) else ""
-        object_ids = cv2.imread(
-            os.path.join(depth_dir, f"object_id{camera_id}{frame_suffix}.png"),
-            cv2.IMREAD_GRAYSCALE,
+        repair_mask = _expand_context_mask(
+            context, _regularize_context_mask(context, camera_id, repair_mask)
         )
-        material_ids = cv2.imread(
-            os.path.join(depth_dir, f"material_id{camera_id}{frame_suffix}.png"),
-            cv2.IMREAD_GRAYSCALE,
-        )
-        boundary_labels = None
-        if object_ids is not None or material_ids is not None:
-            shape = repair_mask.shape[:2]
-            if object_ids is None:
-                object_ids = np.ones(shape, dtype=np.uint8)
-            elif object_ids.shape != shape:
-                object_ids = cv2.resize(
-                    object_ids, (shape[1], shape[0]), interpolation=cv2.INTER_NEAREST
-                )
-            if material_ids is None:
-                material_ids = np.zeros(shape, dtype=np.uint8)
-            elif material_ids.shape != shape:
-                material_ids = cv2.resize(
-                    material_ids, (shape[1], shape[0]), interpolation=cv2.INTER_NEAREST
-                )
-            boundary_labels = (
-                object_ids.astype(np.int32) * 256 + material_ids.astype(np.int32)
-            )
-
-        if experimental_enabled(context.scene, 'qwen_regularize_context_mask'):
-            repair_mask = regularize_repair_mask(
-                repair_mask,
-                threshold=127,
-                dilation=getattr(context.scene, 'qwen_mask_uncertainty_dilation', 1),
-                min_island_area=getattr(context.scene, 'qwen_mask_min_island_area', 16),
-                min_hole_area=getattr(context.scene, 'qwen_mask_min_hole_area', 8),
-                min_strip_width=getattr(context.scene, 'qwen_mask_min_strip_width', 2),
-                boundary_labels=boundary_labels,
-                keep_largest_components=getattr(
-                    context.scene, 'qwen_mask_keep_largest_components', 0
-                ),
-            )
-        else:
-            repair_mask = np.where(repair_mask > 127, 255, 0).astype(np.uint8)
         # Depth/ID discontinuities are never trusted context. Forcing these
         # pixels to repair prevents front objects from imprinting silhouettes
         # onto the surface behind them.
@@ -614,7 +656,7 @@ class ComfyUIGenerate(_PBRMixin, bpy.types.Operator):
             camera_id,
             repair_mask=repair_path,
             trusted_mask=trusted_path,
-            trust_threshold=getattr(context.scene, 'qwen_trust_threshold', 0.7),
+            trust_threshold=getattr(context.scene, 'qwen_trust_threshold', 0.5),
         )
 
         # These files are generated immediately before their first upload, but
@@ -665,9 +707,10 @@ class ComfyUIGenerate(_PBRMixin, bpy.types.Operator):
         )
 
     def _dilate_qwen_context_fallback(self, context, camera_id, fallback_color):
-        """Legacy rigging-branch fallback-color dilation."""
+        """Clean up (Regularize Context Boundary) and expand (context expansion)
+        the fallback-color regions of a context render without confidence gating."""
         dilation = int(max(0, context.scene.qwen_context_fallback_dilation))
-        if dilation <= 0:
+        if dilation <= 0 and not _regularized_context(context.scene):
             return
         image_path = get_file_path(
             context, "inpaint", subtype="render", camera_id=camera_id
@@ -691,12 +734,11 @@ class ComfyUIGenerate(_PBRMixin, bpy.types.Operator):
         )
         if not np.any(mask):
             return
-        kernel_size = max(1, dilation * 2 + 1)
-        kernel = cv2.getStructuringElement(
-            cv2.MORPH_ELLIPSE, (kernel_size, kernel_size)
-        )
-        dilated_mask = cv2.dilate(
-            mask.astype(np.uint8) * 255, kernel, iterations=1
+        # Holes the cleanup marks as kept have no projected colour to restore;
+        # only the regions it adds are painted.
+        dilated_mask = _expand_context_mask(
+            context,
+            _regularize_context_mask(context, camera_id, mask.astype(np.uint8) * 255),
         ) > 0
         pixel_data[dilated_mask, :3] = fallback_rgb
         pixel_data[dilated_mask, 3] = 255
@@ -709,7 +751,7 @@ class ComfyUIGenerate(_PBRMixin, bpy.types.Operator):
             self._uploaded_images_cache.pop(os.path.abspath(image_path), None)
 
     def _apply_qwen_context_cleanup(self, context, image_bytes):
-        """Legacy rigging-branch global fallback-hue cleanup."""
+        """Fallback cleanup: recolor fallback-hue residue in a later Qwen output."""
         hue_tolerance = max(context.scene.qwen_context_cleanup_hue_tolerance, 0.0)
         value_adjust = context.scene.qwen_context_cleanup_value_adjust
         fallback_color = tuple(context.scene.qwen_guidance_fallback_color)
@@ -1029,16 +1071,17 @@ class ComfyUIGenerate(_PBRMixin, bpy.types.Operator):
         self._view_plan = None
         if use_camera_plan:
             view_records = []
+            # The plan freezes what each view adds to the texture prompt: its view prompt and the prompts of the
+            # described objects it sees, sampled now with the cameras where they will render from.
+            from ..cameras.visibility import detect, view_prompt as compose_view_prompt
+            grids = (detect(context, self._cameras)
+                     if getattr(context.scene, 'use_object_prompts', False) else {})
             for index, cam in enumerate(self._cameras):
                 if "sg_view_uuid" not in cam:
                     cam["sg_view_uuid"] = uuid.uuid4().hex
                 cam_res_x = int(cam.get("sg_res_x", render.resolution_x))
                 cam_res_y = int(cam.get("sg_res_y", render.resolution_y))
-                prompt_item = next(
-                    (item for item in context.scene.camera_prompts if item.name == cam.name),
-                    None,
-                )
-                view_prompt = prompt_item.prompt if prompt_item and prompt_item.prompt else ""
+                view_prompt = compose_view_prompt(context.scene, cam, grids.get(cam.name))
                 view_id = str(cam["sg_view_uuid"])
                 matrix_world = tuple(
                     tuple(float(value) for value in row) for row in cam.matrix_world
@@ -1125,9 +1168,12 @@ class ComfyUIGenerate(_PBRMixin, bpy.types.Operator):
             self._to_texture = [obj for obj in bpy.context.view_layer.objects if obj.type == 'MESH' and not obj.hide_get()]
 
         # Find all mesh objects, check their material ids and store the highest one
+        # (a reprojection or regeneration reads and replaces generated views,
+        # which Masked Edit layers do not have)
+        reproject = context.scene.generation_mode in {'project_only', 'regenerate_selected'}
         for obj in self._to_texture:
             for slot in obj.material_slots:
-                material_id = get_last_material_index(obj)
+                material_id = get_last_material_index(obj, include_edits=not reproject)
                 if (material_id > self._material_id):
                     self._material_id = material_id
             # Check if there's room for the projection buffer UV map (only 1 slot needed)
@@ -1272,6 +1318,18 @@ class ComfyUIGenerate(_PBRMixin, bpy.types.Operator):
                 self._total_images += len(self._cameras)  # Add refinement steps
         elif context.scene.generation_method == 'uv_inpaint':
             self._total_images = len(self._to_texture)
+
+        # Reproject and Regenerate Selected rebuild the projection material from
+        # the generation's views; the Masked Edit layers on it are laid again
+        # after the run. After Bake Textures the bake is the active material;
+        # the layers, the views to reset and the context of the first
+        # regenerated view are in the projection material.
+        self._edit_layers = []
+        if context.scene.generation_mode in {'project_only', 'regenerate_selected'}:
+            from .masked_edit import capture_layers
+            for obj in self._to_texture:
+                activate_projection_material(obj)
+            self._edit_layers = capture_layers(self._to_texture)
 
         # Regenerate mode preparation
         if context.scene.generation_mode == 'regenerate_selected':
@@ -1550,7 +1608,7 @@ class ComfyUIGenerate(_PBRMixin, bpy.types.Operator):
 
         reliable = []
         risks = []
-        trust = float(getattr(context.scene, 'qwen_trust_threshold', 0.7))
+        trust = float(getattr(context.scene, 'qwen_trust_threshold', 0.5))
         discard_cosine = math.cos(math.radians(float(context.scene.discard_factor)))
         front_threshold = max(0.0, min(1.0, max(trust, discard_cosine)))
         homogeneous_positions = np.concatenate(
@@ -1647,7 +1705,7 @@ class ComfyUIGenerate(_PBRMixin, bpy.types.Operator):
                     and context.scene.qwen_refine_use_depth)
                 or (getattr(context.scene, 'sg_rework_projection_guard', False)
                     and context.scene.generation_method == 'sequential')
-                or (experimental_enabled(context.scene, 'qwen_regularize_context_mask')
+                or (_regularized_context(context.scene)
                     and context.scene.generation_method == 'sequential')
             )
             if need_depth and context.scene.generation_method != 'uv_inpaint':
@@ -1937,6 +1995,28 @@ class ComfyUIGenerate(_PBRMixin, bpy.types.Operator):
                             else:
                                 image = self.workflow_manager.generate(context, controlnet_info=controlnet_info, ipadapter_ref_info=ipadapter_ref_info)
                         else:
+                            if (context.scene.generation_mode == 'regenerate_selected'
+                                    and self._current_image == min(self._selected_camera_ids)):
+                                # Regeneration starts mid-sequence: project the
+                                # views before it, as the run did, so its context
+                                # holds those and not the views being regenerated.
+                                self._stage = "Projecting Image"
+                                def earlier_project_callback():
+                                    try:
+                                        yield from project_image(
+                                            context, self._to_texture, self._material_id,
+                                            stop_index=self._current_image - 1,
+                                            cameras=self._cameras,
+                                            view_plan=self._view_plan,
+                                            _steps=True,
+                                        )
+                                    except Exception as e:
+                                        self._error = str(e)
+                                        traceback.print_exc()
+                                    return None
+                                self._run_on_main_thread(earlier_project_callback, finish_on_cancel=True)
+                                if self._error:
+                                    return
                             self._stage = "Preparing Next Camera"
                             self._progress = 0
                             def context_callback():
@@ -2020,7 +2100,6 @@ class ComfyUIGenerate(_PBRMixin, bpy.types.Operator):
                     if (context.scene.model_architecture in EDIT_ARCHITECTURES
                             and context.scene.generation_method == 'sequential'
                             and self._current_image > 0
-                            and not getattr(context.scene, 'qwen_use_confidence_context', False)
                             and context.scene.qwen_context_cleanup
                             and context.scene.qwen_context_render_mode in {'REPLACE_STYLE', 'ADDITIONAL'}):
                         image = self._apply_qwen_context_cleanup(context, image)
@@ -2252,6 +2331,7 @@ class ComfyUIGenerate(_PBRMixin, bpy.types.Operator):
                     )
                     if getattr(context.scene, 'pbr_auto_lighting', False):
                         _pbr_setup_studio_lights(context, self._to_texture)
+                self._replay_edit_layers(context)
                 return None
             self._stage = "Projecting Image"
             redraw_ui(context)
@@ -2281,7 +2361,7 @@ class ComfyUIGenerate(_PBRMixin, bpy.types.Operator):
                 if getattr(context.scene, 'pbr_auto_lighting', False):
                     _pbr_setup_studio_lights(context, self._to_texture)
 
-
+            self._replay_edit_layers(context)
             return None
 
         if context.scene.view_blend_use_color_match and self._to_texture:
@@ -2376,7 +2456,7 @@ class ComfyUIGenerate(_PBRMixin, bpy.types.Operator):
         )
         use_part_ids = (
             use_projection_guard
-            or experimental_enabled(context.scene, 'qwen_regularize_context_mask')
+            or _regularized_context(context.scene)
         )
         # Workbench retains the fast ordinary depth-guidance path. Cycles is
         # required whenever a consumer needs categorical object/material IDs;
@@ -2659,7 +2739,7 @@ class ComfyUIGenerate(_PBRMixin, bpy.types.Operator):
         """
         with _RenderStateTransaction(context):
             use_part_ids = (getattr(context.scene, 'sg_rework_projection_guard', False)
-                            or experimental_enabled(context.scene, 'qwen_regularize_context_mask'))
+                            or _regularized_context(context.scene))
             engine = 'CYCLES' if use_part_ids else 'BLENDER_WORKBENCH'
             if context.scene.render.engine != engine:
                 context.scene.render.engine = engine

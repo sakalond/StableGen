@@ -2103,10 +2103,37 @@ def _require_printable_mesh(mesh, *, label="Mesh", require_closed=True):
     return topology
 
 
+# Make Solid's flood fill: gaps in the surface up to about twice this many voxels do not let outside space into
+# the inside, and faces visible from this many directions are always kept (exterior_fill). Chosen on 19 hard
+# TRELLIS.2 meshes: 3 keeps a median 18% of the hidden area (2: 33%, no closing: 74%) and removes a median 1.8% of
+# the visible area.
+FLOOD_CLOSE_HOLES = 3
+FLOOD_VIEW_DIRECTIONS = 64
+
+
 def _make_solid_mesh_object(
         obj, fill_gaps=True, visible_faces=None, keep_largest_island=False,
         face_visibility=None, *, use_evaluated_mesh=True, raycast_count=None,
-        weld_distance=0.0, robust_fill=True, smooth_caps=True):
+        weld_distance=0.0, robust_fill=True, smooth_caps=True,
+        visibility_method='FLOOD', flood_resolution=None,
+        require_printable=True, seal_bottom=False,
+        close_holes=FLOOD_CLOSE_HOLES, view_directions=FLOOD_VIEW_DIRECTIONS):
+    """Remove interior geometry and cap the holes it leaves.
+
+    visibility_method 'FLOOD' keeps the faces that empty space from outside
+    reaches (exterior_fill); 'RAYCAST' keeps the faces hit by rays from a ring
+    of viewpoints around the object (raycast_count of them), the older test.
+    close_holes and view_directions (FLOOD only) keep hairline gaps in the
+    surface from letting the flood reach the inside, without removing faces
+    that can be seen from outside.
+    seal_bottom (FLOOD only) closes the object's underside before the flood,
+    so a hollow object open at the bottom loses its inner shell and gets a
+    capped bottom instead of staying an open shell.
+    require_printable rejects a result with open or non-manifold edges (the
+    slicer export needs that); generated meshes such as TRELLIS.2's carry
+    non-manifold seams of their own, so mesh post-processing passes False and
+    takes the best result instead of keeping every interior shell.
+    """
     import bmesh
     from mathutils.bvhtree import BVHTree
     import numpy as np
@@ -2128,12 +2155,49 @@ def _make_solid_mesh_object(
         eval_obj = None
         temp.calc_loop_triangles()
     try:
+        flood_visible = None
+        if visible_faces is None and visibility_method == 'FLOOD':
+            from .exterior_fill import DEFAULT_RESOLUTION, exterior_triangles
+            t0 = time.perf_counter()
+            temp.calc_loop_triangles()
+            coords = np.empty(len(temp.vertices) * 3, dtype=np.float32)
+            temp.vertices.foreach_get("co", coords)
+            triangles = np.empty(len(temp.loop_triangles) * 3, dtype=np.int32)
+            temp.loop_triangles.foreach_get("vertices", triangles)
+            polygons = np.empty(len(temp.loop_triangles), dtype=np.int32)
+            temp.loop_triangles.foreach_get("polygon_index", polygons)
+            exterior, info = exterior_triangles(
+                coords.reshape(-1, 3),
+                triangles.reshape(-1, 3),
+                resolution=flood_resolution or DEFAULT_RESOLUTION,
+                seal_bottom=seal_bottom,
+                close_holes=close_holes,
+                view_directions=view_directions,
+                up_axis=2,
+            )
+            flood_visible = np.zeros(len(temp.polygons), dtype=bool)
+            flood_visible[polygons[exterior]] = True
+            print(
+                "[StableGen Make Solid] Exterior flood fill: kept "
+                f"{int(flood_visible.sum())} of {len(flood_visible)} faces "
+                f"(grid {info.get('shape')}) in {time.perf_counter() - t0:.4f}s"
+            )
+
         bm = bmesh.new()
         bm.from_mesh(temp)
         source_vertex_layer, source_face_windings = (
             _capture_source_face_windings(bm)
         )
-        
+
+        exterior_layer = None
+        if flood_visible is not None:
+            # Carried on a face layer so it survives the optional weld below,
+            # which can drop degenerate faces and renumber the rest.
+            exterior_layer = bm.faces.layers.int.new("_SG_Exterior")
+            bm.faces.ensure_lookup_table()
+            for face, visible in zip(bm.faces, flood_visible.tolist()):
+                face[exterior_layer] = 1 if visible else 0
+
         # The 3D-print export historically welds coincident evaluated geometry.
         # General post-processing must not globally weld detached character
         # shells (clothing/body, armor panels, eyes, etc.), because doing so
@@ -2142,7 +2206,21 @@ def _make_solid_mesh_object(
             bmesh.ops.remove_doubles(
                 bm, verts=bm.verts, dist=float(weld_distance)
             )
-        
+        else:
+            # A mesh stored as separate triangles (flat-shaded or exported
+            # per corner) shares no edges, so every kept face would border a
+            # hole to cap. Join its coincident corners when most of them are
+            # duplicates; the few coincident vertices of a generated mesh
+            # (pinch points) stay apart.
+            positions = np.empty(len(bm.verts) * 3, dtype=np.float64)
+            temp.vertices.foreach_get("co", positions)
+            positions = positions.reshape(-1, 3)
+            if len(positions) and len(positions) >= 1.5 * len(np.unique(positions, axis=0)):
+                extent = float(np.linalg.norm(positions.max(axis=0) - positions.min(axis=0)))
+                before = len(bm.verts)
+                bmesh.ops.remove_doubles(bm, verts=bm.verts, dist=1e-7 * max(extent, 1e-9))
+                print(f"[StableGen Make Solid] Joined split corners: {before} -> {len(bm.verts)} vertices")
+
         bm.faces.ensure_lookup_table()
         bm.edges.ensure_lookup_table()
         bm.verts.ensure_lookup_table()
@@ -2172,7 +2250,13 @@ def _make_solid_mesh_object(
             avg_color = get_avg_color(f.loops, color_lay)
             face_info.append((center, avg_color, f.index))
         print(f"[StableGen Make Solid] Collected face info in {time.perf_counter() - t0:.4f}s")
-            
+
+        if exterior_layer is not None:
+            visible_faces = {
+                f.index for f in bm.faces if f[exterior_layer]
+            }
+            bm.faces.layers.int.remove(exterior_layer)
+
         if visible_faces is None:
             t0 = time.perf_counter()
             bvh = BVHTree.FromBMesh(bm)
@@ -2349,6 +2433,11 @@ def _make_solid_mesh_object(
                                     stack.append(linked)
                     components.append(component)
 
+                # A branching boundary (two holes touching at a vertex) or a
+                # loop triangle_fill cannot close stays open. Capping across
+                # it would create overlapping faces, and failing the whole
+                # operation would leave every interior shell in place.
+                skipped = 0
                 for component in components:
                     component_vertices = {
                         vert for edge in component for vert in edge.verts
@@ -2360,11 +2449,8 @@ def _make_solid_mesh_object(
                         ) != 2
                     ]
                     if branching:
-                        raise RuntimeError(
-                            "cannot safely cap a branching boundary "
-                            f"({len(component)} edges, "
-                            f"{len(branching)} branching vertices)"
-                        )
+                        skipped += 1
+                        continue
                     fill_result = bmesh.ops.triangle_fill(
                         bm,
                         edges=list(component),
@@ -2376,11 +2462,29 @@ def _make_solid_mesh_object(
                         if isinstance(geom, bmesh.types.BMFace)
                         and geom not in source_faces
                     ]
+                    # A loop through pinch points (coincident vertices
+                    # kept apart above) fills with zero-area triangles
+                    # between them. They close nothing, and the result's
+                    # validation rejected the whole mesh for them.
+                    degenerate = [
+                        face for face in component_faces
+                        if face.calc_area() <= 1.0e-10
+                    ]
+                    if degenerate:
+                        bmesh.ops.delete(bm, geom=degenerate, context='FACES')
+                        component_faces = [
+                            face for face in component_faces if face.is_valid
+                        ]
                     if not component_faces:
-                        raise RuntimeError(
-                            "failed to create a cap for a valid boundary loop"
-                        )
+                        skipped += 1
+                        continue
                     new_faces.extend(component_faces)
+                if skipped:
+                    print(
+                        f"[StableGen Make Solid] Left {skipped} of "
+                        f"{len(components)} boundary loops open (branching "
+                        "or not fillable)"
+                    )
             else:
                 # Preserve the historical 3D-print fill behavior. The general
                 # post-processing operator uses the validated triangle-fill
@@ -2612,15 +2716,23 @@ def _make_solid_mesh_object(
             print(f"[StableGen Make Solid] Stored _SG_FaceVisibility on {n_faces} faces")
 
         solid_mesh.calc_loop_triangles()
-        try:
-            _require_printable_mesh(
-                solid_mesh,
-                label=f"Make Solid result for {obj.name}",
-                require_closed=bool(fill_gaps),
+        if require_printable:
+            try:
+                _require_printable_mesh(
+                    solid_mesh,
+                    label=f"Make Solid result for {obj.name}",
+                    require_closed=bool(fill_gaps),
+                )
+            except Exception:
+                bpy.data.meshes.remove(solid_mesh)
+                raise
+        else:
+            topology = _mesh_topology_counts(solid_mesh)
+            print(
+                "[StableGen Make Solid] Result topology: "
+                f"{topology['boundary']} open edges, "
+                f"{topology['non_manifold']} non-manifold edges"
             )
-        except Exception:
-            bpy.data.meshes.remove(solid_mesh)
-            raise
         print(f"[StableGen Make Solid] Total execution time: {time.perf_counter() - t_start:.4f}s")
         return solid_mesh
     finally:

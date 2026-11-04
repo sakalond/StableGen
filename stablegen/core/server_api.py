@@ -62,7 +62,9 @@ def confirm_server(operator, context):
         prefs.server_online = True
         return True
     prefs.server_online = False
-    operator.report({'ERROR'}, offline_message(prefs.server_address))
+    from ..setup import runtime
+    note = runtime.offline_note()       # the local ComfyUI is starting, or starts now
+    operator.report({'WARNING'} if note else {'ERROR'}, note or offline_message(prefs.server_address))
     return False
 
 
@@ -73,7 +75,7 @@ def offline_message(server_address):
 
 
 def check_trellis2_available(server_address, timeout=1.0):
-    """Checks if TRELLIS.2 custom nodes are installed in ComfyUI.
+    """Checks if ComfyUI has its native TRELLIS.2 nodes (ComfyUI 0.42 or newer).
 
     Args:
         server_address (str): The address:port of the ComfyUI server.
@@ -82,27 +84,12 @@ def check_trellis2_available(server_address, timeout=1.0):
     Returns:
         bool: True if TRELLIS.2 nodes are detected, False otherwise.
     """
+    from ..mesh_gen.trellis2_graph import PROBE_NODE
     if not server_address:
         return False
-    try:
-        url = f"http://{server_address}/object_info/Trellis2ImageToShape"
-        response = requests.get(url, timeout=timeout)
-        if response.status_code == 200:
-            data = response.json()
-            if 'Trellis2ImageToShape' in data:
-                print("[TRELLIS2] Auto-detect: TRELLIS.2 nodes found in ComfyUI.")
-                return True
-        print("[TRELLIS2] Auto-detect: TRELLIS.2 nodes NOT found in ComfyUI.")
-        return False
-    except Exception as e:
-        print(f"[TRELLIS2] Auto-detect failed: {e}")
-        return False
-    except requests.exceptions.RequestException as e:
-        print(f"[StableGen]   Initial server check failed: Request Error ({e}).")
-        return False
-    except Exception as e:
-        print(f"[StableGen]   Initial server check failed: Unexpected Error ({e}).")
-        return False
+    found = fetch_node_info(server_address, PROBE_NODE, timeout=timeout) is not None
+    print(f"[TRELLIS2] Auto-detect: ComfyUI's TRELLIS.2 nodes {'found' if found else 'NOT found'}.")
+    return found
 
 
 def check_pbr_available(server_address, timeout=1.0):
@@ -151,6 +138,33 @@ def check_skintokens_autorig_available(server_address, timeout=1.0):
     except Exception as e:
         print(f"[SkinTokens] Auto-detect failed: {e}")
         return False
+
+
+MESHTOOLS_NODES = {
+    'lato2': 'LATO2Remesh',         # ComfyUI-LATO2
+}
+
+
+def check_meshtools_available(server_address, timeout=1.0):
+    """Which mesh tool nodes ComfyUI has: {'lato2': bool}."""
+    found = {tool: False for tool in MESHTOOLS_NODES}
+    if not server_address:
+        return found
+    for tool, node_class in MESHTOOLS_NODES.items():
+        try:
+            response = requests.get(f"http://{server_address}/object_info/{node_class}", timeout=timeout)
+            found[tool] = response.status_code == 200 and node_class in response.json()
+        except Exception as e:
+            print(f"[MeshTools] Auto-detect of {node_class} failed: {e}")
+            break
+    print(f"[MeshTools] Auto-detect: {', '.join(t for t, ok in found.items() if ok) or 'no nodes'} found.")
+    return found
+
+
+def apply_meshtools_available(scene, found):
+    """Store a check_meshtools_available() result on the scene."""
+    found = found or {}
+    scene.meshtools_lato2_available = bool(found.get('lato2', False))
 
 
 def fetch_node_info(server_address, node_class, timeout=1.0):

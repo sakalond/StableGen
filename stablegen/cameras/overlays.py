@@ -9,7 +9,7 @@ from bpy_extras.view3d_utils import location_3d_to_region_2d
 from gpu_extras.batch import batch_for_shader
 
 from ..texturing.view_plan import generation_cameras, order_cameras
-from .geometry import _get_camera_resolution
+from .geometry import _get_camera_resolution, _set_display_square
 from . import prompt_overlay
 
 _ADDON_PKG = __package__.rsplit('.', 1)[0]
@@ -39,7 +39,18 @@ def _snapshot(context):
     if key not in _snapshots:
         _snapshots[key] = dict(scene=scene, layer=context.view_layer, cameras=(), images={},
                                dirty=True, manifests={})
-    return _snapshots[key]
+    snapshot = _snapshots[key]
+    # The timer refreshes the cameras; drop any deleted since then before a draw handler reads them (#129).
+    snapshot['cameras'] = tuple(c for c in snapshot['cameras'] if _alive(c))
+    return snapshot
+
+
+def _alive(obj):
+    try:
+        obj.as_pointer()
+    except ReferenceError:
+        return False
+    return True
 
 
 def _source_materials(context):
@@ -409,6 +420,9 @@ def _sg_draw_view_labels():
     context = _draw_context()
     if context is None or context.region_data.view_perspective == 'CAMERA':
         return
+    from ..ui.studio import preview_open
+    if preview_open(context.window, context.area):     # a camera's full-size view covers this viewport
+        return
     settings = context.scene.sg_camera_display
     if settings.labels == 'NONE':
         return
@@ -567,8 +581,7 @@ def _sg_restore_square_display(scene):
         for c in cameras
     )
     if max_side > 0:
-        scene.render.resolution_x = max_side
-        scene.render.resolution_y = max_side
+        _set_display_square(scene, max_side)
     # Refresh viewports
     for area in bpy.context.screen.areas if bpy.context.screen else []:
         if area.type == 'VIEW_3D':

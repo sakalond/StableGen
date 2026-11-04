@@ -12,6 +12,4 @@ from .workflow_templates import (  # noqa: F401
     gguf_unet_loader,
     prompt_text_qwen_image_edit,
     prompt_text_flux2_klein,
-    prompt_text_trellis2,
-    prompt_text_trellis2_shape_only,
 )

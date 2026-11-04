@@ -19,7 +19,7 @@ import numpy as np
 from ..core import ADDON_PKG, legacy_panel_enabled
 from ..utils import sg_modal_active, get_file_path
 from .pbr_emission import emission_from_hsv, emission_from_residual
-from .rendering import _RenderStateTransaction
+from .rendering import _RenderStateTransaction, EDIT_NORMAL_LAYER as NORMAL_LAYER
 from ..core.architectures import MASKED_EDIT_ARCHITECTURES, QWEN_ARCHITECTURES, SDXL_GRAPH_ARCHITECTURES
 
 MASK_UV = 'SG Edit Mask UV'
@@ -40,6 +40,13 @@ def unified_paint(scene):
     return (settings.image_paint.unified_paint_settings
             if hasattr(settings.image_paint, 'unified_paint_settings')
             else settings.unified_paint_settings)
+
+
+def reference_path(scene):
+    """The reference image the edit follows (an absolute path), or None when none is used."""
+    if scene.model_architecture not in QWEN_ARCHITECTURES or not scene.sg_masked_use_reference:
+        return None
+    return bpy.path.abspath(scene.sg_masked_reference_image) if scene.sg_masked_reference_image else ''
 
 
 def qwen_edit_instruction(instruction, overlay, template=None):
@@ -704,10 +711,14 @@ def resolve_layers(scene, apply):
 def pbr_targets(material):
     """Inputs that carry projected PBR maps: {channel: input socket}.
 
-    roughness and metallic are Principled inputs, normal is the Normal Map node's Color input and
-    height the Displacement node's Height input; these are returned only when linked, so unlinked
-    constant values are left alone. emission is the Principled Emission Color, returned even when
-    unlinked: a material without an emission map is black there, and an edit may add the glow.
+    roughness and metallic are Principled inputs, height the Displacement node's Height input;
+    these are returned only when linked, so unlinked constant values are left alone. normal is the
+    Normal Map node's Color input when that node decodes world space (a projection material: the
+    edit's world-space normal colours mix in directly), and the Principled Normal input when it
+    decodes tangent space (a bake) or comes from an earlier edit's decoded layer: there the edit's
+    normals mix in decoded (world_normal_layer). emission is the Principled Emission Color,
+    returned even when unlinked: a material without an emission map is black there, and an edit
+    may add the glow.
     """
     shader = material.node_tree.nodes.get(material.get('_sg_mask_shader', ''))
     if not shader or shader.type != 'BSDF_PRINCIPLED':
@@ -718,7 +729,9 @@ def pbr_targets(material):
             targets[channel] = shader.inputs[name]
     normal = shader.inputs['Normal'].links[0].from_node if shader.inputs['Normal'].links else None
     if normal and normal.type == 'NORMAL_MAP' and normal.inputs['Color'].links:
-        targets['normal'] = normal.inputs['Color']
+        targets['normal'] = normal.inputs['Color'] if normal.space == 'WORLD' else shader.inputs['Normal']
+    elif normal and normal.label == NORMAL_LAYER:
+        targets['normal'] = shader.inputs['Normal']
     out = output_node(material)
     displacement = (out.inputs['Displacement'].links[0].from_node
                     if out and 'Displacement' in out.inputs and out.inputs['Displacement'].links else None)
@@ -947,6 +960,12 @@ def add_pbr_layers(material, layer, maps, use_albedo, emission_strength=2.5):
         if texture.inputs['Vector'].links:
             links.new(texture.inputs['Vector'].links[0].from_socket, tex.inputs['Vector'])
         tex.location = (texture.location[0], texture.location[1] - 300 * (len(added) + 1))
+        if channel == 'normal' and target.node.type == 'BSDF_PRINCIPLED':
+            location = (mix.location[0], mix.location[1] - 300 * (len(added) + 1))
+            links.new(world_normal_layer(material.node_tree, factor, tex.outputs['Color'], previous, location),
+                      target)
+            added.append(channel)
+            continue
         layer_mix = nodes.new('ShaderNodeMixRGB')
         layer_mix.label = f'Masked Edit {channel}'
         layer_mix.location = (mix.location[0], mix.location[1] - 300 * (len(added) + 1))
@@ -956,6 +975,81 @@ def add_pbr_layers(material, layer, maps, use_albedo, emission_strength=2.5):
         links.new(layer_mix.outputs['Color'], target)
         added.append(channel)
     return added
+
+
+def world_normal_layer(tree, factor, edit_color, previous, location=(0, 0)):
+    """One edit view's normals over *previous* (a shading normal), mixed as decoded vectors.
+
+    The edit's normal maps hold world-space normals as colours. A bake's Normal Map node decodes
+    tangent space, so mixing those colours into its input shaded the edit black (a wall's world
+    normal read as a tangent normal lies flat in the surface). The edit's colours are decoded in
+    world space instead and mixed with *previous* by the layer's *factor* (0 shows the edit, as in
+    the colour layer). Returns the normalized result socket.
+    """
+    nodes, links = tree.nodes, tree.links
+    decode = nodes.new('ShaderNodeNormalMap')
+    decode.space = 'WORLD'
+    decode.label = NORMAL_LAYER
+    decode.location = (location[0] - 200, location[1])
+    links.new(edit_color, decode.inputs['Color'])
+    blend = nodes.new('ShaderNodeMix')
+    blend.data_type = 'VECTOR'
+    blend.label = NORMAL_LAYER
+    blend.location = location
+    socket = {s.identifier: s for s in blend.inputs}
+    links.new(factor, socket['Factor_Float'])
+    links.new(decode.outputs['Normal'], socket['A_Vector'])
+    links.new(previous, socket['B_Vector'])
+    unit = nodes.new('ShaderNodeVectorMath')
+    unit.operation = 'NORMALIZE'
+    unit.label = NORMAL_LAYER
+    unit.location = (location[0] + 200, location[1])
+    links.new(next(s for s in blend.outputs if s.identifier == 'Result_Vector'), unit.inputs[0])
+    return unit.outputs['Vector']
+
+
+def repair_edit_normal_layers(materials):
+    """Masked Edits made before world_normal_layer mixed their world-space normal colours into a
+    tangent-space Normal Map's input, which shaded the edited region black. Rebuild those layers
+    as decoded ones. Returns the names of the repaired materials."""
+    repaired = []
+    for material in materials:
+        if not material or not material.use_nodes or not material.node_tree:
+            continue
+        tree = material.node_tree
+        for decode in [n for n in tree.nodes if n.type == 'NORMAL_MAP' and n.space != 'WORLD']:
+            chain, socket = [], decode.inputs['Color']
+            while (socket.links and socket.links[0].from_node.type == 'MIX_RGB'
+                   and socket.links[0].from_node.label == NORMAL_LAYER):
+                chain.append(socket.links[0].from_node)
+                socket = chain[-1].inputs['Color2']
+            if not chain or not socket.links:
+                continue
+            if any(not m.inputs['Fac'].links or not m.inputs['Color1'].links for m in chain):
+                continue
+            consumers = [link.to_socket for link in decode.outputs['Normal'].links]
+            tree.links.new(socket.links[0].from_socket, decode.inputs['Color'])
+            result = decode.outputs['Normal']
+            for old in reversed(chain):                     # the earliest edit view first
+                result = world_normal_layer(tree, old.inputs['Fac'].links[0].from_socket,
+                                            old.inputs['Color1'].links[0].from_socket, result, old.location)
+                tree.nodes.remove(old)
+            for to_socket in consumers:
+                tree.links.new(result, to_socket)
+            repaired.append(material.name)
+    return repaired
+
+
+def opaque_write_mask(mask, alpha):
+    """The write mask without the pixels a view returned transparent.
+
+    Qwen 2.1's native RGBA output can cut a foreground object out and leave the
+    masked surface behind it transparent; projected, those pixels wrote black.
+    They keep the existing texture instead, as in generation.
+    """
+    from PIL import Image
+    opaque = np.where(np.asarray(alpha) >= 128, 255, 0).astype(np.uint8)
+    return Image.fromarray(np.minimum(np.asarray(mask), opaque))
 
 
 def project_view(context, objects, camera, image_path, write_path, material_id, expand=0):
@@ -993,6 +1087,8 @@ def project_view(context, objects, camera, image_path, write_path, material_id, 
         if texture is not None:
             # Keeps camera image displays on the generated views, not this edit layer.
             texture['sg_masked_edit'] = True
+            # Where the view was taken from, for laying the layer again (replay_layers)
+            texture['sg_edit_camera_matrix'] = [v for row in camera.matrix_world for v in row]
             layers[obj.name] = {'mix': mix.name, 'texture': texture.name}
         selected = selection_socket(material, obj.sg_edit_mask)
         # With expansion enabled, the camera-space write mask defines the
@@ -1015,6 +1111,146 @@ def project_view(context, objects, camera, image_path, write_path, material_id, 
             if node.type == 'TEX_IMAGE' and node.image and not node.image.packed_file:
                 node.image.pack()
     return layers
+
+
+def _upstream_selection(socket, depth=12):
+    """The selection snapshot gating a layer's weight: the first frozen-selection texture upstream of *socket*."""
+    pending, seen = [socket], set()
+    while pending and depth:
+        depth -= 1
+        following = []
+        for item in pending:
+            for link in item.links:
+                node = link.from_node
+                if node.as_pointer() in seen:
+                    continue
+                seen.add(node.as_pointer())
+                if node.type == 'TEX_IMAGE' and node.label.startswith(FROZEN):
+                    return node
+                following.extend(node.inputs)
+        pending = following
+    return None
+
+
+def capture_layers(objects):
+    """The Masked Edit layers each object's projection material carries, oldest first.
+
+    Reproject and Regenerate Selected rebuild a projection material from the
+    generation's views, which dropped the edit layers on it; the run lays them
+    again afterwards with replay_layers. A layer is read back from its edit's
+    folder (masked-edit.json: the camera and the selection expansion; the view's
+    generated image and write mask) and the selection snapshot its weight used.
+    """
+    captured = []
+    for obj in objects:
+        material = obj.active_material
+        if material is None or not material.use_nodes:
+            continue
+        nodes = material.node_tree.nodes
+        for texture in nodes:
+            if texture.type != 'TEX_IMAGE' or not texture.get('sg_masked_edit') or texture.image is None:
+                continue
+            try:
+                layer_id = int(texture.label.split('-')[1])
+            except (IndexError, ValueError):
+                continue
+            view_dir = Path(bpy.path.abspath(texture.image.filepath)).parent.parent
+            report_path = view_dir.parent / 'masked-edit.json'
+            try:
+                report = json.loads(report_path.read_text(encoding='utf-8'))
+            except (OSError, ValueError):
+                print(f"[StableGen] Masked Edit layer {layer_id} on {obj.name}: no edit report at {report_path}")
+                continue
+            key = lambda path: Path(path).resolve().as_posix().lower()
+            view = next((v for v in report.get('views', []) if key(v.get('directory', '')) == key(view_dir)), None)
+            if view is None or not view.get('camera'):
+                print(f"[StableGen] Masked Edit layer {layer_id} on {obj.name}: its view is not in {report_path}")
+                continue
+            mix = next((n for n in nodes if n.bl_idname == 'ShaderNodeMixRGB'
+                        and _upstream_texture(n.inputs['Color1']) == texture), None)
+            snapshot = _upstream_selection(mix.inputs['Fac']) if mix else None
+            matrix = texture.get('sg_edit_camera_matrix')
+            captured.append({
+                'object': obj.name, 'layer': layer_id, 'camera': view['camera'], 'directory': str(view_dir),
+                'expand': int(report.get('expand_selection_px', 0) or 0),
+                'snapshot': snapshot.image.name if snapshot is not None and snapshot.image else None,
+                'pbr': bool(report.get('pbr_channels')),
+                'matrix': list(matrix) if matrix is not None and len(matrix) == 16 else None,
+            })
+    return sorted(captured, key=lambda entry: entry['layer'])
+
+
+def replay_layers(context, captured):
+    """Lay the captured Masked Edit layers (capture_layers) over the rebuilt projection, in their order.
+
+    Each edit view is projected again through project_view from where its camera
+    stood for the edit (a temporary copy when it has moved since), with its
+    generated image, write mask, expansion and selection snapshot. A layer whose
+    camera or files are gone is reported and left out; edited PBR maps are not
+    laid again. Returns the number of edit views laid.
+    """
+    scene = context.scene
+    views = {}
+    for entry in captured:
+        views.setdefault((entry['layer'], entry['camera'], entry['directory']), []).append(entry)
+    laid = 0
+    for (layer_id, camera_name, directory), entries in sorted(views.items(), key=lambda item: item[0][0]):
+        view_dir = Path(directory)
+        camera = bpy.data.objects.get(camera_name)
+        image_path = view_dir / 'generated.png'
+        write_path = view_dir / 'write_mask_opaque.png'
+        if not write_path.is_file():
+            write_path = view_dir / 'write-mask.png'
+        targets = [(bpy.data.objects.get(e['object']), e) for e in entries]
+        targets = [(obj, e) for obj, e in targets if obj is not None and obj.active_material]
+        if (camera is None or camera.type != 'CAMERA' or not targets
+                or not image_path.is_file() or not write_path.is_file()):
+            print(f"[StableGen] Masked Edit layer {layer_id} ({camera_name}) not laid again: "
+                  "its camera or files are gone")
+            continue
+        if any(e['pbr'] for _obj, e in targets):
+            print(f"[StableGen] Masked Edit layer {layer_id}: its edited PBR maps are not laid again")
+        for obj, entry in targets:
+            # As begin_layers prepares a material, without copying it or the mesh
+            material = obj.active_material
+            for node in material.node_tree.nodes:
+                if node.label == FROZEN:
+                    node.label = FROZEN + ' Previous'
+                if node.name == COVERAGE:
+                    node.name = COVERAGE + ' Previous'
+            snapshot = bpy.data.images.get(entry['snapshot']) if entry['snapshot'] else None
+            if snapshot is not None:
+                mask_socket(material, snapshot)
+            source = color_socket(material)
+            before = output_node(material).inputs['Surface'].links[0].from_node
+            material['_sg_mask_shader'] = before.name if before.type in {'BSDF_PRINCIPLED', 'EMISSION'} else ''
+            if before.type in {'BSDF_PRINCIPLED', 'EMISSION'}:
+                material.node_tree.links.new(source, color_input(before))
+        # A camera moved since the edit projects from where the view was taken
+        matrix = targets[0][1].get('matrix')
+        view_camera = camera
+        if matrix is not None:
+            from mathutils import Matrix
+            taken = Matrix([matrix[i:i + 4] for i in range(0, 16, 4)])
+            if any(abs(a - b) > 1e-5 for row_a, row_b in zip(taken, camera.matrix_world)
+                   for a, b in zip(row_a, row_b)):
+                view_camera = camera.copy()
+                view_camera.matrix_world = taken
+                scene.collection.objects.link(view_camera)
+        previous = scene.get('_sg_masked_output')
+        scene['_sg_masked_output'] = str(view_dir)
+        try:
+            project_view(context, [obj for obj, _e in targets], view_camera, str(image_path), str(write_path),
+                         layer_id, targets[0][1]['expand'])
+            laid += 1
+        finally:
+            if previous is None:
+                del scene['_sg_masked_output']
+            else:
+                scene['_sg_masked_output'] = previous
+            if view_camera is not camera:
+                bpy.data.objects.remove(view_camera)
+    return laid
 
 
 class SG_OT_MaskedEdit(bpy.types.Operator):
@@ -1046,7 +1282,10 @@ class SG_OT_MaskedEdit(bpy.types.Operator):
                 raise ValueError('Set a valid output directory in StableGen preferences')
             if not context.scene.sg_masked_prompt.strip():
                 raise ValueError('Describe the requested edit first')
-            self.objects = [o for o in eligible_objects(context) if o.sg_edit_mask and MASK_UV in o.data.uv_layers]
+            reference = reference_path(context.scene)
+            if reference is not None and not Path(reference).is_file():
+                raise ValueError('Choose a reference image, or turn off Use Reference Image')
+            self.objects =[o for o in eligible_objects(context) if o.sg_edit_mask and MASK_UV in o.data.uv_layers]
             if not self.objects:
                 raise ValueError('Paint a selection on a target mesh first')
             for obj in self.objects:
@@ -1062,6 +1301,8 @@ class SG_OT_MaskedEdit(bpy.types.Operator):
             self.saved_active = context.view_layer.objects.active
             self.saved_selected = list(context.selected_objects)
             self.saved_timestamp = self.scene.output_timestamp
+            # Kept in the scene too: a file saved during the edit restores it on load.
+            self.scene['_sg_mask_run_timestamp'] = self.saved_timestamp
             self.saved_engine = self.scene.render.engine
             self.scene['_sg_mask_original_engine'] = self.saved_engine
             self.scene.output_timestamp = datetime.now().strftime('%Y-%m-%dT%H-%M-%S') + '-masked-' + uuid.uuid4().hex[:6]
@@ -1127,6 +1368,7 @@ class SG_OT_MaskedEdit(bpy.types.Operator):
             'expand_selection_px': int(self.scene.sg_masked_expand),
             'edge_softness_px': int(self.scene.sg_masked_feather),
             'use_depth': bool(self.scene.sg_masked_use_depth),
+            'reference_image': reference_path(self.scene),
             'custom_prompt': bool(self.scene.sg_masked_use_custom_prompt),
             'pbr_channels': sorted(getattr(self, 'pbr_channels', ())),
             'prompt_template': (self.scene.sg_masked_custom_prompt
@@ -1140,6 +1382,8 @@ class SG_OT_MaskedEdit(bpy.types.Operator):
             self.timer = None
         self.scene.camera = self.saved_camera
         self.scene.output_timestamp = self.saved_timestamp
+        if '_sg_mask_run_timestamp' in self.scene:
+            del self.scene['_sg_mask_run_timestamp']
         if not any(o.sg_mask_original for o in self.scene.objects):
             self.scene.render.engine = self.saved_engine
         for obj in context.view_layer.objects:
@@ -1187,6 +1431,8 @@ class SG_OT_MaskedEdit(bpy.types.Operator):
                 paths['overlay'] = overlay
             if depth:
                 paths['depth'] = depth
+            if reference_path(context.scene):
+                paths['reference'] = reference_path(context.scene)
             for key, path in paths.items():
                 uploaded = upload_image_to_comfyui(server, str(path), operator=self)
                 if not uploaded:
@@ -1201,7 +1447,8 @@ class SG_OT_MaskedEdit(bpy.types.Operator):
                     'prompt': context.scene.sg_masked_prompt,
                     'overlay': self.uploads.get('overlay'),
                     'depth': self.uploads.get('depth'),
-                    'prompt_template': (context.scene.sg_masked_custom_prompt
+                    'reference': self.uploads.get('reference'),
+                    'prompt_template':(context.scene.sg_masked_custom_prompt
                                         if context.scene.sg_masked_use_custom_prompt else None),
                 })
             else:
@@ -1300,8 +1547,12 @@ class SG_OT_MaskedEdit(bpy.types.Operator):
             with Image.open(self.result) as generated, Image.open(self.current_dir / 'context.png') as original:
                 if generated.size != original.size:
                     raise RuntimeError('Generated image dimensions differ from the camera render; refusing misaligned projection')
-                # Preserve original RGB outside the mask even in saved camera outputs.
                 mask = Image.open(self.write_mask).convert('L')
+                if 'A' in generated.getbands():
+                    mask = opaque_write_mask(mask, generated.getchannel('A'))
+                    self.write_mask = self.current_dir / 'write_mask_opaque.png'
+                    mask.save(self.write_mask)
+                # Preserve original RGB outside the mask even in saved camera outputs.
                 Image.composite(generated.convert('RGB'), original.convert('RGB'), mask).save(self.current_dir / 'composited.png')
             # Use raw generated RGB: the surface shader applies the feather once.
             self._stage = 'Projecting Result'
@@ -1507,6 +1758,13 @@ def draw_masked_edit_controls(layout, context):
     if scene.model_architecture in QWEN_ARCHITECTURES:
         layout.prop(scene, 'sg_masked_overlay')
         layout.prop(scene, 'sg_masked_use_depth')
+        layout.prop(scene, 'sg_masked_use_reference', toggle=True, icon='FILE_IMAGE')
+        if scene.sg_masked_use_reference:
+            box = layout.box()
+            box.prop(scene, 'sg_masked_reference_image', text='Image')
+            if scene.model_architecture == 'qwen_image_edit' and scene.sg_masked_use_depth:
+                box.label(text='Qwen Image Edit takes three images: the reference replaces the depth map.',
+                          icon='INFO')
         layout.prop(scene, 'sg_masked_use_custom_prompt', text='Custom Guidance Prompt', toggle=True, icon='TEXT')
         if scene.sg_masked_use_custom_prompt:
             box = layout.box()
@@ -1557,6 +1815,14 @@ def register_properties():
     bpy.types.Scene.sg_masked_use_depth = bpy.props.BoolProperty(
         name='Use Depth Map', default=False,
         description='Send the current camera depth as Image3 for structural guidance; useful for shape-sensitive edits but may weaken material or additive changes')
+    bpy.types.Scene.sg_masked_use_reference = bpy.props.BoolProperty(
+        name='Use Reference Image', default=False,
+        description='Send an image whose design the edit follows inside the selection, such as a logo, a pattern '
+                    'or a print, fitted to the surface. Qwen Image Edit takes three images, so the reference '
+                    'replaces the depth map there')
+    bpy.types.Scene.sg_masked_reference_image = bpy.props.StringProperty(
+        name='Reference Image', default='', subtype='FILE_PATH',
+        description='Image the edit follows, scaled to about 1 MP for the model')
     bpy.types.Scene.sg_masked_use_custom_prompt = bpy.props.BoolProperty(
         name='Use Custom Guidance Prompt', default=False,
         description='Override the default Qwen Masked Edit guidance prompt')
@@ -1593,6 +1859,6 @@ def unregister_properties():
         keymap.keymap_items.remove(item)
     _paint_keymaps.clear()
     for owner, names in ((bpy.types.Object, ('sg_edit_mask', 'sg_mask_paint_original', 'sg_mask_original', 'sg_mask_original_mesh')),
-                         (bpy.types.Scene, ('sg_mask_previous_canvas', 'sg_masked_prompt', 'sg_masked_overlay', 'sg_masked_use_depth', 'sg_masked_use_custom_prompt', 'sg_masked_custom_prompt', 'sg_masked_resolution', 'sg_masked_expand', 'sg_masked_feather', 'sg_masked_strength', 'sg_masked_update_pbr', 'sg_masked_status'))):
+                         (bpy.types.Scene, ('sg_mask_previous_canvas', 'sg_masked_prompt', 'sg_masked_overlay', 'sg_masked_use_depth', 'sg_masked_use_reference', 'sg_masked_reference_image', 'sg_masked_use_custom_prompt', 'sg_masked_custom_prompt', 'sg_masked_resolution', 'sg_masked_expand', 'sg_masked_feather', 'sg_masked_strength', 'sg_masked_update_pbr', 'sg_masked_status'))):
         for name in names:
             delattr(owner, name)

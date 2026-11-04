@@ -429,11 +429,13 @@ def register_properties(update_model_list, ControlNetUnit, LoRAUnit,
     bpy.types.Scene.qwen_image_21_native_rgba = bpy.props.BoolProperty(
         name="Native RGBA Output",
         description=(
-            "Wrap Qwen-Image 2.1 prompts with the native transparency instruction. "
-            "When enabled, transparent generated pixels are excluded from texture "
-            "projection. Disable it to let the prompt and model choose the background"
+            "Wrap Qwen-Image 2.1 prompts with the native transparency instruction, "
+            "so the model cuts the subject out on a transparent background. Off by "
+            "default: the model also cuts away surfaces it should paint, such as "
+            "ground and walls, which leaves them for worse-angled views. "
+            "Transparent generated pixels are never projected"
         ),
-        default=True,
+        default=False,
         update=update_parameters,
     )
     bpy.types.Scene.moss_depth_control = bpy.props.BoolProperty(
@@ -688,6 +690,15 @@ def register_properties(update_model_list, ControlNetUnit, LoRAUnit,
                     "with >500 faces",
         default=False, update=update_parameters
     )
+    bpy.types.Scene.sg_object_relative_projection = bpy.props.BoolProperty(
+        name="Object-Relative Projection",
+        description="Remember each camera relative to the textured object, so the texture stays put when the "
+                    "object is moved, rotated or scaled, when cameras are moved or removed, and when objects are "
+                    "added later. Self-occlusion is still ray traced per pixel, against the object alone; what "
+                    "other objects covered comes from per-camera ownership maps taken when the views were "
+                    "projected. Native Raycast path (Blender 5.1+); not combined with Bake Visibility Weights",
+        default=False, update=update_parameters
+    )
     bpy.types.Scene.discard_factor = bpy.props.FloatProperty(
         name="Discard Factor",
         description="If the texture is facing the camera at an angle greater than this value, it will be discarded. This is useful for preventing artifacts from the very edge of the generated texture appearing when keeping high discard factor (use ~65 for best results when generating textures around an object)",
@@ -892,6 +903,13 @@ def register_properties(update_model_list, ControlNetUnit, LoRAUnit,
         description="Prefer views that observe the surface more directly and with more projected detail. Estimates geometric observation quality, not the artistic quality of generated images.",
         default=TEXTURING_DEFAULTS["sg_rework_acquisition_quality"], update=update_parameters,
     )
+    bpy.types.Scene.sg_view_density_exponent = bpy.props.FloatProperty(
+        name="Distance weight",
+        description="With Weight by view quality: how much nearer views win where views overlap. Each view's weight "
+                    "is multiplied by its projected pixel density raised to this power; 0 ignores distance, 1 weighs "
+                    "a view at half the distance twice as much",
+        default=1.0, min=0.0, max=4.0, update=update_parameters,
+    )
     bpy.types.Scene.sg_rework_projection_guard = bpy.props.BoolProperty(
         name="Depth/Part Projection Guard",
         description="Reduce projection near depth and object/material boundaries to prevent foreground colors spilling onto surfaces behind them. DPPG controls source acceptance separately from ordinary view weighting.",
@@ -1032,7 +1050,7 @@ def register_properties(update_model_list, ControlNetUnit, LoRAUnit,
             ('image', 'Image', 'Use an existing image as input'),
             ('prompt', 'Prompt', 'Generate an image from the prompt first, then feed to TRELLIS.2'),
         ],
-        default='image', update=update_trellis2_generate_from
+        default='prompt', update=update_trellis2_generate_from
     )
     bpy.types.Scene.trellis2_texture_mode = bpy.props.EnumProperty(
         name="Texture Mode", description="How to generate textures for the 3D mesh",
@@ -1145,7 +1163,7 @@ def register_properties(update_model_list, ControlNetUnit, LoRAUnit,
     bpy.types.Scene.trellis2_preview_gallery_enabled = bpy.props.BoolProperty(
         name="Preview Gallery",
         description="When in prompt mode, generate multiple images with different seeds and let you pick the best one before proceeding to 3D generation",
-        default=False, update=update_parameters
+        default=True, update=update_parameters
     )
     bpy.types.Scene.trellis2_preview_gallery_count = bpy.props.IntProperty(
         name="Gallery Count", description="Number of images to generate per batch in the preview gallery",
@@ -1236,8 +1254,8 @@ def register_properties(update_model_list, ControlNetUnit, LoRAUnit,
         subtype='COLOR', default=(1.0, 0.0, 1.0), min=0.0, max=1.0, update=update_parameters
     )
     bpy.types.Scene.qwen_context_cleanup = bpy.props.BoolProperty(
-        name="Legacy fallback cleanup",
-        description="Clean fallback-color residue before projecting subsequent Qwen outputs in the legacy context path. Used when confidence-gated context is off.",
+        name="Fallback cleanup",
+        description="Recolor missing-context-color residue in each later Qwen output before it is projected.",
         default=False, update=update_parameters
     )
     bpy.types.Scene.qwen_context_cleanup_hue_tolerance = bpy.props.FloatProperty(
@@ -1246,28 +1264,28 @@ def register_properties(update_model_list, ControlNetUnit, LoRAUnit,
     )
     bpy.types.Scene.qwen_context_cleanup_value_adjust = bpy.props.FloatProperty(
         name="Brightness adjustment",
-        description="Brightness adjustment applied during legacy fallback cleanup. -1 darkens toward black; 0 preserves brightness; 1 brightens toward white.",
+        description="Brightness adjustment applied during fallback cleanup. -1 darkens toward black; 0 preserves brightness; 1 brightens toward white.",
         default=0.0, min=-1.0, max=1.0, update=update_parameters
     )
     bpy.types.Scene.qwen_context_fallback_dilation = bpy.props.IntProperty(
-        name="Legacy context expansion (px)",
-        description="In the legacy context path, expand missing-context regions by this many image pixels before sending the render to the model. Used when confidence-gated context is off.",
+        name="Context expansion (px)",
+        description="Expand the missing-context regions of each context render by this many image pixels before sending it to the model.",
         default=1, min=0, max=64, update=update_parameters
     )
     bpy.types.Scene.qwen_use_confidence_context = bpy.props.BoolProperty(
-        name="Protect reliable context",
-        description="Protect context observed reliably by previous source cameras and mark unreliable regions for regeneration. This confidence decision is separate from the displayed RGB mixture.",
+        name="Confidence-Gated Context",
+        description="Replace the context weighting: each later view keeps only the context whose best earlier source view reaches the minimum trusted view quality, and everything below it is blanked to the missing-context color and generated again. The displayed RGB blend is unchanged.",
         default=TEXTURING_DEFAULTS["qwen_use_confidence_context"], update=update_parameters,
     )
     bpy.types.Scene.qwen_regularize_context_mask = bpy.props.BoolProperty(
-        name="Clean repair-mask boundaries",
-        description="Clean fragmented repair-mask boundaries using the island, hole, strip and expansion controls below. Experimental.",
+        name="Regularize Context Boundary",
+        description="Clean up the missing-context mask of each context render before it is blanked: drop small kept islands, fill small missing holes, close thin kept strips and expand missing regions by the settings below, separately within each object and material.",
         default=TEXTURING_DEFAULTS["qwen_regularize_context_mask"], update=update_parameters,
     )
     bpy.types.Scene.qwen_trust_threshold = bpy.props.FloatProperty(
         name="Minimum trusted view quality",
-        description="Minimum geometric source-view quality needed to protect existing context. Higher values mark more surface for repair; this is not an artistic image-quality score.",
-        default=0.70, min=0.0, max=1.0, update=update_parameters,
+        description="Minimum geometric source-view quality needed to keep existing context. Higher values blank more surface for regeneration; this is not an artistic image-quality score.",
+        default=0.50, min=0.0, max=1.0, update=update_parameters,
     )
     bpy.types.Scene.qwen_mask_min_island_area = bpy.props.IntProperty(
         name="Minimum trusted island (px²)",
@@ -1326,6 +1344,17 @@ def register_properties(update_model_list, ControlNetUnit, LoRAUnit,
     bpy.types.Scene.use_camera_prompts = bpy.props.BoolProperty(
         name="Use view prompts", description="Include each camera’s view prompt with the shared generation prompt. Use view prompts for viewing direction or details belonging to that view.",
         default=True, update=update_parameters
+    )
+    bpy.types.Scene.use_object_prompts = bpy.props.BoolProperty(
+        name="Use object prompts",
+        description="Add each described object's prompt to the views that see it, largest first. Describe an object "
+                    "from an open camera card's Objects in view",
+        default=False, update=update_parameters
+    )
+    bpy.types.Object.sg_object_prompt = bpy.props.StringProperty(
+        name="Object prompt",
+        description="Describes this object. With Use object prompts, every view that sees it includes this text",
+        default=""
     )
     bpy.types.Scene.sg_camera_order = bpy.props.CollectionProperty(
         type=CameraOrderItem, name="Camera Generation Order",
@@ -1461,6 +1490,28 @@ def register_properties(update_model_list, ControlNetUnit, LoRAUnit,
         name="SkinTokens Auto-Rig Available",
         description="Whether the StableGen SkinTokens auto-rig node is available on the ComfyUI server (auto-detected)",
         default=False
+    )
+    # ── Mesh tools (ComfyUI-LATO2) ──────────────────────────────────────
+    bpy.types.Scene.meshtools_lato2_available = bpy.props.BoolProperty(
+        name="LATO.2 Available",
+        description="Whether ComfyUI-LATO2's LATO2Remesh node is available on the ComfyUI server (auto-detected)",
+        default=False
+    )
+    bpy.types.Scene.show_meshtools = bpy.props.BoolProperty(
+        name="Show Mesh Tools", description="Toggle the mesh tools section", default=False
+    )
+    bpy.types.Scene.meshtools_hide_source = bpy.props.BoolProperty(
+        name="Hide Source",
+        description="Hide the source object after a remeshed or edited copy is imported",
+        default=True
+    )
+    bpy.types.Scene.meshtools_lato2_vertices = bpy.props.IntProperty(
+        name="Vertices",
+        description="Target vertex count of the low-poly mesh (LATO.2 generates 200 to 5000 vertices)",
+        default=2000, min=200, max=5000, step=100
+    )
+    bpy.types.Scene.meshtools_lato2_seed = bpy.props.IntProperty(
+        name="Seed", description="Random seed for LATO.2", default=42, min=0
     )
     bpy.types.Scene.show_trellis2_params = bpy.props.BoolProperty(
         name="Show TRELLIS.2 Section", description="Toggle TRELLIS.2 Image-to-3D section", default=False
@@ -1691,6 +1742,7 @@ def register_properties(update_model_list, ControlNetUnit, LoRAUnit,
             ('none', "None (Trimesh)", "Keep triangles (raw or decimated) - no retopology solver"),
             ('qdc', "QDC (Server)", "Quad Dual Contouring - uniform server-side quad remeshing (handles both decimation and remeshing natively)"),
             ('quadriflow', "Quadriflow (Local) [Experimental]", "Curvature-adaptive local quad retopology in Blender (Zero-dependency). Note: Experimental, might produce artifacts"),
+            ('lato2', "LATO.2 Low-Poly (Server)", "Rebuild the mesh with generated low-poly topology (200 to 5000 vertices) on the ComfyUI server; needs the LATO.2 package (ComfyUI-LATO2). Shape-only and diffusion texturing, not native TRELLIS.2 textures"),
         ],
         default='qdc',
         update=update_parameters
@@ -1704,6 +1756,14 @@ def register_properties(update_model_list, ControlNetUnit, LoRAUnit,
         name="Solidify Mesh",
         description="Apply watertight capping and hollowing to delete internal geometry, saving UV and texture space",
         default=False, update=update_parameters
+    )
+    bpy.types.Scene.trellis2_solidify_seal_bottom = bpy.props.BoolProperty(
+        name="Close Bottom Openings",
+        description=(
+            "Treat the object's underside as closed while finding interior geometry, so a hollow mesh open at "
+            "the bottom (outer and inner shell joined at the rim) becomes solid with a capped bottom"
+        ),
+        default=True, update=update_parameters
     )
     bpy.types.Scene.trellis2_autorig_enabled = bpy.props.BoolProperty(
         name="Auto-Rig",
@@ -2111,6 +2171,7 @@ def unregister_properties(load_handler, _sg_queue_load_handler):
         'generation_progress',
         'overwrite_material',
         'bake_visibility_weights',
+        'sg_object_relative_projection',
         'discard_factor',
         'discard_factor_generation_only',
         'discard_factor_after_generation',
@@ -2153,6 +2214,7 @@ def unregister_properties(load_handler, _sg_queue_load_handler):
         'sg_rework_aligned_resolution',
         'sg_rework_full_resolution_scale',
         'sg_rework_acquisition_quality',
+        'sg_view_density_exponent',
         'sg_rework_projection_guard',
         'qwen_global_style_vlm_only',
         'qwen_context_vlm_only',
@@ -2197,6 +2259,7 @@ def unregister_properties(load_handler, _sg_queue_load_handler):
         'output_timestamp',
         'camera_prompts',
         'use_camera_prompts',
+        'use_object_prompts',
         'sg_camera_order',
         'sg_camera_order_index',
         'sg_use_custom_camera_order',
@@ -2251,6 +2314,8 @@ def unregister_properties(load_handler, _sg_queue_load_handler):
     for prop in _simple_scene_props:
         if hasattr(bpy.types.Scene, prop):
             delattr(bpy.types.Scene, prop)
+    if hasattr(bpy.types.Object, 'sg_object_prompt'):
+        del bpy.types.Object.sg_object_prompt
 
     # --- PBR Decomposition Properties ---
     pbr_props = [
@@ -2310,7 +2375,7 @@ def unregister_properties(load_handler, _sg_queue_load_handler):
         'trellis2_texture_size', 'trellis2_decimation', 'trellis2_remesh',
         'trellis2_decimate_method', 'trellis2_remesh_method',
         'trellis2_post_processing_enabled',
-        'trellis2_solidify',
+        'trellis2_solidify', 'trellis2_solidify_seal_bottom',
         'trellis2_autorig_enabled', 'trellis2_autorig_use_transfer',
         'trellis2_autorig_use_skeleton', 'trellis2_autorig_use_postprocess',
         'trellis2_autorig_cleanup_cross_limb_weights',
@@ -2322,6 +2387,8 @@ def unregister_properties(load_handler, _sg_queue_load_handler):
         'trellis2_autorig_hf_path',
         'trellis2_auto_lighting',
         'trellis2_skip_texture', 'trellis2_bg_removal', 'trellis2_background_color',
+        'meshtools_lato2_available', 'show_meshtools', 'meshtools_hide_source', 'meshtools_lato2_vertices',
+        'meshtools_lato2_seed',
     ]
     for prop in trellis2_props:
         if hasattr(bpy.types.Scene, prop):

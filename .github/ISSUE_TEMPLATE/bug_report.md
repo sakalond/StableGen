@@ -44,8 +44,8 @@ PASTE COMFYUI SERVER LOGS HERE
 * **ComfyUI Installation:** [e.g., Standard local install]
 * **GPU:** [e.g., NVIDIA RTX 3080]
 
-* **StableGen Installation Method:** [e.g., `installer.py` (Recommended), Manual] (See `README.md`)
-    * If `installer.py` was used, which package was selected? [e.g., Minimal, Essential, Recommended, Complete SDXL] (See `installer.py`)
+* **ComfyUI setup:** [e.g., StableGen's own, My ComfyUI folder, Remote server, Manual] (See StableGen's add-on preferences)
+    * Which models are installed? [e.g., SDXL, Qwen Image 2.1, TRELLIS.2] (Preferences > Models, or `installer.py --list` on a remote server)
 
 **StableGen Parameters (if relevant):**
 

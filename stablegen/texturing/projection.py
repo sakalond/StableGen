@@ -1,12 +1,15 @@
 from ..core.feature_flags import experimental_enabled
 import bpy
 import os
+import re
+from functools import partial
 from math import atan, tan, pi
 
 from ..utils import get_last_material_index, get_file_path, get_dir_path
 from .rendering import prepare_baking, bake_texture, unwrap
 from ..cameras.geometry import _get_camera_resolution
 from mathutils import Matrix, Vector
+from .graph_controls import early_priority_share as _early_priority_share
 from .jobs import operation
 from .projection_cache import eligible as _cache_eligible, configuration as _cache_configuration, graph_state as _graph_state, asset_state as _asset_state
 from .svm_budget import SVM_STACK_SIZE, estimate_svm_stack
@@ -245,14 +248,28 @@ def _scene_projection_scale(context):
 
 
 def _multiply_projection_weight_by_alpha(
-    nodes, links, weight_node, image_node, label
+    nodes, links, weight_node, image_node, label, threshold=None
 ):
-    """Return a projection weight multiplied by an image's alpha channel."""
+    """Return a projection weight multiplied by an image's alpha channel.
+
+    With ``threshold`` the weight is gated on alpha instead: the weights are
+    normalized afterwards, so a nearly transparent pixel that is the only
+    view of a surface would otherwise count fully, with its color already
+    multiplied by that alpha (Cycles premultiplies straight-alpha images).
+    """
+    alpha = image_node.outputs["Alpha"]
+    if threshold is not None:
+        gate = nodes.new("ShaderNodeMath")
+        gate.operation = 'GREATER_THAN'
+        gate.inputs[1].default_value = threshold
+        gate.label = f"{label} gate"
+        links.new(alpha, gate.inputs[0])
+        alpha = gate.outputs[0]
     alpha_weighted = nodes.new("ShaderNodeMath")
     alpha_weighted.operation = 'MULTIPLY'
     alpha_weighted.label = label
     links.new(weight_node.outputs[0], alpha_weighted.inputs[0])
-    links.new(image_node.outputs["Alpha"], alpha_weighted.inputs[1])
+    links.new(alpha, alpha_weighted.inputs[1])
     return alpha_weighted
 
 
@@ -310,6 +327,30 @@ def _copy_uv_to_attribute(obj, uv_layer_name, attr_name):
     attr = obj.data.attributes.new(name=attr_name, type='FLOAT_VECTOR', domain='CORNER')
     attr.data.foreach_set("vector", vec_buf)
     obj.data.update()
+
+
+def _remove_stale_uv_projectors(obj):
+    """Remove UV Project modifiers that target the temporary buffer UV map.
+
+    Only a failed projection leaves one behind. Blender 5 writes such a
+    modifier into the active UV map, so it must not stay on the object.
+    """
+    for modifier in [m for m in obj.modifiers
+                     if m.type == 'UV_PROJECT' and m.uv_layer == _SG_BUFFER_UV_NAME]:
+        obj.modifiers.remove(modifier)
+
+
+def _apply_uv_projector(context, obj, modifier):
+    """Apply *modifier* on *obj* even when the caller's context names another
+    object (Studio diagnostics pin the inspected camera), and fail loudly."""
+    name = modifier.name  # the applied modifier is freed
+    with context.temp_override(object=obj, active_object=obj,
+                               selected_objects=[obj], selected_editable_objects=[obj]):
+        bpy.ops.object.modifier_apply(modifier=name)
+    left = obj.modifiers.get(name)
+    if left is not None:
+        obj.modifiers.remove(left)
+        raise RuntimeError(f"Could not apply the camera projection to {obj.name}.")
 
 
 def _projection_uvw_name(camera_index, mat_id):
@@ -549,6 +590,349 @@ def _warn_coarse_projection_faces(objects, cameras, mat_id, reason):
 def _projection_uv_output(node):
     """UV socket of a projection UV node (attribute, UV map or built chain)."""
     return node.outputs["Vector"] if "Vector" in node.outputs else node.outputs["UV"]
+
+
+# ── Object-relative projection ────────────────────────────────────────────
+# The native visibility test compares the shading point with each camera in
+# world space, so moving a textured object, moving a camera or adding an
+# occluder later changes which camera colours it.  With
+# ``sg_object_relative_projection`` the test runs in the frame the object had
+# when the views were projected: the point and normal are mapped back into
+# that frame, the self-occlusion ray starts from the camera carried along with
+# the object (Raycast "Only Local"), and occlusion by other objects comes from
+# per-camera ownership maps rendered at projection time.
+
+def _frame_prop(mat_id, kind, row):
+    """Object property with one row of the object's world matrix when ``mat_id``'s views were projected:
+    ``kind`` '' the matrix, 'Inv' its inverse."""
+    return f"_SG_Frame{kind}_{mat_id}_{row}"
+
+
+def _owner_prop(mat_id):
+    """Object property with the object's flat colour in ``mat_id``'s ownership maps."""
+    return f"_SG_Owner_{mat_id}"
+
+
+def _store_projection_frame(obj, mat_id, replace):
+    """Remember where ``obj`` was when ``mat_id``'s views were projected. ``replace`` is set when this projection
+    recomputed the projection UVs; otherwise the frame those UVs were made in stays, and a duplicate, which
+    copies its source's UVs and properties, keeps its source's texture."""
+    if not replace and _frame_prop(mat_id, '', 0) in obj:
+        return
+    matrix = obj.matrix_world.copy()
+    inverse = matrix.inverted_safe()
+    for row in range(3):
+        obj[_frame_prop(mat_id, '', row)] = tuple(matrix[row])
+        obj[_frame_prop(mat_id, 'Inv', row)] = tuple(inverse[row])
+    # Writing custom properties does not tell the depsgraph: the viewport's engines kept reading the frame as
+    # missing and drew the object black until something else updated it.
+    obj.update_tag()
+
+
+def _projection_anchor_nodes(nodes, links, mat_id):
+    """Build one material's object-relative inputs: ``position`` and ``normal`` (the shading point and normal in
+    the frame the object had when ``mat_id``'s views were projected), ``current_position`` (the shading point in
+    today's world) and ``current(point)``, which carries a projection-time point such as a camera along with the
+    object to where it is now. The frame rows are per-object properties read with Attribute (Object) nodes, so a
+    material shared by several objects stays right for each."""
+    def node(kind, label, **settings):
+        new = nodes.new(kind)
+        new.label = f"{label}-{mat_id}"
+        new['sg_layout_stage'] = 'Object-relative frame'
+        for name, value in settings.items():
+            setattr(new, name, value)
+        return new
+
+    def rows(kind):
+        return [node("ShaderNodeAttribute", f"Frame{kind}Row{r}", attribute_type='OBJECT',
+                     attribute_name=_frame_prop(mat_id, kind, r)) for r in range(3)]
+
+    def apply(row_nodes, vector, affine, label):
+        combine = node("ShaderNodeCombineXYZ", label)
+        for r, row in enumerate(row_nodes):
+            dot = node("ShaderNodeVectorMath", f"{label}Row{r}", operation='DOT_PRODUCT')
+            links.new(row.outputs["Vector"], dot.inputs[0])
+            if isinstance(vector, Vector):
+                dot.inputs[1].default_value = vector
+            else:
+                links.new(vector, dot.inputs[1])
+            value = dot.outputs["Value"]
+            if affine:
+                offset = node("ShaderNodeMath", f"{label}Offset{r}", operation='ADD')
+                links.new(value, offset.inputs[0])
+                links.new(row.outputs["Alpha"], offset.inputs[1])
+                value = offset.outputs[0]
+            links.new(value, combine.inputs[r])
+        return combine.outputs["Vector"]
+
+    coordinates = node("ShaderNodeTexCoord", "ObjectPoint")
+    position = apply(rows(''), coordinates.outputs["Object"], True, "ProjectionFramePoint")
+    geometry = node("ShaderNodeNewGeometry", "CurrentSurface")
+    to_object = node("ShaderNodeVectorTransform", "NormalToObject", vector_type='NORMAL',
+                     convert_from='WORLD', convert_to='OBJECT')
+    links.new(geometry.outputs["Normal"], to_object.inputs[0])
+    inverse_rows = rows('Inv')
+    # The frame's normal matrix is its inverse transposed, so the normal is the inverse's rows weighted by the
+    # normal's components. Rows of its own made ten object attributes with the owner colour, and EEVEE reads only
+    # eight per material (GPU_MAX_UNIFORM_ATTR): the rest read as zero and Material Preview drew the object black.
+    axes = node("ShaderNodeSeparateXYZ", "NormalToObjectAxes")
+    links.new(to_object.outputs[0], axes.inputs[0])
+    raw = None
+    for r, row in enumerate(inverse_rows):
+        term = node("ShaderNodeVectorMath", f"ProjectionFrameNormalRow{r}", operation='SCALE')
+        links.new(row.outputs["Vector"], term.inputs[0])
+        links.new(axes.outputs[r], term.inputs["Scale"])
+        if raw is None:
+            raw = term.outputs["Vector"]
+            continue
+        total = node("ShaderNodeVectorMath", f"ProjectionFrameNormalSum{r}", operation='ADD')
+        links.new(raw, total.inputs[0])
+        links.new(term.outputs["Vector"], total.inputs[1])
+        raw = total.outputs["Vector"]
+    normal = node("ShaderNodeVectorMath", "ProjectionFrameNormal", operation='NORMALIZE')
+    links.new(raw, normal.inputs[0])
+
+    def current(point, after=None):
+        # ``after`` (the previous camera's raycast result) delays the carried point, and with it the whole
+        # ray, until that raycast: one camera's ray inputs wait on the SVM stack at a time, not every camera's.
+        value = Vector(point)
+        if after is not None:
+            bound = node("ShaderNodeMath", "CarriedPointAfterRaycastBound", operation='MAXIMUM')
+            bound.inputs[1].default_value = 1e30
+            links.new(after, bound.inputs[0])
+            bounds = node("ShaderNodeCombineXYZ", "CarriedPointAfterRaycastBounds")
+            for axis in range(3):
+                links.new(bound.outputs[0], bounds.inputs[axis])
+            late = node("ShaderNodeVectorMath", "CarriedPointAfterRaycast", operation='MINIMUM')
+            late.inputs[0].default_value = value
+            links.new(bounds.outputs[0], late.inputs[1])
+            value = late.outputs["Vector"]
+        to_world = node("ShaderNodeVectorTransform", "CarriedToWorld", vector_type='POINT',
+                        convert_from='OBJECT', convert_to='WORLD')
+        links.new(apply(inverse_rows, value, True, "CarriedPoint"), to_world.inputs[0])
+        return to_world.outputs[0]
+
+    return {'position': position, 'normal': normal.outputs["Vector"],
+            'current_position': geometry.outputs["Position"], 'current': current}
+
+
+def _render_ownership_maps(context, cameras, mat_id, replace):
+    """Per-camera ownership maps for object-relative projection: which object each pixel of each camera showed
+    when ``mat_id``'s views were projected, as a flat colour per object (32-bit EXR at the camera's projection
+    resolution, the generated images' pixel grid). ``replace`` renders them all again, for a projection that
+    recomputed the projection UVs; otherwise only missing maps are rendered and the rest are reused, as later
+    sequential steps and previews project the same views. Returns the maps' atlas (see _ownership_atlas)."""
+    scene = context.scene
+    directory = get_dir_path(context, 'inpaint')['visibility']
+    os.makedirs(directory, exist_ok=True)
+    paths = [os.path.join(directory, f"projection_ownership{i}-{mat_id}.exr") for i in range(len(cameras))]
+    missing = [i for i, path in enumerate(paths) if replace or not os.path.isfile(path)]
+    if not missing:
+        return _ownership_atlas(paths, mat_id, rebuild=False)
+    key = _owner_prop(mat_id)
+    meshes = [obj for obj in scene.objects if obj.type == 'MESH']
+    # A partial render keeps the colours the remaining maps already use.
+    keep = len(missing) < len(paths)
+    taken = {tuple(round(c * 255) for c in obj[key]) for obj in meshes if keep and key in obj}
+    index = 0
+    for obj in meshes:
+        if keep and key in obj:
+            continue
+        index += 1
+        while ((index >> 16) & 255, (index >> 8) & 255, index & 255) in taken:
+            index += 1
+        obj[key] = tuple(c / 255.0 for c in ((index >> 16) & 255, (index >> 8) & 255, index & 255))
+        obj.update_tag()        # the viewport reads the colour through the depsgraph (see _store_projection_frame)
+
+    material = bpy.data.materials.new("SG Ownership")
+    material.use_nodes = True
+    tree = material.node_tree
+    tree.nodes.clear()
+    attribute = tree.nodes.new("ShaderNodeAttribute")
+    attribute.attribute_type = 'OBJECT'
+    attribute.attribute_name = key
+    emission = tree.nodes.new("ShaderNodeEmission")
+    output = tree.nodes.new("ShaderNodeOutputMaterial")
+    tree.links.new(attribute.outputs["Color"], emission.inputs["Color"])
+    tree.links.new(emission.outputs[0], output.inputs["Surface"])
+    world = bpy.data.worlds.new("SG Ownership World")
+    world.use_nodes = True
+    world.node_tree.nodes["Background"].inputs["Color"].default_value = (0, 0, 0, 1)
+
+    render, cycles, view = scene.render, scene.cycles, scene.view_settings
+    settings = render.image_settings
+    # One sample at each pixel centre, the flat colours written unchanged. Restored in this order, so the
+    # file format is back before its colour depth.
+    overrides = [
+        (render, 'engine', 'CYCLES'), (cycles, 'samples', 1), (cycles, 'use_denoising', False),
+        (cycles, 'filter_width', 0.01), (cycles, 'film_exposure', 1.0), (cycles, 'sample_clamp_direct', 0.0),
+        (cycles, 'sample_clamp_indirect', 0.0), (render, 'film_transparent', False),
+        (render, 'use_motion_blur', False), (render, 'use_border', False), (render, 'use_multiview', False),
+        (render, 'use_compositing', False), (render, 'use_sequencer', False),
+        (render, 'use_single_layer', True), (render, 'resolution_percentage', 100), (scene, 'world', world),
+        (context.view_layer, 'material_override', material),
+        (view, 'view_transform', 'Standard'), (view, 'look', 'None'), (view, 'exposure', 0.0),
+        (view, 'gamma', 1.0), (settings, 'file_format', 'OPEN_EXR'), (settings, 'color_depth', '32'),
+        (settings, 'color_mode', 'RGB'),
+    ]
+    restore = [(owner, name, getattr(owner, name)) for owner, name, _value in overrides]
+    restore += [(scene, 'camera', scene.camera), (render, 'resolution_x', render.resolution_x),
+                (render, 'resolution_y', render.resolution_y), (render, 'filepath', render.filepath)]
+    try:
+        for owner, name, value in overrides:
+            setattr(owner, name, value)
+        for i in missing:
+            scene.camera = cameras[i]
+            render.resolution_x, render.resolution_y = _get_camera_resolution(cameras[i], scene)
+            render.filepath = paths[i]
+            bpy.ops.render.render(write_still=True)
+    finally:
+        for owner, name, value in restore:
+            setattr(owner, name, value)
+        bpy.data.materials.remove(material)
+        bpy.data.worlds.remove(world)
+    return _ownership_atlas(paths, mat_id, rebuild=True)
+
+
+def _ownership_atlas(paths, mat_id, rebuild):
+    """Pack the cameras' ownership maps into one image. EEVEE fits only so many image textures in a material: with
+    the raycasts, six generated images and six maps already drew Material Preview black. 8-bit holds the flat
+    owner colours exactly. ``rebuild`` packs the maps again (some were rendered anew). Returns the atlas path, each
+    camera's (x, y, width, height) in it, bottom-left origin like image pixels, and the atlas size."""
+    import numpy as np
+
+    path = os.path.join(os.path.dirname(paths[0]), f"projection_ownership_atlas-{mat_id}.png")
+    maps = [bpy.data.images.load(map_path, check_existing=False) for map_path in paths]
+    try:
+        sizes = [tuple(image.size) for image in maps]
+        # Rows well inside the GPU's 16384 pixel texture limit
+        limit = max(8192, max(width for width, _height in sizes))
+        rects, x, y, row = [], 0, 0, 0
+        for width, height in sizes:
+            if x and x + width > limit:
+                x, y, row = 0, y + row, 0
+            rects.append((x, y, width, height))
+            x, row = x + width, max(row, height)
+        size = (max(rx + rw for rx, _ry, rw, _rh in rects), y + row)
+        if rebuild or not os.path.isfile(path):
+            atlas = np.zeros((size[1], size[0], 4), dtype=np.float32)
+            atlas[..., 3] = 1.0
+            for image, (x, y, width, height) in zip(maps, rects):
+                pixels = np.empty(width * height * 4, dtype=np.float32)
+                image.pixels.foreach_get(pixels)
+                atlas[y:y + height, x:x + width] = pixels.reshape(height, width, 4)
+            packed = bpy.data.images.new("SG Ownership Atlas", size[0], size[1])
+            try:
+                packed.colorspace_settings.name = 'Non-Color'
+                packed.pixels.foreach_set(atlas.ravel())
+                packed.filepath_raw = path
+                packed.file_format = 'PNG'
+                packed.save()
+            finally:
+                bpy.data.images.remove(packed)
+            get_or_load_image(path, force_reload=True)    # an atlas loaded before must show the new maps
+    finally:
+        for image in maps:
+            bpy.data.images.remove(image)
+    return path, rects, size
+
+
+def _ownership_test(nodes, links, atlas, uv_node, mat_id, i, owner_cache, after):
+    """1 where camera ``i``'s ownership map shows this object at the shading point's projection UV, else 0: an
+    equality test on the generated image's own pixel grid, so another object that stood in front when the views
+    were projected keeps its pixels, and objects added or moved since then change nothing. ``atlas`` is
+    _ownership_atlas's result, ``owner_cache`` holds the material's one owner-colour node. The map is read through
+    ``after`` (the camera's raycast result), like the generated image, so Cycles does not keep every camera's
+    sample on the stack until the raycasts."""
+    path, rects, (atlas_width, atlas_height) = atlas
+    x, y, width, height = rects[i]
+    image = get_or_load_image(path)
+    if image is None:
+        return None
+    image.colorspace_settings.name = 'Non-Color'
+    texture = nodes.new("ShaderNodeTexImage")
+    texture.image = image
+    texture.interpolation = 'Closest'
+    texture.extension = 'EXTEND'
+    texture.label = f"Ownership-{i}-{mat_id}"
+    texture['sg_layout_stage'] = 'Raycast visibility'
+    bound = nodes.new("ShaderNodeMath")
+    bound.operation = 'MAXIMUM'
+    bound.inputs[1].default_value = 1e30
+    links.new(after, bound.inputs[0])
+    bounds = nodes.new("ShaderNodeCombineXYZ")
+    for axis in range(3):
+        links.new(bound.outputs[0], bounds.inputs[axis])
+    late_uv = nodes.new("ShaderNodeVectorMath")
+    late_uv.operation = 'MINIMUM'
+    late_uv.label = f"OwnershipUVAfterRaycast-{i}-{mat_id}"
+    links.new(_projection_uv_output(uv_node), late_uv.inputs[0])
+    links.new(bounds.outputs[0], late_uv.inputs[1])
+    # The camera's tile, held half a pixel inside it: outside its view (where the camera has no weight) a point
+    # reads the tile's edge rather than a neighbouring camera's map.
+    low = nodes.new("ShaderNodeVectorMath")
+    low.operation = 'MAXIMUM'
+    low.inputs[1].default_value = (0.5 / width, 0.5 / height, 0.0)
+    links.new(late_uv.outputs["Vector"], low.inputs[0])
+    high = nodes.new("ShaderNodeVectorMath")
+    high.operation = 'MINIMUM'
+    high.inputs[1].default_value = (1.0 - 0.5 / width, 1.0 - 0.5 / height, 0.0)
+    links.new(low.outputs["Vector"], high.inputs[0])
+    tile = nodes.new("ShaderNodeVectorMath")
+    tile.operation = 'MULTIPLY_ADD'
+    tile.label = f"OwnershipTile-{i}-{mat_id}"
+    tile.inputs[1].default_value = (width / atlas_width, height / atlas_height, 0.0)
+    tile.inputs[2].default_value = (x / atlas_width, y / atlas_height, 0.0)
+    links.new(high.outputs["Vector"], tile.inputs[0])
+    links.new(tile.outputs["Vector"], texture.inputs["Vector"])
+    for helper in (bound, bounds, late_uv, low, high, tile):
+        helper.hide = True
+        helper['sg_layout_stage'] = 'Raycast visibility'
+    if 'owner' not in owner_cache:
+        owner = nodes.new("ShaderNodeAttribute")
+        owner.attribute_type = 'OBJECT'
+        owner.attribute_name = _owner_prop(mat_id)
+        owner.label = f"OwnerColour-{mat_id}"
+        owner['sg_layout_stage'] = 'Object-relative frame'
+        # An object without a colour (added to the material later) must not own the black background.
+        present = nodes.new("ShaderNodeVectorMath")
+        present.operation = 'LENGTH'
+        links.new(owner.outputs["Vector"], present.inputs[0])
+        has_owner = nodes.new("ShaderNodeMath")
+        has_owner.operation = 'GREATER_THAN'
+        has_owner.inputs[1].default_value = 0.5 / 255.0
+        links.new(present.outputs["Value"], has_owner.inputs[0])
+        owner_cache['owner'], owner_cache['present'] = owner, has_owner
+    distance = nodes.new("ShaderNodeVectorMath")
+    distance.operation = 'DISTANCE'
+    links.new(texture.outputs["Color"], distance.inputs[0])
+    links.new(owner_cache['owner'].outputs["Vector"], distance.inputs[1])
+    match = nodes.new("ShaderNodeMath")
+    match.operation = 'LESS_THAN'
+    match.inputs[1].default_value = 0.25 / 255.0
+    links.new(distance.outputs["Value"], match.inputs[0])
+    # Only another object's colour means something covered this point. The background shows where the pixel's
+    # centre fell just off this object's own outline; rejecting it left the outline's texels to no camera at all
+    # where every view sees that edge from the side (black specks along a wall's top edge).
+    shown = nodes.new("ShaderNodeVectorMath")
+    shown.operation = 'LENGTH'
+    links.new(texture.outputs["Color"], shown.inputs[0])
+    background = nodes.new("ShaderNodeMath")
+    background.operation = 'LESS_THAN'
+    background.inputs[1].default_value = 0.5 / 255.0
+    links.new(shown.outputs["Value"], background.inputs[0])
+    uncovered = nodes.new("ShaderNodeMath")
+    uncovered.operation = 'MAXIMUM'
+    links.new(match.outputs[0], uncovered.inputs[0])
+    links.new(background.outputs[0], uncovered.inputs[1])
+    owned = nodes.new("ShaderNodeMath")
+    owned.operation = 'MINIMUM'
+    owned.label = f"OwnedPixel-{i}-{mat_id}"
+    links.new(uncovered.outputs[0], owned.inputs[0])
+    links.new(owner_cache['present'].outputs[0], owned.inputs[1])
+    for helper in (distance, match, shown, background, uncovered, owned):
+        helper['sg_layout_stage'] = 'Raycast visibility'
+    return owned.outputs[0]
 
 
 def _bake_visibility_weights(
@@ -886,11 +1270,12 @@ def _bake_visibility_weights(
                     _scene_projection_scale(context) * focal_pixels
                     / np.maximum(dists, 1e-8)
                 )
-            density_confidence = np.clip(
+            # Unclamped and only with view-quality weighting, like the live
+            # material's density term (see there).
+            density_confidence = np.power(
                 projected_span / max(0.5 * min(cam_res_x_n, cam_res_y_n), 1.0),
-                0.0,
-                1.0,
-            )
+                getattr(scene, 'sg_view_density_exponent', 1.0),
+            ) if getattr(scene, 'sg_rework_acquisition_quality', False) else 1.0
             # Store unsharpened acquisition quality.  The material owns the
             # single authoritative SharpW exponent stage.
             w = np.maximum(dot_dn, 0.0) * density_confidence
@@ -928,7 +1313,7 @@ def _bake_visibility_weights(
 
 
 def create_native_raycast_visibility(nodes, links, camera, geometry, context, i, mat_id, stop_index,
-                                     pre_factors=None, extra=None):
+                                     pre_factors=None, extra=None, anchor=None, owned=None):
     """
     Creates a visibility weight node group using the native Raycast shader node (Blender 5.1+).
     Replicates the OSL raycast.osl shader logic:
@@ -936,6 +1321,13 @@ def create_native_raycast_visibility(nodes, links, camera, geometry, context, i,
       2. Occlusion check (Raycast from camera, compare Hit Distance with expected distance)
       3. Angle check (surface normal vs ray direction)
       4. Weight = pow(orthogonality, Power)
+
+    ``anchor`` (``_projection_anchor_nodes``) makes it object-relative: the
+    frustum, angle and distance terms use the point and normal in the frame
+    the object had at projection time, the occlusion ray starts from the
+    camera carried along with the object and tests only the object itself
+    ("Only Local"), and ``owned`` (``_ownership_test``) rejects what another
+    object covered at projection time.
 
     Cycles compiles the raycast one sweep after the camera math (its direction
     is converted to a normal), so the raycast-free terms are multiplied first
@@ -968,7 +1360,9 @@ def create_native_raycast_visibility(nodes, links, camera, geometry, context, i,
     normalize_node.operation = 'NORMALIZE'
     normalize_node.location = (x_base, -500 + y_base)
 
-    links.new(geometry.outputs["Position"], subtract.inputs[0])
+    surface_position = anchor['position'] if anchor else geometry.outputs["Position"]
+    surface_normal = anchor['normal'] if anchor else geometry.outputs["Normal"]
+    links.new(surface_position, subtract.inputs[0])
     links.new(subtract.outputs["Vector"], normalize_node.inputs[0])
 
     # --- Length (camera-to-surface distance) ---
@@ -1163,14 +1557,37 @@ def create_native_raycast_visibility(nodes, links, camera, geometry, context, i,
     # ========================================
     raycast = nodes.new("ShaderNodeRaycast")
     raycast.location = (x_base + 200, y_base)
-    links.new(add_camera_loc.outputs["Vector"], raycast.inputs["Position"])
-    links.new(normalize_node.outputs["Vector"], raycast.inputs["Direction"])
+    ray_length = length_node.outputs["Value"]
+    if anchor:
+        # The camera as it stood to the object at projection time, wherever
+        # the object is now; only the object itself can occlude this ray.
+        carried_camera = anchor['current'](camera_location, anchor.get('after'))
+        carried_ray = nodes.new("ShaderNodeVectorMath")
+        carried_ray.operation = 'SUBTRACT'
+        carried_ray.label = f"CarriedCameraToSurface-{i}-{mat_id}"
+        links.new(anchor['current_position'], carried_ray.inputs[0])
+        links.new(carried_camera, carried_ray.inputs[1])
+        carried_direction = nodes.new("ShaderNodeVectorMath")
+        carried_direction.operation = 'NORMALIZE'
+        links.new(carried_ray.outputs["Vector"], carried_direction.inputs[0])
+        carried_length = nodes.new("ShaderNodeVectorMath")
+        carried_length.operation = 'LENGTH'
+        links.new(carried_ray.outputs["Vector"], carried_length.inputs[0])
+        for helper in (carried_ray, carried_direction, carried_length):
+            helper['sg_layout_stage'] = 'Raycast visibility'
+        raycast.only_local = True
+        links.new(carried_camera, raycast.inputs["Position"])
+        links.new(carried_direction.outputs["Vector"], raycast.inputs["Direction"])
+        ray_length = carried_length.outputs["Value"]
+    else:
+        links.new(add_camera_loc.outputs["Vector"], raycast.inputs["Position"])
+        links.new(normalize_node.outputs["Vector"], raycast.inputs["Direction"])
     threshold_plus = nodes.new("ShaderNodeMath")
     threshold_plus.operation = 'ADD'
     threshold_plus.location = (x_base + 100, y_base + 100)
     ray_epsilon = _scene_ray_epsilon(context)
     threshold_plus.inputs[1].default_value = ray_epsilon * 10.0
-    links.new(length_node.outputs["Value"], threshold_plus.inputs[0])
+    links.new(ray_length, threshold_plus.inputs[0])
     links.new(threshold_plus.outputs[0], raycast.inputs["Length"])
 
     hit_dist_plus = nodes.new("ShaderNodeMath")
@@ -1182,7 +1599,7 @@ def create_native_raycast_visibility(nodes, links, camera, geometry, context, i,
     dist_check = nodes.new("ShaderNodeMath")
     dist_check.operation = 'LESS_THAN'
     dist_check.location = (x_base + 500, y_base + 50)
-    links.new(length_node.outputs["Value"], dist_check.inputs[0])
+    links.new(ray_length, dist_check.inputs[0])
     links.new(hit_dist_plus.outputs[0], dist_check.inputs[1])
 
     occlusion_ok = nodes.new("ShaderNodeMath")
@@ -1190,8 +1607,20 @@ def create_native_raycast_visibility(nodes, links, camera, geometry, context, i,
     occlusion_ok.location = (x_base + 600, y_base + 50)
     links.new(raycast.outputs["Is Hit"], occlusion_ok.inputs[0])
     links.new(dist_check.outputs[0], occlusion_ok.inputs[1])
+    occlusion_socket = occlusion_ok.outputs[0]
+    owned_socket = owned(occlusion_socket) if owned is not None else None
+    if owned_socket is not None:
+        owned_ok = nodes.new("ShaderNodeMath")
+        owned_ok.operation = 'MINIMUM'
+        owned_ok.label = f"OwnedAndUnoccluded-{i}-{mat_id}"
+        owned_ok['sg_layout_stage'] = 'Raycast visibility'
+        links.new(occlusion_socket, owned_ok.inputs[0])
+        links.new(owned_socket, owned_ok.inputs[1])
+        occlusion_socket = owned_ok.outputs[0]
     visible, raycast_sinks = _absorb_unused_raycast_outputs(
-        nodes, links, raycast, occlusion_ok.outputs[0])
+        nodes, links, raycast, occlusion_socket)
+    if anchor:
+        anchor['after'] = visible.outputs[0]    # the next camera's carried ray waits for this raycast
 
     # ========================================
     # ANGLE CHECK + WEIGHT
@@ -1200,7 +1629,7 @@ def create_native_raycast_visibility(nodes, links, camera, geometry, context, i,
     dot_d_normal.operation = 'DOT_PRODUCT'
     dot_d_normal.location = (x_base + 300, y_base - 150)
     links.new(normalize_node.outputs["Vector"], dot_d_normal.inputs[0])
-    links.new(geometry.outputs["Normal"], dot_d_normal.inputs[1])
+    links.new(surface_normal, dot_d_normal.inputs[1])
 
     clamp_dot = nodes.new("ShaderNodeMath")
     clamp_dot.operation = 'MAXIMUM'
@@ -1576,6 +2005,33 @@ def create_native_feather(nodes, links, normalize_node, camera_fov_node, camera_
 
 
 _SG_VORONOI_PLACEHOLDER_NAME = "_SG_Voronoi_Placeholder"
+
+def is_baked_material(material):
+    """A material made by Bake Textures, or a Masked Edit of one: its baked image is the texture."""
+    return bool(material.get('sg_baked')) or re.search(r'_baked(\.\d+)?( Masked Edit)*$', material.name) is not None
+
+
+def activate_projection_material(obj):
+    """Make the object's projection material active again when a bake's material is.
+
+    A bake's material holds its final texture and is the active one after Bake
+    Textures; projecting into it, or reading a run's views from it, replaced or
+    missed the projection. Faces move to the projection material (a new one if
+    the object has none); the bake stays for the user to switch back to.
+    """
+    if obj.active_material is None or not is_baked_material(obj.active_material):
+        return obj.active_material
+    baked = obj.active_material
+    index = next((k for k, m in enumerate(obj.data.materials)
+                  if m and m is not baked and not is_baked_material(m)), -1)
+    if index < 0:
+        obj.data.materials.append(bpy.data.materials.new(name="ProjectionMaterial"))
+        index = len(obj.data.materials) - 1
+    obj.active_material_index = index
+    obj.data.polygons.foreach_set("material_index", [index] * len(obj.data.polygons))
+    obj.data.update()
+    return obj.active_material
+
 
 def _get_voronoi_placeholder(color=(1.0, 0.0, 1.0)):
     """Get or create a 1x1 solid-colour image used as placeholder for
@@ -2042,6 +2498,17 @@ def project_image(
         if level == 0 and len(shaders) > 1:
             # ── Step 1: Neutralize per-camera Power (set to 1.0) ──────
             user_exponent = None
+            # The upstream walks below read each input's source from one index: NodeSocket.links scans every link
+            # of the tree per call, which made them quadratic in the camera count (and worse once object-relative
+            # rays chain each camera to the previous camera's raycast).
+            feeding = {link.to_socket.as_pointer(): link.from_node for link in links}
+
+            def upstream_nodes(node):
+                for socket in node.inputs:
+                    source = feeding.get(socket.as_pointer())
+                    if source is not None:
+                        yield source
+
             for idx in range(len(weight_nodes)):
                 w = weight_nodes[idx]
                 node = w[0] if isinstance(w, tuple) else w
@@ -2088,8 +2555,7 @@ def project_image(
                                 user_exponent = upstream.inputs["Power"].default_value
                             upstream.inputs["Power"].default_value = 1.0
                             break
-                        for socket in upstream.inputs:
-                            pending.extend(link.from_node for link in socket.links)
+                        pending.extend(upstream_nodes(upstream))
 
                 # OSL path: ShaderNodeScript with "Power" input
                 elif node.type == 'SCRIPT' and "Power" in node.inputs:
@@ -2120,8 +2586,7 @@ def project_image(
                             user_exponent = upstream.inputs["Power"].default_value
                         upstream.inputs["Power"].default_value = 1.0
                         break
-                    for socket in upstream.inputs:
-                        pending.extend(link.from_node for link in socket.links)
+                    pending.extend(upstream_nodes(upstream))
 
             if user_exponent is None:
                 user_exponent = 1.0
@@ -2316,11 +2781,10 @@ def project_image(
                 links.new(sum_node.outputs[0], div_node.inputs[1])
 
                 if legacy_priority:
-                    map_range_node = nodes_collection.new("ShaderNodeMapRange")
-                    map_range_node.label = f'EarlyPriorityMap-{level}-{i}'
+                    map_range_node = _early_priority_share(
+                        nodes_collection, links, div_node.outputs[0],
+                        context.scene.early_priority_strength, f'EarlyPriorityMap-{level}-{i}')
                     map_range_node.location = (x_offset - 400, y_offset + vert_offset)
-                    map_range_node.inputs[1].default_value = context.scene.early_priority_strength
-                    links.new(div_node.outputs[0], map_range_node.inputs[0])
 
                 # Create a MixRGB node for color blending of the two inputs
                 mix_node = nodes_collection.new("ShaderNodeMixRGB")
@@ -2428,6 +2892,7 @@ def project_image(
                 buffer_uv = obj.data.uv_layers.get(_SG_BUFFER_UV_NAME)
                 if not buffer_uv:
                     buffer_uv = obj.data.uv_layers.new(name=_SG_BUFFER_UV_NAME)
+                _remove_stale_uv_projectors(obj)
 
                 # Add the UV Project Modifier
                 uv_project_mod = obj.modifiers.new(name="UVProject", type='UV_PROJECT')
@@ -2452,7 +2917,7 @@ def project_image(
                 obj.data.uv_layers.active = buffer_uv
 
                 # Apply the modifier
-                bpy.ops.object.modifier_apply(modifier=uv_project_mod.name)
+                _apply_uv_projector(context, obj, uv_project_mod)
 
                 # Copy buffer UV data to a named attribute (no UV slot limit)
                 attr_name = f"ProjectionUV_{i}_{mat_id}"
@@ -2511,6 +2976,19 @@ def project_image(
                 to_project, cameras, mat_id, "Baked visibility weighting")
             _bake_visibility_weights(context, to_project, cameras, mat_id)
 
+    # ── Optional: object-relative projection (native Raycast path) ───────
+    use_anchor = (getattr(context.scene, 'sg_object_relative_projection', False)
+                  and bpy.app.version >= (5, 1, 0) and not use_baked_weights)
+    ownership = None
+    if use_anchor:
+        # The frame and the maps belong to the projection UVs: a call that recomputed them takes the scene
+        # as it is now, later sequential steps and previews keep what the UVs were made with.
+        fresh = (not reuse_projection_uv
+                 and (context.scene.generation_method != 'sequential' or stop_index == 0))
+        for obj in to_project:
+            _store_projection_frame(obj, mat_id, replace=fresh)
+        ownership = _render_ownership_maps(context, cameras, mat_id, replace=fresh)
+
     # Switch to Cycles (needed for Raycast shader node on all versions)
     if context.scene.render.engine != 'CYCLES':
         context.scene.render.engine = 'CYCLES'
@@ -2522,7 +3000,20 @@ def project_image(
         else:
             context.scene.cycles.use_osl = True
 
+    loaded_images = {}
+
+    def load_image(path):
+        """``get_or_load_image`` once per file and call: every material reads the same views and masks, and
+        Overwrite Material's reload only has to bring each file up to date once."""
+        if path not in loaded_images:
+            loaded_images[path] = get_or_load_image(path, force_reload=context.scene.overwrite_material)
+        return loaded_images[path]
+
     processed_materials = set()
+    # The material this call rebuilt from scratch. Every other object whose projection material would be rebuilt
+    # the same way gets it instead: the graph reads per-object attributes only, so one material serves them all,
+    # is built once and compiles once.
+    shared_material = None
     svm_estimates = {}
     cache_key = (_cache_configuration(context.scene, cameras, mat_id, assets, to_project)
                  if stable_sequential else None)
@@ -2534,9 +3025,17 @@ def project_image(
         context.view_layer.objects.active = obj
         obj.select_set(True)
 
+        # Local edits (Masked Edit, local refine) edit the active material on
+        # purpose, a bake included, and keep doing so.
+        local_edit = (context.scene.generation_method == 'local_edit'
+                      or (context.scene.model_architecture in QWEN_ARCHITECTURES
+                          and context.scene.qwen_generation_method == 'local_edit'))
+        if not local_edit:
+            activate_projection_material(obj)
+
         # Create the material
         to_switch = False
-        is_local_edit = (context.scene.generation_method == 'local_edit' or (context.scene.model_architecture in QWEN_ARCHITECTURES and context.scene.qwen_generation_method == 'local_edit'))
+        is_local_edit =(context.scene.generation_method == 'local_edit' or (context.scene.model_architecture in QWEN_ARCHITECTURES and context.scene.qwen_generation_method == 'local_edit'))
         if is_local_edit and not context.scene.overwrite_material:
             # Copy active material
             mat = obj.active_material.copy()
@@ -2547,7 +3046,7 @@ def project_image(
             # Use active material
             mat = obj.active_material
         else:
-            mat = bpy.data.materials.new(name="ProjectionMaterial")
+            mat = shared_material or bpy.data.materials.new(name="ProjectionMaterial")
             obj.data.materials.append(mat)
             # Mark as active material
             obj.active_material_index = obj.material_slots.find(mat.name)
@@ -2566,9 +3065,20 @@ def project_image(
 
         # UV and baked-visibility attributes were prepared on every mesh above.
         # The shader reads those named attributes at the shading point, so its
-        # topology is independent of the representative object. Local edits
-        # retain their existing append/copy behavior.
-        if not is_local_edit and mat.name in processed_materials:
+        # topology is independent of the representative object. A local edit
+        # appends its pass once to a material several objects share; a copied
+        # material is new and always gets its own.
+        if mat.name in processed_materials:
+            continue
+        # Masked Edit layers belong to their object (its selection gates them) and are laid again on its own
+        # material after the run, so a material that carried them is neither shared nor replaced, also at the
+        # later sequential steps that find it rebuilt without them.
+        own_material = mat.get('sg_object_material') or (
+            mat.use_nodes and any(node.get('sg_masked_edit') for node in mat.node_tree.nodes))
+        if own_material:
+            mat['sg_object_material'] = True
+        if not is_local_edit and shared_material is not None and not own_material:
+            obj.active_material = shared_material
             continue
 
         # Enable use of nodes
@@ -2599,26 +3109,28 @@ def project_image(
                 and cache_entry['assets'] == _asset_state(cache_entry['asset_paths'])
                 and cache_entry['state'] == _graph_state(mat)):
             image_path = get_file_path(context, 'generated', camera_id=stop_index, material_id=mat_id)
-            image = get_or_load_image(image_path, force_reload=context.scene.overwrite_material)
+            image = load_image(image_path)
             if image:
                 nodes[cache_entry['images'][stop_index]].image = image
-                write = cache_entry['writes'].get(stop_index)
-                if write:
-                    texture_name, bypass_name, mask_path = write
-                    mask = (get_or_load_image(mask_path, force_reload=context.scene.overwrite_material)
+                writes = cache_entry['writes'].get(stop_index, ())
+                for texture_name, bypass_name, mask_path, present, missing in writes:
+                    mask = (load_image(mask_path)
                             if os.path.isfile(mask_path) else None)
                     if mask:
                         mask.colorspace_settings.name = 'Non-Color'
+                    elif not missing:
+                        print("[StableGen] WARNING: confidence write mask "
+                              f"missing for camera {stop_index}; refusing to upgrade "
+                              "source confidence for that view.")
                     nodes[texture_name].image = mask
-                    nodes[bypass_name].inputs[1].default_value = 0.0 if mask else 1.0
+                    nodes[bypass_name].inputs[1].default_value = present if mask else missing
                 nodes[cache_entry['gates'][stop_index]].inputs[1].default_value = 1.0
                 for frame in nodes:
                     if frame.type == 'FRAME' and frame.label.startswith(f'View {stop_index + 1:02d} |'):
                         frame.label = frame.label.removesuffix(' | pending')
                 cache_entry['stop'] = stop_index
                 cache_entry['asset_paths'].append(image_path)
-                if write:
-                    cache_entry['asset_paths'].append(mask_path)
+                cache_entry['asset_paths'] += [write[2] for write in writes]
                 cache_entry['assets'] = _asset_state(cache_entry['asset_paths'])
                 cache_entry['state'] = _graph_state(mat)
                 processed_materials.add(mat.name)
@@ -2690,16 +3202,15 @@ def project_image(
                             and stop_index == 0
                             and context.scene.sequential_ipadapter_mode == 'first'):
                         image_path = image_path.replace(".png", "_ipadapter.png")
-                    image = get_or_load_image(
-                        image_path,
-                        force_reload=context.scene.overwrite_material,
-                    )
+                    image = load_image(image_path)
                     if image:
                         node.image = image
                     break
             processed_materials.add(mat.name)
             continue
         elif not is_local_edit:
+            if not own_material:
+                shared_material = mat
             # Rebuild mode is required for per-view assets that only exist
             # after generation (write masks, guards, and confidence inputs).
             # Clear existing nodes
@@ -2752,7 +3263,7 @@ def project_image(
             if not os.path.exists(ef_path):
                 print(f"[StableGen] Edge-feather mask not found: {ef_path}")
                 return None
-            ef_image = get_or_load_image(ef_path, force_reload=context.scene.overwrite_material)
+            ef_image = load_image(ef_path)
             if ef_image is None:
                 return None
 
@@ -2781,8 +3292,15 @@ def project_image(
             mat_id_inner,
             binary=False,
             label_prefix="SequentialWrite",
+            missing=1.0,
         ):
-            """Sample the authoritative per-view sequential write mask."""
+            """Sample the authoritative per-view sequential write mask.
+
+            ``missing`` is the weight a stable sequential graph uses while the
+            mask file is absent: 1 (neutral) for a write mask, 0 for a
+            confidence write mask, which a rebuild then replaces by a 0
+            constant and refuses to upgrade.
+            """
             mask_path = get_file_path(
                 context,
                 "inpaint",
@@ -2791,10 +3309,7 @@ def project_image(
             )
             if not os.path.exists(mask_path) and not stable_sequential:
                 return None
-            mask_image = get_or_load_image(
-                mask_path,
-                force_reload=context.scene.overwrite_material,
-            ) if os.path.isfile(mask_path) and cam_index <= stop_index else None
+            mask_image = load_image(mask_path) if os.path.isfile(mask_path) and cam_index <= stop_index else None
             if mask_image is None and not stable_sequential:
                 return None
             if mask_image:
@@ -2817,14 +3332,16 @@ def project_image(
             to_float.label = f"{label_prefix}Weight-{cam_index}-{mat_id_inner}"
             links.new(_mask_value(nodes, links, mask_tex).outputs[0], to_float.inputs[0])
             if stable_sequential:
-                # A missing mask is a neutral multiplier, matching a rebuild.
-                # Bind its resource before opening the camera's active gate.
+                # A missing mask gives the ``missing`` weight, matching a
+                # rebuild. Bind its resource before opening the camera's gate.
+                present = 0.0 if missing else 1.0
                 bypass = nodes.new('ShaderNodeMath')
-                bypass.operation = 'MAXIMUM'
+                bypass.operation = 'MAXIMUM' if missing else 'MULTIPLY'
                 bypass.label = f'{label_prefix}Available-{cam_index}-{mat_id_inner}'
-                bypass.inputs[1].default_value = 0.0 if mask_image else 1.0
+                bypass.inputs[1].default_value = present if mask_image else missing
                 links.new(to_float.outputs[0], bypass.inputs[0])
-                sequential_writes[cam_index] = (mask_tex.name, bypass.name, mask_path)
+                sequential_writes.setdefault(cam_index, []).append(
+                    (mask_tex.name, bypass.name, mask_path, present, missing))
                 return bypass
             return to_float
 
@@ -2838,9 +3355,7 @@ def project_image(
             )
             if not os.path.exists(guard_path):
                 return None
-            guard_image = get_or_load_image(
-                guard_path, force_reload=context.scene.overwrite_material
-            )
+            guard_image = load_image(guard_path)
             if guard_image is None:
                 return None
             guard_image.colorspace_settings.name = 'Non-Color'
@@ -2859,7 +3374,14 @@ def project_image(
             return guard_weight
 
         def _acquisition_quality(weight, length_node, camera, cam_index):
-            """Multiply a projection weight by the view's projected pixel density."""
+            """Multiply a projection weight by the view's projected pixel density.
+
+            The density used to be clamped at 1, which every camera within
+            about four scene scales reached, so distance never decided between
+            views and a far view at a slightly better angle beat a near one.
+            Only ratios between views matter after normalization, so the
+            unclamped density is raised to the scene's distance weight.
+            """
             cam_res_x, cam_res_y = _get_camera_resolution(camera, context.scene)
             fov_for_density = camera.data.angle_x
             if cam_res_y > cam_res_x:
@@ -2877,8 +3399,9 @@ def project_image(
             density.label = f"ProjectedDensity-{cam_index}-{mat_id}"
             links.new(length_node.outputs["Value"], density.inputs[1])
             clamp_density = nodes.new("ShaderNodeMath")
-            clamp_density.operation = 'MINIMUM'
-            clamp_density.inputs[1].default_value = 1.0
+            clamp_density.operation = 'POWER'
+            clamp_density.label = f"DistanceWeight-{cam_index}-{mat_id}"
+            clamp_density.inputs[1].default_value = getattr(context.scene, 'sg_view_density_exponent', 1.0)
             links.new(density.outputs[0], clamp_density.inputs[0])
             acquisition = nodes.new("ShaderNodeMath")
             acquisition.operation = 'MULTIPLY'
@@ -2901,6 +3424,11 @@ def project_image(
         )
 
         geometry_nodes = []
+        # Object-relative projection: one set of frame nodes per material, an
+        # ownership test per camera (native Raycast path only).
+        anchor = (_projection_anchor_nodes(nodes, links, mat_id)
+                  if use_anchor and use_native_raycast else None)
+        owner_cache = {}
         for i, camera in enumerate(cameras):
             camera_node_start = {node.as_pointer() for node in nodes}
             native_extra = {}
@@ -2916,7 +3444,7 @@ def project_image(
                 and not context.scene.use_ipadapter and i == 0 and context.scene.sequential_ipadapter_mode == 'first':
                     image_path = get_file_path(context, "generated", camera_id=i, material_id=mat_id).replace(".png", "_ipadapter.png")
 
-                image = get_or_load_image(image_path, force_reload=context.scene.overwrite_material)
+                image = load_image(image_path)
                 if image:
                     tex_image.image = image
             elif voronoi_active:
@@ -2994,13 +3522,15 @@ def project_image(
                 # ── Native Raycast path (Blender 5.1+) ──
                 is_local_edit_mode = (context.scene.generation_method == 'local_edit' or (context.scene.model_architecture in QWEN_ARCHITECTURES and context.scene.qwen_generation_method == 'local_edit'))
                 native_pre_factors = None
-                if (not is_local_edit_mode
-                        and getattr(context.scene, 'sg_rework_acquisition_quality', False)):
+                acquisition = getattr(context.scene, 'sg_rework_acquisition_quality', False)
+                if not is_local_edit_mode and (acquisition or context.scene.visibility_vignette):
                     # Frame-edge and density terms do not depend on the
-                    # raycast; they are combined before it (see there).
+                    # raycast; they are combined before it (see there). The
+                    # frame fade applies on its own: without it a view's
+                    # frame edge is a hard seam wherever another view
+                    # continues the surface.
                     def native_pre_factors(weight, parts, camera=camera, i=i):
-                        if (context.scene.generation_method == 'sequential'
-                                and context.scene.visibility_vignette):
+                        if context.scene.visibility_vignette:
                             frame_weight = create_native_feather(
                                 nodes, links, parts['normalize'], parts['fov'],
                                 parts['aspect'], parts['direction'], parts['up'],
@@ -3012,10 +3542,15 @@ def project_image(
                             links.new(weight, frame_quality.inputs[0])
                             links.new(frame_weight.outputs[0], frame_quality.inputs[1])
                             weight = frame_quality.outputs[0]
+                        if not acquisition:
+                            return weight
                         return _acquisition_quality(weight, parts['length'], camera, i).outputs[0]
+                owned = (partial(_ownership_test, nodes, links, ownership, uv_map_node, mat_id, i,
+                                 owner_cache) if anchor is not None else None)
                 result = create_native_raycast_visibility(
                     nodes, links, camera, geometry, context, i, mat_id, stop_index,
                     pre_factors=native_pre_factors, extra=native_extra,
+                    anchor=anchor, owned=owned,
                 )
                 angle_weight = result[0]
                 # Destructure result for create_native_feather
@@ -3120,10 +3655,7 @@ def project_image(
                     or (context.scene.model_architecture in QWEN_ARCHITECTURES
                         and context.scene.qwen_generation_method == 'local_edit')
                 )
-                needs_frame_quality = (
-                    context.scene.generation_method == 'sequential'
-                    and context.scene.visibility_vignette
-                )
+                needs_frame_quality = context.scene.visibility_vignette
                 if is_local_edit_mode or needs_frame_quality:
                     # Add Feather script
                     script_feather = nodes.new("ShaderNodeScript")
@@ -3166,7 +3698,7 @@ def project_image(
                             final_weight_node = (script_angle, script_feather)
                     elif is_local_edit_mode:
                         final_weight_node = (script_angle, script_feather)
-                    elif getattr(context.scene, 'sg_rework_acquisition_quality', False):
+                    elif needs_frame_quality:
                         frame_quality = nodes.new("ShaderNodeMath")
                         frame_quality.operation = 'MULTIPLY'
                         frame_quality.label = f"FrameEdgeQuality-{i}-{mat_id}"
@@ -3303,6 +3835,8 @@ def project_image(
                         if use_qwen21_generated_alpha
                         else f"SDXLFeatherAlpha-{i}-{mat_id}"
                     ),
+                    # Qwen 2.1's transparency is a cutout; SDXL's alpha is a feather
+                    threshold=0.5 if use_qwen21_generated_alpha else None,
                 )
 
             if stable_sequential:
@@ -3346,8 +3880,7 @@ def project_image(
                             f"projection_guard_feather{i}.png",
                         )
                         if os.path.isfile(feather_path):
-                            feather_image = get_or_load_image(
-                                feather_path, force_reload=context.scene.overwrite_material)
+                            feather_image = load_image(feather_path)
                             if feather_image is not None:
                                 feather_image.colorspace_settings.name = 'Non-Color'
                                 feather_tex = nodes.new("ShaderNodeTexImage")
@@ -3376,8 +3909,7 @@ def project_image(
                                     import json
                                     with open(calibration_path) as stream:
                                         distance_scale = float(json.load(stream)['distance_scale'])
-                                    occlusion_image = get_or_load_image(
-                                        occlusion_path, force_reload=context.scene.overwrite_material)
+                                    occlusion_image = load_image(occlusion_path)
                                     occlusion_image.colorspace_settings.name = 'Non-Color'
                                     occlusion_tex = nodes.new("ShaderNodeTexImage")
                                     occlusion_tex.label = f"ProjectionOcclusionFeather-{i}-{mat_id}"
@@ -3431,8 +3963,7 @@ def project_image(
                                     influence_path = os.path.join(os.path.dirname(feather_path),
                                                                   f"projection_guard_influence{i}.png")
                                     if os.path.isfile(influence_path):
-                                        influence_image = get_or_load_image(
-                                            influence_path, force_reload=context.scene.overwrite_material)
+                                        influence_image = load_image(influence_path)
                                         influence_image.colorspace_settings.name = 'Non-Color'
                                         influence_tex = nodes.new("ShaderNodeTexImage")
                                         influence_tex.name = f"SGFeatherInfluenceMask-{i}-{mat_id}"
@@ -3454,11 +3985,13 @@ def project_image(
             if (confidence_context_active and script_nodes_outputs
                     and not isinstance(script_nodes_outputs[-1], tuple)):
                 confidence_quality = script_nodes_outputs[-1]
-                if i > stop_index:
+                if i > stop_index and not stable_sequential:
                     # Voronoi generation intentionally leaves future camera
                     # placeholders active for colour segmentation. They are
                     # not acquired observations and must never contribute to
-                    # source confidence.
+                    # source confidence. (A stable sequential graph keeps the
+                    # chain: its pending cameras are exactly zero through their
+                    # active gate until their view lands.)
                     confidence_quality = nodes.new("ShaderNodeValue")
                     confidence_quality.outputs[0].default_value = 0.0
                     confidence_quality.label = f"ConfidenceFuture-{i}-{mat_id}"
@@ -3468,6 +4001,7 @@ def project_image(
                         mat_id,
                         binary=True,
                         label_prefix="ConfidenceWrite",
+                        missing=0.0,
                     )
                     if confidence_write is None:
                         print(
@@ -3526,16 +4060,9 @@ def project_image(
             best_quality.label = "SGBestSourceQuality"
 
         # Build mix shader tree
-        if mat.name in processed_materials and is_local_edit:
-            # If we already processed this material, we don't need to rebuild the mix tree
-            # But we still need to connect the nodes for the current object (done in the loop below)
-            # We need to find the existing mix node to position the output node
-            # The mix node is connected to the output node
-            mix_node = output.inputs["Surface"].links[0].from_node
-        else:
-            mix_node, _ = yield from build_mix_tree(tex_image_nodes, script_nodes_outputs, nodes, links, previous_node, stop_index=stop_index, _steps=True)
-            links.new(mix_node.outputs[0], output.inputs["Surface"])
-            processed_materials.add(mat.name)
+        mix_node, _ = yield from build_mix_tree(tex_image_nodes, script_nodes_outputs, nodes, links, previous_node, stop_index=stop_index, _steps=True)
+        links.new(mix_node.outputs[0], output.inputs["Surface"])
+        processed_materials.add(mat.name)
 
         # Move output node right to the mix_node
         output.location = (mix_node.location[0] + 400, mix_node.location[1])
@@ -3616,7 +4143,8 @@ def project_image(
         if stable_sequential:
             active_assets = [n.image.filepath for i, n in enumerate(tex_image_nodes)
                              if i <= stop_index and n.image]
-            active_assets += [v[2] for i, v in sequential_writes.items() if i <= stop_index]
+            active_assets += [write[2] for i, writes in sequential_writes.items() if i <= stop_index
+                              for write in writes]
             incremental_cache[mat.as_pointer()] = dict(
                 key=cache_key, stop=stop_index, state=_graph_state(mat),
                 writes=sequential_writes, asset_paths=active_assets, assets=_asset_state(active_assets),
@@ -3769,13 +4297,15 @@ def reinstate_compare_nodes(context, to_project, stop_id_mat_id_pairs):
     This will esentially revert given views to not-generated state for viewpoint regeneration.
     """
 
+    reinstated = set()
     for obj in to_project:
         if not obj.active_material:
             continue
 
         mat = obj.active_material
-        if not mat.use_nodes:
+        if not mat.use_nodes or mat.as_pointer() in reinstated:
             continue
+        reinstated.add(mat.as_pointer())
 
         nodes = mat.node_tree.nodes
         links = mat.node_tree.links

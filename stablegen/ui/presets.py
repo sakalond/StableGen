@@ -1,5 +1,6 @@
 """Preset definitions, callbacks, and preset operators."""
 
+from contextlib import contextmanager
 import math
 import bpy  # pylint: disable=import-error
 import mathutils  # pylint: disable=import-error
@@ -89,16 +90,14 @@ PRESETS["QWEN 2.1 PRECISE"] = {
         "DPM++ SDE and SGM Uniform with no Lightning LoRA. This combination "
         "produced broad, coherent panels that followed the model silhouette and "
         "continued well into later views. Best when adjacent cameras overlap "
-        "well; sparse coverage can still introduce artifacts. Qwen 2.1 is also "
-        "prompted to generate native RGBA views, independently of the sampler, "
-        "and transparent pixels are excluded from texture projection."
+        "well; sparse coverage can still introduce artifacts."
     ),
     "model_architecture": "qwen_image_21",
     "steps": 20,
     "cfg": 1.0,
     "sampler": "dpmpp_sde",
     "scheduler": "sgm_uniform",
-    "qwen_image_21_native_rgba": True,
+    "qwen_image_21_native_rgba": False,
     "qwen_guidance_background_color": mathutils.Color((0.5, 0.5, 0.5)),
     "lora_units": [],
 }
@@ -115,8 +114,7 @@ PRESETS["QWEN 2.1 PRECISE+"] = {
         "Uses a 0.50 context trust threshold, a 3 px silhouette margin and "
         "backface projection. Retains Qwen 2.1 Precise's projected-context "
         "strategy, 20 steps, CFG 1.0, DPM++ SDE, SGM Uniform, blending exponent "
-        "7 and native RGBA output, with no Lightning LoRA. Transparent pixels "
-        "are excluded from projection. Research options are off. Best suited "
+        "7, with no Lightning LoRA. Research options are off. Best suited "
         "to overlapping camera views; fine patterns and material continuity "
         "can still vary, and standard Precise can work better on some assets."
     ),
@@ -141,8 +139,6 @@ PRESETS["QWEN 2.1 SAFE"] = {
         "and details around the object. Uses the tested projection-oriented "
         "configuration of 20 steps, CFG 1, DPM++ SDE and SGM Uniform with no "
         "Lightning LoRA. It favors broad, geometry-following texture regions. "
-        "Qwen 2.1 is prompted to generate native RGBA views independently of the "
-        "sampler, and transparent pixels are excluded from texture projection. "
         "It is slower when the initial reference is tall or large."
     ),
     "model_architecture": "qwen_image_21",
@@ -150,7 +146,7 @@ PRESETS["QWEN 2.1 SAFE"] = {
     "cfg": 1.0,
     "sampler": "dpmpp_sde",
     "scheduler": "sgm_uniform",
-    "qwen_image_21_native_rgba": True,
+    "qwen_image_21_native_rgba": False,
     "sequential_ipadapter": True,
     "sequential_ipadapter_mode": "first",
     "qwen_context_render_mode": "NONE",
@@ -168,10 +164,9 @@ PRESETS["QWEN 2.1 CONTEXT + REFERENCE"] = {
         "depth guide for geometry and the initial view for overall appearance. "
         "A 50-degree discard angle excludes grazing projections during generation, "
         "then resets to 90 degrees for the final material; blending exponent is 7. "
-        "Uses 20 steps, CFG 1.0, DPM++ SDE, SGM Uniform, native RGBA output and no "
-        "LoRA. Transparent generated pixels are excluded from projection. "
+        "Uses 20 steps, CFG 1.0, DPM++ SDE, SGM Uniform and no LoRA. "
         "Confidence-Gated Context, Acquisition Quality Weighting and Depth/Part "
-        "Projection Guard are off; legacy fallback dilation is 1 px, cleanup is "
+        "Projection Guard are off; context expansion is 1 px, fallback cleanup is "
         "off and backface projection is allowed. Captures the current manually "
         "tuned setup; intended for comparing context coverage and appearance "
         "consistency across overlapping views."
@@ -208,9 +203,8 @@ PRESETS["LOCAL EDIT (QWEN 2.1)"] = {
         "Preserves the original Local Edit camera coverage and edge-feathering "
         "settings so the edited projections blend into the existing material. "
         "Uses 20 steps, CFG 1.0, DPM++ SDE, SGM Uniform, blending exponent 7 "
-        "and native RGBA output, with no Lightning LoRA. Transparent generated "
-        "pixels do not contribute to projection. This edits camera-selected "
-        "areas; use Masked Edit generation mode for painted-mask selection."
+        "and no Lightning LoRA. This edits camera-selected areas; use Masked "
+        "Edit generation mode for painted-mask selection."
     ),
     "architecture_mode": "qwen_image_21",
     "model_architecture": "qwen_image_21",
@@ -220,7 +214,7 @@ PRESETS["LOCAL EDIT (QWEN 2.1)"] = {
     "cfg": 1.0,
     "sampler": "dpmpp_sde",
     "scheduler": "sgm_uniform",
-    "qwen_image_21_native_rgba": True,
+    "qwen_image_21_native_rgba": False,
     "qwen_guidance_background_color": mathutils.Color((0.5, 0.5, 0.5)),
     "lora_units": [],
 }
@@ -233,10 +227,9 @@ PRESETS["REFINE (QWEN 2.1)"] = {
         "as its editing input, making this suitable for overall color, art "
         "style or surface-appearance changes. Preserves the original Qwen "
         "Refine workflow settings. Uses 20 steps, CFG 1.0, DPM++ SDE, SGM "
-        "Uniform, blending exponent 7 and native RGBA output, with no Lightning "
-        "LoRA. Transparent generated pixels are excluded from projection. "
-        "Use Local Edit for camera-targeted changes or Masked Edit generation "
-        "mode to select an area by painting."
+        "Uniform, blending exponent 7 and no Lightning LoRA. Use Local Edit for "
+        "camera-targeted changes or Masked Edit generation mode to select an "
+        "area by painting."
     ),
     "architecture_mode": "qwen_image_21",
     "model_architecture": "qwen_image_21",
@@ -246,10 +239,43 @@ PRESETS["REFINE (QWEN 2.1)"] = {
     "cfg": 1.0,
     "sampler": "dpmpp_sde",
     "scheduler": "sgm_uniform",
-    "qwen_image_21_native_rgba": True,
+    "qwen_image_21_native_rgba": False,
     "qwen_guidance_background_color": mathutils.Color((0.5, 0.5, 0.5)),
     "lora_units": [],
 }
+
+# TRELLIS.2 meshes textured with Qwen-Image 2.1, which replaced Qwen Image
+# Edit's: each keeps its TRELLIS.2 mesh, camera and texturing setup and takes
+# Qwen 2.1's tested sampling. Voronoi keeps its own blending exponents. They
+# replace the Qwen Image Edit ones in their order, so the numbers saved files
+# store for every preset stay put.
+_TRELLIS_QWEN_21 = {
+    "PRECISE": "Precise detail when camera overlap is good. Relies on context renders plus the prompt.",
+    "SAFE": "Safer fallback when coverage is limited. Uses the TRELLIS.2 input image as sequential style "
+            "reference for global coherence.",
+    "ALT": "Uses ADDITIONAL context renders with TRELLIS.2 style transfer for consistency.",
+    "VORONOI": "Voronoi projection with exponent 1000 for hard camera segmentation during generation, then "
+               "resets to 15 for softer blending.",
+}
+for _name, _purpose in _TRELLIS_QWEN_21.items():
+    _values = PRESETS.pop(f"QWEN {_name} (MESH + TEXTURE)")
+    PRESETS[f"QWEN 2.1 {_name} (MESH + TEXTURE)"] = {
+        **_values,
+        "description": (
+            f"Uses TRELLIS.2 and Qwen-Image 2.1 to generate a textured mesh. {_purpose} Samples 20 steps at CFG 1 "
+            "with DPM++ SDE and SGM Uniform and no Lightning LoRA."
+        ),
+        "model_architecture": "qwen_image_21",
+        "trellis2_texture_mode": "qwen_image_21",
+        "weight_exponent": _values["weight_exponent"] if _name == "VORONOI" else 7.0,
+        "steps": 20,
+        "cfg": 1.0,
+        "sampler": "dpmpp_sde",
+        "scheduler": "sgm_uniform",
+        "qwen_image_21_native_rgba": False,
+        "qwen_guidance_background_color": mathutils.Color((0.5, 0.5, 0.5)),
+        "lora_units": [],
+    }
 
 # Qwen-Image 2.1 Turbo keeps every Qwen 2.1 view, context and projection
 # strategy and changes only the sampling: its trained 8-step schedule at CFG 1
@@ -268,8 +294,7 @@ for _base_name, _purpose in _QWEN_21_TURBO_PURPOSES.items():
         "description": (
             f"Qwen-Image 2.1 Turbo {_purpose}. Matches {_base_name.title()} except "
             "for sampling: the Turbo model's trained 8-step schedule at CFG 1 with "
-            "Euler, several times faster than 20 DPM++ SDE steps. Native RGBA "
-            "output is on and transparent pixels are excluded from projection."
+            "Euler, several times faster than 20 DPM++ SDE steps."
         ),
         "architecture_mode": "qwen_image_21_turbo",
         "model_architecture": "qwen_image_21_turbo",
@@ -388,6 +413,62 @@ for _preset_values in PRESETS.values():
         ):
             _preset_values.pop(_prompt_field, None)
 
+# Preset names repeat their model and variant, which the panels show as tags instead: they list only the current
+# architecture's presets, so the model name is redundant there.
+PRESET_MODEL_NAMES = {'qwen_image_edit': 'qwen', 'qwen_image_21': 'qwen 2.1', 'qwen_image_21_turbo': 'qwen 2.1 turbo',
+                      'fibo_edit': 'fibo', 'moss_image': 'moss', 'flux2_klein': 'klein'}
+PRESET_VARIANTS = {'nunchaku': 'Nunchaku', 'experimental': 'Experimental'}
+PRESET_WORKFLOWS = ('New texture', 'Refine', 'Local edit', 'UV inpaint', 'Mesh + texture', 'Mesh only')
+
+
+def preset_workflow(preset):
+    if preset.get('architecture_mode') == 'trellis2':
+        return 'Mesh only' if preset.get('trellis2_texture_mode') == 'none' else 'Mesh + texture'
+    if preset.get('generation_method') == 'uv_inpaint':
+        return 'UV inpaint'
+    if 'local_edit' in (preset.get('generation_method'), preset.get('qwen_generation_method')):
+        return 'Local edit'
+    if preset.get('qwen_generation_method') == 'refine':
+        return 'Refine'
+    return 'New texture'
+
+
+def preset_model(preset):
+    if preset.get('architecture_mode') == 'trellis2':
+        return preset.get('trellis2_texture_mode', 'none')
+    return preset.get('model_architecture', 'sdxl')
+
+
+def preset_architecture(preset):
+    """The Architecture choice a preset belongs to."""
+    return preset.get('architecture_mode') or preset.get('model_architecture', 'sdxl')
+
+
+def strip_word(label, word):
+    lower = label.casefold()
+    if lower.endswith(' (' + word + ')'):
+        return label[:-len(word) - 3], True
+    if lower.startswith(word + ' '):
+        return label[len(word) + 1:], True
+    return label, False
+
+
+def preset_label(identifier, label):
+    preset = PRESETS.get(identifier)
+    if not preset:
+        return label
+    trellis = preset.get('architecture_mode') == 'trellis2'
+    for word in ('mesh + texture', 'mesh only', *PRESET_VARIANTS) if trellis else PRESET_VARIANTS:
+        label = strip_word(label, word)[0]
+    name = PRESET_MODEL_NAMES.get(preset_model(preset))
+    if name:
+        label = strip_word(label, name)[0]
+    if label.startswith('Uv '):         # title() case of UV
+        label = 'UV ' + label[3:]
+    # TRELLIS.2 (MESH ONLY): its name is all model, so it is named for what it does ('Default' is SDXL's)
+    return 'Mesh only' if trellis and label.casefold() == 'trellis.2' else label
+
+
 # Global list of all generation parameter names to check for a preset.
 GEN_PARAMETERS = [
     'control_after_generate',
@@ -441,6 +522,7 @@ GEN_PARAMETERS = [
     'sg_rework_aligned_resolution',
     'sg_rework_full_resolution_scale',
     'sg_rework_acquisition_quality',
+    'sg_view_density_exponent',
     'sg_rework_projection_guard',
     'qwen_global_style_vlm_only',
     'qwen_context_vlm_only',
@@ -577,6 +659,7 @@ GEN_PARAMETERS = [
     'mask_blocky',
     'architecture_mode',
     'use_camera_prompts',
+    'use_object_prompts',
     'sg_use_custom_camera_order',
     'generation_mode',
     'texture_objects',
@@ -693,6 +776,53 @@ def get_preset_items(self, context):
                   for item in visible_items)
     # Blender's dynamic enums borrow their strings; keep every returned variant.
     return _PRESET_ENUM_CACHE.setdefault(items, items)
+
+
+def architecture_presets(context, architecture):
+    """The presets the panels offer for *architecture*, in their order: by workflow, then as listed."""
+    items = _build_preset_items(context, deprecated_architectures_enabled(context))
+    names = [item[0] for item in items
+             if item[0] in PRESETS and preset_architecture(PRESETS[item[0]]) == architecture]
+    order = {workflow: index for index, workflow in enumerate(PRESET_WORKFLOWS)}
+    return sorted(names, key=lambda name: order.get(preset_workflow(PRESETS[name]), len(order)))
+
+
+def preset_value(context, key):
+    """*key*'s value in the first preset of the scene's architecture, or None when that preset does not set it."""
+    names = architecture_presets(context, context.scene.architecture_mode)
+    if not names:
+        return None
+    values = PRESETS[names[0]]
+    if key in values:
+        return values[key]
+    return None if values.get('custom', False) else TEXTURING_DEFAULTS.get(key)
+
+
+def matching_preset(context, name, architecture):
+    """The preset of *architecture* whose panel name (without model and variant words) is *name*'s, preferring one
+    with the same variants (Nunchaku); without such a preset, the architecture's first one."""
+    names = architecture_presets(context, architecture)
+    plain = lambda key: preset_label(key, key.title()).casefold()
+    variants = lambda key: {word for word in PRESET_VARIANTS if strip_word(key.title(), word)[1]}
+    same = [key for key in names if plain(key) == plain(name)]
+    exact = [key for key in same if variants(key) == variants(name)]
+    return (exact or same or names or [None])[0]
+
+
+def carry_preset(context, previous):
+    """After an Architecture switch: when the settings were the stock preset *previous*, apply the new
+    architecture's preset of the same name, else its first preset. Returns whether a preset was applied; custom
+    settings are left as they are."""
+    architecture = context.scene.architecture_mode
+    if (_carry_held or previous not in PRESETS
+            or preset_architecture(PRESETS[previous]) == architecture):
+        return False
+    target = matching_preset(context, previous, architecture)
+    if target is None:
+        return False
+    context.scene.stablegen_preset = target
+    result = apply_preset(context, target, lambda level, message: print(f"[StableGen] {message}"))
+    return 'FINISHED' in result
 
 def normalize_value(key, value):
     if key == "trellis2_remesh" and isinstance(value, bool):
@@ -882,121 +1012,146 @@ class ApplyPreset(bpy.types.Operator):
         return not sg_modal_active(context)
 
     def execute(self, context):
-        preset = context.scene.stablegen_preset
-        if '(EXPERIMENTAL)' in preset and not experiments_enabled(context):
-            self.report({'ERROR'}, "Enable experimental texturing in add-on preferences first")
+        return apply_preset(context, context.scene.stablegen_preset, self.report)
+
+
+# Architecture changes made while a preset is applied, or while a file migrates its architecture, keep the
+# settings instead of carrying a preset over (carry_preset).
+_carry_held = False
+
+
+@contextmanager
+def preset_carry_held():
+    global _carry_held
+    held, _carry_held = _carry_held, True
+    try:
+        yield
+    finally:
+        _carry_held = held
+
+
+def apply_preset(context, preset, report):
+    """Apply stock preset *preset* to the scene, reporting through *report* (an operator's report signature).
+    Returns the operator result."""
+    with preset_carry_held():
+        return _apply_preset(context, preset, report)
+
+
+def _apply_preset(context, preset, report):
+    if '(EXPERIMENTAL)' in preset and not experiments_enabled(context):
+        report({'ERROR'}, "Enable experimental texturing in add-on preferences first")
+        return {'CANCELLED'}
+    if preset in PRESETS:
+        values = PRESETS[preset]
+        if (preset_uses_deprecated_architecture(values)
+                and not deprecated_architectures_enabled(context)):
+            report({'ERROR'}, "Enable deprecated architectures in add-on preferences first; these architectures no longer receive support")
             return {'CANCELLED'}
-        if preset in PRESETS:
-            values = PRESETS[preset]
-            if (preset_uses_deprecated_architecture(values)
-                    and not deprecated_architectures_enabled(context)):
-                self.report({'ERROR'}, "Enable deprecated architectures in add-on preferences first; these architectures no longer receive support")
-                return {'CANCELLED'}
-            if (preset_uses_experimental_architecture(values)
-                    and not experimental_architectures_enabled(context)):
-                self.report({'ERROR'}, "Enable experimental architectures in add-on preferences first")
-                return {'CANCELLED'}
+        if (preset_uses_experimental_architecture(values)
+                and not experimental_architectures_enabled(context)):
+            report({'ERROR'}, "Enable experimental architectures in add-on preferences first")
+            return {'CANCELLED'}
 
-            if not values.get("custom", False):
-                for key, value in TEXTURING_DEFAULTS.items():
-                    if hasattr(context.scene, key):
-                        setattr(context.scene, key, value)
-            
-            # Apply architecture_mode first so dynamic enums that
-            # depend on it (e.g. sequential_ipadapter_mode) are valid
-            # when their values are set in the main loop.
-            if "architecture_mode" in values and hasattr(context.scene, "architecture_mode"):
-                try:
-                    setattr(context.scene, "architecture_mode", values["architecture_mode"])
-                except (TypeError, AttributeError):
-                    pass
-
-            # Apply regular parameters
-            skipped = []
-            for key, value in values.items():
-                if key not in ["controlnet_units", "lora_units", "description"] and hasattr(context.scene, key):
-                    try:
-                        if key == "trellis2_decimate_method" and value == "planar":
-                            setattr(context.scene, "trellis2_decimate_method", "none")
-                            continue
-                        if key == "trellis2_remesh":
-                            if isinstance(value, bool):
-                                legacy_str = "qdc" if value else "none"
-                            else:
-                                legacy_str = value
-                            setattr(context.scene, "trellis2_remesh", legacy_str)
-                            if legacy_str == "qdc":
-                                setattr(context.scene, "trellis2_decimate_method", "server")
-                                setattr(context.scene, "trellis2_remesh_method", "qdc")
-                            elif legacy_str in ("none", "decimate_planar"):
-                                setattr(context.scene, "trellis2_decimate_method", "none")
-                                setattr(context.scene, "trellis2_remesh_method", "none")
-                            elif legacy_str == "decimate_collapse":
-                                setattr(context.scene, "trellis2_decimate_method", "collapse")
-                                setattr(context.scene, "trellis2_remesh_method", "none")
-                            elif legacy_str == "quadriflow":
-                                setattr(context.scene, "trellis2_decimate_method", "none")
-                                setattr(context.scene, "trellis2_remesh_method", "quadriflow")
-                            elif legacy_str == "instant_meshes":
-                                setattr(context.scene, "trellis2_decimate_method", "none")
-                                setattr(context.scene, "trellis2_remesh_method", "quadriflow")
-                            continue
-                        setattr(context.scene, key, value)
-                    except (TypeError, AttributeError):
-                        # Dynamic enum values (e.g. trellis2_input) may not
-                        # exist when the current architecture differs.
-                        skipped.append(key)
-            
-            # Apply ControlNet units if present in the preset
-            if "controlnet_units" in values:
-                # Clear existing units
-                context.scene.controlnet_units.clear()
-                
-                # Add new units from preset
-                controlnet_units = values["controlnet_units"]
-                for unit_data in controlnet_units:
-                    new_unit = context.scene.controlnet_units.add()
-                    for key, value in unit_data.items():
-                        try:
-                            setattr(new_unit, key, value)
-                        except TypeError:
-                            self.report({'ERROR'}, f"Failed to set {key} for ControlNet unit: {value}. Model might be missing or might not be named correctly.")
-                            return {'CANCELLED'}
-                        
-            if "lora_units" in values:
-                # Clear existing LoRA units
-                context.scene.lora_units.clear()
-                
-                # Add new LoRA units from preset
-                lora_units = values["lora_units"]
-                for lora_data in lora_units:
-                    new_lora = context.scene.lora_units.add()
-                    for key, value in lora_data.items():
-                        try:
-                            setattr(new_lora, key, value)
-                        except TypeError:
-                            self.report({'ERROR'}, f"Failed to set {key} for LoRA unit: {value}. Model might be missing or might not be named correctly.")
-                            context.scene.lora_units.remove(len(context.scene.lora_units) - 1)
-                            return {'CANCELLED'}
-                        
-            # Reverse-sync: if the preset set model_architecture but didn't
-            # include architecture_mode, update the visible dropdown to match.
-            if "architecture_mode" not in values:
-                arch = context.scene.model_architecture
-                if arch in DIFFUSION_ARCHITECTURES:
-                    context.scene.architecture_mode = arch
-
-            if skipped:
-                self.report({'WARNING'}, f"Preset '{preset}' applied (skipped {len(skipped)} incompatible setting(s)).")
-            else:
-                self.report({'INFO'}, f"Preset '{preset}' applied.")
-        else:
-            self.report({'INFO'}, "Custom preset active.")
+        if not values.get("custom", False):
+            for key, value in TEXTURING_DEFAULTS.items():
+                if hasattr(context.scene, key):
+                    setattr(context.scene, key, value)
         
-        # Force update to ensure preset detection is correct after list changes
-        update_parameters(self, context)
+        # Apply architecture_mode first so dynamic enums that
+        # depend on it (e.g. sequential_ipadapter_mode) are valid
+        # when their values are set in the main loop.
+        if "architecture_mode" in values and hasattr(context.scene, "architecture_mode"):
+            try:
+                setattr(context.scene, "architecture_mode", values["architecture_mode"])
+            except (TypeError, AttributeError):
+                pass
 
-        return {'FINISHED'}
+        # Apply regular parameters
+        skipped = []
+        for key, value in values.items():
+            if key not in ["controlnet_units", "lora_units", "description"] and hasattr(context.scene, key):
+                try:
+                    if key == "trellis2_decimate_method" and value == "planar":
+                        setattr(context.scene, "trellis2_decimate_method", "none")
+                        continue
+                    if key == "trellis2_remesh":
+                        if isinstance(value, bool):
+                            legacy_str = "qdc" if value else "none"
+                        else:
+                            legacy_str = value
+                        setattr(context.scene, "trellis2_remesh", legacy_str)
+                        if legacy_str == "qdc":
+                            setattr(context.scene, "trellis2_decimate_method", "server")
+                            setattr(context.scene, "trellis2_remesh_method", "qdc")
+                        elif legacy_str in ("none", "decimate_planar"):
+                            setattr(context.scene, "trellis2_decimate_method", "none")
+                            setattr(context.scene, "trellis2_remesh_method", "none")
+                        elif legacy_str == "decimate_collapse":
+                            setattr(context.scene, "trellis2_decimate_method", "collapse")
+                            setattr(context.scene, "trellis2_remesh_method", "none")
+                        elif legacy_str == "quadriflow":
+                            setattr(context.scene, "trellis2_decimate_method", "none")
+                            setattr(context.scene, "trellis2_remesh_method", "quadriflow")
+                        elif legacy_str == "instant_meshes":
+                            setattr(context.scene, "trellis2_decimate_method", "none")
+                            setattr(context.scene, "trellis2_remesh_method", "quadriflow")
+                        continue
+                    setattr(context.scene, key, value)
+                except (TypeError, AttributeError):
+                    # Dynamic enum values (e.g. trellis2_input) may not
+                    # exist when the current architecture differs.
+                    skipped.append(key)
+        
+        # Apply ControlNet units if present in the preset
+        if "controlnet_units" in values:
+            # Clear existing units
+            context.scene.controlnet_units.clear()
+            
+            # Add new units from preset
+            controlnet_units = values["controlnet_units"]
+            for unit_data in controlnet_units:
+                new_unit = context.scene.controlnet_units.add()
+                for key, value in unit_data.items():
+                    try:
+                        setattr(new_unit, key, value)
+                    except TypeError:
+                        report({'ERROR'}, f"Failed to set {key} for ControlNet unit: {value}. Model might be missing or might not be named correctly.")
+                        return {'CANCELLED'}
+                    
+        if "lora_units" in values:
+            # Clear existing LoRA units
+            context.scene.lora_units.clear()
+            
+            # Add new LoRA units from preset
+            lora_units = values["lora_units"]
+            for lora_data in lora_units:
+                new_lora = context.scene.lora_units.add()
+                for key, value in lora_data.items():
+                    try:
+                        setattr(new_lora, key, value)
+                    except TypeError:
+                        report({'ERROR'}, f"Failed to set {key} for LoRA unit: {value}. Model might be missing or might not be named correctly.")
+                        context.scene.lora_units.remove(len(context.scene.lora_units) - 1)
+                        return {'CANCELLED'}
+                    
+        # Reverse-sync: if the preset set model_architecture but didn't
+        # include architecture_mode, update the visible dropdown to match.
+        if "architecture_mode" not in values:
+            arch = context.scene.model_architecture
+            if arch in DIFFUSION_ARCHITECTURES:
+                context.scene.architecture_mode = arch
+
+        if skipped:
+            report({'WARNING'}, f"Preset '{preset}' applied (skipped {len(skipped)} incompatible setting(s)).")
+        else:
+            report({'INFO'}, f"Preset '{preset}' applied.")
+    else:
+        report({'INFO'}, "Custom preset active.")
+    
+    # Force update to ensure preset detection is correct after list changes
+    update_parameters(None, context)
+
+    return {'FINISHED'}
 
 class SwitchToMeshGeneration(bpy.types.Operator):
     """Switch to mesh generation mode using TRELLIS.2"""

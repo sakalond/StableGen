@@ -41,6 +41,32 @@ def _math(nodes, links, operation, label, a, b, *, stage='Graph control wiring',
     return node.outputs[0]
 
 
+def early_priority_share(nodes, links, share, strength, label, *, stage='Early view priority'):
+    """The later view's mix share with Prioritize earlier views: f / (k - (k - 1) f).
+
+    It reaches a half share where the unprioritized share f is (1 + strength) / 2, as the former Map Range did
+    (which gave the later view nothing below a share of strength and then rose linearly to 1). Being smooth, it
+    keeps a frame fade or angle transition as wide as it is instead of squeezing it into the last part of the band,
+    which left near-hard seams. k = (1 + strength) / (1 - strength); strength is a float or a socket (a control).
+    Returns the output node, labelled ``label``.
+    """
+    if isinstance(strength, (int, float)):
+        s = min(max(float(strength), 0.0), 0.999)
+        k = (1 + s) / (1 - s)
+        k_minus_one = k - 1
+    else:
+        s = _math(nodes, links, 'MINIMUM', label + ' strength', strength, 0.999, stage=stage)
+        k = _math(nodes, links, 'DIVIDE', label + ' k',
+                  _math(nodes, links, 'ADD', label + ' 1+s', 1.0, s, stage=stage),
+                  _math(nodes, links, 'SUBTRACT', label + ' 1-s', 1.0, s, stage=stage), stage=stage)
+        k_minus_one = _math(nodes, links, 'SUBTRACT', label + ' k-1', k, 1.0, stage=stage)
+    lowered = _math(nodes, links, 'MULTIPLY', label + ' (k-1)f', k_minus_one, share, stage=stage)
+    denominator = _math(nodes, links, 'SUBTRACT', label + ' k-(k-1)f', k, lowered, stage=stage)
+    result = _math(nodes, links, 'DIVIDE', label, share, denominator, stage=stage)
+    result.node.hide = False
+    return result.node
+
+
 def _controlled_rejection(nodes, links, source, amount, label, *, stage='Graph control wiring',
                           camera_nodes=None, camera_index=None):
     """Replace uses of source by 1 - amount * (1 - source)."""
@@ -211,17 +237,13 @@ def install_projection_controls(material, scene, new_nodes, camera_nodes=None):
             if not factor.links:
                 continue
             source = factor.links[0].from_socket
-            if source.node.type == 'MAP_RANGE':
-                mapping = source.node
-                unprioritized = mapping.inputs[0].links[0].from_socket
+            if source.node.label.startswith('EarlyPriorityMap-'):
+                # built with a fixed strength: its first input is the unprioritized share
+                unprioritized = source.node.inputs[0].links[0].from_socket
             else:
                 unprioritized = source
-                mapping = nodes.new('ShaderNodeMapRange')
-                mapping.label = 'EarlyPriorityMap-' + mix.label.split('-', 1)[1]
-                mapping['sg_layout_stage'] = 'Early view priority'
-                mapping.hide = True
-                links.new(unprioritized, mapping.inputs[0])
-            links.new(strength, mapping.inputs[1])
+            mapping = early_priority_share(nodes, links, unprioritized, strength,
+                                           'EarlyPriorityMap-' + mix.label.split('-', 1)[1])
             placement = dict(stage='Early view priority')
             difference = _math(nodes, links, 'SUBTRACT', 'Priority difference',
                                mapping.outputs[0], unprioritized, **placement)

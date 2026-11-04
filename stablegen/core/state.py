@@ -10,6 +10,7 @@ import time as _time_mod
 import traceback as _traceback
 
 import bpy  # pylint: disable=import-error
+from bpy.app.handlers import persistent
 
 
 # ── Model-list caches (populated by refresh operators) ────────────────────
@@ -63,6 +64,24 @@ def _dec_pending_refreshes():
 # Monotonically incrementing token so we can discard stale results when the
 # server address changes while a request is still in-flight.
 _async_generation = 0
+# Counts opened files: a result asked for before one opened is stale too.
+_load_generation = 0
+
+
+@persistent
+def _file_loading(*_args):
+    global _load_generation
+    _load_generation += 1
+
+
+def register():
+    if _file_loading not in bpy.app.handlers.load_pre:
+        bpy.app.handlers.load_pre.append(_file_loading)
+
+
+def unregister():
+    if _file_loading in bpy.app.handlers.load_pre:
+        bpy.app.handlers.load_pre.remove(_file_loading)
 
 
 def _run_async(work_fn, done_fn, poll_interval=0.25, track_generation=False):
@@ -79,11 +98,16 @@ def _run_async(work_fn, done_fn, poll_interval=0.25, track_generation=False):
     only for server-address-change callbacks where stale results must be
     dropped; refresh operators should leave it False so their results are
     never accidentally discarded.
+
+    A result that finishes after another file was opened is always stale:
+    *done_fn* gets None, so it still clears its flags (the server check,
+    the pending-refresh count) without applying the old file's data.
     """
     global _async_generation
     if track_generation:
         _async_generation += 1
     gen = _async_generation
+    load_gen = _load_generation
 
     container = {}  # mutable box for the thread to deposit its result
 
@@ -98,8 +122,8 @@ def _run_async(work_fn, done_fn, poll_interval=0.25, track_generation=False):
     t.start()
 
     def _poll():
-        # Discard result if the server address changed after we started.
-        if gen != _async_generation:
+        # Discard result if the server address changed, or a file was opened, after we started.
+        if gen != _async_generation or load_gen != _load_generation:
             # Still call done_fn so it can clean up (e.g. decrement
             # _pending_refreshes).  Pass None to signal stale/no result.
             try:
@@ -115,4 +139,5 @@ def _run_async(work_fn, done_fn, poll_interval=0.25, track_generation=False):
             _traceback.print_exc()
         return None  # done
 
-    bpy.app.timers.register(_poll, first_interval=poll_interval)
+    # Persistent: opening a file would otherwise drop the timer, and done_fn's clean-up with it.
+    bpy.app.timers.register(_poll, first_interval=poll_interval, persistent=True)

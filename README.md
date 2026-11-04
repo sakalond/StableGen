@@ -19,7 +19,7 @@ StableGen is a Blender add-on that textures meshes and whole scenes with diffusi
 
 ## One prompt to a rigged asset
 
-Describe a character and pick one of the preview images; StableGen does the rest in one run. TRELLIS.2 builds the mesh, SkinTokens rigs it, and views generated around it are projected into its texture. A run can also start from an image, skip the rig, or keep the texture TRELLIS.2 makes itself. [TRELLIS.2](https://github.com/sakalond/StableGen/wiki/TRELLIS.2-mesh-generation)
+Describe a character and pick one of the preview images; StableGen does the rest in one run. TRELLIS.2 builds the mesh, SkinTokens rigs it, and views generated around it are projected into its texture. A run can also start from an image, skip the rig, or keep the texture TRELLIS.2 makes itself. Afterwards, LATO.2 can rebuild any mesh as low-poly topology, and Make Solid removes the hidden interior shells TRELLIS.2 meshes carry. [TRELLIS.2](https://github.com/sakalond/StableGen/wiki/TRELLIS.2-mesh-generation)
 
 <p>
 <picture><source media="(min-width: 768px)" srcset="https://raw.githubusercontent.com/sakalond/stablegen-media/main/readme/blank.svg"><source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/sakalond/stablegen-media/main/readme/pipeline-phone-dark.webp"><img src="https://raw.githubusercontent.com/sakalond/stablegen-media/main/readme/pipeline-phone-light.webp" alt="The StableGen panel: a prompt, the preview gallery, then the mesh, rig and texture generated in Blender"></picture><picture><source media="(max-width: 767px)" srcset="https://raw.githubusercontent.com/sakalond/stablegen-media/main/readme/blank.svg"><source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/sakalond/stablegen-media/main/readme/pipeline-dark.webp"><img src="https://raw.githubusercontent.com/sakalond/stablegen-media/main/readme/pipeline-light.webp" alt="The StableGen panel: a prompt, the preview gallery, then the mesh, rig and texture generated in Blender"></picture>
@@ -69,7 +69,7 @@ Bake the result, PBR maps included, into UV textures and export it with its rig 
 
 ## Working by hand
 
-Each step can also be done by hand: reorder the cameras and give views their own prompts, change how the views blend and reproject without generating again, extract PBR maps, and repaint a region with Masked Edit.
+Each step can also be done by hand: reorder the cameras, give views their own prompts and describe objects once for every view that sees them, change how the views blend and reproject without generating again, extract PBR maps, and repaint a region with Masked Edit.
 
 <p>
 <picture><source media="(min-width: 768px)" srcset="https://raw.githubusercontent.com/sakalond/stablegen-media/main/readme/blank.svg"><source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/sakalond/stablegen-media/main/readme/tools-phone-dark.webp"><img src="https://raw.githubusercontent.com/sakalond/stablegen-media/main/readme/tools-phone-light.webp" alt="The StableGen panel: camera order and view prompts, blending, PBR maps and Masked Edit"></picture><picture><source media="(max-width: 767px)" srcset="https://raw.githubusercontent.com/sakalond/stablegen-media/main/readme/blank.svg"><source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/sakalond/stablegen-media/main/readme/tools-dark.webp"><img src="https://raw.githubusercontent.com/sakalond/stablegen-media/main/readme/tools-light.webp" alt="The StableGen panel: camera order and view prompts, blending, PBR maps and Masked Edit"></picture>
@@ -92,9 +92,10 @@ Texturing works by projection. Each camera gets a generated view that follows th
 ### Built on
 
 - [ComfyUI](https://github.com/comfyanonymous/ComfyUI) runs every model, locally or on another machine.
-- [TRELLIS.2](https://github.com/microsoft/TRELLIS.2) generates meshes, through [ComfyUI-TRELLIS2](https://github.com/PozzettiAndrea/ComfyUI-TRELLIS2).
+- [TRELLIS.2](https://github.com/microsoft/TRELLIS.2) generates meshes, through ComfyUI's own TRELLIS.2 nodes.
 - [SDXL](https://huggingface.co/stabilityai/stable-diffusion-xl-base-1.0) with ControlNet and IPAdapter, and [Qwen Image](https://github.com/QwenLM/Qwen-Image), generate the texture views. [MOSS-Image](https://huggingface.co/OpenMOSS-Team/MOSS-Image-SFT) and [Bria FIBO 2.0](https://huggingface.co/briaai/Fibo-2.0-edit-turbo) are available as experimental architectures.
 - [SkinTokens](https://github.com/VAST-AI-Research/SkinTokens) rigs characters.
+- [LATO.2](https://github.com/LoHhhha/LATO.2) rebuilds meshes as low-poly topology, through the [ComfyUI-LATO2](https://github.com/sakalond/ComfyUI-LATO2) node.
 - [Marigold](https://github.com/prs-eth/Marigold) and [StableDelight](https://github.com/Stable-X/StableDelight) estimate the PBR maps.
 
 ## Gallery
@@ -115,20 +116,26 @@ Texturing works by projection. Each camera gets a generated view that follows th
 ## Requirements
 
 - Blender 4.2 to 4.5, or 5.1 and later. Blender 5.0 is not supported.
-- A ComfyUI server, preferably with an NVIDIA GPU: about 8 GB of VRAM for SDXL, and 16 GB or more for Qwen Image.
+- ComfyUI: StableGen can install its own, use one you have, or connect to one on another machine. An NVIDIA GPU is preferred: about 8 GB of VRAM for SDXL, and 16 GB or more for Qwen Image.
 - Windows, Linux, or macOS on Apple Silicon.
-- 10 GB to over 50 GB of disk space for models, depending on what you install.
+- 10 GB to over 50 GB of disk space for models, depending on what you install, plus about 5 GB for StableGen's own ComfyUI.
 
 ## Installation
 
-1. Install [ComfyUI](https://github.com/comfyanonymous/ComfyUI#installing) and check that it runs.
-2. Install the custom nodes and models StableGen uses with the installer in this repository, then restart ComfyUI:
-   ```bash
-   python installer.py <path to ComfyUI>
-   ```
-   Package 3 sets up SDXL texturing, package 13 Qwen Image 2.1, package 8 mesh generation, package 14 auto-rigging, and packages 15 to 17 the experimental architectures.
-3. Download the add-on ZIP for your system (Windows x64, Linux x64 or macOS on Apple Silicon) from [Releases](https://github.com/sakalond/stablegen/releases). In Blender, open **Edit > Preferences > Get Extensions**, choose **Install from Disk** in the top-right menu, and select the ZIP.
-4. In the add-on preferences, set **Output Directory** and **Server Address** (`127.0.0.1:8188` by default). Under **System > Network**, enable **Allow Online Access**.
+1. Download the add-on ZIP for your system (Windows x64, Linux x64 or macOS on Apple Silicon) from [Releases](https://github.com/sakalond/stablegen/releases). In Blender, open **Edit > Preferences > Get Extensions**, choose **Install from Disk** in the top-right menu, and select the ZIP.
+2. Under **System > Network**, enable **Allow Online Access**.
+3. Open the StableGen panel in the 3D Viewport's sidebar (**N**). Its **ComfyUI setup** page opens the first time, and later under **•••** > **ComfyUI setup**. Choose where ComfyUI comes from:
+   - **Install StableGen's own**: pick an install folder and press **Install ComfyUI**. StableGen sets up ComfyUI with its own Python and torch for your GPU, about 5 GB, then starts and stops it by itself. Tested on Windows so far.
+   - **Use my ComfyUI folder**: a ComfyUI you already have (portable, git or Desktop install, or one that runs on your system Python). StableGen installs models into it and starts it when needed.
+   - **Connect to a server**: a ComfyUI on another machine, at its server address. Install the models there with the installer (below).
+4. Under **Models** on the same page, install what you need: SDXL or Qwen Image 2.1 for texturing, TRELLIS.2 for meshes, auto-rigging, PBR maps, LATO.2 and the experimental architectures. Each shows its download size; installs can be queued and removed, and an interrupted download resumes. When the selected architecture's models are missing, an **Install** line under Architecture downloads them too.
+5. Set **Output Directory** in the add-on preferences.
+
+On a remote ComfyUI, or without Blender, run the installer on that machine and restart ComfyUI:
+```bash
+python installer.py <path to ComfyUI> --packages 3,8
+```
+Package 3 sets up SDXL texturing, package 13 Qwen Image 2.1, package 8 mesh generation, package 14 auto-rigging, packages 15 to 17 the experimental architectures, and package 18 LATO.2 low-poly remeshing. `python installer.py --create-comfyui <folder>` sets up StableGen's own ComfyUI there.
 
 [Installation](https://github.com/sakalond/StableGen/wiki/Installation) covers every installer package, unattended installs, a remote server and manual setup.
 
@@ -146,7 +153,7 @@ Press <kbd>N</kbd> in the 3D Viewport and open the **StableGen** tab.
 **Generate an asset**
 
 1. Set **Architecture** to **TRELLIS.2** and choose a preset tagged **Mesh + texture**.
-2. On the **Mesh** page, set **Generate mesh from** to **Prompt**, describe the object and enable **Preview gallery**.
+2. On the **Mesh** page, describe the object. **Generate mesh from** starts on **Prompt**, with the **Preview gallery** on.
 3. To rig a character in the same run, enable **Auto-rig** under **Rigging & Animation**.
 4. Click **Generate asset**, then pick a preview image.
 
@@ -167,13 +174,13 @@ StableGen is released under the [GNU General Public License v3.0](LICENSE). The 
 
 - Qwen Image 2.1 and Qwen Image 2.1 Turbo are released under the [Qwen Research License](https://huggingface.co/Qwen/Qwen-Image-2.1/blob/main/LICENSE). Qwen Image Edit and SDXL are not affected.
 - Bria FIBO 2.0 is released under [CC BY-NC 4.0](https://huggingface.co/briaai/Fibo-2.0-edit-turbo); commercial use needs an agreement with Bria.
-- The TRELLIS.2 **Native** texture mode uses NVIDIA's nvdiffrast and nvdiffrec. The other modes do not use them. See [TRELLIS.2 third-party licenses](https://github.com/sakalond/StableGen/wiki/TRELLIS.2-mesh-generation#third-party-licenses).
+- TRELLIS.2's image encoder, Meta's DINOv3, has its own license. See [TRELLIS.2 third-party licenses](https://github.com/sakalond/StableGen/wiki/TRELLIS.2-mesh-generation#third-party-licenses).
 
 ## Acknowledgements
 
 StableGen began as a bachelor's thesis by Ondřej Sakala at the Faculty of Information Technology, Czech Technical University in Prague, supervised by Ing. Radek Richtr, Ph.D. ([full text](https://dspace.cvut.cz/handle/10467/123567)). Part of its development took place during a study stay at Kanazawa University in summer 2026; travel costs were supported by a grant from Nadace „Nadání Josefa, Marie a Zdeňky Hlávkových“.
 
-It builds on [ComfyUI](https://github.com/comfyanonymous/ComfyUI), [ComfyUI-TRELLIS2](https://github.com/PozzettiAndrea/ComfyUI-TRELLIS2) and [Blender](https://www.blender.org/), and was inspired by the [Dream Textures](https://github.com/carson-katri/dream-textures) and [Diffused Texture](https://github.com/FrederikHasecke/diffused-texture-addon) add-ons.
+It builds on [ComfyUI](https://github.com/comfyanonymous/ComfyUI) and [Blender](https://www.blender.org/), ran TRELLIS.2 through [ComfyUI-TRELLIS2](https://github.com/PozzettiAndrea/ComfyUI-TRELLIS2) before ComfyUI had its own nodes, and was inspired by the [Dream Textures](https://github.com/carson-katri/dream-textures) and [Diffused Texture](https://github.com/FrederikHasecke/diffused-texture-addon) add-ons.
 
 <details>
 <summary>Research StableGen draws on</summary>
