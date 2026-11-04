@@ -38,9 +38,12 @@ from ..core.architectures import ARCHITECTURE_ITEMS, QWEN_ARCHITECTURES, archite
 TAB = 'StableGen'
 PAGES = [('GENERATE', 'Texture'), ('CAMERAS', 'Cameras'), ('BLEND', 'Blending')]
 MORE = [('TOOLS', 'Tools'), ('QUEUE', 'Scene queue'), ('DEBUG', 'Diagnostics'),
-        ('MESH', 'Mesh & rig'), ('PRINT', '3D printing'), ('EXPERIMENTS', 'Experiments')]
+        ('MESH', 'Mesh & rig'), ('PRINT', '3D printing'), ('EXPERIMENTS', 'Experiments'),
+        ('SETUP', 'ComfyUI setup')]
 # Architectures that generate the asset itself rather than texturing an existing mesh.
 ASSET_ARCHITECTURES = {'trellis2'}
+DIAGNOSTIC_ICONS = {'SOLID': 'material', 'GRID': 'grid', 'COVERAGE': 'layers', 'VISIBILITY': 'eye', 'WEIGHT': 'graph',
+                    'FEATHER': 'widen', 'CONFIDENCE': 'check', 'SEAMS': 'curve', 'DPPG': 'shield'}
 
 
 ARCHITECTURE_PROPERTIES = {'architecture_mode', 'model_architecture', 'trellis2_texture_mode', 'trellis2_initial_image_arch'}
@@ -450,15 +453,12 @@ class StudioSession:
         self.refresh()
 
     def write_binding(self, binding, value, undo=True):
-        if binding.path == 'sg_studio_diagnostics':
-            scope, mode = _viewport_mode(self, 'EXEC_DEFAULT')
-            with scope:
-                bpy.ops.stablegen.studio_diagnostic(mode, setting=binding.property, value=json.dumps(value))
-                _undo('Change diagnostic display')
-        else:
-            binding.set(bpy.context, value)
-            if undo:
-                _undo('Change ' + binding.rna(bpy.context).name)
+        # Read the label first: after a rename the binding's old name no longer resolves. A diagnostic option
+        # only changes the setting; Update view applies it.
+        label = binding.rna(bpy.context).name
+        binding.set(bpy.context, value)
+        if undo:
+            _undo('Change ' + label)
 
     def begin_edit(self, target, select=False):
         self.commit()
@@ -1657,7 +1657,8 @@ class StudioSession:
         decision = [item for n in self.document.actions for item in model.controls(n)
                     if item.control.method == 'operator' and item.control.args[0] == 'stablegen.resolve_masked_edit']
         utilities = self.page in {'TOOLS', 'DEBUG'} and not decision
-        preview = diagnostics.active(bpy.context.scene)
+        # Diagnostics has its own Restore textures beside the display it shows
+        preview = diagnostics.active(bpy.context.scene) and self.page != 'DEBUG'
         # Keep the last action row twelve pixels clear of the panel's bottom edge.
         bottom_padding = 12
         if progress:
@@ -1830,10 +1831,28 @@ class StudioSession:
         state = bpy.context.scene.sg_studio_diagnostics
         items = [(obj.name, obj.name, 'Inspect this camera') for obj in bpy.context.scene.objects if obj.type == 'CAMERA']
         items.sort()
-        self.menu = {'anchor': rect, 'items': items, 'query': '', 'binding': None,
-                     'callback': lambda name: self.call('stablegen.studio_diagnostic',
-                         {'setting': 'camera', 'value': json.dumps(name)}, mode='EXEC_DEFAULT'),
+        def choose(name):
+            state.camera = bpy.data.objects.get(name)
+            _undo('Change diagnostic camera')
+        self.menu = {'anchor': rect, 'items': items, 'query': '', 'binding': None, 'callback': choose,
                      'index': next((i for i, item in enumerate(items) if state.camera and item[0] == state.camera.name), 0), 'scroll': 0}
+
+    def diagnostic_settings(self, mode):
+        """What a shown display depends on: when it differs from what is shown, Update view applies it."""
+        state = bpy.context.scene.sg_studio_diagnostics
+        return (mode, state.grid_size, state.coverage, state.confidence, state.scope, state.stage,
+                state.camera.name if state.camera else '')
+
+    def show_diagnostic(self, mode):
+        self.call('stablegen.studio_diagnostic', {'value': json.dumps(mode)}, mode='EXEC_DEFAULT')
+        scene = bpy.context.scene
+        if mode == 'TEXTURES' or not diagnostics.active(scene):
+            self.diagnostic_shown = None
+            failure = diagnostics.SG_OT_StudioDiagnostic.failure
+            if mode != 'TEXTURES' and failure:
+                self.tell(failure)
+        else:
+            self.diagnostic_shown = self.diagnostic_settings(mode)
 
     def draw_diagnostics(self, p, x, y, width):
         scene, state = bpy.context.scene, bpy.context.scene.sg_studio_diagnostics
@@ -1846,33 +1865,85 @@ class StudioSession:
         p.rect(x + 12, y - 3, width - 24, 1, 'divider')
         with _viewport(self):
             available = model.operator('stablegen.studio_diagnostic').poll()
-        y += self.draw_binding(p, model.Binding.from_data(state, 'mode'), 'Display', x + 8, y + 8, width - 16, enabled=available) + 8
-        description = diagnostics.DISPLAY_SUMMARIES[state.mode]
-        for _, _, line in wrap(description, width - 16, p.measure):
-            p.text(line, x + 8, y, 10, 'secondary')
-            y += 15
-        y += 6
-        if diagnostics.active(scene):
+        active = diagnostics.active(scene)
+        x, width, y = x + 8, width - 16, y + 8
+        if active:
+            # A display replaces the textures right now: say so above everything it could be confused with
+            name = next(label for key, label, _ in diagnostics.MODES if key == state.mode)
             count = sum(record.object is not None for record in state.meshes)
-            p.text(f'Previewing {count} mesh' + ('es' if count != 1 else '') + ' · Originals preserved',
-                   x + 8, y, 10, 'accent', width - 16)
-            y += 22
+            p.rect(x, y, width, 26, 'tab_selected', 4)
+            p.rect(x, y, 3, 26, 'blue', 1)
+            p.rect(x + 12, y + 10, 6, 6, 'accent', 3)
+            p.text('Showing ' + name, x + 26, y + 7, FONT_SIZE, 'text', width - 40)
+            p.text(f'{count} mesh' + ('es' if count != 1 else '') + ' · originals kept',
+                   x + 36 + p.measure('Showing ' + name), y + 8, 10, 'muted')
+            y += 38
+        # Tiles only choose; Show in viewport applies the chosen display with its options.
+        pick = self.diagnostic_pick or (state.mode if active else 'SOLID')
+        modes = [mode for mode in diagnostics.MODES if mode[0] != 'TEXTURES']
+        columns = 3 if width >= 420 else 2
+        tile_width, tile_height, gap = (width - 6 * (columns - 1)) / columns, 30, 6
+        for index, (key, label, description) in enumerate(modes):
+            rect = (x + index % columns * (tile_width + gap), y + index // columns * (tile_height + gap),
+                    tile_width, tile_height)
+            missing = diagnostics.unavailable(bpy.context, key)
+            hover = self.hovered('diagnostic:' + key)
+            chosen = key == pick
+            p.outline(*rect, 'selected' if chosen else 'raised',
+                      'accent' if chosen else 'hover_border' if hover else 'tool_border')
+            tint = 'disabled' if missing else 'text'
+            p.icon(DIAGNOSTIC_ICONS[key], rect[0] + 10, rect[1] + 8, 13, tint)
+            p.text(label, rect[0] + 30, rect[1] + 8, FONT_SIZE, tint, tile_width - 50)
+            if active and key == state.mode:
+                p.rect(rect[0] + tile_width - 13, rect[1] + 12, 6, 6, 'accent', 3)
+            p.target('diagnostic:' + key, rect, lambda key=key: setattr(self, 'diagnostic_pick', key),
+                     available and not self.busy, missing or description)
+        y += (len(modes) + columns - 1) // columns * (tile_height + gap) - gap + 12
+        option = state.confidence if pick == 'CONFIDENCE' else None
+        missing = diagnostics.unavailable(bpy.context, pick, option)
+        if missing:
+            p.icon('shield', x, y, 12, 'warning')
+            for _, _, line in wrap(missing + '.', width - 18, lambda text: p.measure(text, 10)):
+                p.text(line, x + 18, y + 1, 10, 'warning')
+                y += 15
+        else:
+            for _, _, line in wrap(diagnostics.DISPLAY_SUMMARIES[pick], width, lambda text: p.measure(text, 10)):
+                p.text(line, x, y, 10, 'secondary')
+                y += 15
+        y += 8
         options = {'GRID': ['grid_size'], 'COVERAGE': ['coverage'], 'CONFIDENCE': ['confidence'],
-                   'DPPG': ['scope', 'stage']}.get(state.mode, [])
+                   'DPPG': ['scope', 'stage']}.get(pick, [])
         for key in options:
             binding = model.Binding.from_data(state, key)
-            y += self.draw_binding(p, binding, binding.rna(bpy.context).name, x + 8, y, width - 16, enabled=available)
-        if state.mode in {'WEIGHT', 'FEATHER', 'VISIBILITY', 'CONFIDENCE'} or state.mode == 'DPPG' and state.scope == 'ACTIVE':
-            p.text('Camera', x + 8, y, FONT_SIZE, 'text')
+            y += self.draw_binding(p, binding, binding.rna(bpy.context).name, x, y, width, enabled=available)
+        if pick in {'WEIGHT', 'FEATHER', 'VISIBILITY', 'CONFIDENCE'} or pick == 'DPPG' and state.scope == 'ACTIVE':
+            p.text('Camera', x, y, FONT_SIZE, 'text')
             y += 17
-            rect = (x + 8, y, width - 16, CONTROL_HEIGHT)
+            rect = (x, y, width, CONTROL_HEIGHT)
             p.outline(*rect, 'menu', 'hover_border' if self.hovered('diagnostic-camera') else 'menu_border')
-            p.text(state.camera.name if state.camera else 'Choose camera', rect[0] + 8, y + 5, FONT_SIZE, 'menu_text', width - 49)
-            p.icon('down', x + width - 24, y + 6, 10, 'menu_text')
+            p.text(state.camera.name if state.camera else 'Choose camera', rect[0] + 8, y + 5, FONT_SIZE, 'menu_text', width - 33)
+            p.icon('down', x + width - 16, y + 6, 10, 'menu_text')
             p.target('diagnostic-camera', rect, lambda rect=rect: self.diagnostic_camera_menu(rect), available and not self.busy,
                      'Choose the camera whose signal is displayed')
             y += CONTROL_HEIGHT + 8
         y += 2
+        can_show = available and not self.busy and not missing
+        if active:
+            changed = self.diagnostic_settings(pick) != self.diagnostic_shown
+            half = (width - 6) / 2
+            p.button('diagnostic-update', (x, y, half, CONTROL_HEIGHT + 2), 'Update view',
+                     lambda pick=pick: self.show_diagnostic(pick), icon='play', style='primary',
+                     enabled=can_show and changed,
+                     hint='Show the chosen display with these settings' if changed else 'The viewport shows these settings')
+            p.button('diagnostic-restore', (x + half + 6, y, half, CONTROL_HEIGHT + 2), 'Restore textures',
+                     lambda: self.show_diagnostic('TEXTURES'), icon='reset', style='outlined',
+                     enabled=available and not self.busy, hint='Restore the original mesh, materials and render settings')
+        else:
+            p.button('diagnostic-show', (x, y, width, CONTROL_HEIGHT + 2), 'Show in viewport',
+                     lambda pick=pick: self.show_diagnostic(pick), icon='play', style='primary', enabled=can_show,
+                     hint=missing or 'Replace the textures with this display; your originals are kept')
+        y += CONTROL_HEIGHT + 2 + 10
+        x, width = x - 8, width + 16
         p.end_group((x, start, width, y - start), 'subbox', 'section_border', 3)
         y += 12
         y = self.draw_actions(p, 'Projection analysis', [

@@ -151,7 +151,7 @@ class StableGenAddonPreferences(bpy.types.AddonPreferences):
     enable_debug: bpy.props.BoolProperty(
         name="Enable Debug Settings",
         description="Show diagnostic tools in the main panel for visualising projection weights, blending and coverage",
-        default=False
+        default=True
     )  # type: ignore
 
     show_advanced: bpy.props.BoolProperty(

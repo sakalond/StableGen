@@ -16,6 +16,7 @@ import colorsys
 import glob
 import json
 import numpy as np
+import re
 import sys
 import tempfile
 import shutil
@@ -31,10 +32,6 @@ from .texturing.projection import (
     project_image,
     create_native_raycast_visibility,
     create_native_feather,
-    _SG_BUFFER_UV_NAME,
-    _copy_uv_to_attribute,
-    _projection_uvw_name,
-    _write_projection_uvw,
 )
 from .texturing.rendering import export_emit_image, export_visibility
 from .cameras.geometry import _get_camera_resolution, _SGCameraResolution
@@ -467,51 +464,6 @@ def _save_grid_image(path, width, height, color_rgb, grid_size=64):
     bpy.data.images.remove(img)
 
 
-def _apply_uv_projections(context, cameras, meshes, mat_id):
-    """Create UV projections for each camera on each mesh, storing them
-    as named attributes.  Returns True on success."""
-    for i, camera in enumerate(cameras):
-        for obj in meshes:
-            bpy.ops.object.select_all(action='DESELECT')
-            context.view_layer.objects.active = obj
-            obj.select_set(True)
-            bpy.ops.object.make_single_user(object=True, obdata=True)
-            if obj.data.users > 1:
-                obj.data = obj.data.copy()
-                obj.data.name = f"{obj.name}_data"
-                obj.data.update()
-
-            buffer_uv = obj.data.uv_layers.get(_SG_BUFFER_UV_NAME)
-            if not buffer_uv:
-                buffer_uv = obj.data.uv_layers.new(name=_SG_BUFFER_UV_NAME)
-
-            mod = obj.modifiers.new(name="UVProject", type='UV_PROJECT')
-            mod.projectors[0].object = camera
-            mod.uv_layer = buffer_uv.name
-            cam_res_x, cam_res_y = _get_camera_resolution(camera, context.scene)
-            aspect = cam_res_x / cam_res_y
-            mod.aspect_x = aspect if aspect > 1 else 1
-            mod.aspect_y = 1 / aspect if aspect < 1 else 1
-            obj.data.uv_layers.active = buffer_uv
-            bpy.ops.object.modifier_apply(modifier=mod.name)
-
-            attr_name = f"ProjectionUV_{i}_{mat_id}"
-            _copy_uv_to_attribute(obj, _SG_BUFFER_UV_NAME, attr_name)
-            _write_projection_uvw(obj, camera, attr_name, _projection_uvw_name(i, mat_id))
-
-            original_uv = obj.data.uv_layers[0]
-            if original_uv.name == _SG_BUFFER_UV_NAME and len(obj.data.uv_layers) > 1:
-                original_uv = obj.data.uv_layers[1]
-            obj.data.uv_layers.active = original_uv
-
-    # Clean up buffer UV
-    for obj in meshes:
-        buf = obj.data.uv_layers.get(_SG_BUFFER_UV_NAME)
-        if buf:
-            obj.data.uv_layers.remove(buf)
-    return True
-
-
 def _get_active_camera(context):
     """Return the camera the user intends to preview and its index in the
     sorted camera list.  Detection: selected camera → scene camera → first."""
@@ -626,6 +578,76 @@ def _debug_projection_build_state(scene):
 # ═════════════════════════════════════════════════════════════════════════
 # 1. Draw Solid Colors  (calls the real project_image)
 # ═════════════════════════════════════════════════════════════════════════
+
+def _linear(color):
+    """The debug colours are what their PNGs held, sRGB; shader colours are linear."""
+    return tuple(c / 12.92 if c <= 0.04045 else ((c + 0.055) / 1.055) ** 2.4 for c in color) + (1.0,)
+
+
+def _replace_view_colors(context, meshes, colour):
+    """Give each projected view in *meshes*' materials (Studio passes private copies) another colour than its image:
+    ``colour(tree, image_node, camera, debug_colour)`` returns the socket, its weights, gates and alpha unchanged,
+    so nothing is projected anew. Returns False when the materials hold no projected views."""
+    cameras = _interactive_generation_cameras(context)
+    colors = _saturated_colors(len(cameras))
+    replaced, seen = False, set()
+    for obj in meshes:
+        for slot in obj.material_slots:
+            material = slot.material
+            if material is None or not material.use_nodes or material.as_pointer() in seen:
+                continue
+            seen.add(material.as_pointer())
+            tree = material.node_tree
+            for node in list(tree.nodes):
+                view = re.fullmatch(r'(\d+)-\d+', node.label) if node.type == 'TEX_IMAGE' else None
+                if view is None or int(view[1]) >= len(colors) or not node.outputs['Color'].links:
+                    continue
+                index = int(view[1])
+                socket = colour(tree, node, cameras[index], colors[index])
+                if socket is None:
+                    continue
+                for link in list(node.outputs['Color'].links):
+                    tree.links.new(socket, link.to_socket)
+                replaced = True
+    if replaced:
+        for camera, color in zip(cameras, colors):
+            camera['_sg_debug_projection_color'] = color
+    return replaced
+
+
+def solid_view_colors(context, meshes):
+    """View colours on the textures as they are: each view in its camera's solid colour."""
+    def solid(tree, node, _camera, color):
+        rgb = tree.nodes.new('ShaderNodeRGB')
+        rgb.label = 'SGViewColor-' + node.label
+        rgb.location = (node.location.x - 220, node.location.y)
+        rgb.outputs[0].default_value = _linear(color)
+        return rgb.outputs[0]
+    return _replace_view_colors(context, meshes, solid)
+
+
+def grid_view_colors(context, meshes, grid_size):
+    """The projection grid on the textures as they are: each view a checkerboard in its camera's colour, cells of
+    *grid_size* of that camera's image pixels, read through the view's own projection UV."""
+    def checker(tree, node, camera, color):
+        if not node.inputs['Vector'].links:
+            return None
+        width, height = _get_camera_resolution(camera, context.scene)
+        cells = tree.nodes.new('ShaderNodeVectorMath')
+        cells.operation = 'MULTIPLY'
+        cells.inputs[1].default_value = (width / grid_size, height / grid_size, 0.0)
+        tree.links.new(node.inputs['Vector'].links[0].from_socket, cells.inputs[0])
+        grid = tree.nodes.new('ShaderNodeTexChecker')
+        grid.label = 'SGViewGrid-' + node.label
+        grid.location = (node.location.x - 220, node.location.y)
+        grid.inputs['Scale'].default_value = 1.0
+        # Unit cells; Color1 where the column and row parities differ, the dark cells of the grid PNGs
+        grid.inputs['Color1'].default_value = _linear(tuple(c * 0.4 for c in color))
+        grid.inputs['Color2'].default_value = _linear(color)
+        tree.links.new(cells.outputs[0], grid.inputs['Vector'])
+        return grid.outputs['Color']
+    return _replace_view_colors(context, meshes, checker)
+
 
 class SG_OT_DebugSolidColors(bpy.types.Operator):
     """Project solid saturated colours (one per camera) through the real
@@ -800,6 +822,11 @@ class SG_OT_DebugVisibilityMaterial(bpy.types.Operator):
         return _common_poll(cls, context)
 
     def execute(self, context):
+        # The solid images replace generated views: never write them over the real ones
+        with _debug_projection_output(context):
+            return self._execute_projection(context)
+
+    def _execute_projection(self, context):
         selected_cams = _get_selected_cameras(context)
         meshes = _get_target_meshes(context)
 
@@ -883,11 +910,14 @@ class SG_OT_DebugCoverageHeatmap(bpy.types.Operator):
             else:
                 context.scene.cycles.use_osl = True
 
-        _apply_uv_projections(context, cameras, meshes, mat_id)
-
+        # One material for every mesh: the raycast graph reads no projection UVs and nothing per object
+        mat = None
         for obj in meshes:
-            mat = bpy.data.materials.new(name="SG_Debug_Heatmap")
             obj.data.materials.clear()
+            if mat is not None:
+                obj.data.materials.append(mat)
+                continue
+            mat = bpy.data.materials.new(name="SG_Debug_Heatmap")
             obj.data.materials.append(mat)
             mat.use_nodes = True
             nodes = mat.node_tree.nodes
@@ -1057,9 +1087,13 @@ class SG_OT_DebugPerCameraWeight(bpy.types.Operator):
 
         use_native = bpy.app.version >= (5, 1, 0)
 
+        mat = None  # one material for every mesh: the graph holds nothing per object
         for obj in meshes:
-            mat = bpy.data.materials.new(name=f"SG_Debug_Weight_{cam.name}")
             obj.data.materials.clear()
+            if mat is not None:
+                obj.data.materials.append(mat)
+                continue
+            mat = bpy.data.materials.new(name=f"SG_Debug_Weight_{cam.name}")
             obj.data.materials.append(mat)
             mat.use_nodes = True
             nodes = mat.node_tree.nodes
@@ -1122,9 +1156,13 @@ class SG_OT_DebugFeatherPreview(bpy.types.Operator):
 
         use_native = bpy.app.version >= (5, 1, 0)
 
+        mat = None  # one material for every mesh: the graph holds nothing per object
         for obj in meshes:
-            mat = bpy.data.materials.new(name=f"SG_Debug_Feather_{cam.name}")
             obj.data.materials.clear()
+            if mat is not None:
+                obj.data.materials.append(mat)
+                continue
+            mat = bpy.data.materials.new(name=f"SG_Debug_Feather_{cam.name}")
             obj.data.materials.append(mat)
             mat.use_nodes = True
             nodes = mat.node_tree.nodes
@@ -1189,14 +1227,17 @@ class SG_OT_DebugUVSeamViz(bpy.types.Operator):
             else:
                 context.scene.cycles.use_osl = True
 
-        _apply_uv_projections(context, cameras, meshes, mat_id)
-
         use_native = bpy.app.version >= (5, 1, 0)
         colors = _saturated_colors(len(cameras))
 
+        # One material for every mesh: the raycast graph reads no projection UVs and nothing per object
+        mat = None
         for obj in meshes:
-            mat = bpy.data.materials.new(name="SG_Debug_UVSeams")
             obj.data.materials.clear()
+            if mat is not None:
+                obj.data.materials.append(mat)
+                continue
+            mat = bpy.data.materials.new(name="SG_Debug_UVSeams")
             obj.data.materials.append(mat)
             mat.use_nodes = True
             nodes = mat.node_tree.nodes

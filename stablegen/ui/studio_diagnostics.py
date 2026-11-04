@@ -8,11 +8,12 @@ import uuid
 
 import bpy
 
+from ..texturing.projection import _remove_stale_uv_projectors
 from ..utils import sg_modal_active
 
 MODES = [
     ('TEXTURES', 'Projected textures', 'Return to the original mesh and materials'),
-    ('SOLID', 'View colors', 'One solid color per camera, through the real projection pipeline'),
+    ('SOLID', 'View colors', 'One solid color per camera, blended by the textures’ own view weights'),
     ('GRID', 'Projection grid', 'Check projected image alignment and distortion'),
     ('COVERAGE', 'Coverage', 'Average or strongest camera visibility, shown on a logarithmic heatmap to reveal weak coverage; not normalized RGB contributions'),
     ('VISIBILITY', 'Visibility', 'Inspect which surfaces the cameras can see'),
@@ -39,6 +40,20 @@ OPERATORS = {
     'DPPG': 'debug_dppg_material',
 }
 OPTIONS = {'mode', 'camera', 'grid_size', 'coverage', 'confidence', 'scope', 'stage'}
+# Displays that read a signal from the projection material: the node label it needs, and how to get it.
+SIGNALS = {
+    'CONFIDENCE': {'QUALITY': 'SGBestSourceQuality', 'TRUSTED': 'SGBestSourceQuality',
+                   'REPAIR': 'SGBestSourceQuality', 'ACQUISITION': 'AcquisitionQuality-',
+                   'WRITE': 'SequentialWriteWeight-', 'GUARD': 'ProjectionGuardWeight-'},
+    'DPPG': {None: 'ProjectionGuardWeight-'},
+}
+MISSING = {
+    'SGBestSourceQuality': 'Not in these textures: generate with Confidence context on',
+    'AcquisitionQuality-': 'Not in these textures: reproject with acquisition quality on',
+    'SequentialWriteWeight-': 'Not in these textures: generate with projection write masks on',
+    'ProjectionGuardWeight-': 'Not in these textures: reproject with the depth/part guard on',
+}
+_found = {}
 _OWNED = '_sg_studio_preview'
 
 
@@ -107,6 +122,30 @@ def _targets(context):
     from ..debug_tools import _get_target_meshes
     return [obj for obj in _get_target_meshes(context)
             if obj.library is None and obj.data.library is None]
+
+
+def unavailable(context, mode, option=None):
+    """Why the inspected textures cannot show *mode*, or ''. *option* is the Confidence signal to check;
+    without it any of the mode's signals will do."""
+    needs = SIGNALS.get(mode)
+    if not needs:
+        return ''
+    state = context.scene.sg_studio_diagnostics
+    labels = [needs[option]] if option in needs else list(dict.fromkeys(needs.values()))
+    if state.token:
+        materials = {saved.material for record in state.meshes for saved in record.slots}
+    else:
+        materials = {slot.material for obj in _targets(context) for slot in obj.material_slots}
+    materials = sorted((m for m in materials if m is not None and m.use_nodes), key=lambda m: m.as_pointer())
+    for label in labels:
+        key = (label, tuple((m.as_pointer(), len(m.node_tree.nodes)) for m in materials))
+        if key not in _found:
+            if len(_found) > 64:
+                _found.clear()
+            _found[key] = any(node.label.startswith(label) for m in materials for node in m.node_tree.nodes)
+        if _found[key]:
+            return ''
+    return MISSING[labels[0]]
 
 
 def _snapshot(context, state):
@@ -267,19 +306,25 @@ def apply(context):
         if camera is None:
             raise ValueError('Add cameras before inspecting projection.')
         state.camera = camera
-        selected = meshes + [camera]
-        kwargs = {'grid_size': state.grid_size} if mode == 'GRID' else (
-            {'mode': state.coverage} if mode == 'COVERAGE' else
-            {'mode': state.confidence} if mode == 'CONFIDENCE' else
-            {'scope': state.scope, 'stage': state.stage} if mode == 'DPPG' else {})
-        with context.temp_override(selected_objects=selected, selected_editable_objects=selected,
-                                   active_object=camera, object=camera):
-            op = getattr(bpy.ops.stablegen, OPERATORS[mode])
-            if not op.poll():
-                raise ValueError('This diagnostic requires meshes, cameras and Debug enabled in preferences.')
-            result = op('EXEC_DEFAULT', **kwargs)
-            if 'FINISHED' not in result:
-                raise ValueError('This signal is unavailable. Reproject textures with the relevant feature enabled.')
+        from ..debug_tools import grid_view_colors, solid_view_colors
+        # View colors and the grid recolour the shown views in place; only textures without projected views are
+        # projected anew
+        recolored = (solid_view_colors(context, meshes) if mode == 'SOLID' else
+                     grid_view_colors(context, meshes, state.grid_size) if mode == 'GRID' else False)
+        if not recolored:
+            selected = meshes + [camera]
+            kwargs = {'grid_size': state.grid_size} if mode == 'GRID' else (
+                {'mode': state.coverage} if mode == 'COVERAGE' else
+                {'mode': state.confidence} if mode == 'CONFIDENCE' else
+                {'scope': state.scope, 'stage': state.stage} if mode == 'DPPG' else {})
+            with context.temp_override(selected_objects=selected, selected_editable_objects=selected,
+                                       active_object=camera, object=camera):
+                op = getattr(bpy.ops.stablegen, OPERATORS[mode])
+                if not op.poll():
+                    raise ValueError('This diagnostic requires meshes, cameras and Debug enabled in preferences.')
+                result = op('EXEC_DEFAULT', **kwargs)
+                if 'FINISHED' not in result:
+                    raise ValueError('This signal is unavailable. Reproject textures with the relevant feature enabled.')
     except Exception:
         # Include new IDs even when an existing diagnostic fails halfway through.
         for collection, previous in zip(collections, before):
@@ -305,6 +350,7 @@ class SG_OT_StudioDiagnostic(bpy.types.Operator):
 
     setting: bpy.props.StringProperty(default='mode', options={'HIDDEN'})
     value: bpy.props.StringProperty(default='"TEXTURES"', options={'HIDDEN'})
+    failure = ''  # why the last change fell back to the textures, for the panel to say
 
     @classmethod
     def poll(cls, context):
@@ -314,6 +360,7 @@ class SG_OT_StudioDiagnostic(bpy.types.Operator):
         if self.setting not in OPTIONS:
             return {'CANCELLED'}
         state = context.scene.sg_studio_diagnostics
+        SG_OT_StudioDiagnostic.failure = ''
         try:
             value = json.loads(self.value)
             if self.setting == 'camera':
@@ -322,7 +369,8 @@ class SG_OT_StudioDiagnostic(bpy.types.Operator):
             apply(context)
         except Exception as exc:
             restore(context.scene)
-            self.report({'WARNING'}, str(exc).split('\n')[0])
+            SG_OT_StudioDiagnostic.failure = str(exc).split('\n')[0]
+            self.report({'WARNING'}, SG_OT_StudioDiagnostic.failure)
             return {'FINISHED'}  # rollback itself must be undoable
         for screen in bpy.data.screens:
             for area in screen.areas:
