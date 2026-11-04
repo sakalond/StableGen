@@ -24,14 +24,17 @@ from . import studio_help as help_text
 from . import studio_actions as action_style
 from . import studio_lora as lora
 from . import studio_tips as tips
+from . import studio_setup as setup_page
 from .presentation import Layout, Control, Section, STRUCTURAL_PROPERTIES, TOOL_SECTIONS
 from .studio_text import TextBuffer, wrap
 from .studio_widgets import (Painter, FONT_SIZE, CONTROL_HEIGHT, CONTROL_GAP,
-                             TEXT_LINE_HEIGHT, TEXT_PADDING, font_size)
+                             TEXT_LINE_HEIGHT, TEXT_PADDING, color, font_size)
 from .presets import (PRESETS, PRESET_MODEL_NAMES, PRESET_VARIANTS, PRESET_WORKFLOWS,
                       preset_label as _preset_label, preset_model as _preset_model,
                       preset_workflow as _preset_workflow, strip_word as _strip)
 from ..utils import sg_modal_active
+from ..cameras import visibility
+from ..setup import prefs_ui as setup_prefs, runtime as setup_runtime
 from ..core import ADDON_PKG, legacy_panel_enabled
 from ..core.generation_status import WAITING_STAGES
 from ..core.architectures import ARCHITECTURE_ITEMS, QWEN_ARCHITECTURES, architecture_status
@@ -1593,7 +1596,7 @@ class StudioSession:
         return PAGES + [('TOOLS', 'Tools')]
 
     def more_menu(self, rect):
-        available = {self.section_page(s) for s in self.document.sections}
+        available = {self.section_page(s) for s in self.document.sections} | {'SETUP'}
         primary = dict(self.pages())
         self.menu = {'anchor': rect, 'items': [(key, name, '') for key, name in MORE if key in available and key not in primary],
                      'query': '', 'binding': None, 'index': 0, 'scroll': 0}
@@ -1662,6 +1665,7 @@ class StudioSession:
                      corners='RIGHT' if i == len(buttons) - 1 else 'NONE')
             button_x += button_width
         y += max(left, right)
+        y = setup_page.draw_model_hint(self, p, x, y, width)
         pages = self.pages() + [('MORE', 'More')]
         p.outline(x, y, width, 28, 'card', 'section_border', 4)
         compact = width < 360
@@ -1793,20 +1797,60 @@ class StudioSession:
         primary = model.action(self.document, 'object.test_stable', 'object.stablegen_regenerate',
                                'object.trellis2_generate', 'object.trellis2_batch_generate', 'stablegen.masked_edit')
         disabled_reason = ''
+        # the server line's dot: green while ComfyUI answers, blue while it starts or is checked
+        dot = 'ok' if prefs.server_online else 'accent' if checking_server else 'warning'
+        comfy = None        # the ComfyUI StableGen runs, while it doesn't answer yet
         if primary:
             text = primary.control.kwargs.get('text', '')
             if any(word in text.lower() for word in ('cannot', 'enable online', 'select an image')):
                 disabled_reason = text.replace('Cannot generate: ', '').replace('Cannot edit: ', '')
             if prefs.server_address and not prefs.server_online and not checking_server:
                 disabled_reason = 'ComfyUI offline · ' + prefs.server_address
+                if setup_runtime.local_mode(prefs):     # StableGen runs this ComfyUI: say what it is doing
+                    comfy = setup_runtime.comfy()
+                    disabled_reason = {
+                        'starting': f'Starting ComfyUI… {int(time.time() - comfy.started_at)} s',
+                        'running': 'Connecting to ComfyUI…', 'exited': 'ComfyUI stopped unexpectedly',
+                        'unresponsive': 'ComfyUI is not answering'}.get(comfy.state, 'ComfyUI stopped')
+                    dot = {'starting': 'accent', 'running': 'accent', 'exited': 'warning',
+                           'unresponsive': 'warning'}.get(comfy.state, 'muted')
         scope = 'TRELLIS.2 · Shape and texture' if native else f'{len(selected)} selected views' if selected else f'{count} views · ' + ('Selected objects' if scene.texture_objects == 'selected' else 'All visible objects')
-        p.text('Checking server…' if checking_server else disabled_reason or ('Reproject changes before baking' if self.dirty_projection else scope), x, y, 10,
-               'warning' if disabled_reason or self.dirty_projection else 'muted', width - 64)
-        if selected and not native:
+        # Start, or Log and Restart, on the line itself while StableGen's ComfyUI isn't up
+        commands = []
+        if comfy is not None and comfy.state in ('exited', 'unresponsive'):
+            commands = [('footer-comfy-log', 'Log', 'document', ('operator', 'stablegen.comfy_open_log', {'which': 'COMFYUI'}),
+                         'Open the ComfyUI log'),
+                        ('footer-comfy-restart', 'Restart', 'reset', ('operator', 'stablegen.comfy_start', {}),
+                         'Start ComfyUI again')]
+        elif comfy is not None and comfy.state not in ('starting', 'running'):
+            commands = [('footer-comfy-start', 'Start', 'play', ('operator', 'stablegen.comfy_start', {}),
+                         'Start ComfyUI in the background')]
+        line_right = x + width
+        for key, label, icon, action, hint in reversed(commands):
+            button_width = p.measure(label, 10) + 30
+            line_right -= button_width
+            with _viewport(self):
+                available = model.operator(action[1]).poll() and not self.busy
+            p.button(key, (line_right, y - 3, button_width, 18), label, action, icon=icon, enabled=available,
+                     hover=self.hovered(key), hint=hint, text_size=10)
+        # a ComfyUI that is stopped or starting is no fault: its line stays muted
+        quiet = comfy is not None and comfy.state in ('stopped', 'starting', 'running')
+        p.rect(x, y + 4, 7, 7, dot, 3.5)
+        p.text('Checking server…' if checking_server else disabled_reason or ('Reproject changes before baking' if self.dirty_projection else scope), x + 13, y, 10,
+               'warning' if (disabled_reason or self.dirty_projection) and not quiet else 'muted',
+               line_right - x - 19 if commands else width - 77)
+        if commands:
+            pass
+        elif selected and not native:
             p.button('all-views', (x + width - 65, y - 3, 65, 18), 'All views', self.clear_camera_selection,
                      enabled=not self.busy, hint='Clear only the selected cameras; retain selected meshes')
         else:
             p.text(f'Seed {scene.trellis2_seed if native else scene.seed}', x + width - 64, y, 10, 'muted', 64)
+        if comfy is not None and comfy.state == 'starting':
+            # ComfyUI doesn't say how far along it is: a bar that slows as it fills
+            elapsed = time.time() - comfy.started_at
+            p.rect(x, y + 15, width, 2, 'line', 1)
+            p.rect(x, y + 15, width * min(.95, 1 - .5 ** (elapsed / 20)), 2, 'accent', 1)
         y += 20
         if decision:
             for i, item in enumerate(decision):
@@ -1818,6 +1862,8 @@ class StudioSession:
             label = 'Generate asset' if native else 'Regenerate selected views' if c.args[0] == 'object.stablegen_regenerate' else 'Edit painted selection' if c.args[0] == 'stablegen.masked_edit' else 'Generate textures'
             with _viewport(self):
                 available = primary.enabled and not disabled_reason and model.operator(c.args[0]).poll()
+            # StableGen's own ComfyUI has its commands on the line above; refresh only once it runs
+            refresh_server = refresh_server and (comfy is None or comfy.state == 'running')
             refresh_width = 34 if refresh_server else 0
             p.button('generate', (x, y, width - refresh_width, 28), label, ('operator', c.args[0], c.properties),
                      icon='play', style='primary', enabled=available and not self.busy and not checking_server,
@@ -2639,8 +2685,10 @@ class StudioSession:
             self.card_bounds = {}
             p.panel()
             x, width = 12, p.width - 24
+            setup_page.open_first_run(self)
             top = self.draw_header(p, x, width)
-            bottom = self.draw_footer(p, x, width)
+            # the setup page has nothing to generate: its cards take the whole height
+            bottom = p.height - 6 if self.page == 'SETUP' else self.draw_footer(p, x, width)
             narrow = width < cards.SIDE_BY_SIDE_WIDTH
             if narrow and not tips.dismissed(tips.WIDEN_HINT):
                 bottom = self.draw_widen_hint(p, x, width, bottom)
@@ -2649,8 +2697,14 @@ class StudioSession:
             offset = self.scroll.get(self.page, 0)
             y = top + 12 - offset
             for node in self.document.notices:
+                # the model hint is drawn under Architecture, and the setup page shows what the first-run card says
+                if node.has_operator(*setup_prefs.HINT_OPERATORS) or (
+                        self.page == 'SETUP' and node.has_operator('stablegen.open_setup')):
+                    continue
                 y = self.draw_node(p, node, x, y, width, 'notices')
-            if self.page == 'GENERATE':
+            if self.page == 'SETUP':
+                y = setup_page.draw(self, p, x, y, width)
+            elif self.page == 'GENERATE':
                 y = self.draw_generate(p, x, y, width)
             elif self.page == 'CAMERAS':
                 y = self.draw_cameras(p, x, y, width)

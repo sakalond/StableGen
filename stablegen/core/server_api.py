@@ -62,7 +62,9 @@ def confirm_server(operator, context):
         prefs.server_online = True
         return True
     prefs.server_online = False
-    operator.report({'ERROR'}, offline_message(prefs.server_address))
+    from ..setup import runtime
+    note = runtime.offline_note()       # the local ComfyUI is starting, or starts now
+    operator.report({'WARNING'} if note else {'ERROR'}, note or offline_message(prefs.server_address))
     return False
 
 

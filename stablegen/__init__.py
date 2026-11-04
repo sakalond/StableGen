@@ -51,7 +51,7 @@ from .cameras import (
 )
 from .debug_tools import debug_classes as _debug_classes
 from .cameras import display as camera_display
-from .core import server_monitor
+from .core import server_monitor, state as core_state
 from .texturing.regression import REGRESSION_CLASSES
 from .texturing import masked_edit
 from .utils import AddHDRI, ApplyModifiers, CurvesToMesh
@@ -62,12 +62,16 @@ from .mesh_gen.trellis2 import (
     Trellis2Generate, StableGenApplyBoneDisplay,
     StableGenAutoRigSelectedMesh, StableGenLocalPostProcess,
 )
+from .mesh_gen.meshtools import StableGenLato2Remesh
 from .mesh_gen.batch import (
     TRELLIS2_OT_BatchSelectFolder, TRELLIS2_OT_BatchGenerate,
     TRELLIS2_OT_BatchCancel, TRELLIS2_OT_BatchClear,
     TRELLIS2_OT_BatchBakeSettings,
 )
 from .dae_import import DAE_IMPORT_CLASSES
+from .setup import runtime as setup_runtime
+from .setup.operators import SETUP_CLASSES
+from .ui.studio_setup import CLASSES as STUDIO_SETUP_CLASSES
 
 # -- Core / UI sub-packages ----------------------------------------------
 from .core.preferences import (
@@ -202,6 +206,8 @@ classes.extend(REGRESSION_CLASSES)
 classes.extend(masked_edit.MASKED_EDIT_CLASSES)
 classes.extend(STUDIO_UI_CLASSES)
 classes.extend(camera_display.CLASSES)
+classes.extend(SETUP_CLASSES)
+classes.extend(STUDIO_SETUP_CLASSES)
 
 
 def register():
@@ -221,11 +227,15 @@ def register():
     )
     register_studio_ui()
     camera_display.register()
+    core_state.register()
     server_monitor.register()
+    setup_runtime.register()
 
 
 def unregister():
+    setup_runtime.unregister()
     server_monitor.unregister()
+    core_state.unregister()
     camera_display.unregister()
     unregister_studio_ui()
     masked_edit.unregister_properties()

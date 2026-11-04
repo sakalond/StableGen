@@ -75,6 +75,9 @@ def _tick():
         if (_in_flight or wrapper is None or not wrapper.preferences.server_address
                 or not bpy.app.online_access or not _sidebar_open(context) or _busy(context)):
             return INTERVAL
+        from ..setup import runtime
+        if runtime.maybe_autostart():       # the sidebar needs the local ComfyUI StableGen runs
+            return INTERVAL
         address, timeout = wrapper.preferences.server_address, get_timeout('ping')
         _in_flight = True
         _run_async(lambda: check_server_availability(address, timeout=timeout),

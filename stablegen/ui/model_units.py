@@ -223,6 +223,9 @@ class RefreshCheckpointList(bpy.types.Operator):
 
         server_address = prefs.preferences.server_address
         architecture = getattr(context.scene, "model_architecture", "sdxl")
+        from ..setup import runtime as setup_runtime
+        if setup_runtime.local_mode(prefs.preferences):
+            setup_runtime.refresh_models()      # the panel's Install line follows the same refresh
 
         def _bg_work():
             model_list = None

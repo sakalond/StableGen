@@ -115,20 +115,26 @@ Texturing works by projection. Each camera gets a generated view that follows th
 ## Requirements
 
 - Blender 4.2 to 4.5, or 5.1 and later. Blender 5.0 is not supported.
-- A ComfyUI server, preferably with an NVIDIA GPU: about 8 GB of VRAM for SDXL, and 16 GB or more for Qwen Image.
+- ComfyUI: StableGen can install its own, use one you have, or connect to one on another machine. An NVIDIA GPU is preferred: about 8 GB of VRAM for SDXL, and 16 GB or more for Qwen Image.
 - Windows, Linux, or macOS on Apple Silicon.
-- 10 GB to over 50 GB of disk space for models, depending on what you install.
+- 10 GB to over 50 GB of disk space for models, depending on what you install, plus about 5 GB for StableGen's own ComfyUI.
 
 ## Installation
 
-1. Install [ComfyUI](https://github.com/comfyanonymous/ComfyUI#installing) and check that it runs.
-2. Install the custom nodes and models StableGen uses with the installer in this repository, then restart ComfyUI:
-   ```bash
-   python installer.py <path to ComfyUI>
-   ```
-   Package 3 sets up SDXL texturing, package 13 Qwen Image 2.1, package 8 mesh generation, package 14 auto-rigging, and packages 15 to 17 the experimental architectures.
-3. Download the add-on ZIP for your system (Windows x64, Linux x64 or macOS on Apple Silicon) from [Releases](https://github.com/sakalond/stablegen/releases). In Blender, open **Edit > Preferences > Get Extensions**, choose **Install from Disk** in the top-right menu, and select the ZIP.
-4. In the add-on preferences, set **Output Directory** and **Server Address** (`127.0.0.1:8188` by default). Under **System > Network**, enable **Allow Online Access**.
+1. Download the add-on ZIP for your system (Windows x64, Linux x64 or macOS on Apple Silicon) from [Releases](https://github.com/sakalond/stablegen/releases). In Blender, open **Edit > Preferences > Get Extensions**, choose **Install from Disk** in the top-right menu, and select the ZIP.
+2. Under **System > Network**, enable **Allow Online Access**.
+3. In StableGen's add-on preferences, choose where **ComfyUI** comes from:
+   - **StableGen's own**: pick an install folder and press **Install ComfyUI**. StableGen sets up ComfyUI with its own Python and torch for your GPU, then starts and stops it by itself. Windows and Linux.
+   - **My ComfyUI folder**: a ComfyUI you already have (portable, git or Desktop install). StableGen installs models into it and starts it when needed.
+   - **Remote server**: a ComfyUI on another machine, at its server address. Install the models there with the installer (below).
+4. Under **Models**, install what you need: SDXL or Qwen Image 2.1 for texturing, TRELLIS.2 for meshes, auto-rigging, PBR maps and the experimental architectures. Each shows its download size, and an interrupted download resumes.
+5. Set **Output Directory**.
+
+On a remote ComfyUI, or without Blender, run the installer on that machine and restart ComfyUI:
+```bash
+python installer.py <path to ComfyUI> --packages 3,8
+```
+Package 3 sets up SDXL texturing, package 13 Qwen Image 2.1, package 8 mesh generation, package 14 auto-rigging, and packages 15 to 17 the experimental architectures. `python installer.py --create-comfyui <folder>` sets up StableGen's own ComfyUI there.
 
 [Installation](https://github.com/sakalond/StableGen/wiki/Installation) covers every installer package, unattended installs, a remote server and manual setup.
 

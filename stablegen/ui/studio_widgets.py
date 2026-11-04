@@ -72,8 +72,18 @@ ICON_PATHS = {
     'rig': [[(10, 2), (10, 9), (4, 6)], [(10, 9), (17, 5)], [(10, 9), (6, 19)], [(10, 9), (16, 18)]],
     'graph': [[(2, 2), (2, 18), (19, 18)], [(4, 14), (8, 8), (12, 11), (18, 3)]],
     'shield': [[(10, 2), (18, 5), (17, 13), (10, 19), (3, 13), (2, 5), (10, 2)]],
+    'rename': [[(3, 18), (3, 14), (14, 3), (18, 7), (7, 18), (3, 18)], [(12, 5), (16, 9)]],
+    'server': [[(3, 3), (18, 3), (18, 9), (3, 9), (3, 3)], [(3, 12), (18, 12), (18, 18), (3, 18), (3, 12)],
+               [(11, 6), (15, 6)], [(11, 15), (15, 15)]],
+    'image': [[(2, 3), (19, 3), (19, 18), (2, 18), (2, 3)], [(2, 15), (7, 10), (11, 14), (14, 11), (19, 16)]],
+    'cube': [[(10, 2), (18, 6), (18, 15), (10, 19), (2, 15), (2, 6), (10, 2)], [(2, 6), (10, 10), (18, 6)],
+             [(10, 10), (10, 19)]],
+    'trash': [[(3, 5), (18, 5)], [(8, 5), (8, 2.5), (13, 2.5), (13, 5)], [(5, 5), (6, 19), (15, 19), (16, 5)],
+              [(8.5, 9), (8.5, 15.5)], [(12.5, 9), (12.5, 15.5)]],
+    'warning': [[(10.5, 2), (19.5, 18.5), (1.5, 18.5), (10.5, 2)], [(10.5, 8), (10.5, 12.5)]],
 }
-ICON_CIRCLES = {'camera': (10.5, 11, 4), 'eye': (10, 10, 2.5), 'search': (9, 9, 6)}
+ICON_CIRCLES = {'camera': (10.5, 11, 4), 'eye': (10, 10, 2.5), 'search': (9, 9, 6), 'server': (6.5, 6, 1),
+                'image': (14, 7.5, 1.6), 'warning': (10.5, 15.5, .6)}
 # Filled convex shapes, such as arrowheads that would blur into a thin stroke.
 ICON_FILLS = {'reset': [head for _, head in _SYNC]}
 ICON_PAD = 2
@@ -335,7 +345,7 @@ COLORS = {key: color(value) for key, value in {
     'raised': '545454', 'line': '494949', 'divider': '464646', 'text': 'e6e6e6',
     'secondary': 'c4c4c4', 'muted': '999999', 'accent': '8fa6ca',
     'blue': '4772b3', 'on_accent': 'ffffff', 'hover': '545454', 'disabled': '787878',
-    'warning': 'c0a673', 'selected': '404c5e', 'card': '353535',
+    'warning': 'c0a673', 'selected': '404c5e', 'card': '353535', 'ok': '7dba82',
     'text_selected': '4a4a4a', 'number_selected': '6e6e6e',
     'cursor': '71a8ff', 'switch_off': '545454', 'switch_knob': 'ffffff',
     'outer_edge': '494949',
@@ -381,6 +391,7 @@ def theme_colors(context):
     card = _over(getattr(ui, 'panel_sub_back', (0, 0, 0, .12)), panel)
     subbox = _mix(card, field_back, .2)
     section_border = _mix(border, text, .075)
+    warning = _mix(_rgba(getattr(ui.wcol_state, 'warning', COLORS['warning'])), text, .35)
     return {
         'panel': panel, 'field': field_back, 'field_text': _rgba(field.text),
         'number': _over(number.inner, panel), 'number_text': _rgba(number.text),
@@ -409,7 +420,10 @@ def theme_colors(context):
         'dependency_rail': _mix(panel, text, .23),
         'text_selected': _over(field.item, field_back),
         'number_selected': _mix(_over(number.inner, panel), _rgba(number.text), .18),
-        'warning': _mix(_rgba(getattr(ui.wcol_state, 'warning', COLORS['warning'])), text, .35),
+        'warning': warning,
+        # a model that isn't installed: the tab switcher's selected tab in amber, and its hovered segment
+        'warning_tab': _mix(card, warning, .17), 'warning_strong': _mix(panel, warning, .3),
+        'ok': _mix(COLORS['ok'], text, .2),     # installed, running: the theme has no success color
         'switch_off': _over(ui.wcol_toggle.inner, panel), 'switch_knob': _rgba(ui.wcol_option.item),
         'switch_off_hover': _mix(_over(ui.wcol_toggle.inner, panel), text, .14),
         'tooltip': _over(ui.wcol_tooltip.inner, panel),

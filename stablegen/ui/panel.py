@@ -212,6 +212,8 @@ class StableGenPanel(bpy.types.Panel):
                         and scene.trellis2_generate_from == 'prompt'):
                     box.prop(scene, "trellis2_initial_image_arch")
             return
+        from ..setup.prefs_ui import draw_panel_notices
+        draw_panel_notices(layout, context)
         config_error_message = None
 
         if not os.path.exists(addon_prefs.output_dir):
@@ -276,7 +278,20 @@ class StableGenPanel(bpy.types.Panel):
             ) if not trellis2_op and not comfy_tex_op else None
 
             if config_error_message:
-                if config_error_message == "ComfyUI offline":
+                from ..setup import runtime as setup_runtime
+                if config_error_message == "ComfyUI offline" and setup_runtime.local_mode(addon_prefs):
+                    # StableGen runs this ComfyUI: say what it is doing and offer Start instead of a refresh
+                    state = setup_runtime.comfy().state
+                    split = action_row.split(factor=0.85, align=True)
+                    split.operator("object.trellis2_generate", text={
+                        'starting': "Starting ComfyUI…", 'running': "Connecting to ComfyUI…",
+                        'exited': "ComfyUI stopped unexpectedly"}.get(state, "Cannot generate: ComfyUI stopped"),
+                        icon="SORTTIME" if state in ('starting', 'running') else "ERROR")
+                    if state not in ('starting', 'running'):
+                        split.operator("stablegen.comfy_start", text="", icon='PLAY')
+                    else:
+                        split.operator("stablegen.check_server_status", text="", icon='FILE_REFRESH')
+                elif config_error_message == "ComfyUI offline":
                     split = action_row.split(factor=0.85, align=True)
                     split.operator("object.trellis2_generate", text="Cannot generate: " + config_error_message, icon="ERROR")
                     split.operator("stablegen.check_server_status", text="", icon='FILE_REFRESH')
@@ -531,7 +546,20 @@ class StableGenPanel(bpy.types.Panel):
                     status_row.label(text=scene.sg_masked_status)
             elif config_error_message:
                 # Split the row to have the error message/disabled button and the refresh button
-                if config_error_message == "ComfyUI offline":
+                from ..setup import runtime as setup_runtime
+                if config_error_message == "ComfyUI offline" and setup_runtime.local_mode(addon_prefs):
+                    # StableGen runs this ComfyUI: say what it is doing and offer Start instead of a refresh
+                    state = setup_runtime.comfy().state
+                    split = action_row.split(factor=0.85, align=True)
+                    split.operator("object.test_stable", text={
+                        'starting': "Starting ComfyUI…", 'running': "Connecting to ComfyUI…",
+                        'exited': "ComfyUI stopped unexpectedly"}.get(state, "Cannot generate: ComfyUI stopped"),
+                        icon="SORTTIME" if state in ('starting', 'running') else "ERROR")
+                    if state not in ('starting', 'running'):
+                        split.operator("stablegen.comfy_start", text="", icon='PLAY')
+                    else:
+                        split.operator("stablegen.check_server_status", text="", icon='FILE_REFRESH')
+                elif config_error_message == "ComfyUI offline":
                     split = action_row.split(factor=0.85, align=True) # Adjust factor as needed
                     split.operator("object.test_stable", text="Cannot generate: " + config_error_message, icon="ERROR") # Use ERROR icon
                     # Use the operator from __init__.py
