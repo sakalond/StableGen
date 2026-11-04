@@ -2462,6 +2462,19 @@ def _make_solid_mesh_object(
                         if isinstance(geom, bmesh.types.BMFace)
                         and geom not in source_faces
                     ]
+                    # A loop through pinch points (coincident vertices
+                    # kept apart above) fills with zero-area triangles
+                    # between them. They close nothing, and the result's
+                    # validation rejected the whole mesh for them.
+                    degenerate = [
+                        face for face in component_faces
+                        if face.calc_area() <= 1.0e-10
+                    ]
+                    if degenerate:
+                        bmesh.ops.delete(bm, geom=degenerate, context='FACES')
+                        component_faces = [
+                            face for face in component_faces if face.is_valid
+                        ]
                     if not component_faces:
                         skipped += 1
                         continue
