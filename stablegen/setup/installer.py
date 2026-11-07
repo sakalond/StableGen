@@ -2044,7 +2044,15 @@ def probe_environment(comfyui_path: Path, distributions: List[str] = ()) -> Dict
 
 
 def git_executable() -> Optional[str]:
-    return GIT_EXE if Path(GIT_EXE).is_file() else shutil.which(GIT_EXE)
+    if Path(GIT_EXE).is_file():
+        return GIT_EXE
+    found = shutil.which(GIT_EXE)
+    if found or GIT_EXE != "git" or sys.platform != "linux":
+        return found
+    for candidate in (Path.home() / ".linuxbrew/bin/git", Path("/home/linuxbrew/.linuxbrew/bin/git")):
+        if candidate.is_file():
+            return str(candidate)
+    return None
 
 
 MODEL_TYPES = ("model", "hf_model")
@@ -2241,7 +2249,10 @@ def main(argv: Optional[List[str]] = None) -> int:
     IGNORE_DISK_SPACE = args.ignore_disk_space
     if args.git:
         GIT_EXE = str(Path(args.git).resolve())
-        # node install scripts and pip (git+ URLs) look for git on PATH too
+    else:
+        GIT_EXE = git_executable() or GIT_EXE
+    if Path(GIT_EXE).is_file():
+        # Node install scripts and pip (git+ URLs) look for git on PATH too.
         path = str(Path(GIT_EXE).parent) + os.pathsep + os.environ.get("PATH", "")
         os.environ["PATH"] = UTF8_ENV["PATH"] = path
     saved = sys.stdout, sys.stderr
